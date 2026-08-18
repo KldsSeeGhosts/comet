@@ -3866,6 +3866,15 @@ pub enum ComposerEvent {
     /// yet: the transcript remembers the stable id and promotes it to an
     /// own-turn anchor only when the host materializes the matching bubble.
     Queued { chat_id: String, message_id: String },
+    /// A new worktree's host-side setup attempt completed after its chat id
+    /// was minted. The shell attaches an already-open terminal to that exact
+    /// chat, even when the user has selected another chat in the meantime.
+    WorktreeSetup {
+        chat_id: String,
+        setup_action: Option<zeron_proto::ProjectActionRun>,
+        setup_error: Option<String>,
+        target_device_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
