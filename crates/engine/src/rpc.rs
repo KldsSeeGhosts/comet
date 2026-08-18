@@ -68,6 +68,7 @@ use crate::auth::Auth;
 use crate::change_requests::CheckoutChangeRequests;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
+use crate::project_actions::ProjectActionsStore;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
@@ -500,6 +501,7 @@ pub struct EngineRpc {
     terminals: Terminals,
     previews: Option<zeron_preview::PreviewService>,
     change_requests: CheckoutChangeRequests,
+    project_actions: ProjectActionsStore,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
@@ -521,6 +523,7 @@ impl EngineRpc {
         workspace_files: crate::WorkspaceFiles,
         terminals: Terminals,
         change_requests: CheckoutChangeRequests,
+        project_actions: ProjectActionsStore,
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
@@ -542,6 +545,7 @@ impl EngineRpc {
             terminals,
             previews: None,
             change_requests,
+            project_actions,
             diff_sync,
             uploads,
             agent_accounts,

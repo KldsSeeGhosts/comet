@@ -26,6 +26,7 @@ mod http_error;
 pub mod instance_lock;
 pub mod local_import;
 pub mod profile;
+pub mod project_actions;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -51,6 +52,7 @@ pub use diff_sync::{
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
+pub use project_actions::ProjectActionsStore;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
@@ -131,6 +133,7 @@ pub struct EngineCore {
     pub terminals: Terminals,
     pub previews: zeron_preview::PreviewService,
     pub change_requests: CheckoutChangeRequests,
+    pub project_actions: ProjectActionsStore,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
@@ -258,6 +261,7 @@ impl EngineCore {
             local_device_name(&device_id),
         )
         .map_err(|e| EngineError::Other(e.to_string()))?;
+        let project_actions = ProjectActionsStore::open(profile.store_root())?;
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),
@@ -314,6 +318,7 @@ impl EngineCore {
             terminals,
             previews,
             change_requests,
+            project_actions,
             diff_sync,
             spaces_sync,
             uploads,
@@ -445,6 +450,7 @@ impl EngineCore {
             self.workspace_files.clone(),
             self.terminals.clone(),
             self.change_requests.clone(),
+            self.project_actions.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
