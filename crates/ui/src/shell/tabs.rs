@@ -331,6 +331,9 @@ impl Shell {
             )
         };
 
+        let actions = (!takeover && !on_canvas)
+            .then(|| self.render_project_actions_control(cx))
+            .flatten();
         let inner = div()
             .size_full()
             .flex()
@@ -385,6 +388,7 @@ impl Shell {
                         }),
                 )
             })
+            .children(actions)
             .child(div().flex_1())
             .children(trailing);
 
