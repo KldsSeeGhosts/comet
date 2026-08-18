@@ -60,7 +60,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
-use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
+use zeron_proto::{
+    ChatConfig, EngineInfo, HarnessId, ProjectActionDraft, Space, ToolCall, WorkspaceScope,
+};
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
@@ -253,6 +255,28 @@ struct DeleteWorktreeParams {
     repo_path: String,
     #[serde(alias = "path")]
     worktree_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListProjectActionsParams {
+    space_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpsertProjectActionParams {
+    space_id: String,
+    #[serde(default)]
+    action_id: Option<String>,
+    action: ProjectActionDraft,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteProjectActionParams {
+    space_id: String,
+    action_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -602,6 +626,20 @@ impl EngineRpc {
         self.local_import
             .as_ref()
             .ok_or_else(|| RpcError::Failed("local import requires a synced workspace".into()))
+    }
+
+    fn local_project_action_space(&self, space_id: &str) -> Result<Space, RpcError> {
+        let space = self
+            .workspace
+            .space(space_id)
+            .map_err(|err| RpcError::Failed(err.to_string()))?
+            .ok_or_else(|| RpcError::Failed("Project space not found".into()))?;
+        if space.device_id != self.doc_host.device_id() {
+            return Err(RpcError::Failed(
+                "Project space belongs to another device".into(),
+            ));
+        }
+        Ok(space)
     }
 
     /// Resolve a mention-search root from synced workspace rows. A client may
@@ -988,6 +1026,10 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_WORKSPACE_FILES
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
+            // Project Actions live in the owning engine's private profile store.
+            | methods::LIST_PROJECT_ACTIONS
+            | methods::UPSERT_PROJECT_ACTION
+            | methods::DELETE_PROJECT_ACTION
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
@@ -2259,6 +2301,38 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::LIST_PROJECT_ACTIONS => {
+                let p: ListProjectActionsParams = parse_params(params)?;
+                let space = self.local_project_action_space(&p.space_id)?;
+                let snapshot = self
+                    .project_actions
+                    .snapshot(&space.id, std::path::Path::new(&space.path))
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&snapshot)
+            }
+            methods::UPSERT_PROJECT_ACTION => {
+                let p: UpsertProjectActionParams = parse_params(params)?;
+                let space = self.local_project_action_space(&p.space_id)?;
+                let snapshot = self
+                    .project_actions
+                    .upsert(
+                        &space.id,
+                        std::path::Path::new(&space.path),
+                        p.action_id.as_deref(),
+                        p.action,
+                    )
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&snapshot)
+            }
+            methods::DELETE_PROJECT_ACTION => {
+                let p: DeleteProjectActionParams = parse_params(params)?;
+                let space = self.local_project_action_space(&p.space_id)?;
+                let snapshot = self
+                    .project_actions
+                    .delete(&space.id, std::path::Path::new(&space.path), &p.action_id)
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&snapshot)
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
