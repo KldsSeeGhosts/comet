@@ -362,11 +362,24 @@ impl Shell {
                         ComposerEvent::Queued { message_id, .. } => {
                             t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
                         }
-                        ComposerEvent::NewThreadTransitionStarted => {}
+                        ComposerEvent::NewThreadTransitionStarted
+                        | ComposerEvent::WorktreeSetup { .. } => {}
                     });
                 }
                 cx.notify();
             }
+            ComposerEvent::WorktreeSetup {
+                chat_id,
+                setup_action,
+                setup_error,
+                target_device_id,
+            } => self.attach_worktree_setup(
+                chat_id.clone(),
+                setup_action.clone(),
+                setup_error.clone(),
+                target_device_id.clone(),
+                cx,
+            ),
         }
     }
 
