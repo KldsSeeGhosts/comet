@@ -161,7 +161,7 @@ mkdir -p "$bin_dir" "$apps_dir" "$systemd_dir" "$app_root" \
     "$icons_dir/scalable/apps" "$icons_dir/1024x1024/apps"
 
 # --- desktop entry ---
-desktop_tmp="$(mktemp "${apps_dir}/.${name}.desktop.tmp.XXXXXX")"
+desktop_tmp="$(mktemp "${apps_dir}/.${name}.tmp.XXXXXX.desktop")"
 TEMP_FILES+=("$desktop_tmp")
 cat <<EOF > "$desktop_tmp"
 [Desktop Entry]
@@ -188,7 +188,7 @@ fi
 # the variant's own env (~/.zeron-dev/env for dev). ZERON_DATA_DIR and
 # ZERON_IPC_PORT are baked in so the engine never touches the other variant's
 # state even if the env file is empty.
-unit_tmp="$(mktemp "${systemd_dir}/.${unit}.tmp.XXXXXX")"
+unit_tmp="$(mktemp "${systemd_dir}/.${unit}.tmp.XXXXXX.service")"
 TEMP_FILES+=("$unit_tmp")
 cat <<EOF > "$unit_tmp"
 [Unit]
