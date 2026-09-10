@@ -273,15 +273,18 @@ impl SessionDoc {
         serde_json::from_str(&value).ok()
     }
 
-    pub fn update_context_usage(
-        &self,
-        tokens: Option<u64>,
-        window: Option<u64>,
-    ) -> Result<(), DocError> {
+    pub fn update_context_usage(&self, usage: zeron_proto::ContextUsage) -> Result<(), DocError> {
         let previous = self.context_usage().unwrap_or_default();
+        let components = if usage.components.is_empty() {
+            previous.components.clone()
+        } else {
+            usage.components
+        };
         let next = zeron_proto::ContextUsage {
-            tokens: tokens.or(previous.tokens),
-            window: window.filter(|n| *n > 0).or(previous.window),
+            // Missing fields preserve the previous measurement; zero is valid.
+            tokens: usage.tokens.or(previous.tokens),
+            window: usage.window.filter(|n| *n > 0).or(previous.window),
+            components,
         };
         if next != previous {
             self.doc
@@ -1504,7 +1507,12 @@ mod tests {
             },
         );
         writer.sync(&folded).unwrap();
-        fold_event_into_parts(&mut folded, &AgentEvent::TextDelta { text: "Done".into() });
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::TextDelta {
+                text: "Done".into(),
+            },
+        );
         writer.sync(&folded).unwrap();
         writer.finish(&folded, MessageStatus::Complete).unwrap();
 
@@ -1581,14 +1589,9 @@ mod tests {
                 diff_stats,
                 ..
             } => {
-                // One-liner chips: the fold drops outputs entirely (journal
-                // only), so even a direct apply_sidecar_refs call has no
-                // output to key — diff stats still get their ref (this test
-                // calls apply_sidecar_refs directly; the live fold no longer
-                // does).
-                assert_eq!(output.as_deref(), None);
-                assert_eq!(output_ref.as_deref(), None);
-                assert_eq!(*output_bytes, None);
+                assert_eq!(output.as_deref(), Some("total 0\nmore lines"));
+                assert_eq!(output_ref.as_deref(), Some("chat-2/t1"));
+                assert_eq!(*output_bytes, Some("total 0\nmore lines".len() as u64));
                 assert!(diff.is_none(), "no inline diff text in the doc");
                 assert_eq!(diff_ref.as_deref(), Some("chat-2/t1.diff"));
                 let stats = diff_stats.as_ref().expect("stats survive");
@@ -1773,8 +1776,12 @@ mod context_usage_tests {
     fn context_snapshot_survives_remote_import_restart_and_rebuild() {
         let host = SessionDoc::init("context-chat").unwrap();
         assert_eq!(host.context_usage(), None);
-        host.update_context_usage(Some(150_000), Some(200_000))
-            .unwrap();
+        host.update_context_usage(zeron_proto::ContextUsage {
+            tokens: Some(150_000),
+            window: Some(200_000),
+            components: Vec::new(),
+        })
+        .unwrap();
         let replica = SessionDoc::from_doc(LoroDoc::new());
         replica
             .doc()
@@ -1783,7 +1790,12 @@ mod context_usage_tests {
         assert_eq!(replica.context_usage(), host.context_usage());
         let version = host.doc().oplog_vv();
         // Compaction is a replacement, not an accumulating counter. Zero capacity is invalid.
-        host.update_context_usage(Some(0), Some(0)).unwrap();
+        host.update_context_usage(zeron_proto::ContextUsage {
+            tokens: Some(0),
+            window: Some(0),
+            components: Vec::new(),
+        })
+        .unwrap();
         replica
             .doc()
             .import(&host.doc().export(ExportMode::updates(&version)).unwrap())
@@ -1792,11 +1804,43 @@ mod context_usage_tests {
             replica.context_usage(),
             Some(zeron_proto::ContextUsage {
                 tokens: Some(0),
-                window: Some(200_000)
+                window: Some(200_000),
+                components: Vec::new()
             })
         );
-        host.update_context_usage(None, Some(1_000_000)).unwrap();
+        host.update_context_usage(zeron_proto::ContextUsage {
+            tokens: None,
+            window: Some(1_000_000),
+            components: Vec::new(),
+        })
+        .unwrap();
         assert_eq!(host.context_usage().unwrap().tokens, Some(0));
+        // A breakdown replaces wholesale once reported and survives merges.
+        let components = vec![
+            zeron_proto::ContextComponent {
+                kind: zeron_proto::ContextComponentKind::Tools,
+                tokens: 40,
+            },
+            zeron_proto::ContextComponent {
+                kind: zeron_proto::ContextComponentKind::Messages,
+                tokens: 60,
+            },
+        ];
+        host.update_context_usage(zeron_proto::ContextUsage {
+            tokens: Some(100),
+            window: None,
+            components: components.clone(),
+        })
+        .unwrap();
+        assert_eq!(host.context_usage().unwrap().components, components);
+        // An empty breakdown keeps the previous one.
+        host.update_context_usage(zeron_proto::ContextUsage {
+            tokens: Some(120),
+            window: None,
+            components: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(host.context_usage().unwrap().components, components);
         let rebuilt = crate::rebuild_thin_doc(&host).unwrap().doc;
         assert_eq!(rebuilt.context_usage(), host.context_usage());
         rebuilt.clear_context_usage().unwrap();

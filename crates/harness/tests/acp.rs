@@ -207,7 +207,8 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     // Context occupancy has a dedicated event; billing usage stays separate.
     assert!(events.contains(&AgentEvent::ContextUsage {
         tokens: Some(1200),
-        window: Some(500000)
+        window: Some(500000),
+        components: Vec::new(),
     }));
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Usage { .. })));
 

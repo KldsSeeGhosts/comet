@@ -156,7 +156,11 @@ pub(crate) fn context_usage_event(params: &Value) -> Option<AgentEvent> {
     let window = field(usage, &["modelContextWindow", "model_context_window"])
         .and_then(Value::as_u64)
         .filter(|n| *n > 0);
-    (tokens.is_some() || window.is_some()).then_some(AgentEvent::ContextUsage { tokens, window })
+    (tokens.is_some() || window.is_some()).then_some(AgentEvent::ContextUsage {
+        tokens,
+        window,
+        components: Vec::new(),
+    })
 }
 
 /// Tool-shaped Codex items must always close the lifecycle they open: started
@@ -660,10 +664,16 @@ mod tests {
             Some("th-c".into())
         );
         assert_eq!(
-            notification_thread_id("turn/completed", &json!({"threadId": "th-1", "turn": {"id": "t"}})),
+            notification_thread_id(
+                "turn/completed",
+                &json!({"threadId": "th-1", "turn": {"id": "t"}})
+            ),
             Some("th-1".into())
         );
-        assert_eq!(notification_thread_id("error", &json!({"message": "x"})), None);
+        assert_eq!(
+            notification_thread_id("error", &json!({"message": "x"})),
+            None
+        );
     }
 
     #[test]
@@ -689,7 +699,8 @@ mod context_tests {
             }})),
             Some(AgentEvent::ContextUsage {
                 tokens: Some(42000),
-                window: Some(200000)
+                window: Some(200000),
+                components: Vec::new(),
             })
         );
         assert_eq!(
@@ -698,7 +709,8 @@ mod context_tests {
             }})),
             Some(AgentEvent::ContextUsage {
                 tokens: Some(0),
-                window: None
+                window: None,
+                components: Vec::new(),
             })
         );
         assert_eq!(

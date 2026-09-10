@@ -434,7 +434,11 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                 .find_map(|key| update.get(*key).and_then(Value::as_u64))
                 .filter(|n| *n > 0);
             if tokens.is_some() || window.is_some() {
-                vec![AgentEvent::ContextUsage { tokens, window }]
+                vec![AgentEvent::ContextUsage {
+                    tokens,
+                    window,
+                    components: Vec::new(),
+                }]
             } else {
                 Vec::new()
             }

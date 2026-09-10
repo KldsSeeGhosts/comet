@@ -1423,7 +1423,11 @@ fn context_usage_event(info: &Value, context_windows: &HashMap<String, u64>) -> 
         .and_then(Value::as_str)
         .zip(info.get("modelID").and_then(Value::as_str))
         .and_then(|(provider, model)| context_windows.get(&format!("{provider}/{model}")).copied());
-    (tokens.is_some() || window.is_some()).then_some(AgentEvent::ContextUsage { tokens, window })
+    (tokens.is_some() || window.is_some()).then_some(AgentEvent::ContextUsage {
+        tokens,
+        window,
+        components: Vec::new(),
+    })
 }
 
 /// The requested effort as a variant id the model actually advertises.
@@ -2656,7 +2660,8 @@ mod context_tests {
             context_usage_event(&info, &windows),
             Some(AgentEvent::ContextUsage {
                 tokens: Some(42100),
-                window: Some(200000)
+                window: Some(200000),
+                components: Vec::new(),
             })
         );
         assert_eq!(
@@ -2670,7 +2675,8 @@ mod context_tests {
             ),
             Some(AgentEvent::ContextUsage {
                 tokens: Some(0),
-                window: None
+                window: None,
+                components: Vec::new(),
             })
         );
     }

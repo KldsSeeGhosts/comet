@@ -376,6 +376,8 @@ pub enum AgentEvent {
     ContextUsage {
         tokens: Option<u64>,
         window: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        components: Vec<ContextComponent>,
     },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
@@ -562,15 +564,55 @@ mod tests {
 }
 
 /// Host-owned context snapshot, replicated with the chat document.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub window: Option<u64>,
+    /// Estimated composition of the occupied context. Empty means unknown and
+    /// preserves whatever was previously replicated (see doc-side merging).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<ContextComponent>,
 }
 
 impl ContextUsage {
     pub fn fraction(self) -> Option<f64> {
         Some(self.tokens? as f64 / self.window.filter(|n| *n > 0)? as f64)
     }
+}
+
+/// One measured slice of the context window, in tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextComponent {
+    pub kind: ContextComponentKind,
+    pub tokens: u64,
+}
+
+/// What a [`ContextComponent`] counts. Fixed set so every client can label
+/// and color it without parsing free-form strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextComponentKind {
+    /// Assembled system prompt minus tool snippets, skills, and context files.
+    SystemPrompt,
+    /// Tool definitions sent with the request (snippets plus schemas).
+    Tools,
+    /// Skill listings injected into the prompt.
+    Skills,
+    /// Instruction files (AGENTS.md and friends) loaded into the prompt.
+    ContextFiles,
+    /// Conversation messages, including tool results.
+    Messages,
+}
+
+impl ContextComponentKind {
+    /// Display order: most stable first, conversation last.
+    pub const ALL: [Self; 5] = [
+        Self::Tools,
+        Self::SystemPrompt,
+        Self::Skills,
+        Self::ContextFiles,
+        Self::Messages,
+    ];
 }

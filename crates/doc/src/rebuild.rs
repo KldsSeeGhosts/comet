@@ -54,7 +54,7 @@ pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
         .insert("epoch", THIN_DOC_EPOCH as i64)?;
 
     if let Some(usage) = source.context_usage() {
-        thin.update_context_usage(usage.tokens, usage.window)?;
+        thin.update_context_usage(usage)?;
     }
     let mut sidecar = Vec::new();
     let entries = source.read_entries()?;

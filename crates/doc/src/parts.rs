@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::{AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputQuestion};
+use zeron_proto::{AgentEvent, ToolCall, ToolDiff, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -145,9 +145,8 @@ pub enum MessagePart {
         /// True once a ToolResult arrived.
         #[serde(default)]
         resolved: bool,
-        /// One-line tool output summary ([`summarize_tool_output`]). Old
-        /// entries (pre-strip) still carry up to 4KB here; old app versions
-        /// render this field either way, so the strip is invisible to them.
+        /// Capped tool output supplied by the harness. Keeping it on the part
+        /// lets the transcript show the same result body as the native agent UI.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         /// Inline file diff — written by pre-strip app versions only; new
@@ -329,16 +328,12 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 {
                     *e = *is_error;
                     *resolved = true;
-                    // Tool OUTPUTS never enter the doc (2026-08-10 product
-                    // call: chips are one-liners — name + call info — like
-                    // pre-output builds; the R2 sidecar is parked with them,
-                    // docs/chat2-sync.md A2). Full text lives only in the
-                    // host's run journal. Inline diffs die the same way:
-                    // stats only, never text. `is_error` still folds so
-                    // failed chips read as failed.
-                    let _ = output; // journal-only
-                    *out_slot = None;
-                    *output_bytes = None;
+                    // Harnesses cap result text before it reaches this fold
+                    // (4-32 KiB depending on the provider). Keep that bounded
+                    // body in the doc so expanding a tool shows what actually
+                    // came back. Diff text remains represented by compact stats.
+                    *out_slot = output.clone().filter(|text| !text.trim().is_empty());
+                    *output_bytes = out_slot.as_ref().map(|text| text.len() as u64);
                     *diff_slot = None;
                     *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
                 }
@@ -506,66 +501,13 @@ pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
     })
 }
 
-/// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
+/// Prepare a tool call for transcript storage.
 ///
-/// Keeps: command / path / pattern / url / query / todo items / server+tool names,
-/// and a subagent spawn's model/type (see [`spawn_badge`] — a couple of short
-/// identifiers the chip names the child by).
-/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
-/// Full inputs remain only in the host's local run journal. Idempotent.
+/// Tool invocations are already bounded by each harness and are part of the
+/// visible transcript. Preserve the complete call so expandable cards can
+/// show every argument, including Pi's generic and subagent tool inputs.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
-    match call {
-        ToolCall::WriteFile { path, .. } => ToolCall::WriteFile {
-            path: path.clone(),
-            content: None,
-        },
-        ToolCall::EditFile { path, .. } => ToolCall::EditFile {
-            path: path.clone(),
-            old_string: None,
-            new_string: None,
-        },
-        ToolCall::WebFetch { url, .. } => ToolCall::WebFetch {
-            url: url.clone(),
-            prompt: None,
-        },
-        ToolCall::Mcp { server, tool, .. } => ToolCall::Mcp {
-            server: server.clone(),
-            tool: tool.clone(),
-            input: spawn_badge(call),
-        },
-        ToolCall::Unknown { name, .. } => ToolCall::Unknown {
-            name: name.clone(),
-            input: spawn_badge(call),
-        },
-        other => other.clone(),
-    }
-}
-
-/// The only slice of a tool input allowed into the doc: a subagent spawn's
-/// [`SUBAGENT_INPUT_KEEP`] keys, so the chip can say WHICH model the child
-/// runs on (`Agent · haiku`) without the reader opening the subagent tab.
-///
-/// Everything else — the prompt above all — stays in the host's run journal,
-/// so this stays a whitelist of short identifiers rather than a size cap.
-/// `None` for anything that is not a spawn, and for a spawn that named
-/// neither, which keeps it idempotent: re-sanitizing a sanitized call is a
-/// fixpoint (the kept keys are themselves kept).
-fn spawn_badge(call: &ToolCall) -> Option<serde_json::Value> {
-    if !call.is_subagent_spawn() {
-        return None;
-    }
-    let input = match call {
-        ToolCall::Unknown { input, .. } | ToolCall::Mcp { input, .. } => input.as_ref()?,
-        _ => return None,
-    };
-    let kept: serde_json::Map<String, serde_json::Value> = SUBAGENT_INPUT_KEEP
-        .iter()
-        .filter_map(|key| {
-            let value = input.get(key)?.as_str()?.trim();
-            (!value.is_empty()).then(|| ((*key).to_owned(), serde_json::Value::from(value)))
-        })
-        .collect();
-    (!kept.is_empty()).then(|| serde_json::Value::Object(kept))
+    call.clone()
 }
 
 /// Deterministic continuation id: `"{root}#c{n}"`.
@@ -800,84 +742,20 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_strips_heavy_inputs_and_is_idempotent() {
-        let call = ToolCall::WriteFile {
-            path: "/x".into(),
-            content: Some("secret".into()),
-        };
-        let clean = sanitize_tool_call(&call);
-        assert_eq!(
-            clean,
-            ToolCall::WriteFile {
-                path: "/x".into(),
-                content: None
-            }
-        );
-        assert_eq!(sanitize_tool_call(&clean), clean);
-    }
-
-    /// A spawn keeps the two short identifiers its chip names the child by and
-    /// drops the prompt — the whole point of the whitelist. Still a fixpoint.
-    #[test]
-    fn sanitize_keeps_a_spawns_model_and_drops_its_prompt() {
+    fn sanitize_preserves_complete_tool_arguments() {
         let call = ToolCall::Unknown {
             name: "Agent: Explore theme system".into(),
             input: Some(serde_json::json!({
                 "description": "Explore theme system",
                 "subagent_type": "Explore",
                 "model": "haiku",
-                "prompt": "a very long private prompt",
+                "prompt": "inspect every transcript path",
             })),
         };
-        let clean = sanitize_tool_call(&call);
-        assert_eq!(
-            clean,
-            ToolCall::Unknown {
-                name: "Agent: Explore theme system".into(),
-                input: Some(serde_json::json!({
-                    "model": "haiku",
-                    "subagent_type": "Explore",
-                })),
-            }
-        );
-        assert_eq!(clean.subagent_model(), Some("haiku"));
-        assert_eq!(sanitize_tool_call(&clean), clean);
-    }
-
-    /// An ordinary tool's input still goes, even when it happens to carry a
-    /// `model` argument — the badge is gated on the spawn genus, not the key.
-    #[test]
-    fn sanitize_still_strips_a_non_spawn_carrying_a_model_argument() {
-        let call = ToolCall::Unknown {
-            name: "SomeTool".into(),
-            input: Some(serde_json::json!({ "model": "haiku", "prompt": "secret" })),
-        };
-        assert_eq!(
-            sanitize_tool_call(&call),
-            ToolCall::Unknown {
-                name: "SomeTool".into(),
-                input: None,
-            }
-        );
-    }
-
-    /// A spawn that named no model keeps no input at all — `None`, not an
-    /// empty object, so the doc gains nothing and the fixpoint is exact.
-    #[test]
-    fn sanitize_drops_a_spawn_input_that_names_nothing_worth_keeping() {
-        let call = ToolCall::Unknown {
-            name: "Agent".into(),
-            input: Some(serde_json::json!({ "prompt": "secret", "model": "  " })),
-        };
-        let clean = sanitize_tool_call(&call);
-        assert_eq!(
-            clean,
-            ToolCall::Unknown {
-                name: "Agent".into(),
-                input: None,
-            }
-        );
-        assert_eq!(clean.subagent_model(), None);
+        let stored = sanitize_tool_call(&call);
+        assert_eq!(stored, call);
+        assert_eq!(stored.subagent_model(), Some("haiku"));
+        assert_eq!(sanitize_tool_call(&stored), stored);
     }
 
     #[test]
@@ -990,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_strips_output_to_summary_and_diff_to_stats() {
+    fn fold_keeps_bounded_output_and_reduces_diff_to_stats() {
         let mut parts = Vec::new();
         fold_event_into_parts(
             &mut parts,
@@ -1023,10 +901,8 @@ mod tests {
                 diff_stats,
                 ..
             } => {
-                // One-liner chips: outputs never enter the doc at all
-                // (journal-only); diff text neither — stats survive.
-                assert_eq!(output.as_deref(), None);
-                assert_eq!(*output_bytes, None);
+                assert_eq!(output.as_deref(), Some(full.as_str()));
+                assert_eq!(*output_bytes, Some(full.len() as u64));
                 assert!(diff.is_none(), "inline diff text must not enter the doc");
                 let stats = diff_stats.as_ref().unwrap();
                 assert_eq!(stats.len(), 1);
@@ -1079,10 +955,7 @@ mod tests {
                 diff_ref,
                 ..
             } => {
-                // One-liner fold: outputs never reach the doc, so there is
-                // no output content to key even after resolution; diff
-                // STATS exist, so the diff ref still stamps.
-                assert_eq!(output_ref.as_deref(), None);
+                assert_eq!(output_ref.as_deref(), Some("chat-9/t1"));
                 assert_eq!(diff_ref.as_deref(), Some("chat-9/t1.diff"));
             }
             other => panic!("unexpected {other:?}"),

@@ -1462,7 +1462,7 @@ mod tests {
 #[cfg(test)]
 mod scroll_tests {
     use super::*;
-    use gpui::{AppContext, ScrollHandle, TestAppContext, point};
+    use gpui::{ScrollHandle, TestAppContext, point};
 
     struct QueueScrollTestView {
         queue: ScrollHandle,

@@ -7181,7 +7181,7 @@ impl Render for Composer {
             .update(cx, |pickers, cx| pickers.render_footer(cx));
         let container =
             if !new_chat {
-                let usage = self.state.read(cx).context_usage;
+                let usage = self.state.read(cx).context_usage.clone();
                 container.child(
                     div()
                         .w_full()

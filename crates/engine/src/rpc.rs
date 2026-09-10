@@ -1051,12 +1051,12 @@ fn doc_messages_stream(
                 if frame.is_empty_delta() && usage == previous_usage {
                     continue;
                 }
-                previous_usage = usage;
                 let value = serde_json::to_value(zeron_doc::TranscriptUpdate {
                     frame,
-                    context_usage: usage,
+                    context_usage: usage.clone(),
                 })
                 .ok()?;
+                previous_usage = usage;
                 return Some((value, (rx, prev, doc, previous_usage)));
             }
         },
@@ -2370,8 +2370,12 @@ mod context_usage_tests {
     #[tokio::test]
     async fn context_only_commits_reach_remote_watch_and_reconnect() {
         let host = zeron_doc::SessionDoc::init("context-chat").unwrap();
-        host.update_context_usage(Some(42000), Some(200000))
-            .unwrap();
+        host.update_context_usage(zeron_proto::ContextUsage {
+            tokens: Some(42000),
+            window: Some(200000),
+            components: Vec::new(),
+        })
+        .unwrap();
         // The viewing engine reads a replicated document, with no harness process.
         let remote = Arc::new(zeron_doc::SessionDoc::from_doc(loro::LoroDoc::new()));
         remote
@@ -2384,7 +2388,12 @@ mod context_usage_tests {
         assert_eq!(first["contextUsage"]["tokens"], 42000);
         assert!(first.get("reset").is_some());
         let version = host.doc().oplog_vv();
-        host.update_context_usage(Some(0), None).unwrap();
+        host.update_context_usage(zeron_proto::ContextUsage {
+            tokens: Some(0),
+            window: None,
+            components: Vec::new(),
+        })
+        .unwrap();
         remote
             .doc()
             .import(

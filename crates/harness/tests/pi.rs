@@ -848,3 +848,67 @@ async fn structured_tool_content_is_extracted() {
 
     assert_eq!(tool_result, "cleaned tool output");
 }
+
+#[tokio::test]
+async fn context_breakdown_flows_from_the_session_entry() {
+    use zeron_proto::ContextComponentKind;
+
+    // The fixture reports this file as the pi session; seed it with the
+    // custom entry the zeron-context extension appends after a real turn.
+    let session_file = "/tmp/fake-pi-session.jsonl";
+    std::fs::write(
+        session_file,
+        concat!(
+            r#"{"type":"message","id":"m1","message":{"role":"user"}}"#,
+            "\n",
+            r#"{"type":"custom","id":"z1","customType":"zeron:context-usage","data":{"v":1,"systemPrompt":250,"tools":900,"skills":40,"contextFiles":12,"messages":838,"totalTokens":2050,"contextWindow":1048576}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let (_steer_tx, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    let request = base_request("inspect the file");
+    let stream = PiHarness::new()
+        .with_executable(fixture())
+        .run(request, controls)
+        .await
+        .expect("starts");
+
+    let events = collect_events(stream).await;
+    let _ = std::fs::remove_file(session_file);
+
+    let usages: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ContextUsage {
+                tokens,
+                window,
+                components,
+            } => Some((*tokens, *window, components.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(usages.len() >= 2, "start and settle usage expected");
+
+    // At run start the persisted breakdown rides along with live stats totals.
+    let (tokens, window, components) = &usages[0];
+    assert_eq!(*tokens, Some(25));
+    assert_eq!(*window, Some(100_000));
+    assert_eq!(components.len(), 5);
+    assert_eq!(components[0].kind, ContextComponentKind::Tools);
+    assert_eq!(components[0].tokens, 900);
+    assert_eq!(components[4].kind, ContextComponentKind::Messages);
+
+    // At settle the persisted entry replaces the fallback with authoritative
+    // totals, so the card tracks the turn that just finished.
+    let (tokens, window, components) = usages.last().unwrap();
+    assert_eq!(*tokens, Some(2050));
+    assert_eq!(*window, Some(1_048_576));
+    assert_eq!(components.len(), 5);
+}

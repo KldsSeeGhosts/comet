@@ -81,6 +81,7 @@ actions!(
 /// Restore a default focus only after an in-flight handoff has had a frame to
 /// claim the window. A synchronous focus-lost fallback can otherwise steal
 /// focus from controls that are mounting in response to the same input event.
+#[allow(dead_code)]
 pub(crate) fn restore_focus_if_empty_on_next_frame<T: 'static>(
     focus: FocusHandle,
     window: &mut Window,
@@ -2301,7 +2302,9 @@ impl Shell {
         });
         if let Some(handle) = self.state.read(cx).engine().cloned() {
             let chat_id = self.active_chat.clone();
-            browser.update(cx, |browser, cx| browser.watch_previews(handle, chat_id, cx));
+            browser.update(cx, |browser, cx| {
+                browser.watch_previews(handle, chat_id, cx)
+            });
         }
         let owner = key.clone();
         let sub = cx.subscribe_in(&browser, window, move |this, _, event, window, cx| {

@@ -19,8 +19,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, TodoItem, ToolCall, ToolDiff,
+    AgentEvent, ContextComponent, ContextComponentKind, DoneStatus, HarnessId, Model,
+    ReasoningLevel, RunRequest, SlashCommand, SteeringMode, TodoItem, ToolCall, ToolDiff,
 };
 
 use crate::{Harness, HarnessError, RunControls, StderrTail, crash_message, shutdown_child};
@@ -527,6 +527,11 @@ async fn start_session(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Load on top of the user's own extensions; a failed install only costs
+    // the context breakdown, never the run.
+    if let Some(extension) = install_context_extension() {
+        command.arg("-e").arg(extension);
+    }
     let mut child = command.spawn().map_err(HarnessError::Io)?;
     let stdin = child
         .stdin
@@ -669,9 +674,22 @@ async fn start_session(
             .send(Ok(AgentEvent::AvailableCommands { commands }))
             .await;
     }
-    if let Some((tokens, window)) = context {
+    // Live stats own the totals; the persisted entry contributes the breakdown.
+    let entry = read_context_entry(&native_session).unwrap_or_default();
+    let (mut tokens, mut window) = context.unwrap_or((None, None));
+    if tokens.is_none() {
+        tokens = entry.tokens;
+    }
+    if window.is_none() {
+        window = entry.window;
+    }
+    if tokens.is_some() || window.is_some() || !entry.components.is_empty() {
         let _ = event_tx
-            .send(Ok(AgentEvent::ContextUsage { tokens, window }))
+            .send(Ok(AgentEvent::ContextUsage {
+                tokens,
+                window,
+                components: entry.components,
+            }))
             .await;
     }
     let prompt_id = match rpc.send(json!({"type": "prompt", "message": request.prompt})) {
@@ -775,6 +793,22 @@ async fn session_loop(session: Session) {
                             active_turn = false;
                             prompt_id = None;
                             done_emitted = true;
+                            // The companion extension appends the measured
+                            // composition at settle; publish it before Done so
+                            // the card tracks the turn that just finished.
+                            if let Some(entry) = read_context_entry(&native_session)
+                                && (!entry.components.is_empty() || entry.tokens.is_some())
+                            {
+                                let _ = send_event(
+                                    &event_tx,
+                                    AgentEvent::ContextUsage {
+                                        tokens: entry.tokens,
+                                        window: entry.window,
+                                        components: entry.components,
+                                    },
+                                )
+                                .await;
+                            }
                             let _ = send_done(&event_tx, !failed, &native_session).await;
                             failed = false;
                             if !steering_open { break 'main; }
@@ -812,7 +846,7 @@ async fn session_loop(session: Session) {
                         }
                         "message_end" if value.pointer("/message/role").and_then(Value::as_str) == Some("assistant") => {
                             if let Some(tokens) = value.get("message").and_then(message_context_tokens) {
-                                let _ = send_event(&event_tx, AgentEvent::ContextUsage { tokens: Some(tokens), window: None }).await;
+                                let _ = send_event(&event_tx, AgentEvent::ContextUsage { tokens: Some(tokens), window: None, components: Vec::new() }).await;
                             }
                             emit_message_fallback(&event_tx, value.get("message"), &mut saw_text, &mut saw_reasoning).await;
                             let prev = std::mem::replace(&mut assistant_id, new_message_id());
@@ -1145,6 +1179,108 @@ fn new_message_id() -> String {
     format!("pi-{}", uuid::Uuid::new_v4())
 }
 
+/// Companion extension bundled with this build: it measures what each turn
+/// sends to the model and appends the breakdown to the session file as a
+/// custom entry, which we read back to fill the usage card.
+const CONTEXT_EXTENSION: &str = include_str!("zeron-context.ts");
+const CONTEXT_ENTRY_TYPE: &str = "zeron:context-usage";
+/// Entries land at the file tail every turn, so a bounded tail read is enough
+/// even for very long sessions.
+const CONTEXT_TAIL_BYTES: u64 = 256 * 1024;
+
+fn context_extension_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".zeron")
+            .join("pi")
+            .join("extensions")
+            .join("zeron-context.ts"),
+    )
+}
+
+/// Install the bundled extension under the zeron-owned prefix, refreshing the
+/// file only when the bundled source changed. Best-effort: `None` simply means
+/// the run proceeds without the context breakdown.
+fn install_context_extension() -> Option<PathBuf> {
+    let path = context_extension_path()?;
+    let dir = path.parent()?.to_owned();
+    if std::fs::read_to_string(&path).is_ok_and(|existing| existing == CONTEXT_EXTENSION) {
+        return Some(path);
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    let staging = dir.join(format!(
+        "{}.new-{}",
+        path.file_name()?.to_str()?,
+        std::process::id()
+    ));
+    std::fs::write(&staging, CONTEXT_EXTENSION).ok()?;
+    if std::fs::rename(&staging, &path).is_err() {
+        let _ = std::fs::remove_file(&staging);
+        return None;
+    }
+    Some(path)
+}
+
+/// Latest breakdown persisted by the companion extension.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct PiContextEntry {
+    components: Vec<ContextComponent>,
+    tokens: Option<u64>,
+    window: Option<u64>,
+}
+
+fn parse_context_entry(data: &Value) -> Option<PiContextEntry> {
+    let field = |key: &str| {
+        data.get(key)
+            .and_then(Value::as_u64)
+            .filter(|tokens| *tokens > 0)
+    };
+    let mut components = Vec::new();
+    for (kind, key) in [
+        (ContextComponentKind::Tools, "tools"),
+        (ContextComponentKind::SystemPrompt, "systemPrompt"),
+        (ContextComponentKind::Skills, "skills"),
+        (ContextComponentKind::ContextFiles, "contextFiles"),
+        (ContextComponentKind::Messages, "messages"),
+    ] {
+        if let Some(tokens) = field(key) {
+            components.push(ContextComponent { kind, tokens });
+        }
+    }
+    if components.is_empty() {
+        return None;
+    }
+    Some(PiContextEntry {
+        components,
+        tokens: field("totalTokens"),
+        window: field("contextWindow"),
+    })
+}
+
+fn read_context_entry(session_file: &str) -> Option<PiContextEntry> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(session_file).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(CONTEXT_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(CONTEXT_TAIL_BYTES).read_to_end(&mut bytes).ok()?;
+    let tail = String::from_utf8_lossy(&bytes);
+    // A capped read can split the first line; drop it unless the file fit.
+    let lines: Vec<&str> = tail.lines().skip(usize::from(start > 0)).collect();
+    let entry = lines
+        .iter()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .find(|value| {
+            value.get("type").and_then(Value::as_str) == Some("custom")
+                && value.get("customType").and_then(Value::as_str) == Some(CONTEXT_ENTRY_TYPE)
+        })?;
+    parse_context_entry(entry.get("data")?)
+}
+
 fn context_usage(state: &Value, stats: Option<&Value>) -> Option<(Option<u64>, Option<u64>)> {
     let context = stats.and_then(|stats| stats.pointer("/data/contextUsage"));
     let tokens = context
@@ -1425,6 +1561,78 @@ fn tool_diff(call: Option<&ToolCall>, result: Option<&Value>) -> Option<ToolDiff
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_entry_is_read_from_the_session_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let entry = |tokens: &str| {
+            format!(
+                r#"{{"type":"custom","id":"e1","customType":"{CONTEXT_ENTRY_TYPE}","data":{tokens}}}"#
+            )
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                r#"{"type":"message","message":{"role":"user"}}"#,
+                entry(r#"{"v":1,"tools":900,"systemPrompt":250,"skills":40,"contextFiles":0,"messages":810,"totalTokens":2000,"contextWindow":1048576}"#),
+                // Malformed and unrelated lines must be skipped silently.
+                "{not json",
+                entry(r#"{"v":1,"tools":910,"systemPrompt":250,"skills":40,"contextFiles":12,"messages":838,"totalTokens":2050,"contextWindow":1048576}"#),
+            ),
+        )
+        .unwrap();
+        let parsed = read_context_entry(path.to_str().unwrap()).unwrap();
+        assert_eq!(parsed.tokens, Some(2050));
+        assert_eq!(parsed.window, Some(1_048_576));
+        // Zero categories are dropped; the rest keep the stable wire order.
+        assert_eq!(
+            parsed.components,
+            vec![
+                ContextComponent {
+                    kind: ContextComponentKind::Tools,
+                    tokens: 910
+                },
+                ContextComponent {
+                    kind: ContextComponentKind::SystemPrompt,
+                    tokens: 250
+                },
+                ContextComponent {
+                    kind: ContextComponentKind::Skills,
+                    tokens: 40
+                },
+                ContextComponent {
+                    kind: ContextComponentKind::ContextFiles,
+                    tokens: 12
+                },
+                ContextComponent {
+                    kind: ContextComponentKind::Messages,
+                    tokens: 838
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn context_entry_survives_a_split_tail_and_stays_absent_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let entry = r#"{"type":"custom","customType":"zeron:context-usage","data":{"tools":10,"messages":15,"totalTokens":25}}"#;
+        // The entry sits beyond the tail cap behind one oversized line.
+        let padding = "x".repeat(CONTEXT_TAIL_BYTES as usize);
+        std::fs::write(&path, format!("{padding}\n{entry}\n")).unwrap();
+        let parsed = read_context_entry(path.to_str().unwrap()).unwrap();
+        assert_eq!(parsed.tokens, Some(25));
+        // An entry without measurable categories is no breakdown at all.
+        std::fs::write(
+            &path,
+            r#"{"type":"custom","customType":"zeron:context-usage","data":{"messages":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_context_entry(path.to_str().unwrap()), None);
+        assert_eq!(read_context_entry("/nonexistent/session.jsonl"), None);
+    }
 
     #[test]
     fn models_use_provider_slugs_and_native_thinking_map() {

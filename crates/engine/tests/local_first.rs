@@ -44,8 +44,12 @@ async fn rejecting_edge() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<
             let seen = seen.clone();
             tokio::spawn(async move {
                 let mut request = [0u8; 4096];
-                let _ = stream.read(&mut request).await;
-                seen.fetch_add(1, Ordering::SeqCst);
+                let bytes = stream.read(&mut request).await.unwrap_or(0);
+                // Preview discovery probes localhost ports with HEAD. That is
+                // local service detection, not account-scoped Edge traffic.
+                if bytes > 0 && !request[..bytes].starts_with(b"HEAD /") {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
                 let body = r#"{"error":"revoked"}"#;
                 let response = format!(
                     "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -601,6 +605,10 @@ async fn online_runtime_shutdown_stops_edge_workers_and_retires_the_graph() {
     tokio::time::timeout(std::time::Duration::from_secs(30), runtime.shutdown())
         .await
         .expect("shutdown never returned — an Edge worker did not join");
+    // Let the listener drain connections that entered the kernel accept queue
+    // before cancellation. The assertion below is about new worker traffic,
+    // not when the test server happens to accept an already-open socket.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let after = requests.load(Ordering::SeqCst);
     drop(runtime);
 

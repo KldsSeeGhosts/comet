@@ -72,7 +72,7 @@ fn mock_script() -> Vec<AgentEvent> {
         AgentEvent::ToolResult {
             id: "tool-1".into(),
             is_error: false,
-            output: None,
+            output: Some("wrote /tmp/x".into()),
             diff: None,
         },
         done(DoneStatus::Completed),
@@ -266,8 +266,8 @@ async fn queued_run_command_executes_end_to_end() {
             text: "do the thing".into()
         }]
     );
-    // Assistant entry: folded parts — merged text, then the resolved tool call with the
-    // render-parts privacy policy applied (WriteFile content stripped).
+    // Assistant entry: merged text, then the resolved tool call with its full
+    // invocation and result preserved for the expandable transcript card.
     let assistant = &all[1];
     assert_eq!(assistant.status, Some(MessageStatus::Complete));
     assert_eq!(assistant.parts.len(), 2);
@@ -280,6 +280,7 @@ async fn queued_run_command_executes_end_to_end() {
             call,
             resolved,
             is_error,
+            output,
             ..
         } => {
             assert!(*resolved);
@@ -288,9 +289,10 @@ async fn queued_run_command_executes_end_to_end() {
                 call,
                 &ToolCall::WriteFile {
                     path: "/tmp/x".into(),
-                    content: None
+                    content: Some("SECRET".into())
                 }
             );
+            assert_eq!(output.as_deref(), Some("wrote /tmp/x"));
         }
         other => panic!("unexpected second part {other:?}"),
     }
@@ -646,9 +648,9 @@ async fn retry_reissues_a_swallowed_send() {
     .await;
     wait_for(
         || {
-            entries_now(&core)
-                .iter()
-                .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "re-issued send runs to completion",
     )
@@ -1855,11 +1857,9 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     );
     wait_for(
         || {
-            entries(&core)
-                .iter()
-                .any(|e| {
-                    e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
-                })
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "run completes",
     )
@@ -2153,6 +2153,7 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
                 AgentEvent::ContextUsage {
                     tokens: Some(64000),
                     window: Some(200000),
+                    components: Vec::new(),
                 },
                 done(DoneStatus::Completed),
                 AgentEvent::Subagent {
@@ -2160,11 +2161,13 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
                     event: Box::new(AgentEvent::ContextUsage {
                         tokens: Some(999999),
                         window: Some(1000000),
+                        components: Vec::new(),
                     }),
                 },
                 AgentEvent::ContextUsage {
                     tokens: Some(0),
                     window: None,
+                    components: Vec::new(),
                 },
             ],
             step_delay: Duration::from_millis(20),
@@ -2194,7 +2197,8 @@ async fn context_usage_settles_after_done_without_reopening_the_turn() {
         handle.doc().context_usage(),
         Some(zeron_proto::ContextUsage {
             tokens: Some(0),
-            window: Some(200000)
+            window: Some(200000),
+            components: Vec::new(),
         })
     );
     assert_eq!(

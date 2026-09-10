@@ -1780,8 +1780,17 @@ async fn drive_run(
             }
         }
         // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
-        if let AgentEvent::ContextUsage { tokens, window } = &event {
-            if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
+        if let AgentEvent::ContextUsage {
+            tokens,
+            window,
+            components,
+        } = &event
+        {
+            if let Err(err) = doc_ref.update_context_usage(zeron_proto::ContextUsage {
+                tokens: *tokens,
+                window: *window,
+                components: components.clone(),
+            }) {
                 tracing::warn!(%chat_id, error = %err, "context usage write failed");
             }
             continue;
