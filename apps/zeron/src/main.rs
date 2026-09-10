@@ -38,6 +38,9 @@ enum Command {
     },
     /// Check for a newer release and apply it (download → verify → swap →
     /// service restart). `--check` only reports (exits 1 when one is available).
+    ///
+    /// Fork builds: upstream self-update is disabled; update via `git pull` +
+    /// rebuild from your fork instead (see README fork notes).
     Update {
         #[arg(long)]
         check: bool,
