@@ -4954,6 +4954,18 @@ impl Shell {
         let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
         let menu_id = id.clone();
+        // Companion avatar leads the row. It mirrors the corner status (Working
+        // breathes, Done smiles, Idle sleeps) but stays stable in shape/colour
+        // per chat so the list reads as a cast, not a status column.
+        let avatar_seed = crate::avatar::seed(&id);
+        let avatar_t = motion::pulse_seconds(self.sidebar_pane.entity_id(), cx);
+        let avatar_motion = !motion::reduced_motion(cx);
+        let avatar_state = if undelivered || queued {
+            zeron_proto::ChatIndicator::Errored
+        } else {
+            status
+        };
+        let avatar = crate::avatar::render(avatar_seed, avatar_state, avatar_t, avatar_motion, 20.0);
         // Hover fades over transition-colors (zeron session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
@@ -4971,8 +4983,9 @@ impl Shell {
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
-            .flex_col()
-            .gap(px(2.0))
+            .flex_row()
+            .items_center()
+            .gap(px(Theme::SPACE_SM))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
@@ -5014,96 +5027,106 @@ impl Shell {
                     cx.notify();
                 }),
             )
+            // Companion avatar leads the row.
+            .child(div().flex_none().child(avatar))
             // Line 1: "project @ device", status word / time-ago right.
             .child(
                 div()
-                    .w_full()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
+                    .flex_col()
+                    .gap(px(2.0))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .line_height(px(14.0))
-                            .text_color(subline)
-                            .child(space_name),
-                    )
-                    .child(div().text_color(subline).child(corner)),
-            )
-            // Line 2: harness identity belongs directly with the title,
-            // instead of floating as unrelated metadata below it.
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
-                            )
-                        },
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(13.0))
-                            .line_height(px(17.0))
-                            .child(title),
-                    ),
-            )
-            // Line 3 is structural, not reserved whitespace: compact states
-            // omit it completely when both Branch and Pull request are hidden.
-            .when(shows_metadata, |row| {
-                row.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(4.0))
-                        .when_some(branch, |el, branch| {
-                            el.child(
-                                icon(icons::GIT_BRANCH)
-                                    .size(px(11.0))
-                                    .flex_none()
-                                    .text_color(subline),
-                            )
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(Theme::SPACE_SM))
                             .child(
                                 div()
+                                    .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_size(crate::typography::ui_rems(11.0))
                                     .line_height(px(14.0))
                                     .text_color(subline)
-                                    .child(branch),
+                                    .child(space_name),
                             )
-                        })
-                        // Stable invisible spring keeps the optional PR badge
-                        // pinned right without changing no-PR paint.
-                        .child(div().flex_1().min_w_0())
-                        .when_some(change_request, |el, summary| {
-                            el.child(crate::change_requests::pull_request_badge(
-                                format!("chat-pr-{id}").into(),
-                                summary,
-                                crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
-                                theme,
-                            ))
-                        }),
-                )
-            })
+                            .child(div().text_color(subline).child(corner)),
+                    )
+                    // Line 2: harness identity belongs directly with the title,
+                    // instead of floating as unrelated metadata below it.
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP))
+                            .when_some(
+                                harness.map(crate::pickers::harness_brand_icon),
+                                |el, (path, tint)| {
+                                    el.child(
+                                        icon(path)
+                                            .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                            .flex_none()
+                                            .text_color(tint.unwrap_or(subline).opacity(0.8)),
+                                    )
+                                },
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(13.0))
+                                    .line_height(px(17.0))
+                                    .child(title),
+                            ),
+                    )
+                    // Line 3 is structural, not reserved whitespace: compact
+                    // states omit it when both Branch and Pull request hide.
+                    .when(shows_metadata, |row| {
+                        row.child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .when_some(branch, |el, branch| {
+                                    el.child(
+                                        icon(icons::GIT_BRANCH)
+                                            .size(px(11.0))
+                                            .flex_none()
+                                            .text_color(subline),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(crate::typography::ui_rems(11.0))
+                                            .line_height(px(14.0))
+                                            .text_color(subline)
+                                            .child(branch),
+                                    )
+                                })
+                                // Stable invisible spring keeps the optional PR badge
+                                // pinned right without changing no-PR paint.
+                                .child(div().flex_1().min_w_0())
+                                .when_some(change_request, |el, summary| {
+                                    el.child(crate::change_requests::pull_request_badge(
+                                        format!("chat-pr-{id}").into(),
+                                        summary,
+                                        crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                                        theme,
+                                    ))
+                                }),
+                        )
+                    }),
+            )
             .into_any_element()
     }
 

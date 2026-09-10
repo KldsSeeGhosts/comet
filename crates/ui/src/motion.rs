@@ -123,6 +123,18 @@ fn pulse_delta_every(spec: &MotionSpec, view: EntityId, stride: u64, cx: &mut Ap
     (clock.epoch.elapsed().as_secs_f32() / spec.total().as_secs_f32()).fract()
 }
 
+/// Elapsed seconds on the shared clock, plus the same lease [`pulse_delta`]
+/// takes so the caller keeps repainting. Continuous (not wrapped) for
+/// free-running poses like the session avatar. Reduced motion returns a static
+/// 0 and schedules nothing.
+pub fn pulse_seconds(view: EntityId, cx: &mut App) -> f32 {
+    if cx.reduce_motion() {
+        return 0.0;
+    }
+    pulse_lease_every(view, 1, cx);
+    cx.default_global::<PulseClock>().epoch.elapsed().as_secs_f32()
+}
+
 /// Schedule cosmetic animation through the same bounded clock as loaders.
 /// Renew only while painting an active animation; the clock parks after the
 /// last lease expires, including when a view is hidden or removed.
