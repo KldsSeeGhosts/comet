@@ -465,3 +465,61 @@ async fn later_local_work_imports_as_a_delta() {
     assert_eq!(skipped_chats, 2);
     synced.shutdown().await;
 }
+
+#[tokio::test]
+async fn local_importer_imports_pi_sessions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pi_dir = dir.path().join("pi_sessions");
+    std::fs::create_dir_all(&pi_dir).expect("pi dir");
+
+    let session_file = pi_dir.join("test-pi.jsonl");
+    std::fs::write(
+        &session_file,
+        r#"{"type":"session","id":"pi-sess-123","timestamp":"2026-09-01T10:00:00Z","cwd":"/tmp/pi-work"}
+{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-09-01T10:00:01Z","provider":"cpa","modelId":"gemini-3.8-flash"}
+{"type":"message","id":"u1","parentId":"m1","timestamp":"2026-09-01T10:00:02Z","message":{"role":"user","content":"Explain Rust traits"}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-01T10:00:03Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"internal reasoning"},{"type":"text","text":"Traits define shared behavior."}]}}"#,
+    )
+    .expect("write pi session");
+
+    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    let importer = synced.local_import.as_ref().expect("local importer");
+
+    let summary = importer
+        .import_pi_sessions(Some(&[pi_dir.clone()]))
+        .expect("import pi sessions");
+    assert_eq!(summary.imported_chats, 1);
+    assert_eq!(summary.skipped_chats, 0);
+
+    let chat = synced
+        .workspace
+        .chat("pi-pi-sess-123")
+        .expect("read chat")
+        .expect("chat row");
+    assert_eq!(chat.cwd.as_deref(), Some("/tmp/pi-work"));
+    assert_eq!(chat.title.as_deref(), Some("Explain Rust traits"));
+    assert_eq!(chat.config.as_ref().unwrap().harness, HarnessId::Pi);
+    assert_eq!(
+        chat.config.as_ref().unwrap().model.as_deref(),
+        Some("gemini-3.8-flash")
+    );
+    assert_eq!(
+        chat.harness_session_id.as_deref(),
+        Some(
+            session_file
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+
+    // Re-import is idempotent
+    let reimport = importer
+        .import_pi_sessions(Some(&[pi_dir]))
+        .expect("reimport");
+    assert_eq!(reimport.imported_chats, 0);
+    assert_eq!(reimport.skipped_chats, 1);
+
+    synced.shutdown().await;
+}

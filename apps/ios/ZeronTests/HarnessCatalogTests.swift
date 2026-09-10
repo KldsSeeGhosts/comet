@@ -18,9 +18,28 @@ final class HarnessCatalogTests: XCTestCase {
         let astra = HarnessCatalog.defaultModel(for: "codex")
         XCTAssertEqual(HarnessCatalog.defaultReasoning(for: astra), "high")
 
+        let pi = HarnessCatalog.defaultModel(for: "pi")
+        XCTAssertEqual(pi.id, "default")
+        XCTAssertEqual(HarnessCatalog.defaultReasoning(for: pi), "high")
+
         let short = ModelInfo(id: "short", label: "Short", description: nil,
                               reasoningLevels: ["low", "medium"])
         XCTAssertEqual(HarnessCatalog.defaultReasoning(for: short), "medium")
+    }
+
+    func testNativePiMetadataMatchesRegistry() {
+        let pi = HarnessCatalog.staticInfo(for: "pi")
+        XCTAssertEqual(pi.id, "pi")
+        XCTAssertEqual(pi.label, "Pi")
+        XCTAssertEqual(pi.supportsSteering, true)
+        XCTAssertEqual(pi.steeringMode, "step-boundary")
+        XCTAssertEqual(pi.midTurnSteering, true)
+
+        let models = HarnessCatalog.models(for: "pi")
+        XCTAssertEqual(models.count, 1)
+        XCTAssertEqual(models.first?.id, "default")
+        XCTAssertEqual(models.first?.reasoningLevels,
+                       ["minimal", "low", "medium", "high", "xhigh", "max"])
     }
 
     func testChoiceFallsBackToAdvertisedDefault() {

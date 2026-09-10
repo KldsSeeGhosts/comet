@@ -30,21 +30,25 @@
   kinds) and bridges to the input panel; allow/reject-shaped requests
   auto-accept. Per-turn usage comes from the settled prompt response.
 
-- **Hermes + Pi registered** (2026-08-08): `AcpHarness::hermes()` runs Nous
+- **Hermes registered** (2026-08-08): `AcpHarness::hermes()` runs Nous
   Research's native ACP server (`hermes acp`; Python install via
   `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash` plus the
-  `.[acp]` extra — no npm fallback, so resolution is PATH/`~/.local/bin`/
-  `~/.hermes/bin` only, `HERMES_EXECUTABLE` overrides). No
-  `_session/steering` extension and no effort config advertised (Hermes 4's
-  hybrid reasoning is model-internal) → turn-boundary steering, empty ladder;
-  the model list is discovered over ACP (below), with the Nous flagships as
-  the static fallback. `AcpHarness::pi()` runs the pi coding
-  agent (pi.dev) through the community `pi-acp` adapter (pinned 0.0.33,
-  managed-install fallback; requires the pi CLI itself,
-  `@earendil-works/pi-coding-agent`; `PI_ACP_EXECUTABLE` overrides). Models
-  ride pi's own provider config (catalog advertises a `default` pass-through
-  entry); thinking ladder minimal→max maps onto zeron's levels via the
-  generic `thought_level` preference ladder ("off" has no zeron tier).
+  `.[acp]` extra). It has no npm fallback. Resolution checks PATH,
+  `~/.local/bin`, and `~/.hermes/bin`; `HERMES_EXECUTABLE` overrides it. Hermes
+  has no `_session/steering` extension or effort setting, so steering waits for
+  a turn boundary and the effort ladder is empty. The harness discovers models
+  over ACP and uses the Nous flagships as its static fallback.
+- **Pi moved to native RPC**: `PiHarness` in `crates/harness/src/pi/mod.rs`
+  spawns `pi --mode rpc --approve` and talks to Pi over newline-delimited JSON.
+  The community `pi-acp` process and its managed npm install are gone. The
+  native driver discovers provider/model pairs with `get_available_models`,
+  applies models and thinking levels with Pi's own setters, forwards native
+  text, reasoning, tool, usage, and command events, and settles on
+  `agent_settled`. It stores Pi's `sessionFile` as Comet's opaque harness
+  session id, then resumes with `switch_session`. `PI_EXECUTABLE` overrides
+  binary resolution. Pi's native `steer` command gives it step-boundary
+  steering; Comet exposes minimal through max because its protocol has no
+  `off` reasoning value.
 - **Devin registered** (2026-08-15): `AcpHarness::devin()` runs Cognition's
   native ACP server (`devin acp`; install via
   `curl -fsSL https://cli.devin.ai/install.sh | bash` or
@@ -201,22 +205,12 @@ agent, and structured error details. The engine test checks Working status and
 transcript boundaries with a 100ms watchdog, then verifies autonomous activity
 still settles.
 
-For real-model testing, configure an isolated authenticated Pi agent directory,
-select a model in its settings, and load
-`crates/harness/tests/fixtures/pi-slow-model.ts` (for example, symlink it into that
-agent directory's `extensions/` directory). The extension waits 35 seconds before
-sending the next model request after a completed tool. It does not delay tool
-results or synthesize an ACP completion. Then run:
+Pi no longer belongs to the ACP regression suite. Its parser and transport tests
+live with the native driver under `crates/harness/src/pi/mod.rs`. Run them with:
 
 ```sh
-PI_CODING_AGENT_DIR=/path/to/isolated/pi-agent \
-PI_ACP_PI_COMMAND=/path/to/pi \
-ACP_TEST_RUNS=3 \
-cargo test -p zeron-harness --test real_acp_lifecycle -- --ignored --nocapture
+cargo test -p zeron-harness pi::tests
 ```
 
-These tests require successful real calls; missing authentication or an unloaded
-delay extension fails rather than skips. Verified locally with pi-acp 0.0.33,
-Pi 0.85.1, and `gpt-5.6-luna`: three sessions each completed the original turn and
-two queued follow-ups after 36.6–36.8-second post-tool gaps; cancellation during a
-32-second post-tool gap also completed as Interrupted.
+A real Pi session uses the installed CLI and the user's existing Pi provider
+configuration. Set `PI_EXECUTABLE` when Comet should launch a non-default binary.

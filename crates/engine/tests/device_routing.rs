@@ -773,6 +773,7 @@ async fn terminal_stream_proxies_over_the_relay() {
                     "chatId": "chat-term",
                     "cols": 80,
                     "rows": 24,
+                    "shell": "/bin/sh",
                     "targetDeviceId": "device-b",
                 }),
             )

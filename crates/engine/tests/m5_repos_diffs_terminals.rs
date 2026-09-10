@@ -1326,7 +1326,7 @@ async fn rpc_dispatch_for_m5_methods() {
     let session = client
         .call(
             methods::OPEN_TERMINAL,
-            serde_json::json!({ "chatId": "chat-term", "cols": 80, "rows": 24 }),
+            serde_json::json!({ "chatId": "chat-term", "cols": 80, "rows": 24, "shell": "/bin/sh" }),
         )
         .await
         .expect("OpenTerminal");

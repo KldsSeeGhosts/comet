@@ -60,7 +60,7 @@ not built yet).
 | Devin (ACP) | done | Shared `AcpHarness` spec; `devin acp` (Cognition's native ACP server), turn-boundary steering, no effort ladder (effort rides the advertised model ids). Unattended mode via the `bypass` mode value. Subagent lifecycle and nested transcripts ride Devin's `cognition.ai/subagentSupport` extension. **Live-verified against the real `devin` CLI 3000.6.14** (2026-09-04): model discovery (193 rows), an edit + `cargo test` turn settled on the truthful `end_turn`, `run_subagent` rendered as a link chip with a nested child transcript, stop → `session/cancel` → `stopReason: cancelled`, and `session/load` resume. |
 | Grok (ACP) | done | Shared `AcpHarness` spec; `grok agent stdio`, turn-boundary steering. |
 | Hermes (ACP) | done | Shared `AcpHarness` spec; `hermes acp` (Nous Research's native ACP server), turn-boundary steering, no effort ladder yet. |
-| Pi (ACP) | done | Shared `AcpHarness` spec; community `pi-acp` adapter (pinned 0.0.33, npx fallback), turn-boundary steering, minimal→max thinking ladder. |
+| Pi (native RPC) | done | Direct `pi --mode rpc --approve` driver; native provider/model discovery, session-file resume, command and usage events, typed tools, step-boundary steering, and minimal through max thinking levels. |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
 
 ## §5 Session doc schema

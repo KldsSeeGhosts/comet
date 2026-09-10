@@ -269,6 +269,8 @@ struct OpenTerminalParams {
     chat_id: String,
     cols: u16,
     rows: u16,
+    #[serde(default)]
+    shell: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2127,7 +2129,7 @@ impl RpcService for EngineRpc {
                     .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
                 let session = self
                     .terminals
-                    .open(&cwd, p.cols, p.rows)
+                    .open_with_shell(&cwd, p.cols, p.rows, p.shell.as_deref())
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&session)
             }

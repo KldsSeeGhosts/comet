@@ -50,17 +50,16 @@ struct ModelInfo: Identifiable, Hashable {
 }
 
 enum HarnessCatalog {
-    /// Static fallback = the engine's `default_enabled()` pair. The ACP
-    /// agents (grok/hermes/pi) appear only through a device's live
-    /// `ListHarnesses` catalog — they're opt-in per device via
-    /// Settings → Agents on the desktop.
+    /// Static fallback = the engine's `default_enabled()` pair. Non-default
+    /// agents appear through a device's live `ListHarnesses` catalog — they're
+    /// opt-in per device via Settings → Agents on the desktop.
     static let harnesses: [HarnessInfo] = [
-        HarnessInfo(id: "claude-code", label: "Claude Code"),
-        HarnessInfo(id: "codex", label: "Codex"),
+        HarnessInfo(id: "claude-code", label: "Claude Code", supportsSteering: true, steeringMode: "step-boundary"),
+        HarnessInfo(id: "codex", label: "Codex", supportsSteering: true, steeringMode: "step-boundary"),
     ]
 
     /// Display names for every harness id the fleet can produce, including
-    /// ones this device's static list doesn't offer (acp/mod.rs specs).
+    /// ones this device's static list doesn't offer.
     static let knownLabels: [String: String] = [
         "claude-code": "Claude Code",
         "codex": "Codex",
@@ -72,6 +71,30 @@ enum HarnessCatalog {
         "opencode": "OpenCode",
         "mock": "Mock",
     ]
+
+    /// Static descriptor metadata matching `zeron_engine::registry`.
+    static func staticInfo(for harness: String) -> HarnessInfo {
+        switch harness {
+        case "claude-code":
+            return HarnessInfo(id: "claude-code", label: "Claude Code", supportsSteering: true, steeringMode: "step-boundary")
+        case "codex":
+            return HarnessInfo(id: "codex", label: "Codex", supportsSteering: true, steeringMode: "step-boundary")
+        case "pi":
+            return HarnessInfo(id: "pi", label: "Pi", supportsSteering: true, steeringMode: "step-boundary")
+        case "cursor":
+            return HarnessInfo(id: "cursor", label: "Cursor", supportsSteering: true, steeringMode: "turn-boundary")
+        case "devin":
+            return HarnessInfo(id: "devin", label: "Devin", supportsSteering: true, steeringMode: "turn-boundary")
+        case "grok":
+            return HarnessInfo(id: "grok", label: "Grok", supportsSteering: true, steeringMode: "turn-boundary")
+        case "hermes":
+            return HarnessInfo(id: "hermes", label: "Hermes", supportsSteering: true, steeringMode: "turn-boundary")
+        case "opencode":
+            return HarnessInfo(id: "opencode", label: "OpenCode", supportsSteering: true, steeringMode: "turn-boundary")
+        default:
+            return HarnessInfo(id: harness, label: label(for: harness))
+        }
+    }
 
     static func label(for harness: String) -> String {
         knownLabels[harness] ?? harness
