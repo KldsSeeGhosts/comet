@@ -12,7 +12,7 @@ pub fn builtin_registry() -> &'static ThemeRegistry {
     static REGISTRY: OnceLock<ThemeRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| ThemeRegistry {
         families: vec![
-            family("zeron", "Zeron", vec![zeron_light(), zeron_dark()]),
+            family("zeron", "Noches", vec![zeron_light(), zeron_dark()]),
             family(
                 "vscode-default",
                 "VS Code Default",
@@ -240,7 +240,7 @@ fn zeron_dark() -> ThemeVariant {
     variant(Seeds {
         id: "zeron-dark",
         family_id: "zeron",
-        name: "Zeron Dark",
+        name: "Noches Dark",
         appearance: Appearance::Dark,
         treatment: SurfaceTreatment::Frosted,
         background: "#060606",
@@ -274,7 +274,7 @@ fn zeron_light() -> ThemeVariant {
     variant(Seeds {
         id: "zeron-light",
         family_id: "zeron",
-        name: "Zeron Light",
+        name: "Noches Light",
         appearance: Appearance::Light,
         treatment: SurfaceTreatment::Frosted,
         background: "#ffffff",

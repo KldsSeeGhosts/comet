@@ -131,7 +131,7 @@ if [[ "$variant" == "dev" ]]; then
     app_root="$data_dir/app"
     ipc_port=27655
     app_id="zeron-dev"
-    app_name="Zeron dev"
+    app_name="Noches dev"
     app_comment="Multi-device controller for coding agents (dev build)"
     unit="zeron-dev.service"
     feature_args=(--features dev)
@@ -141,7 +141,7 @@ else
     app_root="$data_dir/app"
     ipc_port=27654
     app_id="zeron"
-    app_name="Zeron"
+    app_name="Noches"
     app_comment="Multi-device controller for coding agents"
     unit="zeron.service"
     feature_args=()
@@ -192,7 +192,7 @@ unit_tmp="$(mktemp "${systemd_dir}/.${unit}.tmp.XXXXXX.service")"
 TEMP_FILES+=("$unit_tmp")
 cat <<EOF > "$unit_tmp"
 [Unit]
-Description=Zeron native headless engine${variant:+ ($variant)}
+Description=Noches native headless engine${variant:+ ($variant)}
 After=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=5

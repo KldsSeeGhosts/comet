@@ -1221,6 +1221,17 @@ pub struct Shell {
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
     user_menu: popover::Popup<()>,
+    /// Titlebar checklist dropdown showing the session's live todo list.
+    /// Per-chat collapse flag for the floating todo progress card
+    /// (ZCode-style details panel). Session-local, default expanded.
+    todo_collapsed: std::collections::HashMap<String, bool>,
+    /// The last rendered todo items per chat — the diff baseline for the
+    /// check-off animation (which items just flipped done).
+    todo_prev: std::collections::HashMap<String, Vec<zeron_proto::TodoItem>>,
+    /// When each `(chat, item-index)` flipped done — drives the check-in and
+    /// strikethrough wipe off wall-clock elapsed, cleaned when an item
+    /// un-dones or the list reshapes.
+    todo_done_at: std::collections::HashMap<(String, usize), std::time::Instant>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
@@ -1458,7 +1469,7 @@ impl Shell {
             Some("signin") => Some(GatePhase::SignIn),
             Some("org") => Some(GatePhase::OrgGate),
             Some("failed") => Some(GatePhase::Failed(
-                "Could not reach the zeron engine on port 27901".into(),
+                "Could not reach the Noches engine on port 27901".into(),
             )),
             _ => None,
         };
@@ -1544,6 +1555,9 @@ impl Shell {
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
+            todo_collapsed: std::collections::HashMap::new(),
+            todo_prev: std::collections::HashMap::new(),
+            todo_done_at: std::collections::HashMap::new(),
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
@@ -3094,7 +3108,7 @@ impl Shell {
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.sidebar_notice = Some("Zeron conversation link copied".into());
+            self.sidebar_notice = Some("Noches conversation link copied".into());
         } else {
             self.sidebar_notice = Some("Conversation link is not ready yet".into());
         }
@@ -3942,7 +3956,7 @@ impl Shell {
                     },
                     Err(err) => {
                         shell.runtime_change_error = Some(format!(
-                            "Could not stop the remote engine: {err}. Run `zeron daemon stop`, then quit and reopen Zeron."
+                            "Could not stop the remote engine: {err}. Run `zeron daemon stop`, then quit and reopen Noches."
                         ).into());
                         cx.notify();
                     }
@@ -5710,7 +5724,7 @@ impl Shell {
         } else if remote_engine {
             "Stop daemon and quit"
         } else {
-            "Quit Zeron"
+            "Quit Noches"
         };
 
         if self.sync_flow == SyncFlow::Enabling && needs_org {
@@ -5735,7 +5749,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Finish signing in in your browser. Zeron will keep using this local workspace until you quit and reopen.",
+                        "Finish signing in in your browser. Noches will keep using this local workspace until you quit and reopen.",
                     )),
                 )
                 .child(
@@ -5779,14 +5793,14 @@ impl Shell {
                     )
                     .into(),
                     (Some(email), None) => format!(
-                        "You're signed in as {email}. Zeron can switch to your synced workspace now."
+                        "You're signed in as {email}. Noches can switch to your synced workspace now."
                     )
                     .into(),
                     (None, Some(phrase)) => format!(
                         "Bring {phrase} from this device into your synced workspace, or start it fresh."
                     )
                     .into(),
-                    (None, None) => "Zeron can switch to your synced workspace now.".into(),
+                    (None, None) => "Noches can switch to your synced workspace now.".into(),
                 };
                 let mut actions = div()
                     .mt(px(16.0))
@@ -5975,9 +5989,9 @@ impl Shell {
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
                         if remote_engine {
-                            "Zeron is using a background daemon. Stop it and quit Zeron, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Noches is using a background daemon. Stop it and quit Noches, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
                         } else {
-                            "Quit and reopen Zeron to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Quit and reopen Noches to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
                         },
                     )),
                 )
@@ -6022,7 +6036,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Zeron will remove your credentials, close the synced workspace, and continue in local mode.",
+                        "Noches will remove your credentials, close the synced workspace, and continue in local mode.",
                     )),
                 )
                 .child(
@@ -6196,7 +6210,7 @@ impl Shell {
                                     .size(px(16.0))
                                     .text_color(theme.text_muted),
                             )
-                            .child(SharedString::from("Zeron conversation link")),
+                            .child(SharedString::from("Noches conversation link")),
                     )
                     .when_some(harness_link, |menu, link| {
                         menu.child(
@@ -6628,6 +6642,11 @@ impl Shell {
             // transcript clearance. The flex_1 spacer has no id/listeners, so
             // pointer + wheel events over it fall through to the list below.
             .child(div().flex_1().min_h_0())
+            // ZCode-style todo progress card: floats top-right INSIDE the
+            // conversation column, so the sidebar seam clips it (never
+            // overlaps the sidebar) and it tracks the column through pane
+            // tweens. Auto-mounts the frame a todo list lands.
+            .children(self.render_todo_card(cx))
             .child({
                 let measured = self.bottom_stack.clone();
                 div()
@@ -7185,7 +7204,7 @@ impl Shell {
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(
-                        "Zeron removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
+                        "Noches removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
                     )),
             )
             .when_some(self.runtime_change_error.clone(), |card, error| {
@@ -7777,7 +7796,7 @@ impl Shell {
                 )
                 .into_any_element(),
             // Login card (zeron App.tsx Gate): centered card on the grid —
-            // logo, "Log in to Zeron", copy, full-width white Log in button.
+            // logo, "Log in to Noches", copy, full-width white Log in button.
             _ => div()
                 .w(px(360.0))
                 .px(px(32.0))
@@ -7803,7 +7822,7 @@ impl Shell {
                         .text_size(crate::typography::ui_rems(18.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(SharedString::from("Log in to Zeron")),
+                        .child(SharedString::from("Log in to Noches")),
                 )
                 .child(
                     div()
@@ -7958,11 +7977,11 @@ impl Shell {
         // then existing memberships and the account escape hatch.
         let blurb: SharedString = match email {
             Some(email) => format!(
-                "Zeron is organized around workspaces — create one for yourself or your team. Signed in as {email}."
+                "Noches is organized around workspaces — create one for yourself or your team. Signed in as {email}."
             )
             .into(),
             None => {
-                "Zeron is organized around workspaces — create one for yourself or your team."
+                "Noches is organized around workspaces — create one for yourself or your team."
                     .into()
             }
         };

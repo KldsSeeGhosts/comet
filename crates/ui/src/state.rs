@@ -28,7 +28,7 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use crate::comments::ReviewComment;
-use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+use zeron_doc::{MessagePart, SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
     AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
@@ -1546,6 +1546,21 @@ impl AppState {
     pub fn selected_chat_row(&self) -> Option<&Chat> {
         let id = self.selected_chat.as_deref()?;
         self.chats.iter().find(|c| c.id == id)
+    }
+
+    /// The selected chat's most recent todo list — the newest `ToolCall::Todo`
+    /// in the transcript (todo updates re-emit the whole list, so the latest
+    /// call carries the current state). `None` while no todo call exists.
+    pub fn latest_todos(&self) -> Option<&[zeron_proto::TodoItem]> {
+        self.transcript.iter().rev().find_map(|entry| {
+            entry.parts.iter().rev().find_map(|part| match part {
+                MessagePart::Tool {
+                    call: zeron_proto::ToolCall::Todo { items },
+                    ..
+                } => Some(items.as_slice()),
+                _ => None,
+            })
+        })
     }
 
     /// The chat the Archive session shortcut acts on: the selected one, unless

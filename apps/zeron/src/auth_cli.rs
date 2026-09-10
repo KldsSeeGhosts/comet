@@ -112,7 +112,7 @@ pub async fn login(config: EngineConfig) -> anyhow::Result<()> {
                     .unwrap_or_default()
             );
             println!(
-                "Sync is ready. Start or restart Zeron to open the synced workspace; existing local sessions will stay local."
+                "Sync is ready. Start or restart Noches to open the synced workspace; existing local sessions will stay local."
             );
         }
         // terminal_sign_in only returns Ok once signed in; keep an honest fallback.

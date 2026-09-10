@@ -3875,7 +3875,7 @@ fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
 fn mention_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
-            "The session's device runs an older zeron — update it to search its files".into()
+            "The session's device runs an older Noches — update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
         RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
@@ -3886,7 +3886,7 @@ fn mention_error_message(err: &RpcError) -> SharedString {
 fn slash_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
-            "The session's device runs an older zeron — update it to list commands".into()
+            "The session's device runs an older Noches — update it to list commands".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
         RpcError::BadParams(_) | RpcError::Failed(_) => {
@@ -6317,7 +6317,7 @@ impl Composer {
     /// border-white/[0.08] bg-white/[0.03] shadow-xl`), uppercase header +
     /// "1/3" counter chip, option rows with number kbd chips, a free-text
     /// override over a hairline, and Back / Next-Submit footer.
-    fn render_wizard(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_wizard(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(wizard) = self.wizard.clone() else {
             return gpui::Empty.into_any_element();
@@ -6473,10 +6473,16 @@ impl Composer {
                     })
                     .child(
                         div()
+                            .id("wizard-options")
                             .mt(px(12.0))
+                            // The panel replaces the composer but can outgrow
+                            // the viewport (many options): cap and scroll so
+                            // the footer and input stay on screen.
+                            .max_h(window.viewport_size().height * 0.4)
                             .flex()
                             .flex_col()
                             .gap(px(4.0))
+                            .overflow_y_scroll()
                             .children(options),
                     )
                     // Free-text override over a hairline (shares the composer
@@ -6849,7 +6855,7 @@ impl Render for Composer {
             });
 
         if wizard_active {
-            let wizard = self.render_wizard(cx);
+            let wizard = self.render_wizard(window, cx);
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
         }
 

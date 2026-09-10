@@ -75,6 +75,9 @@ pub fn render(
             })
             .into()
         })
+        // Match the hover delay the rest of the chrome uses — the gpui
+        // default (500ms) reads as lag next to the 350ms tooltips around it.
+        .tooltip_show_delay(std::time::Duration::from_millis(350))
 }
 
 struct UsageCard {
