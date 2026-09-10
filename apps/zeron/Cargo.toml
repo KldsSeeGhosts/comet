@@ -9,6 +9,11 @@ publish.workspace = true
 name = "zeron"
 path = "src/main.rs"
 
+[features]
+# Dev variant — flips the Wayland app_id and defaults so install.sh can lay
+# down a side-by-side dev build. See docs/dev-prod-workflow.md.
+dev = ["zeron-ui/dev"]
+
 [dependencies]
 zeron-engine.workspace = true
 zeron-rpc.workspace = true

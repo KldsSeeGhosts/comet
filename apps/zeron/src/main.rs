@@ -211,7 +211,7 @@ fn main() -> anyhow::Result<()> {
                 ipc_port: std::env::var("ZERON_IPC_PORT")
                     .ok()
                     .and_then(|p| p.parse().ok())
-                    .unwrap_or(27654),
+                    .unwrap_or_else(default_ipc_port),
                 edge_url: edge_url_from_env(),
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,
@@ -238,7 +238,7 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
         ipc_port: std::env::var("ZERON_IPC_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
-            .unwrap_or(27654),
+            .unwrap_or_else(default_ipc_port),
         default_harness: harness_from_env(),
         // WorkOS mode: the signed-in session's org wins; ZERON_ORG_ID (dev
         // default "dev-org") scopes the workspace room otherwise.
@@ -265,18 +265,33 @@ fn harness_from_env() -> zeron_engine::HarnessId {
     }
 }
 
+/// Default data dir. The dev build (`--features dev`) uses `~/.zeron-dev` so
+/// its engine, device identity, and chats are fully isolated from production's
+/// `~/.zeron` — the same split the install script wires up (separate systemd
+/// unit, IPC port, desktop entry).
 fn dirs_data_dir() -> std::path::PathBuf {
     let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
-    let dir = home.join(".zeron");
+    let dir = home.join(if cfg!(feature = "dev") {
+        ".zeron-dev"
+    } else {
+        ".zeron"
+    });
     // One-shot 0.2.0 migration: adopt the pre-rename data dir (sign-in,
-    // device identity, prefs) instead of starting fresh.
-    if !dir.exists() {
+    // device identity, prefs) instead of starting fresh. Prod builds only —
+    // the dev dir has no legacy `.comet-native` to adopt.
+    if !cfg!(feature = "dev") && !dir.exists() {
         let old = home.join(".comet-native");
         if old.exists() && std::fs::rename(&old, &dir).is_ok() {
             eprintln!("migrated data dir {} -> {}", old.display(), dir.display());
         }
     }
     dir
+}
+
+/// Default IPC port. Dev uses its own so a dev engine and the production
+/// daemon can listen side-by-side without the UI attaching to the wrong one.
+fn default_ipc_port() -> u16 {
+    if cfg!(feature = "dev") { 27655 } else { 27654 }
 }
 
 /// `zeron sync`: dial the running engine's IPC and print per-room sync state.

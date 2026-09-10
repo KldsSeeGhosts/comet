@@ -57,6 +57,16 @@ use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOp
 pub use state::EngineBootConfig;
 pub use zeron_proto::HarnessId;
 
+/// Wayland/X11 `app_id` (and `StartupWMClass`) for the headed window. The dev
+/// build (`--features dev`) reports `zeron-dev` so Hyprland rules, screenshots,
+/// and window lookup can always tell the two variants apart — the same split
+/// ProjectX uses (`dev.projectx.shell` vs `.dev`).
+pub const APP_ID: &str = if cfg!(feature = "dev") {
+    "zeron-dev"
+} else {
+    "zeron"
+};
+
 /// Everything the headed binary passes in (config/env resolution lives in
 /// `apps/zeron`, not here).
 #[derive(Debug, Clone)]
@@ -264,7 +274,7 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // — if these two ever disagree, vibrancy dies on the first theme
             // change and never comes back.
             window_background: theme::Theme::of(cx).window_background_appearance(),
-            app_id: Some("zeron".into()),
+            app_id: Some(APP_ID.into()),
             ..Default::default()
         },
         move |window, cx| {
