@@ -7,7 +7,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
-use zeron_harness::{AcpHarness, CancellationToken, Harness, PiHarness, RunControls, SteerMessage};
+use zeron_harness::{
+    AcpHarness, CancellationToken, Harness, PiHarness, RunCommand, RunControls, SteerMessage,
+};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, SteeringMode, TodoItem, ToolCall,
     UserInputAnswer,
@@ -46,7 +48,7 @@ fn request(prompt: &str) -> RunRequest {
     }
 }
 
-fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+fn controls() -> (RunControls, mpsc::Sender<RunCommand>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
@@ -273,10 +275,10 @@ async fn steering_extension_injects_mid_turn() {
             let ev = ev.expect("stream event");
             if matches!(ev, AgentEvent::TextDelta { ref text } if text == "first") {
                 steer
-                    .send(SteerMessage {
+                    .send(RunCommand::Steer(SteerMessage {
                         prompt: "redirect please".into(),
                         message_id: None,
-                    })
+                    }))
                     .await
                     .expect("steer sent");
             }
@@ -319,10 +321,10 @@ async fn steer_racing_the_turn_end_never_emits_steered_after_done() {
             let ev = ev.expect("stream event");
             if matches!(ev, AgentEvent::TextDelta { ref text } if text == "first") {
                 steer
-                    .send(SteerMessage {
+                    .send(RunCommand::Steer(SteerMessage {
                         prompt: "redirect please".into(),
                         message_id: None,
-                    })
+                    }))
                     .await
                     .expect("steer sent");
             }
@@ -370,10 +372,10 @@ async fn rejected_steer_queues_and_delivers_at_the_turn_boundary() {
                 && let Some(steer) = &steer
             {
                 steer
-                    .send(SteerMessage {
+                    .send(RunCommand::Steer(SteerMessage {
                         prompt: "redirect please".into(),
                         message_id: None,
-                    })
+                    }))
                     .await
                     .expect("steer sent");
             }
@@ -602,6 +604,7 @@ fn acp_and_native_pi_descriptors_match_registry_expectations() {
     assert_eq!(
         pi.reasoning_levels(),
         &[
+            zeron_proto::ReasoningLevel::Off,
             zeron_proto::ReasoningLevel::Minimal,
             zeron_proto::ReasoningLevel::Low,
             zeron_proto::ReasoningLevel::Medium,

@@ -27,6 +27,9 @@ pub enum HarnessId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningLevel {
+    /// Reasoning disabled outright (Pi's `off` thinking level — it bypasses
+    /// the provider's effort mapping entirely).
+    Off,
     Minimal,
     Low,
     Medium,
@@ -275,6 +278,25 @@ pub struct TodoItem {
     pub done: bool,
 }
 
+/// Where a slash command comes from — built into the agent, loaded from a
+/// user/project commands dir, or wrapping a skill (Pi's `skill:` source).
+/// Declaration order is resolution precedence (most specific first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandScope {
+    /// Shipped with the agent itself (also covers extension-registered
+    /// commands — they resolve inside the agent like built-ins).
+    #[default]
+    Builtin,
+    /// Defined by files inside the project (`<repo>/.pi/prompts` et al).
+    Project,
+    /// Defined by files under the user's agent dir (`~/.pi/agent/prompts`).
+    User,
+    /// A provider skill — invoked through the agent's own skill syntax
+    /// (Pi's `/skill:name`), never expanded client-side.
+    Skill,
+}
+
 /// A slash command advertised by the agent (ACP `availableCommands`): typed as
 /// `/name` at the start of the composer, sent to the agent as prompt text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -286,6 +308,25 @@ pub struct SlashCommand {
     /// Placeholder hint for the command's argument, when it takes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_hint: Option<String>,
+    /// What defined the command — pickers group and tag on it; harnesses use
+    /// it to pick the agent's native invocation (Pi skills go out as
+    /// `/skill:name`). Additive: catalogs predating the field read `builtin`.
+    #[serde(default)]
+    pub scope: CommandScope,
+}
+
+/// A mid-run options change for harnesses that apply it to the resident
+/// process (Pi's `set_model`/`set_thinking_level`) instead of restarting the
+/// session. Mirrors the option fields of [`RunRequest`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningLevel>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A file modification carried inline on a tool result (ACP
@@ -385,6 +426,13 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    /// The agent renamed its own session (Pi's `session_info_changed`) —
+    /// applied engine-side to the workspace chat row (the same write a manual
+    /// rename takes), never folded into the transcript.
+    #[serde(rename_all = "camelCase")]
+    TitleUpdated {
+        title: String,
+    },
     /// The agent advertised (or changed) its slash-command set — ACP
     /// `available_commands_update`. The engine caches the latest list per
     /// harness for the composer's `/` popup; never persisted to docs.
@@ -455,6 +503,35 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    /// Additive metadata events stay camelCase-tagged on the wire; old
+    /// consumers that don't know them simply drop the variant.
+    #[test]
+    fn title_updated_round_trips_and_serializes_compactly() {
+        let ev = AgentEvent::TitleUpdated {
+            title: "Fix the flaky test".into(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"titleUpdated","title":"Fix the flaky test"}"#
+        );
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    #[test]
+    fn reasoning_level_serializes_lowercase_with_off() {
+        assert_eq!(
+            serde_json::to_string(&ReasoningLevel::Off).unwrap(),
+            "\"off\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningLevel::XHigh).unwrap(),
+            "\"xhigh\""
+        );
+        // Off sits at the weak end of the ordered ladder.
+        assert!(ReasoningLevel::Off < ReasoningLevel::Minimal);
     }
 
     /// Drivers spell the key differently; the chip must not care which one

@@ -17,6 +17,10 @@ def response(request, data=None, success=True, error=None):
 
 
 current_prompt_mode = ""
+# The session file the fake is sitting on; switch_session repoints it and
+# fork/clone derive the copy's file from it, so tests can assert which
+# session a forked run resumes.
+current_session = "/tmp/fake-pi-session.jsonl"
 
 for line in sys.stdin:
     request = json.loads(line)
@@ -24,7 +28,7 @@ for line in sys.stdin:
     if command == "get_state":
         response(request, {
             "sessionId": "native-session",
-            "sessionFile": "/tmp/fake-pi-session.jsonl",
+            "sessionFile": current_session,
             "model": {"provider": "test", "id": "native", "contextWindow": 100000},
         })
     elif command == "get_available_models":
@@ -42,8 +46,32 @@ for line in sys.stdin:
         if "cancelled" in session_path:
             response(request, {"cancelled": True})
         else:
+            current_session = session_path
             response(request, {})
-    elif command in ("set_model", "set_thinking_level"):
+    elif command == "get_fork_messages":
+        if "no_fork" in current_session:
+            response(request, success=False, error="fork unavailable")
+        else:
+            response(request, {"messages": [
+                {"entryId": "e1", "text": "first turn"},
+                {"entryId": "e2", "text": "second turn"},
+            ]})
+    elif command in ("fork", "clone"):
+        entry_id = request.get("entryId")
+        if command == "fork" and entry_id == "missing":
+            response(request, success=False, error="no such entry")
+            continue
+        current_session = current_session + ".fork"
+        response(request, {})
+    elif command == "set_model":
+        # The distinct window marker lets tests prove the switch landed: the
+        # startup get_state/settlement stats report 100000.
+        response(request, {"model": {
+            "provider": request.get("provider", "test"),
+            "id": request.get("modelId", "native"),
+            "contextWindow": 777000,
+        }})
+    elif command == "set_thinking_level":
         response(request, {})
     elif command == "steer":
         if "steer_reject" in current_prompt_mode:
@@ -76,6 +104,14 @@ for line in sys.stdin:
         if "local_only" in message:
             send({"type": "command_output", "text": "local output"})
             response(request, {"agentInvoked": False})
+            continue
+        # Echo harness: slash-resolution tests assert what the harness put on
+        # the wire by having the resolved message come back as a delta —
+        # "WIRE:…" bodies from expanded templates, "/…" commands verbatim.
+        if message.startswith(("WIRE:", "/")):
+            response(request, {"agentInvoked": True})
+            send({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": message}})
+            send({"type": "agent_settled"})
             continue
 
         response(request, {"agentInvoked": True})
@@ -115,6 +151,12 @@ for line in sys.stdin:
             send({"type": "agent_settled"})
         elif "post_settle_next" in message:
             send({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "turn2_done"}})
+            send({"type": "agent_settled"})
+        elif "auto_title" in message:
+            # Pi renames its session mid-run; the repeat must not re-emit.
+            send({"type": "session_info_changed", "name": "Pi picked a title"})
+            send({"type": "session_info_changed", "name": "Pi picked a title"})
+            send({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "done"}})
             send({"type": "agent_settled"})
         elif "abort" in message or "steer" in message:
             current_prompt_mode = message

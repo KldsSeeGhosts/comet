@@ -492,7 +492,10 @@ impl Harness for PersistentHarness {
             // Parked: serve follow-up turns from the mailbox until the
             // engine hangs up (idle reap / interrupt / shutdown).
             let mut n = 1usize;
-            while let Some(steer) = steering.recv().await {
+            while let Some(command) = steering.recv().await {
+                let zeron_harness::RunCommand::Steer(steer) = command else {
+                    continue;
+                };
                 n += 1;
                 let boundary = AgentEvent::Steered {
                     assistant_message_id: None,

@@ -477,6 +477,29 @@ impl SessionDoc {
         Ok(false)
     }
 
+    /// Remove the entry `message_id` and every entry after it — the doc side
+    /// of a session rewind. Returns `false` when no entry matches.
+    pub fn truncate_from(&self, message_id: &str) -> Result<bool, DocError> {
+        let messages = self.doc.get_list("messages");
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let id_matches = matches!(
+                map.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == message_id
+            );
+            if id_matches {
+                messages.delete(i, messages.len() - i)?;
+                self.doc.commit();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Append an error part to an existing entry (crash recovery: the aborted
     /// entry must SAY why it ended — "Run interrupted by engine restart…" —
     /// not just truncate silently). Returns `false` when no entry matches.
@@ -1210,6 +1233,44 @@ mod tests {
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         }
+    }
+
+    #[test]
+    fn truncate_from_removes_the_entry_and_its_tail() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        for (id, text) in [
+            ("u1", "first"),
+            ("a1", "reply"),
+            ("u2", "second"),
+            ("a2", "reply"),
+        ] {
+            doc.push_message(&SessionMessageEntry {
+                id: id.into(),
+                role: if id.starts_with('u') {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: text.into(),
+                }],
+                created_at: 1,
+                device_id: "dev-a".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+            })
+            .unwrap();
+        }
+        assert!(doc.truncate_from("u2").unwrap());
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["u1", "a1"]
+        );
+        // Idempotent-ish: a missing id is a false, not a wipe.
+        assert!(!doc.truncate_from("nope").unwrap());
+        assert_eq!(doc.read_entries().unwrap().len(), 2);
     }
 
     #[test]

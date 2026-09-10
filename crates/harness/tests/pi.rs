@@ -4,7 +4,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use zeron_harness::{
-    CancellationToken, Harness, HarnessError, PiHarness, RunControls, SteerMessage,
+    CancellationToken, Harness, HarnessError, PiHarness, RunCommand, RunControls, SteerMessage,
 };
 use zeron_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall};
 
@@ -583,10 +583,10 @@ async fn steer_during_turn_delivers_steer_and_settles() {
         events.push(event);
         if is_started {
             let _ = steer_tx
-                .send(SteerMessage {
+                .send(RunCommand::Steer(SteerMessage {
                     prompt: "continue with next step".into(),
                     message_id: None,
-                })
+                }))
                 .await;
             break;
         }
@@ -641,10 +641,10 @@ async fn steering_race_error_response_is_handled_and_emitted() {
         events.push(event);
         if is_started {
             let _ = steer_tx
-                .send(SteerMessage {
+                .send(RunCommand::Steer(SteerMessage {
                     prompt: "steer into settling agent".into(),
                     message_id: None,
-                })
+                }))
                 .await;
             break;
         }
@@ -745,10 +745,10 @@ async fn steering_after_settlement_starts_next_turn_with_done() {
 
     // Send steer after first turn is fully completed and settled
     steer_tx
-        .send(SteerMessage {
+        .send(RunCommand::Steer(SteerMessage {
             prompt: "post_settle_next".into(),
             message_id: None,
-        })
+        }))
         .await
         .expect("steer send succeeds");
 
@@ -850,6 +850,34 @@ async fn structured_tool_content_is_extracted() {
 }
 
 #[tokio::test]
+async fn session_info_changed_renames_the_chat_once_per_name() {
+    let (_steer_tx, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    // The fixture emits the same session name twice before settling.
+    let request = base_request("auto_title");
+    let stream = PiHarness::new()
+        .with_executable(fixture())
+        .run(request, controls)
+        .await
+        .expect("starts");
+
+    let events = collect_events(stream).await;
+
+    let titles: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TitleUpdated { title } => Some(title.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(titles, vec!["Pi picked a title"]);
+}
+
+#[tokio::test]
 async fn context_breakdown_flows_from_the_session_entry() {
     use zeron_proto::ContextComponentKind;
 
@@ -911,4 +939,190 @@ async fn context_breakdown_flows_from_the_session_entry() {
     assert_eq!(*tokens, Some(2050));
     assert_eq!(*window, Some(1_048_576));
     assert_eq!(components.len(), 5);
+}
+
+/// The wire text a `RunCommand::Options` change pushes onto the live RPC
+/// session — the fixture answers set_model with a distinct context window so
+/// the ContextUsage event proves the switch actually went through.
+#[tokio::test]
+async fn options_command_applies_model_live_and_publishes_window() {
+    let (steer_tx, steering) = mpsc::channel(4);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    let mut stream = PiHarness::new()
+        .with_executable(fixture())
+        .run(base_request("inspect the file"), controls)
+        .await
+        .expect("starts");
+
+    // Let the first turn settle, then change the model mid-session.
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        let event = event.expect("valid event");
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    steer_tx
+        .send(RunCommand::Options(zeron_proto::SessionOptions {
+            model: Some("test/native".into()),
+            reasoning: Some(zeron_proto::ReasoningLevel::Low),
+            ..Default::default()
+        }))
+        .await
+        .expect("options send succeeds");
+
+    // The model switch publishes its fresh context window (set_model's
+    // answer carries it — the fixture's 777000 marker proves the request
+    // landed, versus the startup stats' 100000).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            let event = event.expect("valid event");
+            if matches!(
+                event,
+                AgentEvent::ContextUsage {
+                    window: Some(777_000),
+                    ..
+                }
+            ) {
+                return;
+            }
+        }
+        panic!("stream ended before the options-driven ContextUsage");
+    })
+    .await
+    .expect("options publish the new window within timeout");
+}
+
+#[tokio::test]
+async fn prompt_template_expands_before_the_wire() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join(".pi/prompts")).unwrap();
+    std::fs::write(
+        dir.path().join(".pi/prompts/echo_wire.md"),
+        "---\ndescription: echo\n---\nWIRE:$ARGUMENTS",
+    )
+    .unwrap();
+    let (_steer_tx, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    let mut request = base_request("/echo_wire hello there");
+    request.cwd = dir.path().to_string_lossy().into_owned();
+    let stream = PiHarness::new()
+        .with_executable(fixture())
+        .run(request, controls)
+        .await
+        .expect("starts");
+    let events = collect_events(stream).await;
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::TextDelta { text } if text == "WIRE:hello there"
+    )));
+}
+
+#[tokio::test]
+async fn slash_skill_routes_to_the_native_invocation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let skill = dir.path().join(".pi/skills/review");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Review code\n---\nReview carefully",
+    )
+    .unwrap();
+    let (_steer_tx, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    let mut request = base_request("/review src/lib.rs");
+    request.cwd = dir.path().to_string_lossy().into_owned();
+    let stream = PiHarness::new()
+        .with_executable(fixture())
+        .run(request, controls)
+        .await
+        .expect("starts");
+    let events = collect_events(stream).await;
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::TextDelta { text } if text == "/skill:review src/lib.rs"
+    )));
+}
+
+/// A command the catalog knows but no template/skill claims passes through
+/// verbatim — Pi itself decides what `/compact` does.
+#[tokio::test]
+async fn builtin_slash_command_passes_through_verbatim() {
+    let (_steer_tx, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    let stream = PiHarness::new()
+        .with_executable(fixture())
+        .run(base_request("/compact"), controls)
+        .await
+        .expect("starts");
+    let events = collect_events(stream).await;
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::TextDelta { text } if text == "/compact"
+    )));
+}
+
+/// Rewind: fork dropping the last turn lands on `fork` with the boundary
+/// entry and returns the fork's new session file.
+#[tokio::test]
+async fn fork_session_rolls_back_to_a_prior_turn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = dir.path().join("session.jsonl");
+    std::fs::write(&session, "{}\n").unwrap();
+    let forked = PiHarness::new()
+        .with_executable(fixture())
+        .fork_session(dir.path(), session.to_str().unwrap(), 1)
+        .await
+        .expect("fork succeeds");
+    assert_eq!(forked, format!("{}.fork", session.display()));
+}
+
+/// `turns_to_remove == 0` is the whole-session clone path.
+#[tokio::test]
+async fn fork_session_with_zero_turns_clones_the_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = dir.path().join("session.jsonl");
+    std::fs::write(&session, "{}\n").unwrap();
+    let forked = PiHarness::new()
+        .with_executable(fixture())
+        .fork_session(dir.path(), session.to_str().unwrap(), 0)
+        .await
+        .expect("clone succeeds");
+    assert_eq!(forked, format!("{}.fork", session.display()));
+}
+
+#[tokio::test]
+async fn fork_session_rejects_an_overrun_and_a_missing_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = dir.path().join("session.jsonl");
+    std::fs::write(&session, "{}\n").unwrap();
+    let harness = PiHarness::new().with_executable(fixture());
+    let err = harness
+        .fork_session(dir.path(), session.to_str().unwrap(), 5)
+        .await
+        .expect_err("removing more turns than the session has must fail");
+    assert!(err.to_string().contains("only 2 native turns"));
+    let err = harness
+        .fork_session(dir.path(), "/nonexistent/session.jsonl", 1)
+        .await
+        .expect_err("a missing session file must fail before spawn");
+    assert!(err.to_string().contains("missing"));
 }

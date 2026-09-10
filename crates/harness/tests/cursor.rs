@@ -7,7 +7,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
-use zeron_harness::{CancellationToken, CursorHarness, Harness, RunControls, SteerMessage};
+use zeron_harness::{
+    CancellationToken, CursorHarness, Harness, RunCommand, RunControls, SteerMessage,
+};
 use zeron_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall};
 
 fn fixture_path() -> PathBuf {
@@ -43,7 +45,7 @@ fn request(prompt: &str) -> RunRequest {
     }
 }
 
-fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+fn controls() -> (RunControls, mpsc::Sender<RunCommand>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
@@ -180,10 +182,10 @@ async fn steer_after_done_becomes_the_next_turn() {
                 dones += 1;
                 if dones == 1 {
                     steer
-                        .send(SteerMessage {
+                        .send(RunCommand::Steer(SteerMessage {
                             prompt: "follow up".into(),
                             message_id: None,
-                        })
+                        }))
                         .await
                         .expect("steer sent");
                 }

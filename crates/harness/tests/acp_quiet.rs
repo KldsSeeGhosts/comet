@@ -8,7 +8,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
-use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
+use zeron_harness::{
+    AcpHarness, CancellationToken, Harness, RunCommand, RunControls, SteerMessage,
+};
 use zeron_proto::{
     AgentEvent, DoneStatus, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion,
 };
@@ -53,7 +55,7 @@ fn request(prompt: &str) -> RunRequest {
     }
 }
 
-fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+fn controls() -> (RunControls, mpsc::Sender<RunCommand>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
@@ -120,17 +122,17 @@ async fn delayed_turn(scenario: &str) {
     let mut stream = harness.run(request(scenario), controls).await.unwrap();
     // Queue multiple follow-ups while the first prompt remains outstanding.
     steer
-        .send(SteerMessage {
+        .send(RunCommand::Steer(SteerMessage {
             message_id: None,
             prompt: "second".into(),
-        })
+        }))
         .await
         .unwrap();
     steer
-        .send(SteerMessage {
+        .send(RunCommand::Steer(SteerMessage {
             message_id: None,
             prompt: "third".into(),
-        })
+        }))
         .await
         .unwrap();
     let first = collect_until_done(&mut stream).await;
@@ -153,10 +155,10 @@ async fn delayed_turn(scenario: &str) {
     }
     // A fresh user message after completion also reuses the same session.
     steer
-        .send(SteerMessage {
+        .send(RunCommand::Steer(SteerMessage {
             message_id: None,
             prompt: "fourth".into(),
-        })
+        }))
         .await
         .unwrap();
     let fourth = collect_until_done(&mut stream).await;
@@ -217,10 +219,10 @@ async fn cancel_quiet(scenario: &str) {
         "silence must not emit Done"
     );
     steer
-        .send(SteerMessage {
+        .send(RunCommand::Steer(SteerMessage {
             message_id: None,
             prompt: "must not run".into(),
-        })
+        }))
         .await
         .unwrap();
     token.cancel();

@@ -10,7 +10,7 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use zeron_harness::{
-    CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
+    CancellationToken, ClaudeHarness, Harness, HarnessError, RunCommand, RunControls, SteerMessage,
 };
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
@@ -53,7 +53,7 @@ fn request(prompt: &str) -> RunRequest {
 /// Controls whose `request_input` answers every question with `answer_label`.
 fn controls(
     answer_label: &'static str,
-) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+) -> (RunControls, mpsc::Sender<RunCommand>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
@@ -336,10 +336,10 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
 async fn steering_lines_are_written_to_stdin_mid_run() {
     let (controls, steer, _token) = controls("A");
     steer
-        .send(SteerMessage {
+        .send(RunCommand::Steer(SteerMessage {
             prompt: "redirect please".into(),
             message_id: None,
-        })
+        }))
         .await
         .expect("steer queued");
     let events = run_to_end(&harness(), request("scenario:steer"), controls).await;
@@ -624,7 +624,11 @@ async fn live_real_cli_single_turn() {
 async fn commands_come_from_the_initialize_control_request() {
     let h = harness();
     let commands = h.commands().await.expect("discovery succeeds");
-    assert_eq!(commands.len(), 2, "nameless entries are dropped: {commands:?}");
+    assert_eq!(
+        commands.len(),
+        2,
+        "nameless entries are dropped: {commands:?}"
+    );
     assert_eq!(commands[0].name, "review");
     assert_eq!(commands[0].description, "Review a pull request");
     assert_eq!(commands[0].input_hint.as_deref(), Some("[pr number]"));

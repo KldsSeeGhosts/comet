@@ -437,10 +437,13 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // AvailableCommands feeds the engine's per-harness command cache, not
         // the transcript. UserMessage becomes its own doc ENTRY (the engine's
         // subagent sink writes it), never a part of the assistant message.
+        // TitleUpdated lands on the workspace chat row (engine-side rename),
+        // never a transcript part.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::AvailableCommands { .. }
+        | AgentEvent::TitleUpdated { .. }
         | AgentEvent::UserMessage { .. } => {}
     }
 }

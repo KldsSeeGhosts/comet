@@ -2596,7 +2596,49 @@ impl Shell {
                     cx,
                 );
             }
+            TranscriptEvent::RewindMessage { entry_id, text } => {
+                self.rewind_chat(entry_id.to_string(), text.to_string(), cx);
+            }
         }
+    }
+
+    /// The transcript's rewind action: the turn's text lands back in the
+    /// composer for an edited resend, and the engine rewinds the chat — the
+    /// doc tail truncation repaints the transcript off the doc watch.
+    fn rewind_chat(&mut self, entry_id: String, text: String, cx: &mut Context<Self>) {
+        let chat_id = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .unwrap_or_default();
+        if chat_id.is_empty() {
+            return;
+        }
+        self.composer
+            .update(cx, |composer, cx| composer.load_text(text, cx));
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let reply = engine
+                .client()
+                .call(
+                    zeron_rpc::methods::REWIND_CHAT,
+                    serde_json::json!({ "chatId": chat_id, "messageId": entry_id }),
+                )
+                .await;
+            if let Err(err) = reply {
+                this.update(cx, |shell, cx| {
+                    shell.sidebar_notice = Some(format!("Rewind failed: {err}").into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// A spawn chip's "Open subagent": focus the existing tab for that doc,

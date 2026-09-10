@@ -58,11 +58,12 @@ use zeron_proto::{
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
-use crate::{Harness, HarnessError, RunControls};
+use crate::{Harness, HarnessError, RunCommand, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, map_item, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
+    ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, map_item,
+    notification_thread_id, route_child_notification, turn_error_message, turn_id, usage_event,
+    user_message_text,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -308,6 +309,7 @@ impl CodexHarness {
 
 fn reasoning_level(value: &str) -> Option<ReasoningLevel> {
     Some(match value {
+        "off" => ReasoningLevel::Off,
         "minimal" => ReasoningLevel::Minimal,
         "low" => ReasoningLevel::Low,
         "medium" => ReasoningLevel::Medium,
@@ -510,6 +512,7 @@ fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
                 name: name.to_owned(),
                 description: description.to_owned(),
                 input_hint: None,
+                scope: zeron_proto::CommandScope::Skill,
             });
         }
     }
@@ -1373,7 +1376,8 @@ async fn run_session(session: Session) {
             },
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
-                Some(msg) => {
+                Some(RunCommand::Options(_)) => {}
+                Some(RunCommand::Steer(msg)) => {
                     let text = msg.prompt;
                     if let Some(expected) = router.active.clone() {
                         let steer_params = json!({
@@ -1679,7 +1683,11 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                 id: new_message_id(),
                 header: {
                     let h = field(["header", "title", "label"]);
-                    if h.is_empty() { "Codex question".into() } else { h }
+                    if h.is_empty() {
+                        "Codex question".into()
+                    } else {
+                        h
+                    }
                 },
                 question: field(["question", "prompt", "text"]),
                 options: q

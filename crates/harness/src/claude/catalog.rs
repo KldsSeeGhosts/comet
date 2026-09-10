@@ -51,6 +51,9 @@ pub(crate) fn to_effort(
 ) -> Option<&'static str> {
     let base = match reasoning? {
         ReasoningLevel::Ultrathink => return None,
+        // Off has no Claude effort spelling: like ultrathink it rides no
+        // flag here, so send nothing and leave the session's own default.
+        ReasoningLevel::Off => return None,
         ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
         ReasoningLevel::Medium => "medium",
         ReasoningLevel::High => "high",

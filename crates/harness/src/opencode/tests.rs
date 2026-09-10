@@ -79,10 +79,10 @@ impl TurnWire {
         let (steer_tx, steering) = mpsc::channel(4);
         if queued {
             steer_tx
-                .send(crate::SteerMessage {
+                .send(crate::RunCommand::Steer(crate::SteerMessage {
                     prompt: "second".into(),
                     message_id: None,
-                })
+                }))
                 .await
                 .unwrap();
         }

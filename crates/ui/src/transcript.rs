@@ -2498,6 +2498,13 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// The rewind hover action on a user entry: roll the chat back to just
+    /// before this turn (native session fork + doc tail truncation) and
+    /// reload the turn's text into the composer for an edited resend.
+    RewindMessage {
+        entry_id: SharedString,
+        text: SharedString,
+    },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -5028,6 +5035,11 @@ impl Transcript {
         // User entries align end (under the bubble), assistant entries start.
         // Both read timestamp first, then the copy action.
         let is_user_row = matches!(row.kind, RowKind::User { .. });
+        // Rewind points at a turn start: settled user entries on the primary
+        // transcript only (subagent override views are read-only, and a
+        // queued-but-unsent row is not a turn boundary yet).
+        let rewindable = matches!(row.kind, RowKind::User { pending, .. } if !pending)
+            && self.doc_override.is_none();
         let hovered = self
             .hovered_entry
             .as_ref()
@@ -5040,6 +5052,36 @@ impl Transcript {
                 .text_size(crate::typography::ui_rems(12.0))
                 .text_color(theme.text_muted.opacity(0.55))
                 .child(SharedString::from(format_timestamp(ms, &chrono::Local)));
+            let rewind = (rewindable && copy_text.is_some()).then(|| {
+                let entry_id = copy_entry_id.clone();
+                let text = copy_text.clone().unwrap_or_default();
+                let fade_key = format!("rewind-message-hover-{entry_id}");
+                div()
+                    .id(SharedString::from(format!("rewind-message-{entry_id}")))
+                    .size(px(Theme::SPACE_MD * 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .cursor_pointer()
+                    .bg(motion::hover_blend(
+                        &fade_key,
+                        gpui::transparent_black(),
+                        crate::theme::ink(0.08),
+                    ))
+                    .on_hover(motion::hover_listener(fade_key))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(TranscriptEvent::RewindMessage {
+                            entry_id: entry_id.clone(),
+                            text: text.clone(),
+                        });
+                    }))
+                    .child(
+                        crate::icons::icon(crate::icons::RESTART)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+            });
             let copy = copy_text.map(|text| {
                 let entry_id = copy_entry_id.clone();
                 let fade_key = format!("copy-message-hover-{entry_id}");
@@ -5077,7 +5119,7 @@ impl Transcript {
                 .flex_row()
                 .items_center()
                 .gap(px(Theme::SPACE_SM));
-            let metadata = metadata.child(timestamp).children(copy);
+            let metadata = metadata.child(timestamp).children(rewind).children(copy);
             div()
                 .h(px(Theme::SPACE_SM + Theme::SPACE_MD * 2.0))
                 .pt(px(Theme::SPACE_SM))

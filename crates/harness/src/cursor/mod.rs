@@ -51,7 +51,7 @@ use zeron_proto::{
     RunRequest, SteeringMode, TodoItem, ToolCall,
 };
 
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+use crate::{Harness, HarnessError, RunCommand, RunControls, Signal, send_signal, shutdown_child};
 
 /// The pinned SDK (public beta 1.0.x line; inspected against 1.0.28's
 /// typings). Bump deliberately — see the module header.
@@ -574,7 +574,8 @@ async fn run_session(session: Session) {
             },
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
-                Some(msg) => {
+                Some(RunCommand::Options(_)) => {}
+                Some(RunCommand::Steer(msg)) => {
                     if parked {
                         parked = false;
                         let prev = std::mem::replace(&mut assistant_message_id, new_message_id());
@@ -946,10 +947,9 @@ mod tests {
 
     #[test]
     fn nested_frames_arrive_tagged() {
-        let frame: Value = serde_json::from_str(
-            r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#,
-        )
-        .unwrap();
+        let frame: Value =
+            serde_json::from_str(r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#)
+                .unwrap();
         assert_eq!(
             map_shim_frame(&frame, false),
             vec![AgentEvent::Subagent {

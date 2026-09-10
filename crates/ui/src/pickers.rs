@@ -187,6 +187,7 @@ pub fn clamp_reasoning(
 
 pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
     match level {
+        ReasoningLevel::Off => "Off",
         ReasoningLevel::Minimal => "Minimal",
         ReasoningLevel::Low => "Low",
         ReasoningLevel::Medium => "Medium",

@@ -140,7 +140,7 @@ enum HarnessCatalog {
             return [
                 ModelInfo(id: "default", label: "pi default",
                           description: "Runs the model configured in pi (`pi` settings)",
-                          reasoningLevels: ["minimal", "low", "medium", "high", "xhigh", "max"]),
+                          reasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
             ]
         case "opencode":
             // Static fallback only — a reachable host answers `listModels`

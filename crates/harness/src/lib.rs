@@ -20,8 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use zeron_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SessionOptions, SlashCommand,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -44,14 +44,27 @@ pub struct SteerMessage {
     pub message_id: Option<String>,
 }
 
-/// Host-side controls handed to a run: input-request bridge + steering mailbox.
+/// A control message for a resident run. Carrying options on the same mailbox
+/// as steers keeps send order intact: a config change pushed ahead of a
+/// routed prompt is applied before that prompt reaches the agent.
+pub enum RunCommand {
+    /// A prompt — mid-turn steer for step-boundary harnesses, the next turn
+    /// for a session parked between turns.
+    Steer(SteerMessage),
+    /// Model/effort change applied in place (Pi's `set_model` +
+    /// `set_thinking_level`). Only sent to harnesses reporting
+    /// [`Harness::supports_live_options`]; everyone else may ignore it.
+    Options(SessionOptions),
+}
+
+/// Host-side controls handed to a run: input-request bridge + command mailbox.
 pub struct RunControls {
     /// The run sends questions and awaits answers (blocks the agent, mirrors zeron).
     pub request_input: Box<
         dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
     >,
-    /// Steer prompts consumed at step/turn boundaries.
-    pub steering: mpsc::Receiver<SteerMessage>,
+    /// Steer prompts and live option changes, consumed at step/turn boundaries.
+    pub steering: mpsc::Receiver<RunCommand>,
     /// Cancel to interrupt the live run: the harness sends its protocol-level
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
@@ -84,6 +97,35 @@ pub trait Harness: Send + Sync {
     /// Unlike deterministic_turn_end, this need not cover autonomous activity.
     fn authoritative_prompt_end(&self) -> bool {
         self.deterministic_turn_end()
+    }
+    /// Whether a resident run accepts [`RunCommand::Options`] — model/effort
+    /// changes applied in place, so a mid-session pick does not cost a
+    /// process restart (Pi: `set_model` + `set_thinking_level` on the live
+    /// RPC session). Harnesses without it restart+resume on config changes.
+    fn supports_live_options(&self) -> bool {
+        false
+    }
+    /// Whether [`Harness::fork_session`] can clone/rewind this harness's
+    /// native sessions (Pi's session tree). Defaults false.
+    fn supports_session_fork(&self) -> bool {
+        false
+    }
+    /// Fork the native session `session_id` so the copy retains all but the
+    /// last `turns_to_remove` user turns; returns the fork's new native
+    /// session id (a session-file path for the Pi dialects).
+    /// `turns_to_remove == 0` clones the whole session — the "fork from here"
+    /// action at the latest point. Runs out of process; the engine settles
+    /// any live run on the session before calling.
+    async fn fork_session(
+        &self,
+        _cwd: &std::path::Path,
+        _session_id: &str,
+        _turns_to_remove: usize,
+    ) -> Result<String, HarnessError> {
+        Err(HarnessError::Protocol(format!(
+            "{} cannot fork native sessions",
+            self.display_name()
+        )))
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     /// Slash commands the agent advertises (ACP `availableCommands`); empty

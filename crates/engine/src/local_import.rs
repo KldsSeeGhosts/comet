@@ -1217,6 +1217,67 @@ mod tests {
             import_pi_session(&store, &workspace, device_id, &session_file).expect("reimport");
         assert_eq!(reimport, None);
     }
+
+    /// The RPC surface (`ImportPiSessions`) calls [`LocalImporter::import_pi_sessions`];
+    /// the first run imports the scanned sessions, and a second run must be a
+    /// no-op that reports zero imported.
+    #[tokio::test]
+    async fn local_importer_import_pi_sessions_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(DocsStore::open(dir.path()).expect("store"));
+        let device_id = "device-test";
+        let workspace = WorkspaceHost::open(
+            store.clone(),
+            crate::workspace_host::WorkspaceHostConfig {
+                device_id: device_id.into(),
+                device_name: "Test device".into(),
+                platform: "linux".into(),
+                org_id: "test-org".into(),
+                user_id: "test-user".into(),
+                edge: None,
+            },
+        )
+        .expect("workspace host");
+        let importer = LocalImporter::new(
+            dir.path(),
+            device_id,
+            "test-org",
+            "test-user",
+            store.clone(),
+            dir.path().join("journals"),
+            workspace.clone(),
+            Uploads::new(dir.path()),
+        );
+
+        let root = dir.path().join("pi-sessions");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("session.jsonl"),
+            r#"{"type":"session","id":"aaaabbbb-cccc-dddd","timestamp":"2026-09-01T12:00:00Z","cwd":"/tmp/work"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-09-01T12:00:01Z","message":{"role":"user","content":"How do I test this?"}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-01T12:00:05Z","message":{"role":"assistant","content":"Write tests."}}"#,
+        )
+        .expect("write session");
+
+        let summary = importer
+            .import_pi_sessions(Some(&[root.clone()]))
+            .expect("import");
+        assert_eq!(summary.imported_chats, 1);
+        assert_eq!(summary.skipped_chats, 0);
+        assert!(summary.errors.is_empty());
+        assert!(
+            workspace
+                .chat("pi-aaaabbbb-cccc-dddd")
+                .expect("chat")
+                .is_some()
+        );
+
+        // Second invocation: nothing new to do — a no-op with zero imported.
+        let rerun = importer.import_pi_sessions(Some(&[root])).expect("rerun");
+        assert_eq!(rerun.imported_chats, 0);
+        assert_eq!(rerun.skipped_chats, 1);
+        assert!(rerun.errors.is_empty());
+    }
 }
 
 /// Whether a recorded import grants the synced profile `(org, user)` the local

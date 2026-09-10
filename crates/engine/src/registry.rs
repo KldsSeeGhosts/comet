@@ -501,7 +501,8 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
     );
     // Pi over native RPC (`pi --mode rpc`). The static descriptor mirrors
-    // PiHarness: step-boundary steering and Pi's thinking ladder minus "off".
+    // PiHarness: step-boundary steering and Pi's full thinking ladder,
+    // `off` leading it.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Pi,
@@ -509,6 +510,7 @@ pub fn default_registry() -> HarnessRegistry {
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![
+                ReasoningLevel::Off,
                 ReasoningLevel::Minimal,
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
@@ -686,6 +688,7 @@ mod tests {
         assert_eq!(
             pi.reasoning_levels(),
             &[
+                ReasoningLevel::Off,
                 ReasoningLevel::Minimal,
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,

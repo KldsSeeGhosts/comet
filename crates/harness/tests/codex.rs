@@ -9,7 +9,7 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use zeron_harness::{
-    CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
+    CancellationToken, CodexHarness, Harness, HarnessError, RunCommand, RunControls, SteerMessage,
 };
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
@@ -52,7 +52,7 @@ fn request(prompt: &str) -> RunRequest {
 /// Controls whose `request_input` answers every question with `answer_label`.
 fn controls(
     answer_label: &'static str,
-) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+) -> (RunControls, mpsc::Sender<RunCommand>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
@@ -303,10 +303,10 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
 async fn steering_uses_turn_steer_with_expected_turn_id() {
     let (controls, steer, _token) = controls("Yes");
     steer
-        .send(SteerMessage {
+        .send(RunCommand::Steer(SteerMessage {
             prompt: "redirect please".into(),
             message_id: None,
-        })
+        }))
         .await
         .expect("steer queued");
     let events = run_to_end(&harness(), request("scenario:steer"), controls).await;
@@ -346,10 +346,10 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
 async fn rejected_steer_falls_back_to_a_follow_up_turn() {
     let (controls, steer, _token) = controls("Yes");
     steer
-        .send(SteerMessage {
+        .send(RunCommand::Steer(SteerMessage {
             prompt: "redirect please".into(),
             message_id: None,
-        })
+        }))
         .await
         .expect("steer queued");
     let events = run_to_end(&harness(), request("scenario:steer-race"), controls).await;

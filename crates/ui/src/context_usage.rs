@@ -394,7 +394,8 @@ mod tests {
                 ContextComponentKind::Messages,
             ]
         );
-        assert_eq!(usage_summary(&usage).as_deref(), Some("1.0K/1.0M (0.1%)"));
+        // format_compact keeps four-digit counts unsuffixed (999 → "999").
+        assert_eq!(usage_summary(&usage).as_deref(), Some("1000/1.0M (0.1%)"));
     }
 
     #[test]

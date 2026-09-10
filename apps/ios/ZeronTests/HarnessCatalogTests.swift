@@ -39,7 +39,7 @@ final class HarnessCatalogTests: XCTestCase {
         XCTAssertEqual(models.count, 1)
         XCTAssertEqual(models.first?.id, "default")
         XCTAssertEqual(models.first?.reasoningLevels,
-                       ["minimal", "low", "medium", "high", "xhigh", "max"])
+                       ["off", "minimal", "low", "medium", "high", "xhigh", "max"])
     }
 
     func testChoiceFallsBackToAdvertisedDefault() {

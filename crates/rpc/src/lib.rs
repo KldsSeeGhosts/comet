@@ -75,6 +75,17 @@ pub mod methods {
     /// Steer this row into the live turn without interrupting it.
     /// `{ chatId, id }` → `{ sent }`.
     pub const STEER_QUEUED_MESSAGE_NOW: &str = "SteerQueuedMessageNow";
+    /// Rewind a chat to just before the given message: the native session
+    /// forks minus the removed turns and the doc tail truncates, so the next
+    /// prompt continues the fork. `{chatId, messageId}` → `{sessionId}` — the
+    /// forked session's native id.
+    pub const REWIND_CHAT: &str = "RewindChat";
+    /// Fork a chat at the given message's turn into a NEW chat sharing the
+    /// space: the native session keeps the retained turns, the new doc gets
+    /// the entry prefix through the selected turn, and the new chat resumes
+    /// the fork on its next prompt. `{chatId, messageId}` → `{chatId}` — the
+    /// new chat's id.
+    pub const FORK_CHAT: &str = "ForkChat";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.
@@ -126,6 +137,15 @@ pub mod methods {
     pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
     /// One-time local→synced profile import: run it (stream of progress items).
     pub const IMPORT_LOCAL_WORKSPACE: &str = "ImportLocalWorkspace";
+    /// Scan this device's Pi (`pi` coding agent) session roots and import the
+    /// sessions that aren't in the workspace yet (Settings → Agents). Params
+    /// `{roots?}` — an absolute scan-root override; the default roots come
+    /// from `PI_CODING_AGENT_*` / `~/.pi/agent` → `{scanned, imported,
+    /// skipped, errors}`. Idempotent: sessions already imported (by chat id
+    /// or resume id) are skipped, so a re-run reports zero imported.
+    /// IPC-only, like the local-profile import: sessions land in whichever
+    /// engine the call reaches.
+    pub const IMPORT_PI_SESSIONS: &str = "ImportPiSessions";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";

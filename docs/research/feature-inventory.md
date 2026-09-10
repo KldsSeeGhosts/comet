@@ -145,6 +145,7 @@ display EXCLUDED. File paths refer to the reference repo.
 - WatchDevices/WatchChats{deviceId?}/WatchSessions{deviceId?}/WatchDocMessages{chatId}(KEEP)/
   WatchCheckoutDiffs -> streams. (WatchMessages, WatchUsage DROPPED.)
 - QueueCommand{chatId,kind,payload}->{commandId}
+- RewindChat{chatId,messageId}->{sessionId}; ForkChat{chatId,messageId}->{chatId}
 - Mutate: CreateChat, SetChatConfig, SetChatArchived, RenameChat, RenameDevice, DeleteChat,
   MarkChatSeen
 ### AuthRpc (IPC-only)

@@ -4219,6 +4219,18 @@ impl Composer {
         self.sending
     }
 
+    /// The transcript's rewind affordance lands the removed turn's text here
+    /// for an edited resend — same shape as a draft restore on the current
+    /// chat, so it survives a chat switch like any draft would.
+    pub fn load_text(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            self.drafts.remove(&self.current_key);
+        } else {
+            self.drafts.insert(self.current_key.clone(), text.clone());
+        }
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+    }
+
     pub(crate) fn can_edit_queue_in_composer(&self) -> bool {
         !self.sending && self.wizard.is_none()
     }

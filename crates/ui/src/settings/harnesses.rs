@@ -81,6 +81,10 @@ pub struct HarnessesPage {
     error: Option<String>,
     load_task: Option<Task<()>>,
     toggle_task: Option<Task<()>>,
+    /// In-flight `ImportPiSessions` call (one at a time).
+    import_task: Option<Task<()>>,
+    /// Outcome of the last Pi import (scanned/imported/skipped counts).
+    import_status: Option<String>,
 }
 
 impl HarnessesPage {
@@ -94,6 +98,8 @@ impl HarnessesPage {
             error: None,
             load_task: None,
             toggle_task: None,
+            import_task: None,
+            import_status: None,
         };
         page.load(cx);
         page
@@ -173,6 +179,64 @@ impl HarnessesPage {
                         // every Pickers to re-fetch, or the rail keeps the
                         // old set until restart.
                         crate::pickers::bump_harness_catalog(cx);
+                    }
+                    Err(err) => page.error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Scan this device's Pi session roots and import anything new
+    /// (`ImportPiSessions`). Device-local — sessions land in THIS engine's
+    /// workspace — so the entry hides while the page targets another device.
+    /// The importer is idempotent (already-imported sessions are skipped), so
+    /// a re-run is a no-op that reports zero imported.
+    fn import_pi_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.import_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.error = None;
+        self.import_status = None;
+        self.import_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::IMPORT_PI_SESSIONS, serde_json::json!({}))
+                .await;
+            this.update(cx, |page, cx| {
+                page.import_task = None;
+                match result {
+                    Ok(value) => {
+                        let read = |key: &str| {
+                            value.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0)
+                        };
+                        let (scanned, imported, skipped) =
+                            (read("scanned"), read("imported"), read("skipped"));
+                        let errors: Vec<String> = value
+                            .get("errors")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|errors| {
+                                errors
+                                    .iter()
+                                    .filter_map(|error| error.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        page.import_status = Some(if errors.is_empty() {
+                            format!("Imported {imported} of {scanned} scanned · {skipped} already imported")
+                        } else {
+                            format!(
+                                "Imported {imported} of {scanned} scanned · {} failed",
+                                errors.len()
+                            )
+                        });
+                        if let Some(first) = errors.first() {
+                            page.error = Some(first.clone());
+                        }
                     }
                     Err(err) => page.error = Some(err.to_string()),
                 }
@@ -338,6 +402,67 @@ impl HarnessesPage {
         trigger.into_any_element()
     }
 
+    /// The "Import Pi sessions" entry — one card row in the Agents-page rhythm
+    /// (identity tile · title + description · trailing ghost action). Only
+    /// rendered while the page targets this device: the RPC is device-local.
+    fn import_section(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let running = self.import_task.is_some();
+        let (icon_path, tint) = crate::pickers::harness_brand_icon(HarnessId::Pi);
+        let tile = div()
+            .flex_none()
+            .size(px(36.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(crate::theme::ink(0.03))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                crate::icons::icon(icon_path)
+                    .size(px(16.0))
+                    .text_color(tint.unwrap_or(theme.text_muted)),
+            );
+        let mut meta = vec![div()
+            .child(SharedString::from(
+                "Scan this device's pi sessions and import any that aren't in the workspace yet. \
+                 Already-imported sessions are skipped, so this is safe to run again.",
+            ))
+            .into_any_element()];
+        if let Some(status) = &self.import_status {
+            meta.push(div().child(status.clone()).into_any_element());
+        }
+        widgets::section_card(theme)
+            .child(
+                widgets::card_row(theme, true)
+                    .id("pi-import-row")
+                    .child(tile)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(theme, "Import Pi sessions"))
+                            .child(widgets::meta_line(theme, meta)),
+                    )
+                    .child(
+                        widgets::ghost_action(theme)
+                            .id("pi-import-run")
+                            .when(!running, |el| el.hover(|s| widgets::ghost_hover(theme, s)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.import_pi_sessions(cx);
+                            }))
+                            .child(SharedString::from(if running {
+                                "Importing…"
+                            } else {
+                                "Import"
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let theme = Theme::of(cx).clone();
         let Loadable::Ready(list) = &self.harnesses else {
@@ -499,7 +624,12 @@ impl Render for HarnessesPage {
                         .line_height(px(20.0)),
                     )
                     .children(error)
-                    .child(body),
+                    .child(body)
+                    // The import entry is device-local, so it only makes sense
+                    // while the page targets this device (no passthrough).
+                    .when(self.target_device.is_none(), |el| {
+                        el.child(self.import_section(&theme, cx))
+                    }),
             )
     }
 }

@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use zeron_harness::{
-    CancellationToken, Harness, HarnessError, OpencodeHarness, RunControls, SteerMessage,
+    CancellationToken, Harness, HarnessError, OpencodeHarness, RunCommand, RunControls,
+    SteerMessage,
 };
 use zeron_proto::{
     AgentEvent, DoneStatus, ReasoningLevel, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
@@ -233,7 +234,7 @@ fn request(prompt: &str) -> RunRequest {
 }
 
 #[allow(clippy::type_complexity)]
-fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+fn controls() -> (RunControls, mpsc::Sender<RunCommand>, CancellationToken) {
     let (steer_tx, steering) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
@@ -484,10 +485,10 @@ async fn steer_queues_mid_turn_and_delivers_at_idle() {
     let _ = next_event(&mut stream).await; // TextDelta
 
     steer
-        .send(SteerMessage {
+        .send(RunCommand::Steer(SteerMessage {
             prompt: "also do this".into(),
             message_id: None,
-        })
+        }))
         .await
         .unwrap();
     // Give the steer time to land in the queue, then end turn 1.

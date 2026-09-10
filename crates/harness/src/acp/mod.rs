@@ -51,7 +51,7 @@ use zeron_proto::{
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+use crate::{Harness, HarnessError, RunCommand, RunControls, Signal, send_signal, shutdown_child};
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_devin::DevinTracker;
@@ -157,6 +157,7 @@ fn default_effort_values(
         return Vec::new();
     };
     match level {
+        ReasoningLevel::Off => vec!["off", "minimal", "low"],
         ReasoningLevel::Minimal => vec!["minimal", "low"],
         ReasoningLevel::Low => vec!["low", "minimal"],
         ReasoningLevel::Medium => vec!["medium"],
@@ -785,6 +786,7 @@ impl AcpHarness {
 /// Map an advertised `thought_level` value id onto zeron's ladder.
 fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
     match norm_id(value).as_str() {
+        "off" => Some(ReasoningLevel::Off),
         "minimal" => Some(ReasoningLevel::Minimal),
         "low" => Some(ReasoningLevel::Low),
         "medium" => Some(ReasoningLevel::Medium),
@@ -2759,7 +2761,8 @@ async fn run_session(session: Session) {
             },
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
-                Some(msg) => {
+                Some(RunCommand::Options(_)) => {}
+                Some(RunCommand::Steer(msg)) => {
                     // Same transform as the initial prompt: Claude's
                     // Ultrathink prefix rides every steer too.
                     let text = prompt_transform(request.reasoning, &msg.prompt);

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 
-use zeron_harness::{CancellationToken, RunControls, SteerMessage};
+use zeron_harness::{CancellationToken, RunCommand, RunControls};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     UserInputAnswer, UserInputQuestion,
@@ -227,7 +227,7 @@ async fn collect_text(
     harness: &dyn zeron_harness::Harness,
     request: RunRequest,
 ) -> Result<String, EngineError> {
-    let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<RunCommand>(1);
     let controls = RunControls {
         request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
             let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();

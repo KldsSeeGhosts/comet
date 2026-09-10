@@ -28,7 +28,7 @@ use zeron_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
 };
-use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+use zeron_harness::{CancellationToken, Harness, RunCommand, RunControls, SteerMessage};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion,
@@ -105,8 +105,11 @@ impl RuntimeConfig {
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    /// The harness can take model/effort changes mid-run (`RunCommand::Options`)
+    /// — a chat-config save lands on the live mailbox instead of a restart.
+    live_options: bool,
     runtime_config: RuntimeConfig,
-    steer_tx: mpsc::Sender<SteerMessage>,
+    steer_tx: mpsc::Sender<RunCommand>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
     /// Engine-level cancel: arms the run task's grace deadline so a harness that
@@ -362,10 +365,10 @@ impl SessionsEngine {
             )
         });
         if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
-            let message = SteerMessage {
+            let message = RunCommand::Steer(SteerMessage {
                 prompt: request.prompt.clone(),
                 message_id: message_id.clone(),
-            };
+            });
             if steerable && same_runtime && steer_tx.try_send(message).is_ok() {
                 // The run can vanish between the send and here (the idle
                 // reaper, a parked child death): the ledger entry below is
@@ -437,7 +440,7 @@ impl SessionsEngine {
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
 
         let run_id = new_id();
-        let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
+        let (steer_tx, steer_rx) = mpsc::channel::<RunCommand>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
@@ -470,6 +473,7 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                live_options: harness.supports_live_options(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 interrupt_token,
@@ -533,10 +537,10 @@ impl SessionsEngine {
         let Some((run_id, steer_tx, ledger)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
-        let message = SteerMessage {
+        let message = RunCommand::Steer(SteerMessage {
             prompt: prompt.to_string(),
             message_id: message_id.clone(),
-        };
+        });
         if steer_tx.try_send(message).is_err() {
             return Ok(SteerOutcome::NotSteerable);
         }
@@ -613,6 +617,211 @@ impl SessionsEngine {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(true)
+    }
+
+    /// Apply a chat-config model/effort change to the resident run without a
+    /// restart, when the harness supports it (Pi's `set_model` /
+    /// `set_thinking_level`). Returns `true` when the change went out on the
+    /// live mailbox; `false` means the next dispatch should restart+resume.
+    pub fn apply_options(&self, chat_id: &str, config: &zeron_proto::ChatConfig) -> bool {
+        let mut runs = lock(&self.inner.runs);
+        let Some(handle) = runs.get_mut(chat_id) else {
+            return false;
+        };
+        if !handle.live_options || !handle.steerable {
+            return false;
+        }
+        let options = zeron_proto::SessionOptions {
+            model: config.model.clone(),
+            reasoning: config.reasoning,
+            model_options: config.model_options.clone(),
+        };
+        if handle
+            .steer_tx
+            .try_send(RunCommand::Options(options))
+            .is_err()
+        {
+            return false;
+        }
+        // The live mailbox owns the change now — the parked runtime's config
+        // catches up so the next dispatch still routes here.
+        handle.runtime_config.model = config.model.clone();
+        handle.runtime_config.reasoning = config.reasoning;
+        handle.runtime_config.model_options = config.model_options.clone();
+        true
+    }
+
+    /// Rewind `chat_id` to just before `message_id`: settle any live run, fork
+    /// the harness-native session to drop the removed turns, repoint the
+    /// chat's resume cursor at the fork, and truncate the doc tail. The
+    /// message must be a user entry — turn boundaries are the only rewind
+    /// points the native side honors.
+    ///
+    /// Returns the forked session's native id.
+    pub async fn rewind_chat(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<String, EngineError> {
+        let handle = self.doc_handle(chat_id)?;
+        // Settle any live run BEFORE counting: its appends must not race the
+        // turn count, and the fork must never run under a live writer.
+        self.interrupt(chat_id).await?;
+        let entries = handle
+            .doc()
+            .read_entries()
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let Some(index) = entries.iter().position(|e| e.id == message_id) else {
+            return Err(EngineError::Other(format!(
+                "message {message_id} not found in chat {chat_id}"
+            )));
+        };
+        if entries[index].role != MessageRole::User {
+            return Err(EngineError::Other(
+                "rewind points at a sent message, not an agent reply".into(),
+            ));
+        }
+        let turns_to_remove = entries[index..]
+            .iter()
+            .filter(|e| e.role == MessageRole::User)
+            .count();
+        let new_session = self.fork_native_session(chat_id, turns_to_remove).await?;
+        // The doc tail goes last: repointing first means a crash between the
+        // two leaves the session ahead of the transcript rather than the
+        // transcript claiming turns the session already dropped.
+        if !handle
+            .doc()
+            .truncate_from(message_id)
+            .map_err(|e| EngineError::Other(e.to_string()))?
+        {
+            return Err(EngineError::Other(format!(
+                "message {message_id} vanished mid-rewind"
+            )));
+        }
+        Ok(new_session)
+    }
+
+    /// Fork `chat_id` at `message_id`'s turn into a NEW chat sharing the same
+    /// space and checkout: the native session keeps that turn and everything
+    /// before it, the new doc gets the entry prefix through it, and the new
+    /// chat resumes the fork on its next prompt. Returns the new chat id.
+    pub async fn fork_chat(&self, chat_id: &str, message_id: &str) -> Result<String, EngineError> {
+        let handle = self.doc_handle(chat_id)?;
+        let entries = handle
+            .doc()
+            .read_entries()
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let Some(index) = entries.iter().position(|e| e.id == message_id) else {
+            return Err(EngineError::Other(format!(
+                "message {message_id} not found in chat {chat_id}"
+            )));
+        };
+        // The retained turn count: user entries up to and including the turn
+        // containing the selected message.
+        let retained = entries[..=index]
+            .iter()
+            .filter(|e| e.role == MessageRole::User)
+            .count();
+        let total = entries
+            .iter()
+            .filter(|e| e.role == MessageRole::User)
+            .count();
+        let turns_to_remove = total - retained;
+        // Doc-side prefix: everything before the first user entry past the
+        // selected turn (the retained turn's own replies stay attached).
+        let cut = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.role == MessageRole::User)
+            .nth(retained)
+            .map(|(i, _)| i)
+            .unwrap_or(entries.len());
+        let forked = self.fork_native_session(chat_id, turns_to_remove).await?;
+        let ws = self
+            .inner
+            .workspace()
+            .ok_or_else(|| EngineError::Other("workspace host not wired".into()))?;
+        let source = ws
+            .chat(chat_id)?
+            .ok_or_else(|| EngineError::Other(format!("chat {chat_id} not found")))?;
+        let new_chat_id = new_id();
+        ws.create_chat(
+            &new_chat_id,
+            source.space_id.as_deref(),
+            None,
+            source.config.clone(),
+            source.cwd.clone(),
+        )?;
+        if let Some(title) = source.title.as_deref() {
+            let _ = ws.rename_chat(&new_chat_id, &format!("{title} (fork)"));
+        }
+        let new_handle = self.doc_handle(&new_chat_id)?;
+        for entry in &entries[..cut] {
+            new_handle
+                .doc()
+                .push_message(entry)
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+        }
+        if let Some(cwd) = source
+            .harness_session_cwd
+            .as_deref()
+            .or(source.cwd.as_deref())
+        {
+            self.inner
+                .remember_harness_session(&new_chat_id, &forked, cwd);
+        }
+        Ok(new_chat_id)
+    }
+
+    /// Shared native fork for rewind/fork: settle the live run, hand the
+    /// session file to the harness's throwaway forker, repoint resume state.
+    async fn fork_native_session(
+        &self,
+        chat_id: &str,
+        turns_to_remove: usize,
+    ) -> Result<String, EngineError> {
+        let ws = self
+            .inner
+            .workspace()
+            .ok_or_else(|| EngineError::Other("workspace host not wired".into()))?;
+        let chat = ws
+            .chat(chat_id)?
+            .ok_or_else(|| EngineError::Other(format!("chat {chat_id} not found")))?;
+        let host = self
+            .inner
+            .doc_host()
+            .ok_or_else(|| EngineError::Other("doc host not wired".into()))?;
+        let harness = self.inner.registry.resolve(host.harness_for(chat_id))?;
+        if !harness.supports_session_fork() {
+            return Err(EngineError::Other(format!(
+                "{} cannot fork native sessions",
+                harness.display_name()
+            )));
+        }
+        let cwd = chat
+            .harness_session_cwd
+            .clone()
+            .or_else(|| chat.cwd.clone())
+            .or_else(|| self.last_request(chat_id).map(|request| request.cwd))
+            .ok_or_else(|| {
+                EngineError::Other(format!("chat {chat_id} has no working directory"))
+            })?;
+        let session_id = self
+            .inner
+            .resume_for(chat_id, &cwd)
+            .or_else(|| chat.harness_session_id.clone())
+            .ok_or_else(|| {
+                EngineError::Other(format!("chat {chat_id} has no harness session to fork"))
+            })?;
+        // Never fork under a live writer: settle first so the session file is
+        // complete and no process keeps appending past the fork point.
+        self.interrupt(chat_id).await?;
+        let forked = harness
+            .fork_session(std::path::Path::new(&cwd), &session_id, turns_to_remove)
+            .await
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        self.inner.remember_harness_session(chat_id, &forked, &cwd);
+        Ok(forked)
     }
 
     /// Resolve a pending `request_input` question set. Returns `false` when no such
@@ -1792,6 +2001,19 @@ async fn drive_run(
                 components: components.clone(),
             }) {
                 tracing::warn!(%chat_id, error = %err, "context usage write failed");
+            }
+            continue;
+        }
+        // A live rename from the agent (Pi's session_info_changed) takes the
+        // exact write path a manual rename does — the workspace chat row — so
+        // the sidebar updates through the same synced channel. Like capacity
+        // above, it is metadata: applied even on a parked session, never
+        // reopened a turn by, and never folded into the transcript.
+        if let AgentEvent::TitleUpdated { title } = &event
+            && let Some(ws) = inner.workspace()
+        {
+            if let Err(err) = ws.rename_chat(&chat_id, title) {
+                tracing::warn!(%chat_id, error = %err, "agent title write failed");
             }
             continue;
         }

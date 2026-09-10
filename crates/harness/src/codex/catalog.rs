@@ -26,6 +26,9 @@ pub(crate) const REASONING_LEVELS: &[ReasoningLevel] = &[
 /// effort (port of codex.ts `toEffort`).
 pub(crate) fn to_effort(reasoning: Option<ReasoningLevel>) -> Option<&'static str> {
     Some(match reasoning? {
+        // Off has no Codex spelling (the API offers no disable switch): send
+        // nothing and the thread's own default runs — the closest parity.
+        ReasoningLevel::Off => return None,
         ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
         ReasoningLevel::Medium => "medium",
         ReasoningLevel::High => "high",

@@ -856,11 +856,16 @@ impl EngineRpc {
                 .set_chat_archived(&chat_id, archived)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetChatConfig { chat_id, config } => self
-                .workspace
-                .set_chat_config(&chat_id, &config)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::SetChatConfig { chat_id, config } => {
+                self.workspace
+                    .set_chat_config(&chat_id, &config)
+                    .map_err(failed)?;
+                // A resident run that can take the change live keeps its
+                // process; its parked runtime config catches up so the next
+                // dispatch still routes there instead of restarting.
+                self.sessions.apply_options(&chat_id, &config);
+                Ok(())
+            }
             MutateParams::DeleteChat { chat_id } => {
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
@@ -919,6 +924,9 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
+            // Rewind/fork mutate the chat's host-side session + doc.
+            | methods::REWIND_CHAT
+            | methods::FORK_CHAT
             | methods::WATCH_DOC_MESSAGES
             // The queue lives on the chat doc, and only its host may send from
             // it — same addressing as the command ledger next door.
@@ -1248,6 +1256,36 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "outcome": outcome }))
             }
+            methods::REWIND_CHAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                    message_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let session_id = self
+                    .sessions
+                    .rewind_chat(&p.chat_id, &p.message_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "sessionId": session_id }))
+            }
+            methods::FORK_CHAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                    message_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let chat_id = self
+                    .sessions
+                    .fork_chat(&p.chat_id, &p.message_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "chatId": chat_id }))
+            }
             methods::WATCH_DOC_MESSAGES => {
                 let p: ChatParams = parse_params(params)?;
                 let handle = self
@@ -1573,6 +1611,42 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(Box::pin(futures::stream::poll_fn(
                     move |cx| rx.poll_recv(cx),
                 ))))
+            }
+            methods::IMPORT_PI_SESSIONS => {
+                #[derive(Debug, Default, Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    /// Absolute scan-root override; absent = the engine's Pi
+                    /// roots (PI_CODING_AGENT_* env, the agent settings.json's
+                    /// `sessionDir`, then `~/.pi/agent/sessions`).
+                    #[serde(default)]
+                    roots: Option<Vec<String>>,
+                }
+                let p: P = parse_params(params)?;
+                let importer = self.local_importer()?.clone();
+                // Blocking (fs walk + doc-snapshot writes), so it runs off the
+                // dispatcher like the sibling local-import RPCs. The importer
+                // is idempotent — already-imported sessions are skipped.
+                let roots = p.roots.map(|roots| {
+                    roots
+                        .into_iter()
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>()
+                });
+                let summary = tokio::task::spawn_blocking(move || {
+                    importer.import_pi_sessions(roots.as_deref())
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Every scanned session ends imported, skipped, or errored.
+                let scanned = summary.imported_chats + summary.skipped_chats + summary.errors.len();
+                RpcReply::value(&serde_json::json!({
+                    "scanned": scanned,
+                    "imported": summary.imported_chats,
+                    "skipped": summary.skipped_chats,
+                    "errors": summary.errors,
+                }))
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
@@ -2299,6 +2373,10 @@ mod tests {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
+        // Pi import, like the local-profile import, is device-local: sessions
+        // land in whichever engine the call reaches, never a routed target.
+        assert!(!forwardable(methods::IMPORT_LOCAL_WORKSPACE));
+        assert!(!forwardable(methods::IMPORT_PI_SESSIONS));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::SEARCH_GIT_HISTORY));

@@ -54,7 +54,7 @@ use zeron_proto::{
     SteeringMode, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls, shutdown_child};
+use crate::{Harness, HarnessError, RunCommand, RunControls, shutdown_child};
 
 /// opencode loads plugins and MCP config before the server answers; cold
 /// plugin-heavy starts can take minutes. Shared by chat startup and model
@@ -158,6 +158,9 @@ fn variant_candidates(reasoning: Option<ReasoningLevel>) -> Vec<&'static str> {
         return Vec::new();
     };
     match level {
+        // Only applied when the model actually advertises an `off` variant
+        // (pick_variant); otherwise no variant rides and the model default runs.
+        ReasoningLevel::Off => vec!["off"],
         ReasoningLevel::Minimal => vec!["minimal", "low"],
         ReasoningLevel::Low => vec!["low", "minimal"],
         ReasoningLevel::Medium => vec!["medium"],
@@ -172,6 +175,7 @@ fn variant_candidates(reasoning: Option<ReasoningLevel>) -> Vec<&'static str> {
 
 fn variant_to_level(id: &str) -> Option<ReasoningLevel> {
     match id {
+        "off" => Some(ReasoningLevel::Off),
         "minimal" => Some(ReasoningLevel::Minimal),
         "low" => Some(ReasoningLevel::Low),
         "medium" => Some(ReasoningLevel::Medium),
@@ -767,6 +771,7 @@ fn commands_from_wire(commands: &Value) -> Vec<SlashCommand> {
                             .unwrap_or_default()
                             .to_owned(),
                         input_hint: None,
+                        scope: zeron_proto::CommandScope::Builtin,
                     })
                 })
                 .collect()
@@ -1252,7 +1257,8 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open => {
                 match steer {
-                    Some(steer) => {
+                    Some(RunCommand::Options(_)) => {}
+                    Some(RunCommand::Steer(steer)) => {
                         if turn.active {
                             queued_steers.push_back(steer.prompt);
                         } else {

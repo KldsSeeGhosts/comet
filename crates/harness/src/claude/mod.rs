@@ -53,7 +53,7 @@ use zeron_proto::{
     SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+use crate::{Harness, HarnessError, RunCommand, RunControls, Signal, send_signal, shutdown_child};
 use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
@@ -347,6 +347,7 @@ fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                scope: zeron_proto::CommandScope::Builtin,
                 input_hint: c
                     .get("argumentHint")
                     .and_then(Value::as_str)
@@ -667,7 +668,8 @@ async fn run_session(session: Session) {
             },
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
-                Some(msg) => {
+                Some(RunCommand::Options(_)) => {}
+                Some(RunCommand::Steer(msg)) => {
                     let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
                     let _ = stdin_tx.send(StdinMsg::Line(line));
                     // The CLI consumes the queued line at its own step
