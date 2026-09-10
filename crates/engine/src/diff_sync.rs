@@ -11,9 +11,9 @@
 //! - a [`DiffSidecar`] JSON `POST {edge}/diff/{chatId}` for every syncing chat of
 //!   the checkout (bearer = engine edge token), so "review pending changes while
 //!   the host sleeps" works;
-//! Checkout snapshots remain live checkout state. Conversation branch identity
-//! is captured by the command host and is never rewritten from this watcher;
-//! otherwise one checkout change would relabel every chat sharing that folder.
+//!   Checkout snapshots remain live checkout state. Conversation branch identity
+//!   is captured by the command host and is never rewritten from this watcher;
+//!   otherwise one checkout change would relabel every chat sharing that folder.
 //!
 //! Fast recursive `notify` watchers (debounced [`WATCH_DEBOUNCE`]) are backed by a
 //! slow 2-minute repair tick because native watchers may coalesce or drop events.

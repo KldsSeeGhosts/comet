@@ -63,6 +63,7 @@ async fn native_rpc_runs_a_complete_pi_turn() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("inspect the file");
     let stream = PiHarness::new()
@@ -102,6 +103,7 @@ async fn switch_session_cancelled_fails_startup() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let mut request = base_request("resume test");
     request.resume = Some("cancelled-session.jsonl".into());
@@ -127,6 +129,7 @@ async fn ignore_intermediate_non_terminal_settle() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("intermediate_settle");
     let stream = PiHarness::new()
@@ -167,6 +170,7 @@ async fn tool_execution_update_deduplicates_identical_final_result() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("tool_update_dedup");
     let stream = PiHarness::new()
@@ -201,6 +205,7 @@ async fn tool_execution_update_streams_and_updates_on_different_final_result() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("tool_update_progress");
     let stream = PiHarness::new()
@@ -237,6 +242,7 @@ async fn cancellation_issues_correlated_abort_and_drains_with_exactly_one_done()
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: interrupt.clone(),
+        computer_use_socket: None,
     };
     let request = base_request("abort_normal");
     let mut stream = PiHarness::new()
@@ -291,6 +297,7 @@ async fn cancellation_handles_reverse_abort_order_without_duplicate_done() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: interrupt.clone(),
+        computer_use_socket: None,
     };
     let request = base_request("abort_reverse");
     let mut stream = PiHarness::new()
@@ -345,6 +352,7 @@ async fn cancellation_handles_abort_request_error() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: interrupt.clone(),
+        computer_use_socket: None,
     };
     let request = base_request("abort_error");
     let mut stream = PiHarness::new()
@@ -399,6 +407,7 @@ async fn cancellation_after_completion_does_not_emit_duplicate_done() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: interrupt.clone(),
+        computer_use_socket: None,
     };
     let request = base_request("inspect the file");
     let mut stream = PiHarness::new()
@@ -439,6 +448,7 @@ async fn prompt_error_response_terminates_with_error_and_done() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("prompt_error");
     let stream = PiHarness::new()
@@ -474,6 +484,7 @@ async fn child_crash_eof_terminates_with_crash_message() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("crash_eof");
     let stream = PiHarness::new()
@@ -506,6 +517,7 @@ async fn local_only_prompt_completes_without_agent_invoked() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("local_only");
     let stream = PiHarness::new()
@@ -541,6 +553,7 @@ async fn extension_error_is_forwarded() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("extension_error");
     let stream = PiHarness::new()
@@ -571,6 +584,7 @@ async fn steer_during_turn_delivers_steer_and_settles() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("steer_active");
     let mut stream = PiHarness::new()
@@ -629,6 +643,7 @@ async fn steering_race_error_response_is_handled_and_emitted() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("steer_reject");
     let mut stream = PiHarness::new()
@@ -687,6 +702,7 @@ async fn standard_pi_agent_end_does_not_settle_until_agent_settled() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("standard_agent_end");
     let stream = PiHarness::new()
@@ -720,6 +736,7 @@ async fn steering_after_settlement_starts_next_turn_with_done() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("inspect the file");
     let mut stream = PiHarness::new()
@@ -795,6 +812,7 @@ async fn tool_execution_update_followed_by_error_end_emits_error_result() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("tool_update_error");
     let stream = PiHarness::new()
@@ -831,6 +849,7 @@ async fn structured_tool_content_is_extracted() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("structured_content");
     let stream = PiHarness::new()
@@ -859,6 +878,7 @@ async fn session_info_changed_renames_the_chat_once_per_name() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     // The fixture emits the same session name twice before settling.
     let request = base_request("auto_title");
@@ -903,6 +923,7 @@ async fn context_breakdown_flows_from_the_session_entry() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let request = base_request("inspect the file");
     let stream = PiHarness::new()
@@ -954,6 +975,7 @@ async fn options_command_applies_model_live_and_publishes_window() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let mut stream = PiHarness::new()
         .with_executable(fixture())
@@ -1016,6 +1038,7 @@ async fn prompt_template_expands_before_the_wire() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let mut request = base_request("/echo_wire hello there");
     request.cwd = dir.path().to_string_lossy().into_owned();
@@ -1046,6 +1069,7 @@ async fn slash_skill_routes_to_the_native_invocation() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let mut request = base_request("/review src/lib.rs");
     request.cwd = dir.path().to_string_lossy().into_owned();
@@ -1070,6 +1094,7 @@ async fn builtin_slash_command_passes_through_verbatim() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let stream = PiHarness::new()
         .with_executable(fixture())
@@ -1140,6 +1165,7 @@ async fn todo_tool_resolves_items_from_result_tasks() {
         request_input: Box::new(|_| oneshot::channel().1),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let stream = PiHarness::new()
         .with_executable(fixture())
@@ -1202,6 +1228,7 @@ async fn extension_select_bridges_to_input_and_returns_value() {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let stream = PiHarness::new()
         .with_executable(fixture())
@@ -1244,6 +1271,7 @@ async fn extension_confirm_negative_returns_confirmed_false() {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let stream = PiHarness::new()
         .with_executable(fixture())
@@ -1279,6 +1307,7 @@ async fn extension_dialog_dismissal_sends_cancelled() {
         }),
         steering,
         interrupt: CancellationToken::new(),
+        computer_use_socket: None,
     };
     let stream = PiHarness::new()
         .with_executable(fixture())

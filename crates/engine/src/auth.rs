@@ -1097,6 +1097,13 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+#[async_trait::async_trait]
+impl zeron_preview::signaling::TokenSource for Auth {
+    async fn token(&self) -> Option<String> {
+        self.access_token().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,12 +1186,5 @@ mod tests {
                 "user": {"id": "u1", "email": "u@x", "name": null},
             })
         );
-    }
-}
-
-#[async_trait::async_trait]
-impl zeron_preview::signaling::TokenSource for Auth {
-    async fn token(&self) -> Option<String> {
-        self.access_token().await
     }
 }

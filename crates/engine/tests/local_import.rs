@@ -486,7 +486,7 @@ async fn local_importer_imports_pi_sessions() {
     let importer = synced.local_import.as_ref().expect("local importer");
 
     let summary = importer
-        .import_pi_sessions(Some(&[pi_dir.clone()]))
+        .import_pi_sessions(Some(std::slice::from_ref(&pi_dir)))
         .expect("import pi sessions");
     assert_eq!(summary.imported_chats, 1);
     assert_eq!(summary.skipped_chats, 0);

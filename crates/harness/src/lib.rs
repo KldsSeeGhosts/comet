@@ -69,6 +69,13 @@ pub struct RunControls {
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
+    /// Engine-owned computer-use bridge socket (see
+    /// `crates/engine/src/computer_use.rs`). Set only when the engine started
+    /// a bridge for this run; the Pi harness then injects `NOCHES_CUA_SOCKET`
+    /// and the bundled `noches_cua` adapter so the agent's desktop calls are
+    /// approved, serialized, and torn down by the engine rather than any
+    /// user-installed Pi extension.
+    pub computer_use_socket: Option<std::path::PathBuf>,
 }
 
 #[async_trait]

@@ -542,10 +542,10 @@ fn parse_timestamp_ms(value: &Value) -> Option<i64> {
             return i64::try_from(u * 1000).ok();
         }
     }
-    if let Some(s) = value.as_str() {
-        if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-            return Some(dt.timestamp_millis());
-        }
+    if let Some(s) = value.as_str()
+        && let Ok(dt) = DateTime::parse_from_rfc3339(s)
+    {
+        return Some(dt.timestamp_millis());
     }
     None
 }
@@ -592,14 +592,13 @@ pub fn pi_session_roots() -> Vec<PathBuf> {
         .unwrap_or_else(|| home.join(".pi").join("agent"));
     let mut roots = Vec::new();
     let settings = agent_dir.join("settings.json");
-    if let Ok(bytes) = std::fs::read(&settings) {
-        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-            if let Some(s) = value.get("sessionDir").and_then(Value::as_str) {
-                let p = expand_home(PathBuf::from(s));
-                if p.is_absolute() {
-                    roots.push(p);
-                }
-            }
+    if let Ok(bytes) = std::fs::read(&settings)
+        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+        && let Some(s) = value.get("sessionDir").and_then(Value::as_str)
+    {
+        let p = expand_home(PathBuf::from(s));
+        if p.is_absolute() {
+            roots.push(p);
         }
     }
     let standard = agent_dir.join("sessions");
@@ -626,16 +625,16 @@ pub fn scan_pi_session_files(roots: &[PathBuf]) -> Vec<PathBuf> {
                 if seen.insert(path.clone()) {
                     files.push(path);
                 }
-            } else if path.is_dir() {
-                if let Ok(children) = std::fs::read_dir(&path) {
-                    for child in children.flatten() {
-                        let child_path = child.path();
-                        if child_path.is_file()
-                            && child_path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-                            && seen.insert(child_path.clone())
-                        {
-                            files.push(child_path);
-                        }
+            } else if path.is_dir()
+                && let Ok(children) = std::fs::read_dir(&path)
+            {
+                for child in children.flatten() {
+                    let child_path = child.path();
+                    if child_path.is_file()
+                        && child_path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+                        && seen.insert(child_path.clone())
+                    {
+                        files.push(child_path);
                     }
                 }
             }
@@ -736,15 +735,14 @@ pub fn parse_pi_session(path: &Path) -> Result<Option<ParsedPiSession>, EngineEr
                 title = Some(t.to_owned());
             }
         }
-        if kind == "model_change" {
-            if let Some(m) = value
+        if kind == "model_change"
+            && let Some(m) = value
                 .get("modelId")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-            {
-                model = Some(m.to_owned());
-            }
+        {
+            model = Some(m.to_owned());
         }
 
         let Some(id) = value
@@ -811,7 +809,7 @@ pub fn parse_pi_session(path: &Path) -> Result<Option<ParsedPiSession>, EngineEr
 }
 
 /// Trace active branch from the leaf back to the root using `parentId`.
-pub fn pi_active_chain<'a>(entries: &'a [NativePiEntry]) -> Vec<&'a NativePiEntry> {
+pub fn pi_active_chain(entries: &[NativePiEntry]) -> Vec<&NativePiEntry> {
     let by_id: HashMap<&str, &NativePiEntry> = entries
         .iter()
         .map(|entry| (entry.id.as_str(), entry))
@@ -910,13 +908,13 @@ pub fn import_parsed_pi_session(
         .unwrap_or_else(|_| session.path.clone());
     let resume_id = resume_path.to_string_lossy().to_string();
 
-    if let Ok(existing) = workspace.read_chats() {
-        if existing.iter().any(|c| {
+    if let Ok(existing) = workspace.read_chats()
+        && existing.iter().any(|c| {
             c.harness_session_id.as_deref() == Some(&resume_id)
                 || c.harness_session_id.as_deref() == Some(&session.path.to_string_lossy())
-        }) {
-            return Ok(None);
-        }
+        })
+    {
+        return Ok(None);
     }
 
     let title = session.title.clone().or_else(|| {
@@ -1024,6 +1022,21 @@ pub fn import_pi_sessions(
         skipped_chats,
         errors,
     })
+}
+
+/// Whether a recorded import grants the synced profile `(org, user)` the local
+/// profile's uploads root as a read-only jail root. `EngineCore::assemble`
+/// calls this on every account-scoped boot.
+pub fn marker_grants_read_root(data_dir: &Path, org_id: &str, user_id: &str) -> Option<PathBuf> {
+    let marker: Marker = std::fs::read_to_string(data_dir.join(MARKER_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())?;
+    let hit = marker
+        .imports
+        .iter()
+        .any(|e| e.org_id == org_id && e.user_id == user_id);
+    let uploads = data_dir.join("profiles").join("local").join("uploads");
+    (hit && uploads.is_dir()).then_some(uploads)
 }
 
 #[cfg(test)]
@@ -1260,7 +1273,7 @@ mod tests {
         .expect("write session");
 
         let summary = importer
-            .import_pi_sessions(Some(&[root.clone()]))
+            .import_pi_sessions(Some(std::slice::from_ref(&root)))
             .expect("import");
         assert_eq!(summary.imported_chats, 1);
         assert_eq!(summary.skipped_chats, 0);
@@ -1278,19 +1291,4 @@ mod tests {
         assert_eq!(rerun.skipped_chats, 1);
         assert!(rerun.errors.is_empty());
     }
-}
-
-/// Whether a recorded import grants the synced profile `(org, user)` the local
-/// profile's uploads root as a read-only jail root. `EngineCore::assemble`
-/// calls this on every account-scoped boot.
-pub fn marker_grants_read_root(data_dir: &Path, org_id: &str, user_id: &str) -> Option<PathBuf> {
-    let marker: Marker = std::fs::read_to_string(data_dir.join(MARKER_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())?;
-    let hit = marker
-        .imports
-        .iter()
-        .any(|e| e.org_id == org_id && e.user_id == user_id);
-    let uploads = data_dir.join("profiles").join("local").join("uploads");
-    (hit && uploads.is_dir()).then_some(uploads)
 }

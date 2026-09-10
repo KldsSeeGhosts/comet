@@ -29,6 +29,8 @@ use zeron_doc::{
     SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
 };
 use zeron_harness::{CancellationToken, Harness, RunCommand, RunControls, SteerMessage};
+
+use crate::computer_use::{ComputerUseManager, RequestInput, RunBridge};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion,
@@ -161,6 +163,9 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// Engine-owned computer-use bridge: device-wide desktop lease, per-run
+    /// socket, approvals, and driver cleanup (docs/computer-use.md).
+    computer_use: ComputerUseManager,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -182,6 +187,7 @@ impl SessionsEngine {
         registry: Arc<HarnessRegistry>,
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
+        let computer_use = ComputerUseManager::new(device_id.clone());
         Self {
             inner: Arc::new(Inner {
                 device_id,
@@ -196,6 +202,7 @@ impl SessionsEngine {
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                computer_use,
             }),
         }
     }
@@ -447,10 +454,12 @@ impl SessionsEngine {
 
         // Input bridge: the harness asks questions; we mint the request id, park the
         // resolver for `respond_input`, and surface the event through the run pipeline.
-        let request_input = {
+        // Shared by Arc so the computer-use bridge can ask approvals through the
+        // same InputRequested lifecycle without owning the callback.
+        let request_input: RequestInput = {
             let pending = pending_inputs.clone();
             let engine_tx = engine_tx.clone();
-            Box::new(move |questions: Vec<UserInputQuestion>| {
+            Arc::new(move |questions: Vec<UserInputQuestion>| {
                 let (tx, rx) = oneshot::channel();
                 let request_id = new_id();
                 lock(&pending).insert(request_id.clone(), tx);
@@ -463,9 +472,13 @@ impl SessionsEngine {
         };
         let interrupt_token = CancellationToken::new();
         let controls = RunControls {
-            request_input,
+            request_input: {
+                let request_input = request_input.clone();
+                Box::new(move |questions| (request_input)(questions))
+            },
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
+            computer_use_socket: None,
         };
 
         lock(&self.inner.runs).insert(
@@ -505,6 +518,7 @@ impl SessionsEngine {
             request,
             handle.doc_arc(),
             controls,
+            request_input,
             engine_rx,
             cancel_rx,
             RunResumeState {
@@ -1509,7 +1523,8 @@ async fn drive_run(
     harness: Arc<dyn Harness>,
     request: RunRequest,
     doc: Arc<SessionDoc>,
-    controls: RunControls,
+    mut controls: RunControls,
+    request_input: RequestInput,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
@@ -1521,6 +1536,35 @@ async fn drive_run(
     let run_cwd = request.cwd.clone();
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
+    }
+
+    // Engine-owned computer-use bridge (Pi runs only — the bundled adapter is
+    // Pi-specific). The bridge owns the private socket dir, the driver child,
+    // approvals through `request_input`, and the device-wide lease; the
+    // harness just receives the socket path to inject. Startup failure is
+    // fail-open for the RUN (the chat still works) but fail-closed for
+    // computer use (no socket → the bundled adapter refuses rather than
+    // falling back to a user-installed `cua` extension).
+    let mut bridge: Option<RunBridge> = None;
+    if harness_id == HarnessId::Pi {
+        match inner
+            .computer_use
+            .start_bridge(
+                &chat_id,
+                &run_id,
+                request_input.clone(),
+                controls.interrupt.clone(),
+            )
+            .await
+        {
+            Ok((socket, guard)) => {
+                controls.computer_use_socket = Some(socket);
+                bridge = Some(guard);
+            }
+            Err(err) => {
+                tracing::warn!(chat = %chat_id, error = %err, "computer-use bridge unavailable");
+            }
+        }
     }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
@@ -1550,6 +1594,9 @@ async fn drive_run(
             );
             inner.remove_run(&chat_id, &run_id);
             inner.set_status(&chat_id, SessionStatus::Errored, false);
+            if let Some(bridge) = bridge.take() {
+                bridge.finish().await;
+            }
             return;
         }
     };
@@ -1800,6 +1847,9 @@ async fn drive_run(
                 segment_started = now_ms();
                 idle_since = Some(tokio::time::Instant::now());
                 self_continued_turn = false;
+                if let Some(bridge) = &bridge {
+                    bridge.turn_ended().await;
+                }
                 inner.set_status(&chat_id, SessionStatus::Idle, false);
                 continue;
             }
@@ -2060,6 +2110,9 @@ async fn drive_run(
                 );
                 idle_since = None;
                 self_continued_turn = true;
+                if let Some(bridge) = &bridge {
+                    bridge.turn_started();
+                }
                 // The park cleared the fold; rotate to a fresh entry and
                 // fall through — this event is the new segment's first part.
                 entry_id = new_id();
@@ -2069,6 +2122,9 @@ async fn drive_run(
                 match &event {
                     AgentEvent::Steered { .. } => {
                         idle_since = None;
+                        if let Some(bridge) = &bridge {
+                            bridge.turn_started();
+                        }
                         inner.set_status(&chat_id, SessionStatus::Working, true);
                     }
                     AgentEvent::Done { .. } => {
@@ -2165,6 +2221,9 @@ async fn drive_run(
                 chat = %chat_id,
                 "run died before session start; retrying once (resume kept)"
             );
+            if let Some(bridge) = bridge.take() {
+                bridge.finish().await;
+            }
             inner.remove_run(&chat_id, &run_id);
             let engine = SessionsEngine {
                 inner: inner.clone(),
@@ -2332,8 +2391,13 @@ async fn drive_run(
             }
             // PERSISTENT SESSION: a cleanly completed turn on a steerable
             // harness PARKS instead of ending — child + mailbox stay warm for
-            // the next routed dispatch; per-turn state resets for it.
+            // the next routed dispatch; per-turn state resets for it. The
+            // computer-use socket stays available, but the driver and lease
+            // are released. The next turn needs fresh approval.
             if *status == DoneStatus::Completed && steerable && !interrupted {
+                if let Some(bridge) = &bridge {
+                    bridge.turn_ended().await;
+                }
                 folded.clear();
                 dirty = false;
                 entry_id = new_id();
@@ -2344,6 +2408,9 @@ async fn drive_run(
                 self_continued_turn = false;
                 inner.set_status(&chat_id, SessionStatus::Idle, false);
                 continue;
+            }
+            if let Some(bridge) = &bridge {
+                bridge.turn_ended().await;
             }
             break match status {
                 DoneStatus::Errored => SessionStatus::Errored,
@@ -2385,6 +2452,13 @@ async fn drive_run(
         .filter(|h| h.run_id == run_id)
         .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
         .unwrap_or_default();
+    // Computer-use teardown runs BEFORE the handle drops: stop the listener,
+    // drain in-flight calls, end_session → kill+reap the driver, release the
+    // device lease. Idempotent across every exit path above (Done, interrupt,
+    // stream end, reaper).
+    if let Some(bridge) = bridge.take() {
+        bridge.finish().await;
+    }
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
     if !interrupted && !orphans.is_empty() {

@@ -56,6 +56,7 @@ fn controls() -> (RunControls, mpsc::Sender<RunCommand>, CancellationToken) {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        computer_use_socket: None,
     };
     (controls, steer_tx, token)
 }

@@ -427,6 +427,15 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             ("Todo", format!("{done}/{} done", items.len()))
         }
         ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
+        ToolCall::Unknown { name, input } if name == "noches_cua" => (
+            "Computer use",
+            input
+                .as_ref()
+                .and_then(|input| input.get("action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .replace('_', " "),
+        ),
         // Subagent spawns decode as Unknown named "Agent[: <description>]"
         // (every native driver's convention): label them "Agent" with the
         // description as the detail — "Tool · Agent: scan repo" read as two
@@ -436,6 +445,42 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             None if name == "Agent" => ("Agent", String::new()),
             None => ("Tool", name.clone()),
         },
+    }
+}
+
+#[cfg(test)]
+mod computer_use_tests {
+    use super::tool_chip_content;
+    use crate::ToolCall;
+    use serde_json::json;
+
+    #[test]
+    fn managed_computer_use_has_a_readable_action_without_exposing_arguments() {
+        let call = ToolCall::Unknown {
+            name: "noches_cua".into(),
+            input: Some(json!({
+                "action": "type_text",
+                "args": {"text": "private text", "pid": 42},
+            })),
+        };
+        assert_eq!(
+            tool_chip_content(&call),
+            ("Computer use", "type text".into())
+        );
+        assert_eq!(
+            tool_chip_content(&ToolCall::Unknown {
+                name: "noches_cua".into(),
+                input: None,
+            }),
+            ("Computer use", String::new()),
+        );
+        assert_eq!(
+            tool_chip_content(&ToolCall::Unknown {
+                name: "unrelated_tool".into(),
+                input: None,
+            }),
+            ("Tool", "unrelated_tool".into()),
+        );
     }
 }
 

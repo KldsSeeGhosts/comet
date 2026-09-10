@@ -43,6 +43,25 @@ pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
 /// bar's left→right wipe. Rows repaint each frame until elapsed passes this.
 const TODO_CHECK_OFF: std::time::Duration = std::time::Duration::from_millis(260);
 
+fn todo_card_layer(theme: &Theme, header: AnyElement, body: AnyElement) -> AnyElement {
+    let card = popover::popover_card(theme)
+        .w(px(300.0))
+        .flex()
+        .flex_col()
+        .child(header)
+        .child(body);
+
+    // Do not occlude this surface. GPUI's BlockMouse hitbox stops wheel-event
+    // routing at the card chrome, so the transcript cannot scroll while the
+    // pointer is over the floating card.
+    div()
+        .absolute()
+        .top(px(Theme::TITLEBAR_HEIGHT + 10.0))
+        .right(px(14.0))
+        .child(motion::menu_in("todo-card-in", card))
+        .into_any_element()
+}
+
 impl Shell {
     /// The ZCode-style "Progress" card — a floating details panel pinned to
     /// the top-right of the conversation column. Auto-mounts as soon as the
@@ -64,11 +83,7 @@ impl Shell {
         let done = items.iter().filter(|i| i.done).count();
         let total = items.len();
         let chat_id = self.active_chat.clone();
-        let collapsed = self
-            .todo_collapsed
-            .get(&chat_id)
-            .copied()
-            .unwrap_or(false);
+        let collapsed = self.todo_collapsed.get(&chat_id).copied().unwrap_or(false);
         // The first not-done item is "in flight" — expanded in collapsed mode,
         // highlighted in expanded mode. All-done leaves no current row.
         let current_ix = items.iter().position(|i| !i.done);
@@ -112,6 +127,7 @@ impl Shell {
             .pb(px(6.0))
             .cursor_pointer()
             .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
                 let chat = this.active_chat.clone();
                 let next = !this.todo_collapsed.get(&chat).copied().unwrap_or(false);
                 this.todo_collapsed.insert(chat, next);
@@ -164,13 +180,10 @@ impl Shell {
             let check_t = item
                 .done
                 .then(|| {
-                    self.todo_done_at
-                        .get(&(chat_id.clone(), ix))
-                        .map(|at| {
-                            (now.duration_since(*at).as_secs_f32()
-                                / TODO_CHECK_OFF.as_secs_f32())
+                    self.todo_done_at.get(&(chat_id.clone(), ix)).map(|at| {
+                        (now.duration_since(*at).as_secs_f32() / TODO_CHECK_OFF.as_secs_f32())
                             .clamp(0.0, 1.0)
-                        })
+                    })
                 })
                 .flatten();
             let mark = if item.done {
@@ -257,21 +270,7 @@ impl Shell {
                 .into_any_element()
         };
 
-        let card = popover::popover_card(&theme)
-            .w(px(300.0))
-            .occlude()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(body);
-        Some(
-            div()
-                .absolute()
-                .top(px(Theme::TITLEBAR_HEIGHT + 10.0))
-                .right(px(14.0))
-                .child(motion::menu_in("todo-card-in", card))
-                .into_any_element(),
-        )
+        Some(todo_card_layer(&theme, header.into_any_element(), body))
     }
 
     /// Ctrl+Tab / Ctrl+Shift+Tab: step through the sidebar's Sessions list in
@@ -650,4 +649,76 @@ mod cycle_tests {
     // `AppState::sidebar_chats` the sidebar and the jump shortcuts read, and
     // `jump_slots_count_the_rows_the_sidebar_draws` (state.rs) covers the
     // space-filter behaviour for all of them.
+}
+
+#[cfg(test)]
+mod todo_card_input_tests {
+    use super::*;
+    use gpui::{MouseButton, ScrollHandle, TestAppContext, point};
+
+    struct TodoCardInputView {
+        transcript: ScrollHandle,
+        mouse_downs: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Render for TodoCardInputView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let mouse_downs = self.mouse_downs.clone();
+            div()
+                .relative()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("todo-card-test-transcript")
+                        .absolute()
+                        .inset_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.transcript)
+                        .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                            mouse_downs.set(mouse_downs.get() + 1)
+                        })
+                        .child(div().h(px(2_000.0))),
+                )
+                .child(div().flex_1().min_h_0())
+                .child(todo_card_layer(
+                    Theme::of(cx),
+                    div().h(px(32.0)).child("Progress").into_any_element(),
+                    div().h(px(48.0)).child("One task").into_any_element(),
+                ))
+                .child(div().h(px(40.0)).flex_none())
+        }
+    }
+
+    #[gpui::test]
+    fn floating_todo_card_does_not_block_the_conversation_column(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::default()));
+        let (view, cx) = cx.add_window_view(|_, _| TodoCardInputView {
+            transcript: ScrollHandle::new(),
+            mouse_downs: Default::default(),
+        });
+        cx.simulate_resize(gpui::size(px(600.0), px(400.0)));
+        cx.run_until_parked();
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            position: point(px(40.0), px(200.0)),
+            button: MouseButton::Left,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(400.0), px(70.0)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-80.0))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.mouse_downs.get(), 1);
+            assert!(
+                view.transcript.offset().y < px(0.0),
+                "the floating card must not swallow transcript wheel events"
+            );
+        });
+    }
 }

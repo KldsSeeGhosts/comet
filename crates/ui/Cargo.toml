@@ -9,7 +9,7 @@ publish.workspace = true
 # Dev variant: distinct app_id/data-dir identity so a dev build can run
 # side-by-side with production without sharing windows, the IPC port, or
 # engine state. Selected by `apps/zeron`'s `dev` feature (install.sh --dev).
-dev = []
+dev = ["zeron-harness/dev", "zeron-engine/dev"]
 browser-fixture = []
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
 

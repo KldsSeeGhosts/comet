@@ -66,6 +66,7 @@ fn controls() -> (RunControls, mpsc::Sender<RunCommand>, CancellationToken) {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        computer_use_socket: None,
     };
     (controls, steer_tx, token)
 }
@@ -744,8 +745,7 @@ async fn grok_subagent_lifecycle_tails_the_disk_transcript_into_tagged_events() 
             .unwrap();
         writeln!(
             f,
-            "{}",
-            "{\"type\":\"assistant\",\"content\":\"two files\",\"model_id\":\"grok-4.6-build\"}"
+            "{{\"type\":\"assistant\",\"content\":\"two files\",\"model_id\":\"grok-4.6-build\"}}"
         )
         .unwrap();
     });

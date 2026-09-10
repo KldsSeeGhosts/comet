@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Dev variant (propagated from zeron-ui via apps/zeron's `dev` feature):
+# bundled-extension paths must land under ~/.zeron-dev, never prod's ~/.zeron.
+dev = []
+
 [dependencies]
 zeron-proto.workspace = true
 base64 = "0.22"

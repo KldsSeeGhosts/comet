@@ -1173,7 +1173,7 @@ async fn fork_native_session(
 async fn start_session(
     exe: &Path,
     request: RunRequest,
-    controls: RunControls,
+    mut controls: RunControls,
     known_commands: Vec<SlashCommand>,
     interrupt_grace: Duration,
     kill_grace: Duration,
@@ -1192,6 +1192,18 @@ async fn start_session(
     // the context breakdown, never the run.
     if let Some(extension) = install_context_extension() {
         command.arg("-e").arg(extension);
+    }
+    // Always install the managed adapter, including when bridge startup
+    // failed. Otherwise the legacy global tool could silently take over.
+    let extension = install_bundled_extension("noches-cua.ts", CUA_EXTENSION).ok_or_else(|| {
+        HarnessError::Protocol("cannot install the managed computer-use adapter".into())
+    })?;
+    command
+        .env_remove("NOCHES_CUA_SOCKET")
+        .arg("-e")
+        .arg(extension);
+    if let Some(socket) = controls.computer_use_socket.take() {
+        command.env("NOCHES_CUA_SOCKET", socket);
     }
     let mut child = command.spawn().map_err(HarnessError::Io)?;
     let stdin = child
@@ -1264,17 +1276,16 @@ async fn start_session(
             return Err(err);
         }
     }
-    if let Some(reasoning) = request.reasoning {
-        if let Err(err) = rpc
+    if let Some(reasoning) = request.reasoning
+        && let Err(err) = rpc
             .request(json!({
                 "type": "set_thinking_level",
                 "level": reasoning_name(reasoning),
             }))
             .await
-        {
-            shutdown_child(&mut child, kill_grace).await;
-            return Err(err);
-        }
+    {
+        shutdown_child(&mut child, kill_grace).await;
+        return Err(err);
     }
     let state = rpc
         .request(json!({"type": "get_state"}))
@@ -1422,6 +1433,7 @@ async fn session_loop(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        computer_use_socket: _,
     } = controls;
     let request_input: Arc<RequestInputFn> = Arc::new(request_input);
     let mut steering_open = true;
@@ -1460,11 +1472,10 @@ async fn session_loop(session: Session) {
                                 }
                                 if !steering_open { break 'main; }
                             }
-                        } else if value.get("success").and_then(Value::as_bool) == Some(false) {
-                            if active_turn || !done_emitted {
+                        } else if value.get("success").and_then(Value::as_bool) == Some(false)
+                            && (active_turn || !done_emitted) {
                                 let _ = send_event(&event_tx, AgentEvent::Error { message: pi_error_message(&value) }).await;
                             }
-                        }
                         continue;
                     }
                     if is_terminal_settle(event_type, &value) {
@@ -2198,43 +2209,54 @@ fn is_negative_label(label: &str) -> bool {
 /// sends to the model and appends the breakdown to the session file as a
 /// custom entry, which we read back to fill the usage card.
 const CONTEXT_EXTENSION: &str = include_str!("zeron-context.ts");
+/// Managed computer-use adapter. A missing socket disables computer use;
+/// it never falls back to a user-installed desktop tool.
+const CUA_EXTENSION: &str = include_str!("noches-cua.ts");
 const CONTEXT_ENTRY_TYPE: &str = "zeron:context-usage";
 /// Entries land at the file tail every turn, so a bounded tail read is enough
 /// even for very long sessions.
 const CONTEXT_TAIL_BYTES: u64 = 256 * 1024;
 
-fn context_extension_path() -> Option<PathBuf> {
+/// The variant-correct data dir root for bundled-extension state. Honors
+/// `ZERON_DATA_DIR` first (explicit override, what apps/zeron reads), then the
+/// dev build's `~/.zeron-dev`, then production `~/.zeron` — so a dev engine
+/// never writes a prod-owned path.
+pub(crate) fn zeron_data_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("ZERON_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
+    }
     let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".zeron")
-            .join("pi")
-            .join("extensions")
-            .join("zeron-context.ts"),
-    )
+    let dir = if cfg!(feature = "dev") {
+        ".zeron-dev"
+    } else {
+        ".zeron"
+    };
+    Some(PathBuf::from(home).join(dir))
 }
 
-/// Install the bundled extension under the zeron-owned prefix, refreshing the
-/// file only when the bundled source changed. Best-effort: `None` simply means
-/// the run proceeds without the context breakdown.
-fn install_context_extension() -> Option<PathBuf> {
-    let path = context_extension_path()?;
-    let dir = path.parent()?.to_owned();
-    if std::fs::read_to_string(&path).is_ok_and(|existing| existing == CONTEXT_EXTENSION) {
+/// Install a bundled extension under the zeron-owned prefix, refreshing the
+/// file only when the bundled source changed. Best-effort: `None` simply
+/// means the run proceeds without it.
+fn install_bundled_extension(name: &str, source: &str) -> Option<PathBuf> {
+    let dir = zeron_data_dir()?.join("pi").join("extensions");
+    let path = dir.join(name);
+    if std::fs::read_to_string(&path).is_ok_and(|existing| existing == source) {
         return Some(path);
     }
     std::fs::create_dir_all(&dir).ok()?;
-    let staging = dir.join(format!(
-        "{}.new-{}",
-        path.file_name()?.to_str()?,
-        std::process::id()
-    ));
-    std::fs::write(&staging, CONTEXT_EXTENSION).ok()?;
+    let staging = dir.join(format!("{}.new-{}", name, uuid::Uuid::new_v4()));
+    std::fs::write(&staging, source).ok()?;
     if std::fs::rename(&staging, &path).is_err() {
         let _ = std::fs::remove_file(&staging);
         return None;
     }
     Some(path)
+}
+
+fn install_context_extension() -> Option<PathBuf> {
+    install_bundled_extension("zeron-context.ts", CONTEXT_EXTENSION)
 }
 
 /// Latest breakdown persisted by the companion extension.

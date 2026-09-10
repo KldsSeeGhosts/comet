@@ -132,7 +132,10 @@ pub fn pulse_seconds(view: EntityId, cx: &mut App) -> f32 {
         return 0.0;
     }
     pulse_lease_every(view, 1, cx);
-    cx.default_global::<PulseClock>().epoch.elapsed().as_secs_f32()
+    cx.default_global::<PulseClock>()
+        .epoch
+        .elapsed()
+        .as_secs_f32()
 }
 
 /// Schedule cosmetic animation through the same bounded clock as loaders.

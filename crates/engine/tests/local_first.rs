@@ -43,11 +43,17 @@ async fn rejecting_edge() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<
             };
             let seen = seen.clone();
             tokio::spawn(async move {
-                let mut request = [0u8; 4096];
-                let bytes = stream.read(&mut request).await.unwrap_or(0);
-                // Preview discovery probes localhost ports with HEAD. That is
-                // local service detection, not account-scoped Edge traffic.
-                if bytes > 0 && !request[..bytes].starts_with(b"HEAD /") {
+                // TCP can split even the method prefix. Read the request line
+                // before distinguishing preview HEAD probes from Edge traffic.
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(&mut stream);
+                let mut request = String::new();
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    (&mut reader).take(4096).read_line(&mut request),
+                )
+                .await;
+                if matches!(read, Ok(Ok(n)) if n > 0) && !request.starts_with("HEAD /") {
                     seen.fetch_add(1, Ordering::SeqCst);
                 }
                 let body = r#"{"error":"revoked"}"#;
@@ -183,6 +189,10 @@ async fn serve_daemon_edge(
     let captured = path.clone();
     let Ok(ws) = tokio_tungstenite::accept_hdr_async(
         stream,
+        #[allow(
+            clippy::result_large_err,
+            reason = "Tungstenite requires this concrete handshake error type"
+        )]
         move |request: &WsRequest, response: WsResponse| {
             *captured.lock().unwrap() = request.uri().path().to_string();
             Ok(response)
@@ -227,11 +237,7 @@ async fn serve_daemon_edge(
                     "rows": [],
                     "presence": {}
                 });
-                if sink
-                    .send(WsMessage::Text(state.to_string().into()))
-                    .await
-                    .is_err()
-                {
+                if sink.send(WsMessage::Text(state.to_string())).await.is_err() {
                     return;
                 }
             }

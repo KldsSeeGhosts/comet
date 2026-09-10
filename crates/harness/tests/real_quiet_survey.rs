@@ -36,6 +36,7 @@ fn controls() -> (RunControls, mpsc::Sender<RunCommand>, CancellationToken) {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        computer_use_socket: None,
     };
     (controls, steer_tx, token)
 }
@@ -194,7 +195,8 @@ async fn real_all_harnesses_quiet_survey() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let agents: Vec<(&str, fn() -> AcpHarness)> = vec![
+    type HarnessFactory = fn() -> AcpHarness;
+    let agents: Vec<(&str, HarnessFactory)> = vec![
         ("devin", AcpHarness::devin),
         ("grok", AcpHarness::grok),
         ("hermes", AcpHarness::hermes),

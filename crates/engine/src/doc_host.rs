@@ -2617,6 +2617,10 @@ impl DocHost {
         .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Matches the queued-edit RPC parameters"
+    )]
     pub async fn finish_queued_message_edit_with_attachments(
         &self,
         chat_id: &str,

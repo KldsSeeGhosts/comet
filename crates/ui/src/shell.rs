@@ -4965,7 +4965,8 @@ impl Shell {
         } else {
             status
         };
-        let avatar = crate::avatar::render(avatar_seed, avatar_state, avatar_t, avatar_motion, 20.0);
+        let avatar =
+            crate::avatar::render(avatar_seed, avatar_state, avatar_t, avatar_motion, 20.0);
         // Hover fades over transition-colors (zeron session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("chat-row-{id}");
