@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use zeron_proto::{
     AgentEvent, CommandScope, ContextComponent, ContextComponentKind, DoneStatus, HarnessId, Model,
     ReasoningLevel, RunRequest, SessionOptions, SlashCommand, SteeringMode, TodoItem, ToolCall,
-    ToolDiff,
+    ToolDiff, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{
@@ -220,6 +220,12 @@ impl Harness for PiHarness {
 }
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>>;
+
+/// The engine's input bridge, as [`RunControls::request_input`] hands it to
+/// the run: questions in, answers back on a oneshot. Boxed in `RunControls`,
+/// `Arc`'d here so each `extension_ui_request` subtask can hold its own.
+type RequestInputFn =
+    Box<dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync>;
 
 #[derive(Debug)]
 enum Incoming {
@@ -1413,10 +1419,11 @@ async fn session_loop(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
-        request_input: _,
+        request_input,
         mut steering,
         interrupt,
     } = controls;
+    let request_input: Arc<RequestInputFn> = Arc::new(request_input);
     let mut steering_open = true;
     let mut active_turn = true;
     let mut done_emitted = false;
@@ -1532,12 +1539,12 @@ async fn session_loop(session: Session) {
                             let _ = send_event(&event_tx, AgentEvent::ToolCall { id, call }).await;
                         }
                         "tool_execution_update" => {
-                            if let Some(event) = handle_tool_update(&tools, &mut last_tool_results, &value) {
+                            for event in handle_tool_update(&mut tools, &mut last_tool_results, &value) {
                                 let _ = send_event(&event_tx, event).await;
                             }
                         }
                         "tool_execution_end" => {
-                            if let Some(event) = handle_tool_end(&mut tools, &mut last_tool_results, &value) {
+                            for event in handle_tool_end(&mut tools, &mut last_tool_results, &value) {
                                 let _ = send_event(&event_tx, event).await;
                             }
                         }
@@ -1560,9 +1567,22 @@ async fn session_loop(session: Session) {
                                 let _ = send_event(&event_tx, AgentEvent::TitleUpdated { title: name }).await;
                             }
                         }
-                        "extension_ui_request" => if let Some(id) = value.get("id").and_then(Value::as_str) {
-                            rpc.send_unidentified(json!({"type": "extension_ui_response", "id": id, "cancelled": true}));
-                        },
+                        "extension_ui_request" => {
+                            // A notify with warning/error weight is the one
+                            // fire-and-forget worth surfacing — the extension
+                            // meant the user to see it. Info/status/widget
+                            // lines have no Comet surface; dropping is the
+                            // honest no-op (Pi no-ops them in RPC mode too).
+                            if is_error_notify(&value) {
+                                let message = value
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("extension notification")
+                                    .to_owned();
+                                let _ = send_event(&event_tx, AgentEvent::Error { message }).await;
+                            }
+                            handle_extension_ui_request(&value, &rpc, &request_input);
+                        }
                         "extension_error" => {
                             let _ = send_event(&event_tx, AgentEvent::Error { message: pi_error_message(&value) }).await;
                         }
@@ -1702,12 +1722,12 @@ async fn session_loop(session: Session) {
                                     } else {
                                         match event_type {
                                             "tool_execution_update" => {
-                                                if let Some(event) = handle_tool_update(&tools, &mut last_tool_results, &value) {
+                                                for event in handle_tool_update(&mut tools, &mut last_tool_results, &value) {
                                                     let _ = send_event(&event_tx, event).await;
                                                 }
                                             }
                                             "tool_execution_end" => {
-                                                if let Some(event) = handle_tool_end(&mut tools, &mut last_tool_results, &value) {
+                                                for event in handle_tool_end(&mut tools, &mut last_tool_results, &value) {
                                                     let _ = send_event(&event_tx, event).await;
                                                 }
                                             }
@@ -1862,28 +1882,48 @@ fn session_info_name(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Pi's todo tool is CRUD-shaped: `tool_execution_start` args carry only
+/// `{action, id, subject, status, …}` — never the task list — so the chip
+/// opens empty. The authoritative full list arrives on the end frame's
+/// `result.details.tasks`. Re-emitting `ToolCall` for the same id refreshes
+/// the chip in place (the doc fold rewrites an in-segment `call`), so the
+/// todo row settles showing the real list rather than `0/0 done`.
 fn handle_tool_update(
-    tools: &HashMap<String, ToolCall>,
+    tools: &mut HashMap<String, ToolCall>,
     last_tool_results: &mut HashMap<String, (Option<String>, Option<ToolDiff>, bool)>,
     value: &Value,
-) -> Option<AgentEvent> {
+) -> Vec<AgentEvent> {
     let id = value
         .get("toolCallId")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let call = tools.get(&id);
     let partial = value.get("partialResult").or_else(|| value.get("result"));
+    let is_error = value.get("isError").and_then(Value::as_bool) == Some(true);
+    let mut events = Vec::new();
+    // A todo partial result may already carry the growing task list —
+    // refresh the chip the same way the end frame does.
+    if matches!(tools.get(&id), Some(ToolCall::Todo { .. }))
+        && let Some(items) = todo_items_from_result(partial)
+        && let Some(ToolCall::Todo { items: slot }) = tools.get_mut(&id)
+        && *slot != items
+    {
+        *slot = items.clone();
+        events.push(AgentEvent::ToolCall {
+            id: id.clone(),
+            call: ToolCall::Todo { items },
+        });
+    }
+    let call = tools.get(&id);
     let diff = tool_diff(call, partial);
     let output = partial
         .and_then(render_value)
         .filter(|text| !text.is_empty());
-    let is_error = value.get("isError").and_then(Value::as_bool) == Some(true);
     if output.is_some() || diff.is_some() {
         let entry = (output.clone(), diff.clone(), is_error);
         if last_tool_results.get(&id) != Some(&entry) {
             last_tool_results.insert(id.clone(), entry);
-            return Some(AgentEvent::ToolResult {
+            events.push(AgentEvent::ToolResult {
                 id,
                 is_error,
                 output,
@@ -1891,14 +1931,14 @@ fn handle_tool_update(
             });
         }
     }
-    None
+    events
 }
 
 fn handle_tool_end(
     tools: &mut HashMap<String, ToolCall>,
     last_tool_results: &mut HashMap<String, (Option<String>, Option<ToolDiff>, bool)>,
     value: &Value,
-) -> Option<AgentEvent> {
+) -> Vec<AgentEvent> {
     let id = value
         .get("toolCallId")
         .and_then(Value::as_str)
@@ -1907,32 +1947,40 @@ fn handle_tool_end(
     let call = tools.remove(&id);
     let is_error = value.get("isError").and_then(Value::as_bool) == Some(true);
     let result = value.get("result");
+    let mut events = Vec::new();
+    // Resolve the todo list off the end frame and refresh the chip before
+    // its result lands, so the settled row reads `N/M done`.
+    let call = match (call, todo_items_from_result(result)) {
+        (Some(ToolCall::Todo { .. }), Some(items)) => {
+            let call = ToolCall::Todo { items };
+            events.push(AgentEvent::ToolCall {
+                id: id.clone(),
+                call: call.clone(),
+            });
+            Some(call)
+        }
+        (call, _) => call,
+    };
     let diff = tool_diff(call.as_ref(), result);
     let output = result
         .and_then(render_value)
         .filter(|text| !text.is_empty());
     let prev = last_tool_results.remove(&id);
     let entry = (output, diff, is_error);
-    if let Some(prev) = prev {
-        if prev != entry {
-            let (output, diff, is_error) = entry;
-            return Some(AgentEvent::ToolResult {
-                id,
-                is_error,
-                output,
-                diff,
-            });
-        }
-    } else {
+    let changed = match &prev {
+        Some(prev) => *prev != entry,
+        None => true,
+    };
+    if changed {
         let (output, diff, is_error) = entry;
-        return Some(AgentEvent::ToolResult {
+        events.push(AgentEvent::ToolResult {
             id,
             is_error,
             output,
             diff,
         });
     }
-    None
+    events
 }
 
 async fn send_event(
@@ -1965,6 +2013,185 @@ async fn send_done(
 
 fn new_message_id() -> String {
     format!("pi-{}", uuid::Uuid::new_v4())
+}
+
+// ---------------------------------------------------------------------------
+// Extension UI bridge
+// ---------------------------------------------------------------------------
+//
+// In RPC mode Pi translates an extension's `ctx.ui.*` call into an
+// `extension_ui_request` frame on stdout. Dialog methods (`select`,
+// `confirm`, `input`, `editor`) block the agent until a matching
+// `extension_ui_response` arrives on stdin; the fire-and-forget methods
+// (`notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`) expect
+// none. Comet owns a real question surface through the engine's input bridge
+// — the same `InputRequested`/`InputResolved` lifecycle Claude's
+// `AskUserQuestion` drives — so dialogs route there instead of being
+// auto-cancelled, and a Comet answer maps back onto the wire shape the
+// method expects.
+
+/// Serve one `extension_ui_request`. Dialog methods spawn a subtask that
+/// awaits the user's answers through `request_input` and replies on Pi's
+/// stdin; the session loop keeps streaming meanwhile (a blocked select must
+/// not stall the transcript, and a parked run must still interrupt).
+/// Fire-and-forget methods need no response and are dropped.
+fn handle_extension_ui_request(
+    value: &Value,
+    rpc: &PiRpcClient,
+    request_input: &Arc<RequestInputFn>,
+) {
+    let Some(id) = value.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+    let id = id.to_owned();
+    match method {
+        "select" | "confirm" | "input" | "editor" => {
+            let rpc = rpc.clone();
+            let request_input = Arc::clone(request_input);
+            let request = value.clone();
+            let method = method.to_owned();
+            tokio::spawn(async move {
+                let response = match extension_dialog(&request, &method, request_input).await {
+                    Some(response) => response,
+                    // The bridge dropped (run torn down): cancel so the agent
+                    // unblocks instead of wedging on a dialog nobody can see.
+                    None => json!({"type": "extension_ui_response", "id": id, "cancelled": true}),
+                };
+                rpc.send_unidentified(response);
+            });
+        }
+        // notify/setStatus/setWidget/setTitle/set_editor_text: display-only,
+        // no response expected — the agent doesn't park on them. The status
+        // lines have no dedicated Comet surface yet; dropping is the honest
+        // no-op (Pi itself no-ops them when it owns the terminal).
+        _ => {}
+    }
+}
+
+/// Await the Comet answer to a dialog request and shape the
+/// `extension_ui_response` the method expects. `None` means the bridge went
+/// away; `Some(cancelled)` means the user dismissed.
+async fn extension_dialog(
+    request: &Value,
+    method: &str,
+    request_input: Arc<RequestInputFn>,
+) -> Option<Value> {
+    let question = extension_question(request, method);
+    let answers = (request_input)(vec![question]).await.ok()?;
+    let id = request.get("id").and_then(Value::as_str)?.to_owned();
+    // The wizard emits one answer per question; a dialog is a single page.
+    // Empty labels are a dismissal (Esc or submit-without-a-pick), never a
+    // real selection — cancel so the extension sees `undefined`/`false`,
+    // not a phantom empty choice.
+    let labels = answers
+        .into_iter()
+        .next()
+        .map(|answer| answer.labels)
+        .unwrap_or_default();
+    let picked = labels.into_iter().next().filter(|label| !label.is_empty());
+    let response = match method {
+        // A confirm is boolean: only an explicit affirmative confirms true
+        // and an explicit negative confirms false. A typed free-text answer
+        // that is neither is ambiguous — cancel rather than guess a boolean
+        // the user never picked.
+        "confirm" => match picked.as_deref() {
+            Some(label) if is_affirmative_label(label) => {
+                json!({"type": "extension_ui_response", "id": id, "confirmed": true})
+            }
+            Some(label) if is_negative_label(label) => {
+                json!({"type": "extension_ui_response", "id": id, "confirmed": false})
+            }
+            _ => json!({"type": "extension_ui_response", "id": id, "cancelled": true}),
+        },
+        // select / input / editor all answer on `value`; the typed free-text
+        // row already lands in labels[0] the same as a picked option does.
+        _ => match picked {
+            Some(value) => {
+                json!({"type": "extension_ui_response", "id": id, "value": value})
+            }
+            None => json!({"type": "extension_ui_response", "id": id, "cancelled": true}),
+        },
+    };
+    Some(response)
+}
+
+/// Build the single `UserInputQuestion` a dialog becomes. `select` lists its
+/// options; `confirm` becomes a yes/no pick; `input`/`editor` carry no
+/// options so the wizard's free-text row is the whole answer. `header` is
+/// the dialog's method/title context, `question` its prompt text.
+fn extension_question(request: &Value, method: &str) -> UserInputQuestion {
+    let title = request
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let message = request
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+    let question_text = match (title, message) {
+        (Some(title), Some(message)) => format!("{title}\n\n{message}"),
+        (Some(title), None) => title.to_owned(),
+        (None, Some(message)) => message.to_owned(),
+        (None, None) => method.to_owned(),
+    };
+    let options = match method {
+        "select" => request
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|option| {
+                option
+                    .as_str()
+                    .or_else(|| {
+                        option
+                            .get("label")
+                            .or_else(|| option.get("value"))
+                            .and_then(Value::as_str)
+                    })
+                    .map(str::to_owned)
+            })
+            .collect(),
+        "confirm" => vec!["Yes".to_owned(), "No".to_owned()],
+        _ => Vec::new(),
+    };
+    UserInputQuestion {
+        id: uuid::Uuid::new_v4().to_string(),
+        header: title.unwrap_or(method).to_owned(),
+        question: question_text,
+        options,
+        multi_select: false,
+    }
+}
+
+/// Whether a fire-and-forget request is a `notify` the user should see —
+/// `warning`/`error` only; routine `info` notifications stay silent.
+fn is_error_notify(value: &Value) -> bool {
+    value.get("method").and_then(Value::as_str) == Some("notify")
+        && matches!(
+            value.get("notifyType").and_then(Value::as_str),
+            Some("warning") | Some("error")
+        )
+}
+
+/// Whether a confirm-dialog pick reads as the affirmative. Kept narrow and
+/// explicit so a stray typed answer can't be mistaken for consent.
+fn is_affirmative_label(label: &str) -> bool {
+    matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "yes" | "y" | "allow" | "approve" | "ok" | "confirm" | "accept" | "proceed" | "continue"
+    )
+}
+
+/// Whether a confirm-dialog pick reads as the negative.
+fn is_negative_label(label: &str) -> bool {
+    matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "no" | "n" | "deny" | "denied" | "block" | "reject" | "cancel" | "decline" | "disallow"
+    )
 }
 
 /// Companion extension bundled with this build: it measures what each turn
@@ -2276,16 +2503,12 @@ fn map_tool_call(name: &str, args: &Value) -> ToolCall {
             prompt: optional_string(args, &["prompt"]),
         },
         "todo" => ToolCall::Todo {
-            items: args
-                .get("items")
-                .or_else(|| args.get("todos"))
-                .and_then(Value::as_array)
+            // CRUD args carry no list — seed the chip with the task being
+            // touched so the row never reads `0/0 done` mid-flight; the end
+            // frame's `details.tasks` replaces it with the real list.
+            items: todo_items_from(args)
                 .into_iter()
-                .flatten()
-                .map(|item| TodoItem {
-                    text: string_field(item, &["text", "content"]),
-                    done: item.get("done").and_then(Value::as_bool).unwrap_or(false),
-                })
+                .chain(todo_seed_from_crud(args))
                 .collect(),
         },
         _ => ToolCall::Unknown {
@@ -2293,6 +2516,79 @@ fn map_tool_call(name: &str, args: &Value) -> ToolCall {
             input: (!args.is_null()).then(|| args.clone()),
         },
     }
+}
+
+/// Decode a todo list out of whatever shape the value carries. Pi's todo
+/// tool is CRUD-shaped (`{action, id, subject, status, …}`) rather than a
+/// whole-list write like Claude's `TodoWrite`: the call args never hold the
+/// list, but `tool_execution_end`'s `result.details.tasks` carries the FULL
+/// task list every call. A whole-list shape (`items`/`todos`, or a task
+/// array directly) is also accepted so the same decoder serves both the
+/// in-flight args and any list-carrying payload.
+fn todo_items_from(value: &Value) -> Vec<TodoItem> {
+    // Whole-list shapes first: an explicit array wins over the CRUD fields.
+    let list = value
+        .get("items")
+        .or_else(|| value.get("todos"))
+        .or_else(|| value.pointer("/details/tasks"))
+        .or_else(|| value.get("tasks"))
+        .and_then(Value::as_array);
+    if let Some(list) = list {
+        return list.iter().map(todo_item).collect();
+    }
+    if let Some(array) = value.as_array() {
+        return array.iter().map(todo_item).collect();
+    }
+    Vec::new()
+}
+
+/// One todo row. `done` reads the explicit boolean when present, else the
+/// Pi task `status` (`completed`/`cancelled` count as done; `pending` and
+/// `in_progress` stay open).
+fn todo_item(item: &Value) -> TodoItem {
+    let text = string_field(item, &["text", "content", "subject", "title"]);
+    let done = item
+        .get("done")
+        .or_else(|| item.get("completed"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            item.get("status").and_then(Value::as_str).map(|status| {
+                matches!(
+                    status.trim().to_ascii_lowercase().as_str(),
+                    "completed" | "complete" | "done" | "cancelled" | "canceled"
+                )
+            })
+        })
+        .unwrap_or(false);
+    TodoItem { text, done }
+}
+
+/// A one-row seed for a CRUD todo call's args (`{action, subject, status}`).
+/// `create`/`update` name a `subject`; `list`/`get`/`delete`/`clear` carry
+/// none worth showing, so they seed nothing. `Some(vec)` only when there's
+/// a real subject to render.
+fn todo_seed_from_crud(args: &Value) -> Vec<TodoItem> {
+    let subject = args
+        .get("subject")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty());
+    match subject {
+        Some(text) => vec![todo_item(
+            &json!({"subject": text, "status": args.get("status")}),
+        )],
+        None => Vec::new(),
+    }
+}
+
+/// The todo items a `tool_execution_update`/`tool_execution_end` result
+/// resolves to — `result.details.tasks` is Pi's authoritative full list.
+/// Returns `None` when the result carries no task list at all (a non-todo
+/// tool, or an error frame), so callers don't blank the chip on noise.
+fn todo_items_from_result(result: Option<&Value>) -> Option<Vec<TodoItem>> {
+    let result = result?;
+    let items = todo_items_from(result);
+    (!items.is_empty() || result.pointer("/details/tasks").is_some()).then_some(items)
 }
 
 fn tool_diff(call: Option<&ToolCall>, result: Option<&Value>) -> Option<ToolDiff> {

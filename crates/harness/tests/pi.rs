@@ -6,7 +6,10 @@ use tokio::sync::{mpsc, oneshot};
 use zeron_harness::{
     CancellationToken, Harness, HarnessError, PiHarness, RunCommand, RunControls, SteerMessage,
 };
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall};
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
+    UserInputQuestion,
+};
 
 fn fixture() -> PathBuf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi-rpc.py");
@@ -1125,4 +1128,171 @@ async fn fork_session_rejects_an_overrun_and_a_missing_file() {
         .await
         .expect_err("a missing session file must fail before spawn");
     assert!(err.to_string().contains("missing"));
+}
+
+/// Pi's CRUD todo tool reports the full task list on `result.details.tasks`
+/// at `tool_execution_end`; the harness must refresh the chip so it settles
+/// as `N/M done` instead of staying `0/0`.
+#[tokio::test]
+async fn todo_tool_resolves_items_from_result_tasks() {
+    let (_steer_tx, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(|_| oneshot::channel().1),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    let stream = PiHarness::new()
+        .with_executable(fixture())
+        .run(base_request("todo_flow"), controls)
+        .await
+        .expect("starts");
+
+    let events = collect_events(stream).await;
+
+    // Two todo calls → two chips, each settling with the cumulative list.
+    let todo_calls: Vec<&ToolCall> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCall {
+                call: call @ ToolCall::Todo { .. },
+                ..
+            } => Some(call),
+            _ => None,
+        })
+        .collect();
+    // The second call emits a refreshed ToolCall on end; the last emission
+    // for each chip carries its final list.
+    // The in-flight start frame seeds the chip from the CRUD subject so it
+    // never opens at `0/0 done`; the end frame's details.tasks wins.
+    let first = todo_calls.first().expect("a todo chip was emitted");
+    let ToolCall::Todo { items } = first else {
+        unreachable!()
+    };
+    assert_eq!(items.len(), 1, "start seeds the touched subject");
+    assert_eq!(items[0].text, "Inspect renderer");
+
+    let last = todo_calls.last().expect("a todo chip was emitted");
+    let ToolCall::Todo { items } = last else {
+        unreachable!()
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].text, "Inspect renderer");
+    assert!(items[0].done, "completed status maps to done");
+    assert_eq!(items[1].text, "Write tests");
+    assert!(!items[1].done, "pending status stays open");
+}
+
+/// An extension `select` dialog must reach the engine's input bridge and the
+/// picked option must go back on the wire as the response `value`.
+#[tokio::test]
+async fn extension_select_bridges_to_input_and_returns_value() {
+    let (_steer_tx, steering) = mpsc::channel(1);
+    let asked: std::sync::Arc<std::sync::Mutex<Vec<Vec<UserInputQuestion>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let asked_clone = asked.clone();
+    let controls = RunControls {
+        request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
+            asked_clone.lock().unwrap().push(questions);
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(vec![UserInputAnswer {
+                question_id: "q".into(),
+                labels: vec!["Allow".into()],
+            }]);
+            rx
+        }),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    let stream = PiHarness::new()
+        .with_executable(fixture())
+        .run(base_request("extension_select"), controls)
+        .await
+        .expect("starts");
+
+    let events = collect_events(stream).await;
+
+    let questions = asked.lock().unwrap();
+    assert_eq!(questions.len(), 1, "one dialog reached the bridge");
+    let q = &questions[0][0];
+    assert_eq!(q.question, "Allow dangerous command?");
+    assert_eq!(q.options, vec!["Allow", "Block"]);
+    drop(questions);
+
+    // The fixture echoes the wire response value as a text delta.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TextDelta { text } if text == "ANSWER:Allow"
+        )),
+        "select answer went back on the wire: {events:?}"
+    );
+}
+
+/// An extension `confirm` dialog maps onto a yes/no pick; a negative label
+/// answers `confirmed: false` on the wire.
+#[tokio::test]
+async fn extension_confirm_negative_returns_confirmed_false() {
+    let (_steer_tx, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(vec![UserInputAnswer {
+                question_id: questions[0].id.clone(),
+                labels: vec!["No".into()],
+            }]);
+            rx
+        }),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    let stream = PiHarness::new()
+        .with_executable(fixture())
+        .run(base_request("extension_confirm"), controls)
+        .await
+        .expect("starts");
+
+    let events = collect_events(stream).await;
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TextDelta { text } if text == "ANSWER:False"
+        )),
+        "confirm No went back as confirmed:false: {events:?}"
+    );
+}
+
+/// A dismissed dialog answers `cancelled: true` so the extension sees
+/// `undefined`, not a phantom pick.
+#[tokio::test]
+async fn extension_dialog_dismissal_sends_cancelled() {
+    let (_steer_tx, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        // Empty labels = the user dismissed.
+        request_input: Box::new(move |questions: Vec<UserInputQuestion>| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(vec![UserInputAnswer {
+                question_id: questions[0].id.clone(),
+                labels: vec![],
+            }]);
+            rx
+        }),
+        steering,
+        interrupt: CancellationToken::new(),
+    };
+    let stream = PiHarness::new()
+        .with_executable(fixture())
+        .run(base_request("extension_select"), controls)
+        .await
+        .expect("starts");
+
+    let events = collect_events(stream).await;
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TextDelta { text } if text == "ANSWER:CANCELLED"
+        )),
+        "dismissal sent cancelled: {events:?}"
+    );
 }

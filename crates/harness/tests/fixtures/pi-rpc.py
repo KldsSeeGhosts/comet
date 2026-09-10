@@ -145,6 +145,37 @@ for line in sys.stdin:
             send({"type": "tool_execution_update", "toolCallId": "tool-1", "toolName": "read", "partialResult": {"content": "started"}})
             send({"type": "tool_execution_end", "toolCallId": "tool-1", "toolName": "read", "result": None, "isError": True})
             send({"type": "agent_settled"})
+        elif "todo_flow" in message:
+            # Pi's todo tool is CRUD-shaped: start args carry the action, the
+            # authoritative task list only lands on the end's details.tasks.
+            send({"type": "tool_execution_start", "toolCallId": "td-1", "toolName": "todo",
+                  "args": {"action": "create", "subject": "Inspect renderer", "status": "in_progress", "activeForm": "inspecting"}})
+            send({"type": "tool_execution_end", "toolCallId": "td-1", "toolName": "todo", "isError": False,
+                  "result": {"content": [{"type": "text", "text": "Created #1: Inspect renderer (pending)"}],
+                             "details": {"action": "create", "nextId": 2,
+                                         "tasks": [{"id": 1, "subject": "Inspect renderer", "status": "in_progress", "activeForm": "inspecting"}]}}})
+            send({"type": "tool_execution_start", "toolCallId": "td-2", "toolName": "todo",
+                  "args": {"action": "create", "subject": "Write tests"}})
+            send({"type": "tool_execution_end", "toolCallId": "td-2", "toolName": "todo", "isError": False,
+                  "result": {"content": [{"type": "text", "text": "Created #2: Write tests (pending)"}],
+                             "details": {"action": "create", "nextId": 3,
+                                         "tasks": [{"id": 1, "subject": "Inspect renderer", "status": "completed", "activeForm": "inspecting"},
+                                                    {"id": 2, "subject": "Write tests", "status": "pending"}]}}})
+            send({"type": "agent_settled"})
+        elif "extension_select" in message:
+            # An extension dialog: emit the request, then keep the turn alive
+            # until the client's extension_ui_response arrives (the response
+            # branch below echoes the answer back as a text delta so tests can
+            # observe what was sent without the turn settling first).
+            send({"type": "extension_ui_request", "id": "sel-1", "method": "select",
+                  "title": "Allow dangerous command?", "options": ["Allow", "Block"]})
+            current_prompt_mode = "awaiting_extension"
+            continue
+        elif "extension_confirm" in message:
+            send({"type": "extension_ui_request", "id": "cfm-1", "method": "confirm",
+                  "title": "Clear session?", "message": "All messages will be lost."})
+            current_prompt_mode = "awaiting_extension"
+            continue
         elif "structured_content" in message:
             send({"type": "tool_execution_start", "toolCallId": "tool-1", "toolName": "bash", "args": {"command": "ls"}})
             send({"type": "tool_execution_end", "toolCallId": "tool-1", "toolName": "bash", "result": {"content": [{"type": "text", "text": "cleaned tool output"}]}, "isError": False})
@@ -170,6 +201,15 @@ for line in sys.stdin:
             send({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}], "usage": {"input": 20, "output": 5, "totalTokens": 25}}})
             send({"type": "agent_settled"})
     elif command == "extension_ui_response":
-        pass
+        # The answer to a pending dialog: surface what the client sent as a
+        # text delta (so tests observe the exact wire value) and settle the
+        # turn the request was holding open.
+        if current_prompt_mode == "awaiting_extension":
+            answer = request.get("value", request.get("confirmed"))
+            if request.get("cancelled"):
+                answer = "CANCELLED"
+            send({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": f"ANSWER:{answer}"}})
+            send({"type": "agent_settled"})
+            current_prompt_mode = ""
     else:
         response(request, success=False, error=f"unsupported command: {command}")
