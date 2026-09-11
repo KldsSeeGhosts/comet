@@ -273,7 +273,8 @@ impl StderrTail {
             return None;
         }
         let mut joined = tail.iter().cloned().collect::<Vec<_>>().join("\n");
-        joined.truncate(Self::KEEP_BYTES * 2);
+        let cap = Self::KEEP_BYTES * 2;
+        joined.truncate(truncate_to_boundary(&joined, cap).len());
         Some(joined)
     }
 }
@@ -307,6 +308,44 @@ pub(crate) fn crash_message(
     match stderr.snapshot() {
         Some(tail) => format!("{name} exited unexpectedly ({status}): {tail}"),
         None => format!("{name} exited unexpectedly ({status})"),
+    }
+}
+
+/// Truncate `text` to at most `cap` bytes on a UTF-8 character boundary.
+pub(crate) fn truncate_to_boundary(text: &str, cap: usize) -> &str {
+    if text.len() <= cap {
+        return text;
+    }
+    let mut end = cap;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Truncate `text` on a char boundary at or before `cap` bytes, appending `marker` if truncated.
+pub(crate) fn cap_text_with_marker(text: &str, cap: usize, marker: &str) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let mut out = truncate_to_boundary(text, cap).to_owned();
+    out.push_str(marker);
+    out
+}
+
+/// Truncate on a char boundary, marking the cut so the UI can say "truncated".
+pub(crate) fn cap_text(text: &str, cap: usize) -> String {
+    cap_text_with_marker(text, cap, "\n… [truncated]")
+}
+
+/// Extract a displayable message from a caught panic payload.
+pub(crate) fn extract_panic_message(payload: &(dyn std::any::Any + 'static)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
@@ -361,4 +400,76 @@ pub(crate) fn send_signal(pid: u32, signal: Signal) {
 #[cfg(not(unix))]
 pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
     // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_to_boundary_handles_multibyte_characters() {
+        // U+FFFC (3 bytes: EF BF BC) and U+4F60 (3 bytes: E4 BD A0)
+        let fffc = "\u{fffc}\u{fffc}"; // 6 bytes
+        assert_eq!(truncate_to_boundary(fffc, 0), "");
+        assert_eq!(truncate_to_boundary(fffc, 1), "");
+        assert_eq!(truncate_to_boundary(fffc, 2), "");
+        assert_eq!(truncate_to_boundary(fffc, 3), "\u{fffc}");
+        assert_eq!(truncate_to_boundary(fffc, 4), "\u{fffc}");
+        assert_eq!(truncate_to_boundary(fffc, 5), "\u{fffc}");
+        assert_eq!(truncate_to_boundary(fffc, 6), "\u{fffc}\u{fffc}");
+        assert_eq!(truncate_to_boundary(fffc, 10), "\u{fffc}\u{fffc}");
+
+        let ni = "\u{4f60}\u{4f60}"; // 6 bytes
+        assert_eq!(truncate_to_boundary(ni, 2), "");
+        assert_eq!(truncate_to_boundary(ni, 3), "\u{4f60}");
+        assert_eq!(truncate_to_boundary(ni, 5), "\u{4f60}");
+        assert_eq!(truncate_to_boundary(ni, 6), "\u{4f60}\u{4f60}");
+    }
+
+    #[test]
+    fn cap_text_with_marker_applies_on_multibyte_boundary() {
+        let text = "\u{fffc}".repeat(10); // 30 bytes
+        let capped = cap_text_with_marker(&text, 5, "\n… [truncated]");
+        assert_eq!(capped, "\u{fffc}\n… [truncated]");
+
+        let text_ni = "\u{4f60}".repeat(10); // 30 bytes
+        let capped_ni = cap_text(&text_ni, 8); // 8 bytes -> 2 chars = 6 bytes
+        assert_eq!(capped_ni, "\u{4f60}\u{4f60}\n… [truncated]");
+    }
+
+    #[test]
+    fn stderr_tail_snapshot_does_not_panic_on_multibyte_boundary() {
+        let tail = StderrTail::default();
+        // 700 chars of U+FFFC = 2100 bytes per line
+        let line = "\u{fffc}".repeat(700);
+        tail.push(&line);
+        // KEEP_BYTES * 2 is 1400 bytes. 1400 % 3 = 2, so 1400 lands inside the 467th char.
+        let snapshot = tail.snapshot().expect("snapshot present");
+        assert!(snapshot.len() <= StderrTail::KEEP_BYTES * 2);
+        assert_eq!(snapshot.len(), 1398); // 466 * 3 bytes
+        assert_eq!(snapshot.chars().count(), 466);
+
+        let tail_ni = StderrTail::default();
+        let line_ni = "\u{4f60}".repeat(700);
+        tail_ni.push(&line_ni);
+        let snapshot_ni = tail_ni.snapshot().expect("snapshot present");
+        assert!(snapshot_ni.len() <= StderrTail::KEEP_BYTES * 2);
+        assert_eq!(snapshot_ni.len(), 1398);
+        assert_eq!(snapshot_ni.chars().count(), 466);
+    }
+
+    #[test]
+    fn extract_panic_message_formats_str_and_string() {
+        let str_payload: Box<dyn std::any::Any> = Box::new("literal panic payload");
+        assert_eq!(
+            extract_panic_message(&*str_payload),
+            "literal panic payload"
+        );
+
+        let string_payload: Box<dyn std::any::Any> = Box::new(format!("formatted panic: {}", 42));
+        assert_eq!(
+            extract_panic_message(&*string_payload),
+            "formatted panic: 42"
+        );
+    }
 }

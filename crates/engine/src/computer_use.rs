@@ -2,13 +2,20 @@
 //!
 //! A lease covers one active turn, not the lifetime of a parked Pi process.
 //! Interrupts, disconnected callers and turn boundaries cancel outstanding work
-//! before reaping the private Linux driver and releasing that lease.
+//! before reaping the private Linux driver and releasing that lease. Approval
+//! is session-scoped: it survives that teardown so a resumed turn re-acquires
+//! the lease and driver without asking again. On a real host the serve daemon
+//! carries the existing-profile grant only once that approval exists; metadata
+//! asked before approval runs on a daemon spawned without the grant.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -21,6 +28,17 @@ const RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEANUP_TIMEOUT: Duration = Duration::from_millis(750);
+const DESCRIBE_NAMES_LIMIT: usize = 32;
+
+/// MCP revision this client advertises and prefers. A driver may negotiate
+/// any entry in `SUPPORTED_MCP_PROTOCOL_VERSIONS`; nothing else is trusted.
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// MCP revisions whose initialize, tools/list and tools/call contract this
+/// client implements. A negotiated version outside this list fails the
+/// handshake instead of being retained as trusted metadata.
+const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
+    &[MCP_PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
 
 // New driver tools need an explicit review before the agent can invoke them.
 const ACTIONS: &[&str] = &[
@@ -82,8 +100,285 @@ fn error(message: impl ToString) -> Value {
     json!({"isError": true, "content": [{"type":"text", "text":message.to_string()}]})
 }
 
+/// Structured CUA outcome classes from the driver's versioned result model.
+/// Only refusals and explicit error statuses are failed tool executions;
+/// partial, unknown and unverifiable outcomes stay non-errors so callers do
+/// not replay input whose delivery was never established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriverOutcome {
+    Delivered,
+    Refused,
+    Partial,
+    Unknown,
+    Unverifiable,
+    Cancelled,
+    Error,
+}
+
+fn classify_driver_outcome(result: &Value) -> DriverOutcome {
+    let structured = result.get("structuredContent");
+    let status = structured
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let effect = structured
+        .and_then(|value| value.get("effect"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let refused_flag = structured
+        .and_then(|value| value.get("refused"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let driver_is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
+    let refused = |token: Option<&str>| {
+        token.is_some_and(|value| {
+            matches!(
+                value,
+                "refused" | "denied" | "rejected" | "blocked" | "forbidden"
+            )
+        })
+    };
+
+    // A structured refusal outranks the generic execution-error flag: a
+    // refusal reported with isError is still an exact refusal. The driver's
+    // outcome-only variant carries the same signal in `effect`.
+    if refused_flag || refused(status.as_deref()) || refused(effect.as_deref()) {
+        return DriverOutcome::Refused;
+    }
+    match status.as_deref() {
+        Some("error" | "failed" | "failure") => return DriverOutcome::Error,
+        Some("cancelled" | "canceled") => return DriverOutcome::Cancelled,
+        // Uncertain deliveries stay non-errors only while the driver did not
+        // flag the call as failed; an explicit isError makes it an error.
+        Some("partial" | "partially_delivered" | "incomplete") => {
+            return if driver_is_error {
+                DriverOutcome::Error
+            } else {
+                DriverOutcome::Partial
+            };
+        }
+        Some("unknown" | "unobserved" | "indeterminate") => {
+            return if driver_is_error {
+                DriverOutcome::Error
+            } else {
+                DriverOutcome::Unknown
+            };
+        }
+        Some("unverifiable" | "unverified") => {
+            return if driver_is_error {
+                DriverOutcome::Error
+            } else {
+                DriverOutcome::Unverifiable
+            };
+        }
+        _ => {}
+    }
+    match effect.as_deref() {
+        Some("error" | "failed" | "failure") => DriverOutcome::Error,
+        Some("cancelled" | "canceled") => DriverOutcome::Cancelled,
+        Some("unverifiable" | "unverified") => {
+            if driver_is_error {
+                DriverOutcome::Error
+            } else {
+                DriverOutcome::Unverifiable
+            }
+        }
+        Some("partial") => {
+            if driver_is_error {
+                DriverOutcome::Error
+            } else {
+                DriverOutcome::Partial
+            }
+        }
+        Some("unknown") => {
+            if driver_is_error {
+                DriverOutcome::Error
+            } else {
+                DriverOutcome::Unknown
+            }
+        }
+        _ => {
+            if driver_is_error {
+                DriverOutcome::Error
+            } else {
+                DriverOutcome::Delivered
+            }
+        }
+    }
+}
+
+/// Compatibility normalizer for drivers that report a structured refusal
+/// without the MCP execution-error flag. The refusal payload is preserved
+/// verbatim; only the top-level `isError` flag is added. Partial, unknown and
+/// unverifiable outcomes are deliberately left untouched.
+fn normalize_driver_outcome(mut result: Value) -> Value {
+    if matches!(
+        classify_driver_outcome(&result),
+        DriverOutcome::Refused | DriverOutcome::Error
+    ) && result.get("isError").and_then(Value::as_bool) != Some(true)
+        && let Some(map) = result.as_object_mut()
+    {
+        map.insert("isError".into(), Value::Bool(true));
+    }
+    result
+}
+
+/// Negotiated MCP initialize contract, retained after the handshake instead of
+/// being discarded. `instructions` is optional server prose; it is hashed for
+/// diagnostics and never forwarded into model-visible text.
+#[derive(Clone, Debug, Default)]
+struct InitializeInfo {
+    protocol_version: String,
+    server_info: ServerInfo,
+    capabilities: Value,
+    instructions: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ServerInfo {
+    name: String,
+    version: Option<String>,
+}
+
+fn parse_initialize_result(result: &Value) -> CuaResult<InitializeInfo> {
+    let protocol_version = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("cua-driver initialize result is missing a non-empty protocolVersion")?;
+    if !SUPPORTED_MCP_PROTOCOL_VERSIONS.contains(&protocol_version) {
+        return Err(format!(
+            "cua-driver negotiated unsupported MCP protocol version {protocol_version}; supported versions: {}",
+            SUPPORTED_MCP_PROTOCOL_VERSIONS.join(", ")
+        ));
+    }
+    let protocol_version = protocol_version.to_string();
+    let server_info = result
+        .get("serverInfo")
+        .and_then(Value::as_object)
+        .ok_or("cua-driver initialize result is missing serverInfo")?;
+    let name = server_info
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("cua-driver initialize result serverInfo.name must be a non-empty string")?
+        .to_string();
+    let version = match server_info.get("version") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(
+                    "cua-driver initialize result serverInfo.version must be a non-empty string",
+                )?
+                .to_string(),
+        ),
+        None => None,
+    };
+    let capabilities = result
+        .get("capabilities")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or("cua-driver initialize result is missing a capabilities object")?;
+    let instructions = match result.get("instructions") {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => return Err("cua-driver initialize result instructions must be a string".into()),
+        None => None,
+    };
+    Ok(InitializeInfo {
+        protocol_version,
+        server_info: ServerInfo { name, version },
+        capabilities,
+        instructions,
+    })
+}
+
+fn attach_driver_metadata(result: &mut Value, metadata: Value) {
+    if let Some(structured) = result
+        .get_mut("structuredContent")
+        .and_then(Value::as_object_mut)
+    {
+        structured.insert("driver".into(), metadata);
+    }
+}
+
+/// Canonical path of the executable the engine is about to spawn. A
+/// symlinked invocation path resolves to the file itself, so the engine
+/// reports and hashes the target rather than the link. An unresolvable path
+/// fails the spawn instead of falling back to the unresolved link.
+fn canonical_executable(path: &Path) -> CuaResult<PathBuf> {
+    std::fs::canonicalize(path)
+        .map_err(|e| format!("Cannot resolve executable {}: {e}", path.display()))
+}
+
+/// SHA-256 of a driver executable file. Package metadata is never consulted;
+/// an unreadable binary fails the spawn. The native spawn path re-hashes the
+/// running image from `/proc/<pid>/exe`; this digest remains authoritative for
+/// injected script fixtures, which execute through an interpreter.
+async fn hash_executable(path: &Path) -> CuaResult<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| format!("Cannot read {} for hashing: {e}", path.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|e| format!("Cannot hash {}: {e}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    })
+    .await
+    .map_err(|e| format!("cua-driver hashing task failed: {e}"))?
+}
+
+/// Verify that a spawned pid is executing the canonical file the engine
+/// resolved before spawn. `/proc/<pid>/exe` is the kernel's link to the
+/// executed inode, so an atomic replacement that lands between the pre-spawn
+/// hash and exec is visible here instead of being silently accepted.
+fn verify_running_executable(pid: u32, canonical: &Path) -> CuaResult<PathBuf> {
+    let proc_exe = PathBuf::from(format!("/proc/{pid}/exe"));
+    let resolved = std::fs::canonicalize(&proc_exe)
+        .map_err(|e| format!("Cannot resolve {}: {e}", proc_exe.display()))?;
+    if resolved != canonical {
+        return Err(format!(
+            "cua-driver process {pid} is running {} instead of the verified {}; refusing to report an unverified executable",
+            resolved.display(),
+            canonical.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// SHA-256 of the image a spawned pid is actually running, taken from
+/// `/proc/<pid>/exe` after the identity check. Hashing the running path means
+/// a replacement between the pre-spawn hash and exec updates the reported
+/// digest rather than leaving a stale one behind.
+async fn running_executable_sha256(pid: u32, canonical: &Path) -> CuaResult<String> {
+    verify_running_executable(pid, canonical)?;
+    hash_executable(&PathBuf::from(format!("/proc/{pid}/exe"))).await
+}
+
+/// Reap a partially spawned native driver after a post-spawn identity check
+/// fails. Killing both processes keeps the private socket and overlay gone;
+/// the spawn caller reports the verification error instead of a stale path.
+async fn reap_spawned(child: &mut Child, daemon: Option<&mut Child>) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    if let Some(daemon) = daemon {
+        let _ = daemon.start_kill();
+        let _ = daemon.wait().await;
+    }
+}
+
 pub struct ComputerUseManager {
     lease: Arc<Mutex<Option<String>>>,
+    approvals: Arc<Mutex<HashSet<String>>>,
     device_id: String,
     // Tests inject an executable rather than modifying the process environment.
     driver_path: Option<PathBuf>,
@@ -93,9 +388,17 @@ impl ComputerUseManager {
     pub fn new(device_id: String) -> Self {
         Self {
             lease: Arc::new(Mutex::new(None)),
+            approvals: Arc::new(Mutex::new(HashSet::new())),
             device_id,
             driver_path: None,
         }
+    }
+
+    /// Revoke session computer-use approval for a specific chat.
+    ///
+    /// Returns true if an approval grant was present and removed.
+    pub fn forget_computer_use_approval(&self, chat_id: &str) -> bool {
+        lock(&self.approvals).remove(chat_id)
     }
 
     pub async fn start_bridge(
@@ -122,11 +425,14 @@ impl ComputerUseManager {
         // Private endpoint for the per-run serve daemon that owns the agent
         // cursor overlay runloop; the MCP child proxies through it.
         let daemon_socket = dir.path().join("driver.sock");
+        let granted = lock(&self.approvals).contains(chat_id);
         let state = Arc::new(BridgeState {
+            chat_id: chat_id.to_string(),
             owner: format!("chat {chat_id}, run {run_id}"),
             label: format!("noches-{}", uuid::Uuid::new_v4()),
             device_id: self.device_id.clone(),
             lease: self.lease.clone(),
+            approvals: self.approvals.clone(),
             request_input,
             driver_path: self.driver_path.clone(),
             daemon_socket,
@@ -135,7 +441,10 @@ impl ComputerUseManager {
                 cancel: Arc::new(CancellationToken::new()),
             }),
             stop: CancellationToken::new(),
-            runtime: AsyncMutex::new(Runtime::default()),
+            runtime: AsyncMutex::new(Runtime {
+                granted,
+                ..Runtime::default()
+            }),
         });
         let task_state = state.clone();
         let task = tokio::spawn(async move {
@@ -183,17 +492,22 @@ struct Turn {
 #[derive(Default)]
 struct Runtime {
     driver: Option<Driver>,
-    // One whole-turn grant covers inspection, input and desktop control.
+    // One session-wide grant covers inspection, input and desktop control.
+    // It survives per-turn driver/lease teardown so a resumed turn does not
+    // re-ask. A denial stays per-turn and resets here, so a fresh turn may
+    // ask again.
     granted: bool,
     denied: bool,
     lease_held: bool,
 }
 
 struct BridgeState {
+    chat_id: String,
     owner: String,
     label: String,
     device_id: String,
     lease: Arc<Mutex<Option<String>>>,
+    approvals: Arc<Mutex<HashSet<String>>>,
     request_input: RequestInput,
     driver_path: Option<PathBuf>,
     daemon_socket: PathBuf,
@@ -226,13 +540,22 @@ impl BridgeState {
                 return;
             }
         }
+        if let Err(err) = remove_socket_if_present(&self.daemon_socket) {
+            tracing::warn!(error = %err, path = %self.daemon_socket.display(), "computer-use daemon socket cleanup failed");
+        }
         if runtime.lease_held {
             let mut owner = lock(&self.lease);
             if owner.as_deref() == Some(self.owner.as_str()) {
                 *owner = None;
             }
         }
-        *runtime = Runtime::default();
+        // The positive grant is session/chat-scoped and survives teardown; everything
+        // else (driver, lease marker, a denial) belongs to the turn or attempt.
+        let granted = lock(&self.approvals).contains(&self.chat_id);
+        *runtime = Runtime {
+            granted,
+            ..Runtime::default()
+        };
     }
 
     fn active(&self, turn: &CancellationToken) -> bool {
@@ -352,14 +675,13 @@ async fn approve(state: &BridgeState, runtime: &mut Runtime, action: &str) -> Cu
     if runtime.denied {
         return Err("Computer use denied for this turn".into());
     }
-    if runtime.granted {
+    if lock(&state.approvals).contains(&state.chat_id) {
+        runtime.granted = true;
         return Ok(());
     }
+    runtime.granted = false;
     let id = uuid::Uuid::new_v4().to_string();
-    let question = format!(
-        "Allow computer use on host {} for this turn? Requested action: {action}. One approval covers inspecting and controlling apps, pointer and keyboard input, screenshots and clipboard access on that host for the rest of this turn, including visible desktop control.",
-        state.device_id
-    );
+    let question = approval_question(&state.device_id, action);
     let answers = (state.request_input)(vec![UserInputQuestion {
         id: id.clone(),
         header: "Computer use".into(),
@@ -373,6 +695,7 @@ async fn approve(state: &BridgeState, runtime: &mut Runtime, action: &str) -> Cu
         .iter()
         .any(|a| a.question_id == id && a.labels == ["Allow"])
     {
+        lock(&state.approvals).insert(state.chat_id.clone());
         runtime.granted = true;
         Ok(())
     } else {
@@ -402,12 +725,76 @@ async fn handle_call(
         return error("Reserved session/policy arguments are not accepted");
     }
     map.insert("session".into(), json!(state.label));
+    let requested_names = if action == "describe" {
+        let has_name = map.contains_key("name");
+        let has_names = map.contains_key("names");
+        if has_name && has_names {
+            return error("describe accepts either name or names, not both");
+        }
+        if !has_name && !has_names {
+            return error("describe requires either name or names");
+        }
+        if let Some(unexpected) = map
+            .keys()
+            .find(|k| k.as_str() != "name" && k.as_str() != "names" && k.as_str() != "session")
+        {
+            return error(format!("Unexpected argument for describe: {unexpected}"));
+        }
+        if has_name {
+            let Some(name_str) = map.get("name").and_then(Value::as_str) else {
+                return error("args.name must be a string");
+            };
+            if !ACTIONS.contains(&name_str) {
+                return error(format!("Action is not exposed by Noches: {name_str}"));
+            }
+            vec![name_str.to_string()]
+        } else {
+            let Some(arr) = map.get("names").and_then(Value::as_array) else {
+                return error("args.names must be an array of action names");
+            };
+            if arr.is_empty() {
+                return error("args.names must not be empty");
+            }
+            if arr.len() > DESCRIBE_NAMES_LIMIT {
+                return error(format!(
+                    "args.names cannot exceed {DESCRIBE_NAMES_LIMIT} actions"
+                ));
+            }
+            let mut names = Vec::with_capacity(arr.len());
+            for item in arr {
+                let Some(item_str) = item.as_str() else {
+                    return error("args.names must contain only string action names");
+                };
+                if !ACTIONS.contains(&item_str) {
+                    return error(format!("Action is not exposed by Noches: {item_str}"));
+                }
+                names.push(item_str.to_string());
+            }
+            names
+        }
+    } else {
+        Vec::new()
+    };
     let mut runtime = state.runtime.lock().await;
     if !state.active(turn) {
         return error("Computer use is parked or cancelled; start a new turn");
     }
     let metadata = matches!(action, "help" | "describe" | "health_report");
     if !metadata {
+        // A daemon started for metadata before approval runs without the
+        // existing-profile grant. Restart it ungracefully before touching the
+        // lease so the approved action runs on a granted daemon. Injected
+        // fixtures run no daemon and skip this entirely.
+        if let Some(false) = runtime.driver.as_ref().and_then(Driver::daemon_grant) {
+            state.clean_runtime(&mut runtime, false).await;
+        }
+        // The cleanup must not leave an ungranted daemon behind; if one
+        // survives, fail closed instead of routing the action through it.
+        if let Some(false) = runtime.driver.as_ref().and_then(Driver::daemon_grant) {
+            return error(
+                "An ungranted daemon is still running after cleanup; restart computer use and start a new turn",
+            );
+        }
         if !runtime.lease_held {
             let mut lease = lock(&state.lease);
             if let Some(owner) = lease.as_ref() {
@@ -417,18 +804,29 @@ async fn handle_call(
             runtime.lease_held = true;
         }
         if let Err(err) = approve(state, &mut runtime, action).await {
-            // A first-use denial must not reserve the desktop for a parked chat.
+            // A denial must not reserve the desktop for a parked chat.
             if !runtime.granted {
-                *lock(&state.lease) = None;
-                runtime.lease_held = false;
+                let denied = runtime.denied;
+                state.clean_runtime(&mut runtime, false).await;
+                runtime.denied = denied;
             }
             return error(err);
         }
     }
     if runtime.driver.is_none() {
-        match Driver::spawn(state.driver_path.as_ref(), &state.daemon_socket).await {
+        // Metadata runs before approval on an ungranted daemon; once approval
+        // exists (persisted or freshly given this turn) the daemon gets the
+        // grant. There is no pre-approval daemon with the grant.
+        match Driver::spawn(
+            state.driver_path.as_ref(),
+            &state.daemon_socket,
+            runtime.granted,
+        )
+        .await
+        {
             Ok(driver) => runtime.driver = Some(driver),
             Err(err) => {
+                tracing::warn!(error = %err, "computer-use driver spawn failed");
                 state.clean_runtime(&mut runtime, false).await;
                 return error(err);
             }
@@ -439,24 +837,32 @@ async fn handle_call(
         )
         .await;
         if !matches!(result, Ok(Ok(()))) {
+            let detail = match &result {
+                Err(_) => format!("handshake timed out after {}s", START_TIMEOUT.as_secs()),
+                Ok(Err(err)) => format!("handshake failed: {err}"),
+                Ok(Ok(())) => unreachable!(),
+            };
+            tracing::warn!(error = %detail, "computer-use driver init failed");
             state.clean_runtime(&mut runtime, false).await;
-            return error("Could not initialize cua-driver; check installation and desktop access");
+            return error(format!("Could not initialize cua-driver: {detail}"));
         }
     }
     let driver = runtime.driver.as_mut().expect("initialized");
-    let result = if action == "help" || action == "describe" {
-        driver
-            .catalog(if action == "describe" {
-                args.get("name").and_then(Value::as_str)
-            } else {
-                None
-            })
-            .await
+    let result = if action == "help" {
+        driver.catalog(None).await
+    } else if action == "describe" {
+        driver.catalog(Some(&requested_names)).await
+    } else if action == "health_report" {
+        let metadata = driver.initialize_metadata();
+        driver.call(action, args).await.map(|mut result| {
+            attach_driver_metadata(&mut result, metadata);
+            result
+        })
     } else {
         driver.call(action, args).await
     };
     match result {
-        Ok(result) => result,
+        Ok(result) => normalize_driver_outcome(result),
         Err(err) => {
             turn.cancel();
             state.clean_runtime(&mut runtime, false).await;
@@ -475,9 +881,44 @@ struct Driver {
     // The serve daemon that owns the agent cursor overlay runloop. Present
     // only for the real driver; injected test fixtures stay on direct mcp.
     daemon: Option<Child>,
+    // Whether that daemon was spawned with --grant existing-profile. Fixed
+    // at spawn and only meaningful when daemon is Some; the engine tracks
+    // this explicitly instead of reading the child's argv back.
+    existing_profile_granted: bool,
+    // Negotiated MCP initialize contract, retained from the handshake.
+    initialize: InitializeInfo,
+    // Full tools/list result reused while the negotiated capabilities prove
+    // the list cannot change. Cleared with the driver at turn teardown.
+    tools_list_cache: Option<Value>,
+    // Configured or resolved invocation path, reported for operators.
+    exe_path: PathBuf,
+    // Canonical target of `exe_path`; this is the file hashed and spawned.
+    exe_canonical_path: PathBuf,
+    exe_sha256: String,
 }
 
 impl Driver {
+    /// Grant state of the live serve daemon, if this driver runs one.
+    /// Drivers without a daemon (injected fixtures) return None.
+    fn daemon_grant(&self) -> Option<bool> {
+        self.daemon.as_ref().map(|_| self.existing_profile_granted)
+    }
+
+    /// A driver whose retained capabilities declare a `tools` capability
+    /// without `listChanged: true` cannot change its tool list for the life of
+    /// this connection: MCP only publishes list-change notifications when the
+    /// capability sets `listChanged`. That covers the real cua-driver
+    /// `capabilities: {"tools": {}}` handshake, where the optional flag is
+    /// absent and therefore false. A missing tools capability or
+    /// `listChanged: true` keeps discovery on every help/describe call.
+    fn tools_list_cacheable(&self) -> bool {
+        self.initialize
+            .capabilities
+            .get("tools")
+            .and_then(Value::as_object)
+            .is_some_and(|tools| tools.get("listChanged").and_then(Value::as_bool) != Some(true))
+    }
+
     fn base_command(exe: &std::path::Path) -> Command {
         let mut command = Command::new(exe);
         command
@@ -512,31 +953,67 @@ impl Driver {
         command
     }
 
-    async fn spawn(path: Option<&PathBuf>, daemon_socket: &PathBuf) -> CuaResult<Self> {
+    /// Pure argument construction for the real driver's serve daemon, so
+    /// tests can assert policy-critical flags without spawning a process.
+    fn serve_command(exe: &std::path::Path, daemon_socket: &PathBuf, grant: bool) -> Command {
+        let mut command = Self::base_command(exe);
+        command
+            .arg("serve")
+            .arg("--socket")
+            .arg(daemon_socket)
+            .arg("--permission-mode")
+            .arg("standard");
+        // The engine's own approval question already disclosed attaching
+        // to an existing logged-in Chromium profile; this narrow grant
+        // admits only that standard-mode boundary. It is not unrestricted
+        // mode and does not bypass driver-level refusals. A daemon started
+        // for metadata before approval runs without it.
+        if grant {
+            command.arg("--grant").arg("existing-profile");
+        }
+        command
+            // serve owns the overlay; it does not read stdin.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null());
+        command
+    }
+
+    async fn spawn(
+        path: Option<&PathBuf>,
+        daemon_socket: &PathBuf,
+        grant_existing_profile: bool,
+    ) -> CuaResult<Self> {
         let exe = match path {
             Some(path) => path.clone(),
             None => resolve_driver_exe()?,
         };
+        // Resolve the invocation path before hashing and spawning, so the
+        // digest covers the file the kernel executes rather than a symlink.
+        // Never derive this from package metadata; an unreadable binary
+        // fails here.
+        let canonical_exe = canonical_executable(&exe)?;
+        let exe_sha256 = hash_executable(&canonical_exe).await?;
         // The real driver runs as a per-run serve daemon plus an mcp proxy so
         // the agent cursor overlay has a UI runloop. Injected test fixtures
-        // only implement stdio mcp, so they keep the single-process path.
-        let (daemon, mcp_socket) = if path.is_none() {
-            let mut daemon = Self::base_command(&exe);
-            daemon
-                .arg("serve")
-                .arg("--socket")
-                .arg(daemon_socket)
-                .arg("--permission-mode")
-                .arg("standard")
-                // serve owns the overlay; it does not read stdin.
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null());
-            let mut daemon = daemon
-                .spawn()
-                .map_err(|e| format!("Cannot start {} serve: {e}", exe.display()))?;
+        // only implement stdio mcp, so they keep the single-process path and
+        // have no daemon whose grant state could matter.
+        let (mut daemon, mcp_socket, existing_profile_granted) = if path.is_none() {
+            remove_socket_if_present(daemon_socket)?;
+            let mut daemon =
+                Self::serve_command(&canonical_exe, daemon_socket, grant_existing_profile)
+                    .spawn()
+                    .map_err(|e| format!("Cannot start {} serve: {e}", canonical_exe.display()))?;
             if let Some(mut stderr) = daemon.stderr.take() {
                 tokio::spawn(async move {
-                    let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+                    let mut line = String::new();
+                    let mut reader = BufReader::new(&mut stderr);
+                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let trimmed = line.trim_end();
+                        if !trimmed.is_empty() {
+                            tracing::warn!(target: "cua-driver-serve", "{trimmed}");
+                        }
+                        line.clear();
+                    }
                 });
             }
             // Wait for the daemon's socket to accept before proxying into it.
@@ -555,18 +1032,60 @@ impl Driver {
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            (Some(daemon), Some(daemon_socket.clone()))
+            (
+                Some(daemon),
+                Some(daemon_socket.clone()),
+                grant_existing_profile,
+            )
         } else {
-            (None, None)
+            // Injected fixtures record true: they run no serve daemon, so the
+            // ungranted-daemon restart logic in handle_call never applies.
+            (None, None, true)
         };
-        let mut child = Self::mcp_command(&exe, mcp_socket.as_ref())
+        let mut child = Self::mcp_command(&canonical_exe, mcp_socket.as_ref())
             .spawn()
-            .map_err(|e| format!("Cannot start {}: {e}", exe.display()))?;
+            .map_err(|e| format!("Cannot start {}: {e}", canonical_exe.display()))?;
+        // The real driver runs as native binaries; injected test fixtures are
+        // scripts executed through an interpreter, so only the native path
+        // verifies what the kernel executed. The verification reaps the child
+        // and daemon on failure instead of returning a hash the process never
+        // ran.
+        let exe_sha256 = if path.is_none() {
+            let daemon_pid = daemon.as_ref().and_then(Child::id);
+            let mcp_pid = child.id();
+            let Some((daemon_pid, mcp_pid)) = daemon_pid.zip(mcp_pid) else {
+                reap_spawned(&mut child, daemon.as_mut()).await;
+                return Err("cua-driver process id missing after spawn".into());
+            };
+            let identity = verify_running_executable(daemon_pid, &canonical_exe)
+                .and_then(|_| verify_running_executable(mcp_pid, &canonical_exe));
+            if let Err(err) = identity {
+                reap_spawned(&mut child, daemon.as_mut()).await;
+                return Err(err);
+            }
+            match running_executable_sha256(mcp_pid, &canonical_exe).await {
+                Ok(sha256) => sha256,
+                Err(err) => {
+                    reap_spawned(&mut child, daemon.as_mut()).await;
+                    return Err(err);
+                }
+            }
+        } else {
+            exe_sha256
+        };
         let stdin = child.stdin.take().ok_or("driver stdin missing")?;
         let stdout = child.stdout.take().ok_or("driver stdout missing")?;
         if let Some(mut stderr) = child.stderr.take() {
             tokio::spawn(async move {
-                let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+                let mut line = String::new();
+                let mut reader = BufReader::new(&mut stderr);
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        tracing::warn!(target: "cua-driver-mcp", "{trimmed}");
+                    }
+                    line.clear();
+                }
             });
         }
         Ok(Self {
@@ -575,6 +1094,12 @@ impl Driver {
             reader: BufReader::new(stdout),
             next_id: 0,
             daemon,
+            existing_profile_granted,
+            initialize: InitializeInfo::default(),
+            tools_list_cache: None,
+            exe_path: exe,
+            exe_canonical_path: canonical_exe,
+            exe_sha256,
         })
     }
 
@@ -608,14 +1133,45 @@ impl Driver {
     }
 
     async fn handshake(&mut self) -> CuaResult<()> {
-        self.request(
-            "initialize",
-            json!({"protocolVersion":"2024-11-05", "capabilities":{},
-            "clientInfo":{"name":"noches", "version":env!("CARGO_PKG_VERSION")}}),
-        )
-        .await?;
+        let result = self
+            .request(
+                "initialize",
+                json!({"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities":{},
+                "clientInfo":{"name":"noches", "version":env!("CARGO_PKG_VERSION")}}),
+            )
+            .await?;
+        self.initialize = parse_initialize_result(&result)?;
         self.send(json!({"jsonrpc":"2.0", "method":"notifications/initialized"}))
             .await
+    }
+
+    /// Trusted handshake metadata for managed help/diagnostic results. The
+    /// raw `instructions` prose stays in the driver struct; only a digest and
+    /// byte count are exposed so untrusted server text never reaches prompts.
+    fn initialize_metadata(&self) -> Value {
+        let instructions = self.initialize.instructions.as_ref().map(|text| {
+            let mut hasher = Sha256::new();
+            hasher.update(text.as_bytes());
+            json!({
+                "present": true,
+                "bytes": text.len(),
+                "sha256": format!("{:x}", hasher.finalize()),
+            })
+        });
+        json!({
+            "protocolVersion": &self.initialize.protocol_version,
+            "serverInfo": {
+                "name": &self.initialize.server_info.name,
+                "version": &self.initialize.server_info.version,
+            },
+            "capabilities": &self.initialize.capabilities,
+            "instructions": instructions,
+            "executable": {
+                "path": self.exe_path.to_string_lossy(),
+                "canonicalPath": self.exe_canonical_path.to_string_lossy(),
+                "sha256": &self.exe_sha256,
+            },
+        })
     }
 
     async fn call(&mut self, action: &str, args: Value) -> CuaResult<Value> {
@@ -623,27 +1179,74 @@ impl Driver {
             .await
     }
 
-    async fn catalog(&mut self, name: Option<&str>) -> CuaResult<Value> {
-        if name.is_some_and(|name| !ACTIONS.contains(&name)) {
-            return Err("Action is not exposed by Noches".into());
-        }
-        let list = self.request("tools/list", json!({})).await?;
-        let tools: Vec<_> = list
-            .get("tools")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|tool| {
-                tool.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|n| ACTIONS.contains(&n) && name.is_none_or(|wanted| n == wanted))
-            })
-            .cloned()
-            .collect();
-        Ok(
-            json!({"content":[{"type":"text","text":"Available managed computer-use tools. Use describe with args.name for a schema."}],
-            "structuredContent":{"tools":tools}}),
-        )
+    async fn catalog(&mut self, filter: Option<&[String]>) -> CuaResult<Value> {
+        let list = match &self.tools_list_cache {
+            Some(list) => list.clone(),
+            None => {
+                let list = self.request("tools/list", json!({})).await?;
+                if self.tools_list_cacheable() {
+                    self.tools_list_cache = Some(list.clone());
+                }
+                list
+            }
+        };
+        let tools: Vec<_> = match filter {
+            Some(wanted) => {
+                let available = list
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|tool| {
+                        tool.get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|n| ACTIONS.contains(&n))
+                    })
+                    .collect::<Vec<_>>();
+                let mut ordered = Vec::new();
+                for name in wanted {
+                    if let Some(tool) = available
+                        .iter()
+                        .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+                        && !ordered
+                            .iter()
+                            .any(|t: &Value| t.get("name").and_then(Value::as_str) == Some(name))
+                    {
+                        ordered.push((*tool).clone());
+                    }
+                }
+                ordered
+            }
+            None => list
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| ACTIONS.contains(&n))
+                })
+                .cloned()
+                .collect(),
+        };
+        let text = if filter.is_some() {
+            "Requested managed computer-use schemas. Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer; only scope=desktop with explicit disruption approval may use the real seat."
+        } else {
+            "Available managed computer-use tools. Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer; only scope=desktop with explicit disruption approval may use the real seat. Use describe with args.name or args.names for schemas."
+        };
+        // Keep the tools/list top-level contract metadata (`schema_version`,
+        // `capability_version`, enforcement inventory) alongside the filtered
+        // managed tools; the negotiated contract is part of the result.
+        let mut structured = match list {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        structured.remove("tools");
+        structured.insert("tools".into(), Value::Array(tools));
+        structured.insert("driver".into(), self.initialize_metadata());
+        Ok(json!({"content":[{"type":"text","text":text}],
+            "structuredContent": Value::Object(structured)}))
     }
 
     async fn kill(&mut self) -> CuaResult<()> {
@@ -661,6 +1264,20 @@ impl Driver {
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+}
+
+fn approval_question(device_id: &str, action: &str) -> String {
+    format!(
+        "Allow computer use on host {device_id} for this session? Requested action: {action}. One approval covers inspecting and controlling apps, pointer and keyboard input, screenshots and clipboard access on that host for the rest of this session, including visible desktop control. It also lets the driver attach DevTools to an existing logged-in Chromium-family browser profile when a tool requests browser_prepare on it.",
+    )
+}
+
+fn remove_socket_if_present(path: &std::path::Path) -> CuaResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("Could not remove stale {}: {err}", path.display())),
     }
 }
 

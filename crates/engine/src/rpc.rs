@@ -806,6 +806,9 @@ impl EngineRpc {
                 .map(drop),
             MutateParams::DeleteSpace { space_id } => {
                 let deleted = self.workspace.delete_space(&space_id).map_err(failed)?;
+                for chat_id in &deleted.chat_ids {
+                    self.sessions.forget_computer_use_approval(chat_id);
+                }
                 // Best-effort teardown of live runs we host for the deleted chats
                 // (the doc rows are already tombstoned; a straggler run would only
                 // write into an orphaned session doc).
@@ -867,6 +870,7 @@ impl EngineRpc {
                 Ok(())
             }
             MutateParams::DeleteChat { chat_id } => {
+                self.sessions.forget_computer_use_approval(&chat_id);
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
                 Ok(())

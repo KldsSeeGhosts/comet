@@ -1379,7 +1379,8 @@ async fn start_session(
             return Err(err);
         }
     };
-    tokio::spawn(session_loop(Session {
+    let supervisor_tx = event_tx.clone();
+    let session_task = tokio::spawn(session_loop(Session {
         child,
         rpc,
         incoming,
@@ -1394,7 +1395,27 @@ async fn start_session(
         kill_grace,
         stderr_tail,
     }));
+    supervise_session_task(session_task, supervisor_tx);
     Ok(event_rx)
+}
+
+pub(crate) fn supervise_session_task(
+    handle: tokio::task::JoinHandle<()>,
+    event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(err) = handle.await
+            && err.is_panic()
+        {
+            let panic_payload = err.into_panic();
+            let message = crate::extract_panic_message(&*panic_payload);
+            let _ = event_tx
+                .send(Err(HarnessError::Protocol(format!(
+                    "Pi session loop panicked: {message}"
+                ))))
+                .await;
+        }
+    })
 }
 
 struct Session {
@@ -2454,12 +2475,11 @@ fn render_value(value: &Value) -> Option<String> {
         return None;
     }
 
-    let mut text = text;
-    if text.len() > OUTPUT_CAP {
-        text.truncate(OUTPUT_CAP);
-        text.push_str("\n… output truncated");
-    }
-    Some(text)
+    Some(crate::cap_text_with_marker(
+        &text,
+        OUTPUT_CAP,
+        "\n… output truncated",
+    ))
 }
 
 fn string_field(value: &Value, names: &[&str]) -> String {
@@ -3044,6 +3064,66 @@ mod tests {
             render_value(&structured).as_deref(),
             Some("cleaned tool output")
         );
+    }
+
+    #[test]
+    fn render_value_caps_multibyte_text_safely() {
+        let fffc_text = "\u{fffc}".repeat(12000);
+        let rendered_fffc = render_value(&json!(fffc_text)).expect("rendered value present");
+        assert!(rendered_fffc.ends_with("\n… output truncated"));
+        let body_fffc = rendered_fffc.strip_suffix("\n… output truncated").unwrap();
+        assert!(body_fffc.len() <= OUTPUT_CAP);
+        assert_eq!(body_fffc.len(), 32766);
+        assert_eq!(body_fffc.chars().count(), 10922);
+
+        let ni_text = "\u{4f60}".repeat(12000);
+        let rendered_ni = render_value(&json!(ni_text)).expect("rendered value present");
+        assert!(rendered_ni.ends_with("\n… output truncated"));
+        let body_ni = rendered_ni.strip_suffix("\n… output truncated").unwrap();
+        assert!(body_ni.len() <= OUTPUT_CAP);
+        assert_eq!(body_ni.len(), 32766);
+        assert_eq!(body_ni.chars().count(), 10922);
+    }
+
+    #[tokio::test]
+    async fn supervise_session_task_propagates_panic_payload() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let panicking_task = tokio::spawn(async {
+            panic!("fatal parsing error \u{fffc} payload");
+        });
+        supervise_session_task(panicking_task, event_tx);
+        let event = event_rx.recv().await;
+        match event {
+            Some(Err(HarnessError::Protocol(msg))) => {
+                assert!(
+                    msg.contains("Pi session loop panicked: fatal parsing error \u{fffc} payload"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected HarnessError::Protocol with panic payload, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn supervise_session_task_preserves_normal_eof() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let normal_task = tokio::spawn(async {});
+        supervise_session_task(normal_task, event_tx);
+        let event = event_rx.recv().await;
+        assert!(event.is_none());
+    }
+
+    #[tokio::test]
+    async fn supervise_session_task_preserves_cancellation() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let task = tokio::spawn(async {
+            futures::future::pending::<()>().await;
+        });
+        task.abort();
+        let supervisor = supervise_session_task(task, event_tx);
+        let _ = supervisor.await;
+        let event = event_rx.recv().await;
+        assert!(event.is_none());
     }
 
     #[test]

@@ -2,28 +2,148 @@ use super::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn real_daemon_args_carry_serve_standard_mode_and_existing_profile_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("cua-driver");
+    std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+    let socket = dir.path().join("driver.sock");
+
+    let build_args = |grant: bool| {
+        let command = Driver::serve_command(&exe, &socket, grant);
+        let program = command.as_std().get_program().to_string_lossy();
+        assert!(program.ends_with("cua-driver"), "program: {program}");
+        command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<String>>()
+    };
+
+    // grant=false: metadata daemons run without the profile grant.
+    let ungranted = build_args(false);
+    let serve_pos = ungranted
+        .iter()
+        .position(|a| a == "serve")
+        .expect("serve arg");
+    assert_eq!(serve_pos, 0, "serve must be the subcommand, first arg");
+    let mode = ungranted
+        .iter()
+        .position(|a| a == "--permission-mode")
+        .expect("--permission-mode flag");
+    assert_eq!(ungranted[mode + 1], "standard", "mode must stay standard");
+    let socket_arg = ungranted
+        .iter()
+        .position(|a| a == "--socket")
+        .expect("--socket flag");
+    assert_eq!(ungranted[socket_arg + 1], socket.to_string_lossy());
+    assert!(
+        !ungranted.iter().any(|a| a == "--grant"),
+        "ungranted daemon must not carry --grant: {ungranted:?}"
+    );
+
+    // grant=true: exactly one existing-profile grant.
+    let granted = build_args(true);
+    assert_eq!(
+        granted.len(),
+        ungranted.len() + 2,
+        "grant adds only its flag pair"
+    );
+    let grants: Vec<usize> = granted
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--grant")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        grants,
+        vec![ungranted.len()],
+        "exactly one trailing --grant"
+    );
+    assert_eq!(granted[grants[0] + 1], "existing-profile", "grant value");
+}
+
+#[test]
+fn mcp_fixture_command_has_no_daemon_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("driver.py");
+    let socket = dir.path().join("driver.sock");
+
+    // Real-host path: the mcp child proxies through the daemon socket and
+    // must carry only mcp + --socket, never serve-side policy flags.
+    let proxied = Driver::mcp_command(&exe, Some(&socket));
+    let args: Vec<String> = proxied
+        .as_std()
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(args.first().map(String::as_str), Some("mcp"));
+    for flag in ["serve", "--permission-mode", "--grant"] {
+        assert!(
+            !args.iter().any(|a| a == flag),
+            "proxied mcp command must not carry daemon flag {flag}: {args:?}"
+        );
+    }
+    assert_eq!(args.iter().filter(|a| *a == "--socket").count(), 1);
+
+    // Injected fixture path: single-process stdio mcp, no socket at all.
+    let plain = Driver::mcp_command(&exe, None);
+    let args: Vec<String> = plain
+        .as_std()
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(args, vec!["mcp"], "fixture mcp command must stay bare");
+}
+
+#[test]
+fn approval_question_discloses_existing_profile_devtools_attachment() {
+    let text = approval_question("test-host", "list_windows");
+    assert!(text.contains("Allow computer use on host test-host for this session?"));
+    assert!(
+        text.contains("attach DevTools to an existing logged-in Chromium-family browser profile"),
+        "question must disclose existing-profile DevTools attachment: {text}"
+    );
+}
+
 fn manager(dir: &Path) -> ComputerUseManager {
+    manager_with_initialize(
+        dir,
+        r#"{"protocolVersion":"2024-11-05","serverInfo":{"name":"python-fixture","version":"1.2.3"},"capabilities":{"tools":{}},"instructions":"FIXTURE_INSTRUCTIONS_SENTINEL"}"#,
+    )
+}
+
+fn manager_with_initialize(dir: &Path, initialize: &str) -> ComputerUseManager {
     let path = dir.join("driver.py");
     std::fs::write(&path, r#"#!/usr/bin/python3
 import json, os, sys, time
 from pathlib import Path
+here = Path(__file__).parent
 log = Path(__file__).with_suffix('.log')
+init = json.loads((here / 'driver.init.json').read_text())
 for line in sys.stdin:
     req = json.loads(line)
     with log.open('a') as f:
         f.write(json.dumps(dict(req, pid=os.getpid())) + '\n')
     if 'id' not in req: continue
-    if req['method'] == 'initialize': result = {'protocolVersion':'2024-11-05'}
+    if req['method'] == 'initialize': result = init
     elif req['method'] == 'tools/list':
-        result = {'tools':[{'name':'click','inputSchema':{'type':'object'}}, {'name':'set_config'}]}
+        result = {'tools':[{'name':'click','inputSchema':{'type':'object'}}, {'name':'list_windows','inputSchema':{'type':'object'}}, {'name':'set_config'}],
+                  'schema_version':'1', 'capability_version':'1',
+                  'enforcement_adapters':[{'id':'fixture.adapter','state':'active'}]}
     else:
         assert req['method'] == 'tools/call'
         args = req['params']['arguments']
         if args.get('block'): time.sleep(60)
+        if isinstance(args.get('refusal'), dict):
+            structured = dict(args['refusal'])
+        else:
+            structured = {'args':args,'pid':os.getpid()}
         result = {'content':[{'type':'text','text':'你好'}, {'type':'image','mimeType':'image/png','data':'cG5n'}],
-                  'structuredContent':{'args':args,'pid':os.getpid()}, 'isError':args.get('refuse', False)}
+                  'structuredContent':structured, 'isError':args.get('refuse', False)}
     print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
 "#).unwrap();
+    std::fs::write(dir.join("driver.init.json"), initialize).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut manager = ComputerUseManager::new("test-host".into());
@@ -44,6 +164,18 @@ fn approval(allow: bool, count: Arc<AtomicUsize>) -> RequestInput {
     })
 }
 
+#[test]
+fn stale_daemon_socket_is_removed_idempotently() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("driver.sock");
+    std::fs::write(&socket, b"stale").unwrap();
+
+    remove_socket_if_present(&socket).unwrap();
+    remove_socket_if_present(&socket).unwrap();
+
+    assert!(!socket.exists());
+}
+
 async fn call(socket: &Path, action: &str, args: Value) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut stream = UnixStream::connect(socket).await.unwrap();
@@ -56,6 +188,16 @@ async fn call(socket: &Path, action: &str, args: Value) -> Value {
     })
     .await
     .expect("test bridge timed out")
+}
+
+/// Fixture request count by MCP method, as observed by the driver process.
+fn request_count(dir: &Path, method: &str) -> usize {
+    std::fs::read_to_string(dir.join("driver.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value.get("method").and_then(Value::as_str) == Some(method))
+        .count()
 }
 
 #[tokio::test]
@@ -84,7 +226,7 @@ async fn full_results_permissions_and_turn_lease() {
     let help = call(&a, "help", json!({})).await;
     assert_eq!(
         help["structuredContent"]["tools"].as_array().unwrap().len(),
-        1
+        2
     );
     assert_eq!(count.load(Ordering::SeqCst), 0);
     let result = call(
@@ -118,11 +260,479 @@ async fn full_results_permissions_and_turn_lease() {
     assert_eq!(call(&b, "list_windows", json!({})).await["isError"], false);
     bridge_b.turn_ended().await;
     bridge_a.turn_started();
-    assert_eq!(call(&a, "list_windows", json!({})).await["isError"], false);
-    assert_eq!(count.load(Ordering::SeqCst), 3, "a fresh turn asks again");
+    let resumed = call(&a, "list_windows", json!({})).await;
+    assert_eq!(resumed["isError"], false);
+    assert_ne!(
+        resumed["structuredContent"]["pid"].as_u64().unwrap(),
+        pid,
+        "a resumed turn re-acquires the lease behind a fresh driver"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        2,
+        "a session grant survives turn boundaries; only the driver and lease reset"
+    );
     bridge_a.finish().await;
     bridge_b.finish().await;
     assert!(!a.exists());
+}
+
+#[tokio::test]
+async fn structured_refusal_normalizes_to_error_and_preserves_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let (socket, bridge) = manager
+        .start_bridge(
+            "refuse",
+            "refuse",
+            approval(true, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // Replays the audited noches_session_export browser refusal verbatim: the
+    // driver returned status=refused without setting the tool-level
+    // execution-error flag, and nested every refusal field.
+    let refusal = json!({
+        "status": "refused",
+        "refusal": {
+            "code": "browser_consent_required",
+            "message": "this standalone browser profile requires explicit existing-profile approval before Cua can inspect its DevTools endpoint",
+            "detail": {
+                "next_action": "browser_prepare",
+                "reason": "consumer_profile_endpoint_requires_grant",
+                "supported_strategies": ["existing_profile"],
+            },
+        },
+    });
+    let result = call(&socket, "get_browser_state", json!({"refusal": refusal})).await;
+    assert_eq!(
+        result["isError"], true,
+        "a structured refusal is a failed tool execution: {result}"
+    );
+    assert_eq!(
+        result["structuredContent"], refusal,
+        "the nested refusal payload must be preserved verbatim"
+    );
+    assert_eq!(
+        result["content"][0]["text"], "你好",
+        "normalization must not replace the driver's evidence"
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn effect_refused_normalizes_with_its_driver_error_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let (socket, bridge) = manager
+        .start_bridge(
+            "effect-refuse",
+            "effect-refuse",
+            approval(true, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // Replays the audited `effect: refused` trace, which arrived with isError
+    // already set; the refusal payload must survive normalization untouched.
+    let outcome = json!({
+        "code": "background_unavailable",
+        "detail": "client_not_qualified",
+        "effect": "refused",
+        "ok": false,
+        "reason": "client_not_qualified",
+        "route": "synthetic_events",
+        "verified": false,
+    });
+    let result = call(
+        &socket,
+        "click",
+        json!({"refusal": outcome, "refuse": true}),
+    )
+    .await;
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(result["structuredContent"], outcome);
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn partial_unknown_and_unverifiable_outcomes_are_not_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let (socket, bridge) = manager
+        .start_bridge(
+            "uncertain",
+            "uncertain",
+            approval(true, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    for status in ["partial", "unknown", "unverifiable"] {
+        let result = call(
+            &socket,
+            "click",
+            json!({"refusal": {"status": status, "delivery_id": "d1"}}),
+        )
+        .await;
+        assert_ne!(
+            result["isError"], true,
+            "{status} delivery is uncertain, not a failed execution: {result}"
+        );
+        assert_eq!(result["structuredContent"]["status"], status);
+        assert_eq!(result["structuredContent"]["delivery_id"], "d1");
+    }
+    // `effect: unverifiable` is the documented outcome-only variant.
+    let effect = call(
+        &socket,
+        "click",
+        json!({"refusal": {"effect": "unverifiable", "delivery_id": "d2"}}),
+    )
+    .await;
+    assert_ne!(effect["isError"], true, "{effect}");
+    assert_eq!(effect["structuredContent"]["effect"], "unverifiable");
+    bridge.finish().await;
+}
+
+#[test]
+fn driver_outcome_precedence_is_consistent_for_is_error_and_status() {
+    use DriverOutcome::*;
+    let cases = [
+        (json!({"structuredContent": {"status": "refused"}}), Refused),
+        (
+            json!({"isError": true, "structuredContent": {"status": "refused"}}),
+            Refused,
+        ),
+        (
+            json!({"isError": true, "structuredContent": {"effect": "refused"}}),
+            Refused,
+        ),
+        (
+            json!({"isError": true, "structuredContent": {"refused": true}}),
+            Refused,
+        ),
+        (json!({"structuredContent": {"status": "error"}}), Error),
+        (json!({"structuredContent": {"status": "failed"}}), Error),
+        (json!({"isError": true}), Error),
+        (
+            json!({"structuredContent": {"status": "cancelled"}}),
+            Cancelled,
+        ),
+        (
+            json!({"isError": true, "structuredContent": {"status": "cancelled"}}),
+            Cancelled,
+        ),
+        (json!({"structuredContent": {"status": "partial"}}), Partial),
+        (
+            json!({"isError": true, "structuredContent": {"status": "partial"}}),
+            Error,
+        ),
+        (json!({"structuredContent": {"status": "unknown"}}), Unknown),
+        (
+            json!({"isError": true, "structuredContent": {"status": "unknown"}}),
+            Error,
+        ),
+        (
+            json!({"structuredContent": {"status": "unverifiable"}}),
+            Unverifiable,
+        ),
+        (
+            json!({"isError": true, "structuredContent": {"effect": "unverifiable"}}),
+            Error,
+        ),
+        (
+            json!({"structuredContent": {"status": "delivered"}}),
+            Delivered,
+        ),
+    ];
+    for (result, expected) in cases {
+        assert_eq!(
+            classify_driver_outcome(&result),
+            expected,
+            "result: {result}"
+        );
+    }
+}
+
+#[test]
+fn normalizer_promotes_only_refusals_and_errors() {
+    let refused = normalize_driver_outcome(json!({
+        "structuredContent": {"status": "refused", "refusal": {"code": "denied"}}
+    }));
+    assert_eq!(refused["isError"], true);
+    let uncertain = normalize_driver_outcome(json!({
+        "structuredContent": {"effect": "unverifiable", "delivery_id": "d1"}
+    }));
+    assert!(
+        uncertain.get("isError").is_none(),
+        "uncertain delivery must stay non-error: {uncertain}"
+    );
+}
+
+#[tokio::test]
+async fn help_retains_initialize_metadata_and_exact_executable_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let exe = dir.path().join("driver.py");
+    let canonical_exe = std::fs::canonicalize(&exe).unwrap();
+    let expected_sha = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(&canonical_exe).unwrap())
+    );
+    let (socket, bridge) = manager
+        .start_bridge(
+            "metadata",
+            "metadata",
+            approval(false, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let help = call(&socket, "help", json!({})).await;
+    assert_ne!(help["isError"], true, "{help}");
+    let driver = &help["structuredContent"]["driver"];
+    assert_eq!(driver["protocolVersion"], "2024-11-05");
+    assert_eq!(driver["serverInfo"]["name"], "python-fixture");
+    assert_eq!(driver["serverInfo"]["version"], "1.2.3");
+    assert_eq!(driver["capabilities"]["tools"], json!({}));
+    assert_eq!(driver["executable"]["path"], json!(exe.to_string_lossy()));
+    assert_eq!(
+        driver["executable"]["canonicalPath"],
+        json!(canonical_exe.to_string_lossy())
+    );
+    assert_eq!(driver["executable"]["sha256"], json!(expected_sha));
+    assert_eq!(driver["instructions"]["present"], true);
+    assert!(driver["instructions"]["bytes"].as_u64().unwrap() > 0);
+    assert!(
+        !serde_json::to_string(&help)
+            .unwrap()
+            .contains("FIXTURE_INSTRUCTIONS_SENTINEL"),
+        "raw server instructions must not reach the result: {help}"
+    );
+    // health_report carries the same trusted metadata for diagnostics.
+    let health = call(&socket, "health_report", json!({})).await;
+    assert_ne!(health["isError"], true, "{health}");
+    assert_eq!(
+        health["structuredContent"]["driver"]["executable"]["sha256"],
+        json!(expected_sha)
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn invalid_initialize_metadata_fails_the_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager_with_initialize(
+        dir.path(),
+        r#"{"serverInfo":{"name":"fixture"},"capabilities":{}}"#,
+    );
+    let (socket, bridge) = manager
+        .start_bridge(
+            "bad-init",
+            "bad-init",
+            approval(true, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let result = call(&socket, "list_windows", json!({})).await;
+    assert_eq!(result["isError"], true, "{result}");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("protocolVersion"),
+        "handshake failure must name the invalid field: {text}"
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn unsupported_negotiated_protocol_version_fails_the_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager_with_initialize(
+        dir.path(),
+        r#"{"protocolVersion":"1999-01-01","serverInfo":{"name":"python-fixture","version":"1.2.3"},"capabilities":{"tools":{"listChanged":false}}}"#,
+    );
+    let (socket, bridge) = manager
+        .start_bridge(
+            "bad-protocol",
+            "bad-protocol",
+            approval(true, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let result = call(&socket, "help", json!({})).await;
+    assert_eq!(result["isError"], true, "{result}");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("unsupported MCP protocol version 1999-01-01"),
+        "handshake failure must name the negotiated version: {text}"
+    );
+    assert!(
+        text.contains("2025-06-18"),
+        "the failure must name a supported version: {text}"
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn symlinked_driver_reports_invocation_and_canonical_executable_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("driver.py");
+    let invocation = dir.path().join("driver-link");
+    let mut manager = manager(dir.path());
+    std::os::unix::fs::symlink(&target, &invocation).unwrap();
+    manager.driver_path = Some(invocation.clone());
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    let expected_sha = format!("{:x}", Sha256::digest(std::fs::read(&target).unwrap()));
+
+    let (socket, bridge) = manager
+        .start_bridge(
+            "symlink",
+            "symlink",
+            approval(false, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let help = call(&socket, "help", json!({})).await;
+    assert_ne!(help["isError"], true, "{help}");
+    let executable = &help["structuredContent"]["driver"]["executable"];
+    assert_eq!(executable["path"], json!(invocation.to_string_lossy()));
+    assert_eq!(
+        executable["canonicalPath"],
+        json!(canonical.to_string_lossy()),
+        "canonical target must be reported, not only the symlink path"
+    );
+    assert_eq!(
+        executable["sha256"],
+        json!(expected_sha),
+        "the digest must cover the symlink target"
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn stable_tool_list_is_cached_with_contract_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let (socket, bridge) = manager
+        .start_bridge(
+            "cache",
+            "cache",
+            approval(false, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let help = call(&socket, "help", json!({})).await;
+    assert_ne!(help["isError"], true, "{help}");
+    let structured = &help["structuredContent"];
+    assert_eq!(structured["schema_version"], "1");
+    assert_eq!(structured["capability_version"], "1");
+    assert_eq!(
+        structured["enforcement_adapters"][0]["id"],
+        "fixture.adapter"
+    );
+    assert_eq!(request_count(dir.path(), "tools/list"), 1);
+
+    let describe = call(
+        &socket,
+        "describe",
+        json!({"names": ["list_windows", "click"]}),
+    )
+    .await;
+    assert_ne!(describe["isError"], true, "{describe}");
+    assert_eq!(describe["structuredContent"]["schema_version"], "1");
+    assert_eq!(describe["structuredContent"]["capability_version"], "1");
+    assert_eq!(
+        describe["structuredContent"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let help_again = call(&socket, "help", json!({})).await;
+    assert_ne!(help_again["isError"], true, "{help_again}");
+    assert_eq!(
+        request_count(dir.path(), "tools/list"),
+        1,
+        "an absent listChanged defaults to false and reuses one tools/list per live driver"
+    );
+
+    // The cache belongs to the driver, not the bridge: a fresh turn on the
+    // same bridge rediscovers the schema.
+    bridge.turn_ended().await;
+    bridge.turn_started();
+    let restarted = call(&socket, "help", json!({})).await;
+    assert_ne!(restarted["isError"], true, "{restarted}");
+    assert_eq!(
+        request_count(dir.path(), "tools/list"),
+        2,
+        "a fresh driver must discover tools/list again"
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn tool_list_capability_semantics_drive_the_cache() {
+    // MCP omits `listChanged` when the server cannot change its list, so the
+    // real cua-driver `capabilities: {tools: {}}` handshake caches. An absent
+    // tools capability or `listChanged: true` must keep discovering.
+    for (capabilities, expected) in [
+        (json!({"tools": {"listChanged": true}}), 2),
+        (json!({}), 2),
+        (json!({"tools": {"listChanged": false}}), 1),
+        (json!({"tools": {}}), 1),
+    ] {
+        let label = capabilities.to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let initialize = json!({
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {"name": "python-fixture", "version": "1.2.3"},
+            "capabilities": capabilities.clone(),
+        })
+        .to_string();
+        let manager = manager_with_initialize(dir.path(), &initialize);
+        let (socket, bridge) = manager
+            .start_bridge(
+                "capability",
+                "capability",
+                approval(false, Arc::new(AtomicUsize::new(0))),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let help = call(&socket, "help", json!({})).await;
+            assert_ne!(help["isError"], true, "{help}");
+        }
+        assert_eq!(
+            request_count(dir.path(), "tools/list"),
+            expected,
+            "capabilities {label} must produce {expected} tools/list requests"
+        );
+        bridge.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn running_executable_identity_and_hash_follow_the_executed_image() {
+    let current = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let expected = format!("{:x}", Sha256::digest(std::fs::read(&current).unwrap()));
+    let pid = std::process::id();
+    assert_eq!(
+        running_executable_sha256(pid, &current).await.unwrap(),
+        expected,
+        "the reported digest must come from the running image"
+    );
+    let other = current.with_file_name("definitely-not-the-running-binary");
+    let error = running_executable_sha256(pid, &other).await.unwrap_err();
+    assert!(
+        error.contains("instead of"),
+        "a process running another file must be refused: {error}"
+    );
 }
 
 #[tokio::test]
@@ -156,6 +766,17 @@ async fn denial_and_unreviewed_actions_fail_closed_without_holding_lease() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert!(lock(&manager.lease).is_none());
     assert!(!dir.path().join("driver.log").exists());
+    bridge.turn_ended().await;
+    bridge.turn_started();
+    assert_eq!(
+        call(&socket, "list_windows", json!({})).await["isError"],
+        true
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        2,
+        "a denial is per-turn; a fresh turn asks again"
+    );
     bridge.finish().await;
 }
 
@@ -283,5 +904,270 @@ async fn installed_driver_metadata_smoke() {
     );
     bridge.turn_ended().await;
     assert!(lock(&manager.lease).is_none());
+
+    bridge.turn_started();
+    let restarted = call(&socket, "health_report", json!({})).await;
+    assert_ne!(restarted["isError"], true, "{restarted}");
+    bridge.turn_ended().await;
     bridge.finish().await;
+}
+
+#[tokio::test]
+async fn positive_grant_persists_across_bridge_recreation_per_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let count = Arc::new(AtomicUsize::new(0));
+
+    // Chat 1, Bridge 1: first action triggers prompt (count -> 1).
+    let (socket1, bridge1) = manager
+        .start_bridge(
+            "chat-1",
+            "run-1",
+            approval(true, count.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let res1 = call(&socket1, "click", json!({"pid": 42})).await;
+    assert_eq!(res1["isError"], false);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    // Destroy bridge 1.
+    bridge1.finish().await;
+    assert!(!socket1.exists());
+    assert!(
+        lock(&manager.lease).is_none(),
+        "lease must be released when bridge is destroyed"
+    );
+
+    // Chat 1, Bridge 2: recreation inherits approval from manager; no second prompt (count stays 1).
+    let (socket2, bridge2) = manager
+        .start_bridge(
+            "chat-1",
+            "run-2",
+            approval(true, count.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let res2 = call(&socket2, "click", json!({"pid": 42})).await;
+    assert_eq!(res2["isError"], false);
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "second bridge for the same chat inherits approval without prompting"
+    );
+    bridge2.finish().await;
+    assert!(!socket2.exists());
+    assert!(
+        lock(&manager.lease).is_none(),
+        "lease must not be held merely because a chat has approval"
+    );
+
+    // Chat 2, Bridge 3: another chat is isolated; it must still prompt (count -> 2).
+    let (socket3, bridge3) = manager
+        .start_bridge(
+            "chat-2",
+            "run-1",
+            approval(true, count.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let res3 = call(&socket3, "click", json!({"pid": 42})).await;
+    assert_eq!(res3["isError"], false);
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        2,
+        "another chat must prompt independently"
+    );
+    bridge3.finish().await;
+    assert!(lock(&manager.lease).is_none());
+}
+
+#[tokio::test]
+async fn describe_accepts_name_and_names_and_rejects_invalid_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let (socket, bridge) = manager
+        .start_bridge(
+            "chat-desc",
+            "run-desc",
+            approval(false, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // 1. One name returns single schema
+    let res1 = call(&socket, "describe", json!({"name": "click"})).await;
+    assert_ne!(res1["isError"], true);
+    let tools1 = res1["structuredContent"]["tools"].as_array().unwrap();
+    assert_eq!(tools1.len(), 1);
+    assert_eq!(tools1[0]["name"], "click");
+    assert_match_pointer_digest(&res1["content"][0]["text"]);
+
+    // 2. Bounded names array returns multiple schemas in one tools/list response
+    let res2 = call(
+        &socket,
+        "describe",
+        json!({"names": ["click", "list_windows"]}),
+    )
+    .await;
+    assert_ne!(res2["isError"], true);
+    let tools2 = res2["structuredContent"]["tools"].as_array().unwrap();
+    assert_eq!(tools2.len(), 2);
+    assert_eq!(tools2[0]["name"], "click");
+    assert_eq!(tools2[1]["name"], "list_windows");
+    assert_match_pointer_digest(&res2["content"][0]["text"]);
+
+    // Preserves ordering
+    let res_rev = call(
+        &socket,
+        "describe",
+        json!({"names": ["list_windows", "click"]}),
+    )
+    .await;
+    assert_ne!(res_rev["isError"], true);
+    let tools_rev = res_rev["structuredContent"]["tools"].as_array().unwrap();
+    assert_eq!(tools_rev.len(), 2);
+    assert_eq!(tools_rev[0]["name"], "list_windows");
+    assert_eq!(tools_rev[1]["name"], "click");
+
+    // 3. Rejects unexposed action in name
+    let unexp1 = call(&socket, "describe", json!({"name": "set_config"})).await;
+    assert_eq!(unexp1["isError"], true);
+
+    // 4. Rejects unexposed action in names
+    let unexp2 = call(
+        &socket,
+        "describe",
+        json!({"names": ["click", "set_config"]}),
+    )
+    .await;
+    assert_eq!(unexp2["isError"], true);
+
+    // 5. Rejects unknown action name
+    let unk1 = call(&socket, "describe", json!({"name": "nonexistent"})).await;
+    assert_eq!(unk1["isError"], true);
+    let unk2 = call(
+        &socket,
+        "describe",
+        json!({"names": ["click", "nonexistent"]}),
+    )
+    .await;
+    assert_eq!(unk2["isError"], true);
+
+    // 6. Rejects mixed shapes (both name and names)
+    let mixed = call(
+        &socket,
+        "describe",
+        json!({"name": "click", "names": ["click"]}),
+    )
+    .await;
+    assert_eq!(mixed["isError"], true);
+
+    // 7. Rejects missing name and names
+    let empty_args = call(&socket, "describe", json!({})).await;
+    assert_eq!(empty_args["isError"], true);
+
+    // 8. Rejects empty names array
+    let empty_names = call(&socket, "describe", json!({"names": []})).await;
+    assert_eq!(empty_names["isError"], true);
+
+    // 9. Rejects non-string name
+    let bad_name = call(&socket, "describe", json!({"name": 123})).await;
+    assert_eq!(bad_name["isError"], true);
+
+    // 10. Rejects non-array names
+    let bad_names = call(&socket, "describe", json!({"names": "click"})).await;
+    assert_eq!(bad_names["isError"], true);
+
+    // 11. Rejects non-string element in names
+    let bad_elem = call(&socket, "describe", json!({"names": ["click", 123]})).await;
+    assert_eq!(bad_elem["isError"], true);
+
+    // 12. Rejects unexpected extra args
+    let extra = call(
+        &socket,
+        "describe",
+        json!({"name": "click", "unexpected": true}),
+    )
+    .await;
+    assert_eq!(extra["isError"], true);
+
+    // 13. Rejects bounded limit overflow (> 32)
+    let overflow = (0..33).map(|_| "click").collect::<Vec<_>>();
+    let bad_limit = call(&socket, "describe", json!({"names": overflow})).await;
+    assert_eq!(bad_limit["isError"], true);
+
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn revocation_clears_stored_grant_and_forces_existing_and_new_bridges_to_reprompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let count = Arc::new(AtomicUsize::new(0));
+
+    let (socket, bridge) = manager
+        .start_bridge(
+            "chat-revoke",
+            "run-1",
+            approval(true, count.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    // First action prompts and grants session approval.
+    let res = call(&socket, "click", json!({"pid": 10})).await;
+    assert_eq!(res["isError"], false);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    // Second action in same bridge uses cached approval without prompt.
+    let res2 = call(&socket, "click", json!({"pid": 10})).await;
+    assert_eq!(res2["isError"], false);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+
+    // Revoke approval synchronously.
+    assert!(manager.forget_computer_use_approval("chat-revoke"));
+    assert!(!manager.forget_computer_use_approval("chat-revoke"));
+
+    // Existing bridge's next non-metadata action prompts again.
+    let res3 = call(&socket, "click", json!({"pid": 10})).await;
+    assert_eq!(res3["isError"], false);
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+
+    // Tear down bridge and create a new bridge for the same chat after another revocation.
+    bridge.finish().await;
+    assert!(manager.forget_computer_use_approval("chat-revoke"));
+
+    let (socket2, bridge2) = manager
+        .start_bridge(
+            "chat-revoke",
+            "run-2",
+            approval(true, count.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let res4 = call(&socket2, "click", json!({"pid": 10})).await;
+    assert_eq!(res4["isError"], false);
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+
+    bridge2.finish().await;
+}
+
+fn assert_match_pointer_digest(text: &Value) {
+    let s = text.as_str().unwrap();
+    assert!(
+        s.contains("Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer"),
+        "expected pointer digest in {s}"
+    );
+    assert!(
+        s.contains("only scope=desktop with explicit disruption approval may use the real seat"),
+        "expected disruption guidance in {s}"
+    );
 }

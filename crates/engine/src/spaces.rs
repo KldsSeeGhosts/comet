@@ -49,10 +49,13 @@ struct SpaceEntry {
     folder_watch: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
+pub type OrphanRevocationCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct SpacesSyncInner {
     repos: Repos,
     workspace: WorkspaceHost,
     device_id: String,
+    on_orphan_deleted: OrphanRevocationCallback,
     entries: Mutex<HashMap<String, Arc<SpaceEntry>>>,
     /// Ends the supervisor loop eagerly on shutdown (weak refs alone only end
     /// it once the whole graph drops).
@@ -72,12 +75,18 @@ pub struct SpacesSync {
 impl SpacesSync {
     /// Build and start the sync loop: follows the workspace spaces watch and
     /// runs the repair tick. Requires a tokio runtime.
-    pub fn start(repos: Repos, workspace: WorkspaceHost, device_id: &str) -> Self {
+    pub fn start(
+        repos: Repos,
+        workspace: WorkspaceHost,
+        device_id: &str,
+        on_orphan_deleted: OrphanRevocationCallback,
+    ) -> Self {
         let sync = Self {
             inner: Arc::new(SpacesSyncInner {
                 repos,
                 workspace: workspace.clone(),
                 device_id: device_id.to_string(),
+                on_orphan_deleted,
                 entries: Mutex::new(HashMap::new()),
                 cancel: CancellationToken::new(),
                 supervisor: Mutex::new(None),
@@ -273,8 +282,14 @@ fn sweep_orphans(inner: &Arc<SpacesSyncInner>) {
             continue;
         }
         tracing::info!(chat = %chat.id, space = %space_id, "deleting orphaned chat (space gone)");
-        if let Err(err) = inner.workspace.delete_chat(&chat.id) {
-            tracing::warn!(chat = %chat.id, error = %err, "spaces: orphan delete failed");
+        match inner.workspace.delete_chat(&chat.id) {
+            Ok(true) => {
+                (inner.on_orphan_deleted)(&chat.id);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(chat = %chat.id, error = %err, "spaces: orphan delete failed");
+            }
         }
     }
 }

@@ -862,6 +862,15 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    /// Revoke session computer-use approval for a specific chat.
+    ///
+    /// Returns true if an approval grant was present and removed.
+    pub fn forget_computer_use_approval(&self, chat_id: &str) -> bool {
+        self.inner
+            .computer_use
+            .forget_computer_use_approval(chat_id)
+    }
+
     /// Boot recovery: for every journal whose last event is not `Done` (a run died
     /// mid-stream), stamp this device's abandoned `streaming` doc entries `aborted`
     /// with a VISIBLE "Run interrupted by engine restart" error part, close the
@@ -2393,7 +2402,8 @@ async fn drive_run(
             // harness PARKS instead of ending — child + mailbox stay warm for
             // the next routed dispatch; per-turn state resets for it. The
             // computer-use socket stays available, but the driver and lease
-            // are released. The next turn needs fresh approval.
+            // are released. Session approval survives; the next turn
+            // re-acquires the lease and driver without asking again.
             if *status == DoneStatus::Completed && steerable && !interrupted {
                 if let Some(bridge) = &bridge {
                     bridge.turn_ended().await;

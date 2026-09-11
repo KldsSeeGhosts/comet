@@ -294,7 +294,15 @@ impl EngineCore {
         sessions.set_turn_listener(Arc::new(move |chat_id, cwd| {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
-        let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        let sessions_for_orphans = sessions.clone();
+        let spaces_sync = SpacesSync::start(
+            repos.clone(),
+            workspace.clone(),
+            &device_id,
+            Arc::new(move |chat_id| {
+                sessions_for_orphans.forget_computer_use_approval(chat_id);
+            }),
+        );
         Ok(Self {
             sessions,
             doc_host,

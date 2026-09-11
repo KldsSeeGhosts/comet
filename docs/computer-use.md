@@ -17,20 +17,25 @@ implementation is `crates/engine/src/computer_use.rs`.
 ## Permissions and ownership
 
 - The first app inspection or control request asks through Noches' native
-  question UI. One approval covers the engine host for the current turn:
+  question UI. One approval covers the engine host for the current session:
   inspecting and controlling apps, pointer and keyboard input, screenshots
   and clipboard access, including visible desktop control. It is not a
-  per-app allowlist.
+  per-app allowlist. A denial lasts until the turn ends; a fresh turn may
+  ask again.
 - One chat at a time can hold this engine's desktop lease. It covers the
   whole active turn, including pauses between tool calls, rather than just
   individual clicks. Other chats receive a busy error.
 - Turn completion closes the driver session, reaps the driver and releases
-  the lease. A parked Pi process keeps its bridge socket, but no desktop
-  permissions or driver. The next turn needs fresh approval.
+  the lease. A parked Pi process keeps its bridge socket and its approval,
+  but no desktop lease or driver. The next turn re-acquires both without
+  asking again.
 - On a real host the engine runs `cua-driver serve` behind the MCP child for
-  the length of the turn. The daemon owns the agent cursor overlay runloop,
-  so the synthetic cursor renders on screen instead of only updating in
-  memory. Both processes are reaped before the lease is released.
+  the length of the turn. Metadata asked before approval starts a daemon
+  without `--grant existing-profile`; that daemon never has the grant, and
+  it is replaced by a granted daemon once approval exists. The daemon owns
+  the agent cursor overlay runloop, so the synthetic
+  cursor renders on screen instead of only updating in memory. Both
+  processes are reaped before the lease is released.
 - Stop, a disconnected tool caller, transport failure or timeout cancels
   outstanding work. The Linux driver process is killed and reaped before
   its lease is released. Already delivered input cannot be undone. Unknown
@@ -38,11 +43,20 @@ implementation is `crates/engine/src/computer_use.rs`.
 - The engine stamps its own session label. Session lifecycle tools,
   configuration changes, recordings and unreviewed actions are not exposed.
   `help` and `describe` use MCP `tools/list`, not nonexistent driver tools.
+- `help` and `health_report` expose the MCP handshake contract the engine
+  retained: negotiated protocol version, server identity, capabilities, and
+  the exact executable path and SHA-256 actually spawned. Optional server
+  instructions are retained as a digest only and never reach a model prompt.
 
-Driver authorization stays in `standard` mode. Inherited `CUA_*` environment
-settings are removed before launching the child, then standard mode and
-Wayland support are set explicitly. Driver-level permission refusals remain
-errors; a Noches grant does not bypass them.
+Driver authorization stays in `standard` mode. A daemon started after
+approval carries the narrow `--grant existing-profile`, which only admits
+attaching DevTools to an existing logged-in Chromium-family profile after
+the user approved computer use for the session; a pre-approval metadata
+daemon never carries the grant and is replaced by a granted one when
+approval arrives. Inherited `CUA_*` environment settings are removed
+before launching the child, then standard mode, that grant and Wayland
+support are set explicitly. Driver-level permission refusals remain errors;
+a Noches grant does not bypass them.
 
 The socket directory is private, mode 0700, and the socket is mode 0600.
 Each run gets a distinct connection and identity. No computer-use endpoint
@@ -63,10 +77,23 @@ to install the adapter prevents that Pi process from starting.
 Full MCP text, images and structured results reach the adapter. Structured
 results are both retained in tool details and included in model-readable
 text, so accessibility tokens and delivery facts survive. Combined text is
-capped at 50KB or 2000 lines. Larger text is saved in a private temporary
-file, with its path in the tool result. These local result files remain
-available until removed or cleaned by the operating system. Treat them as
-sensitive app content.
+capped at 50KB or 2000 lines. A truncated result is exported as two private
+files: `result.txt` holds the human-readable text and `result.json` holds a
+valid JSON document with the action and full structured content. The
+directory is mode 0700 and both files are mode 0600, and the tool result
+carries both paths. These local result files remain available until removed
+or cleaned by the operating system. Treat them as sensitive app content.
+
+The adapter normalizes the driver's structured outcome model. A structured
+refusal (`status: refused`, `effect: refused`, or `refused: true`) becomes a
+failed Pi tool execution while the full refusal payload, reason code,
+permitted next action and approval metadata stay in the result. The audited
+driver nests those fields under `refusal: {code, message, detail: {reason,
+next_action, supported_strategies}}`; the adapter reads that layout and the
+older flat one. A refusal classification outranks the generic `isError` flag,
+while partial, unknown and unverifiable deliveries stay non-errors only when
+the driver did not set `isError`. Uncertain deliveries report uncertain
+delivery and are never replayed automatically.
 
 ## Installation and limits
 

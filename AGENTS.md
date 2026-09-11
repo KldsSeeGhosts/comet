@@ -7,10 +7,14 @@ checked-out branch. Full contract: `docs/dev-prod-workflow.md`.
 
 - `dev` is the development branch; `main` is the release branch. Do work on
   `dev`, merge to `main` via PR.
-- dev: `cargo build --release --features dev` -> `zeron-dev` (app_id
+- dev: `cargo build --features dev` -> `zeron-dev` (debug profile; app_id
   `zeron-dev`, data `~/.zeron-dev`, IPC `27655`, `zeron-dev.service`).
+  `./dev.sh` runs the full iteration loop (build -> install -> restart ->
+  relaunch). Use `cargo check -p zeron --features dev` for fast verification
+  and `./install.sh --dev --release` for a pre-merge optimized check.
 - prod: `cargo build --release` -> `zeron` (app_id `zeron`, data `~/.zeron`,
-  IPC `27654`, `zeron.service`).
+  IPC `27654`, `zeron.service`). Prod is only built on clean `main`; normal
+  releases come from CI + `zeron update`.
 - **Variant rule:** on `dev`, build/verify the dev variant only; prod binary
   only on clean `main`. The distinct app_id + IPC port + data dir keep the two
   fully isolated — never let a dev engine touch `~/.zeron`.
@@ -20,6 +24,8 @@ checked-out branch. Full contract: `docs/dev-prod-workflow.md`.
 After a major change, install the selected variant (do not stop after tests):
 
 ```bash
+./dev.sh                # dev: debug build + install + restart + relaunch
+# or, for a release-profile check:
 ./install.sh            # dev on `dev`, prod on clean `main`
 systemctl --user restart zeron-dev.service   # or zeron.service for prod
 ```

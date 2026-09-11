@@ -875,6 +875,37 @@ enum AccountMenuAction {
 
 const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Transient sidebar confirmations (link copied, session id copied) clear
+/// themselves; failure notices stay until clicked.
+const SIDEBAR_TOAST_TTL: Duration = Duration::from_secs(4);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeKind {
+    Error,
+    Toast,
+}
+
+#[derive(Debug, Clone)]
+struct SidebarNotice {
+    kind: NoticeKind,
+    text: SharedString,
+}
+
+impl SidebarNotice {
+    fn error(text: impl Into<SharedString>) -> Self {
+        Self {
+            kind: NoticeKind::Error,
+            text: text.into(),
+        }
+    }
+
+    fn toast(text: impl Into<SharedString>) -> Self {
+        Self {
+            kind: NoticeKind::Toast,
+            text: text.into(),
+        }
+    }
+}
 
 /// Wait until a stopped daemon can no longer win the next bootstrap probe and
 /// has released the data directory for the replacement runtime.
@@ -1232,8 +1263,9 @@ pub struct Shell {
     /// strikethrough wipe off wall-clock elapsed, cleaned when an item
     /// un-dones or the list reshapes.
     todo_done_at: std::collections::HashMap<(String, usize), std::time::Instant>,
-    /// Inline sidebar error strip (mutation failures); click dismisses.
-    sidebar_notice: Option<SharedString>,
+    /// Inline sidebar strip: mutation failures stick until clicked;
+    /// transient confirmations (`Toast`) auto-dismiss.
+    sidebar_notice: Option<SidebarNotice>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -1618,7 +1650,7 @@ impl Shell {
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
-            self.sidebar_notice = Some(notice.into());
+            self.sidebar_notice = Some(SidebarNotice::error(notice));
         }
         let next_sync_flow = {
             let state = state.read(cx);
@@ -2632,7 +2664,7 @@ impl Shell {
         self.composer
             .update(cx, |composer, cx| composer.load_text(text, cx));
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some("Engine not connected".into());
+            self.sidebar_notice = Some(SidebarNotice::error("Engine not connected"));
             cx.notify();
             return;
         };
@@ -2646,7 +2678,8 @@ impl Shell {
                 .await;
             if let Err(err) = reply {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("Rewind failed: {err}").into());
+                    shell.sidebar_notice =
+                        Some(SidebarNotice::error(format!("Rewind failed: {err}")));
                     cx.notify();
                 })
                 .ok();
@@ -3108,9 +3141,9 @@ impl Shell {
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.sidebar_notice = Some("Noches conversation link copied".into());
+            self.show_sidebar_toast("Noches conversation link copied", cx);
         } else {
-            self.sidebar_notice = Some("Conversation link is not ready yet".into());
+            self.sidebar_notice = Some(SidebarNotice::error("Conversation link is not ready yet"));
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -3126,7 +3159,7 @@ impl Shell {
             .and_then(crate::links::harness_conversation_link);
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link.url));
-            self.sidebar_notice = Some(format!("{} copied", link.label).into());
+            self.show_sidebar_toast(format!("{} copied", link.label), cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -3142,10 +3175,33 @@ impl Shell {
             .and_then(|chat| chat.harness_session_id.clone());
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(id));
-            self.sidebar_notice = Some("Harness session ID copied".into());
+            self.show_sidebar_toast("Harness session ID copied", cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
+    }
+
+    /// Show a transient sidebar confirmation that clears itself after
+    /// `SIDEBAR_TOAST_TTL`. The generation guards the timer so a newer notice
+    /// is never cleared by an older toast's expiry.
+    fn show_sidebar_toast(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let notice = SidebarNotice::toast(text);
+        self.sidebar_notice = Some(notice.clone());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SIDEBAR_TOAST_TTL).await;
+            this.update(cx, |shell, cx| {
+                let still_current = shell
+                    .sidebar_notice
+                    .as_ref()
+                    .is_some_and(|current| current.text == notice.text);
+                if still_current {
+                    shell.sidebar_notice = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
@@ -3393,14 +3449,14 @@ impl Shell {
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some("Engine not connected".into());
+            self.sidebar_notice = Some(SidebarNotice::error("Engine not connected"));
             cx.notify();
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
+                    shell.sidebar_notice = Some(SidebarNotice::error(format!("{err}")));
                     cx.notify();
                 })
                 .ok();
@@ -3666,8 +3722,9 @@ impl Shell {
                         if local {
                             shell.sync_flow = SyncFlow::Enabling;
                         }
-                        shell.sidebar_notice =
-                            Some(format!("Could not cancel sign-in: {err}").into());
+                        shell.sidebar_notice = Some(SidebarNotice::error(format!(
+                            "Could not cancel sign-in: {err}"
+                        )));
                     }
                 }
                 cx.notify();
@@ -3996,7 +4053,8 @@ impl Shell {
                     {
                         shell.sync_flow = SyncFlow::Idle;
                     }
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
+                    shell.sidebar_notice =
+                        Some(SidebarNotice::error(format!("Sign in failed: {err}")));
                     cx.notify();
                 }
             })
@@ -5364,8 +5422,13 @@ impl Shell {
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
             })
-            // Inline mutation-failure notice.
+            // Inline sidebar notice: failures (danger) stay until clicked;
+            // confirmations (toast tone) also clear on their own timer.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
+                let color = match notice.kind {
+                    NoticeKind::Error => theme.danger,
+                    NoticeKind::Toast => theme.text_muted,
+                };
                 el.child(
                     div()
                         .id("sidebar-notice")
@@ -5375,15 +5438,15 @@ impl Shell {
                         .py(px(4.0))
                         .rounded(px(Theme::CONTROL_RADIUS))
                         .border_1()
-                        .border_color(theme.danger)
+                        .border_color(color)
                         .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.danger)
+                        .text_color(color)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sidebar_notice = None;
                             cx.notify();
                         }))
-                        .child(notice),
+                        .child(notice.text),
                 )
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))

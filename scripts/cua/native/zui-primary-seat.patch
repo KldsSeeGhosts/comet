@@ -1,0 +1,502 @@
+diff --git a/crates/gpui_linux/src/linux/wayland/client.rs b/crates/gpui_linux/src/linux/wayland/client.rs
+index 7b719e9..1a7ba8a 100644
+--- a/crates/gpui_linux/src/linux/wayland/client.rs
++++ b/crates/gpui_linux/src/linux/wayland/client.rs
+@@ -306,7 +306,8 @@ pub(crate) struct WaylandClientState {
+     globals: Globals,
+     pub gpu_context: GpuContext,
+     pub compositor_gpu: Option<CompositorGpuHint>,
+-    wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
++    wl_seat: wl_seat::WlSeat,
++    noches_seats: noches_seat_selection::Seats<wl_seat::WlSeat>,
+     wl_pointer: Option<wl_pointer::WlPointer>,
+     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
+     pinch_scale: f32,
+@@ -641,7 +642,8 @@ impl WaylandClient {
+         let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn).unwrap();
+         let qh = event_queue.handle();
+ 
+-        let mut seat: Option<wl_seat::WlSeat> = None;
++        let seat_names = noches_seat_names(&conn, &globals);
++        let mut noches_seats = noches_seat_selection::Seats::new();
+         #[allow(clippy::mutable_key_type)]
+         let mut in_progress_outputs = HashMap::default();
+         #[allow(clippy::mutable_key_type)]
+@@ -650,12 +652,10 @@ impl WaylandClient {
+             for global in list {
+                 match &global.interface[..] {
+                     "wl_seat" => {
+-                        seat = Some(globals.registry().bind::<wl_seat::WlSeat, _, _>(
+-                            global.name,
+-                            wl_seat_version(global.version),
+-                            &qh,
+-                            (),
+-                        ));
++                        let seat = globals.registry().bind::<wl_seat::WlSeat, _, _>(
++                            global.name, wl_seat_version(global.version), &qh, (),
++                        );
++                        noches_seats.insert(global.name, seat, seat_names.get(&global.name).cloned());
+                     }
+                     "wl_output" => {
+                         let output = globals.registry().bind::<wl_output::WlOutput, _, _>(
+@@ -708,7 +708,8 @@ impl WaylandClient {
+         let compositor_gpu = detect_compositor_gpu();
+         let gpu_context = Rc::new(RefCell::new(None));
+ 
+-        let seat = seat.unwrap();
++        let seat = noches_seats.current()
++            .expect("Wayland exposed no named ordinary input seat").0;
+         let globals = Globals::new(
+             globals,
+             common.foreground_executor.clone(),
+@@ -781,6 +782,7 @@ impl WaylandClient {
+             gpu_context,
+             compositor_gpu,
+             wl_seat: seat,
++            noches_seats,
+             wl_pointer: None,
+             wl_keyboard: None,
+             pinch_gesture: None,
+@@ -1247,19 +1249,12 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
+                 version,
+             } => match &interface[..] {
+                 "wl_seat" => {
+-                    if let Some(wl_pointer) = state.wl_pointer.take() {
+-                        wl_pointer.release();
+-                    }
+-                    if let Some(wl_keyboard) = state.wl_keyboard.take() {
+-                        wl_keyboard.release();
+-                    }
+-                    state.wl_seat.release();
+-                    state.wl_seat = registry.bind::<wl_seat::WlSeat, _, _>(
+-                        name,
+-                        wl_seat_version(version),
+-                        qh,
+-                        (),
++                    // Do not acquire input children before the seat's Name.
++                    // A new Cua seat must never replace the physical seat.
++                    let seat = registry.bind::<wl_seat::WlSeat, _, _>(
++                        name, wl_seat_version(version), qh, (),
+                     );
++                    state.noches_seats.insert(name, seat, None);
+                 }
+                 "wl_output" => {
+                     let output = registry.bind::<wl_output::WlOutput, _, _>(
+@@ -1276,8 +1271,12 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
+                 }
+                 _ => {}
+             },
+-            wl_registry::Event::GlobalRemove { name: _ } => {
+-                // TODO: handle global removal
++            wl_registry::Event::GlobalRemove { name } => {
++                if let Some(removed) = state.noches_seats.remove(name) {
++                    if removed != state.wl_seat { removed.release(); }
++                    state.noches_refresh_seat(qh);
++                }
++                // Output removal is handled separately from input-seat identity.
+             }
+             _ => {}
+         }
+@@ -1543,75 +1542,10 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for WaylandClie
+     }
+ }
+ 
+-impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
+-    fn event(
+-        state: &mut Self,
+-        seat: &wl_seat::WlSeat,
+-        event: wl_seat::Event,
+-        _: &(),
+-        _: &Connection,
+-        qh: &QueueHandle<Self>,
+-    ) {
+-        if let wl_seat::Event::Capabilities {
+-            capabilities: WEnum::Value(capabilities),
+-        } = event
+-        {
+-            let client = state.get_client();
+-            let mut state = client.borrow_mut();
+-            if capabilities.contains(wl_seat::Capability::Keyboard) {
+-                let keyboard = seat.get_keyboard(qh, ());
+-
+-                if let Some(text_input) = state.text_input.take() {
+-                    text_input.destroy();
+-                    state.ime_pre_edit = None;
+-                    state.composing = false;
+-                }
+-
+-                state.text_input = state
+-                    .globals
+-                    .text_input_manager
+-                    .as_ref()
+-                    .map(|text_input_manager| text_input_manager.get_text_input(seat, qh, ()));
+-
+-                if let Some(wl_keyboard) = &state.wl_keyboard {
+-                    wl_keyboard.release();
+-                }
+-
+-                state.wl_keyboard = Some(keyboard);
+-            }
+-            if capabilities.contains(wl_seat::Capability::Pointer) {
+-                let pointer = seat.get_pointer(qh, ());
+-
+-                if let Some(cursor_shape_device) = state.cursor_shape_device.take() {
+-                    cursor_shape_device.destroy();
+-                }
+-
+-                state.cursor_shape_device = state
+-                    .globals
+-                    .cursor_shape_manager
+-                    .as_ref()
+-                    .map(|cursor_shape_manager| cursor_shape_manager.get_pointer(&pointer, qh, ()));
+-
+-                state.pinch_gesture = state.globals.gesture_manager.as_ref().map(
+-                    |gesture_manager: &zwp_pointer_gestures_v1::ZwpPointerGesturesV1| {
+-                        gesture_manager.get_pinch_gesture(&pointer, qh, ())
+-                    },
+-                );
+-
+-                if let Some(wl_pointer) = &state.wl_pointer {
+-                    wl_pointer.release();
+-                }
+-
+-                state.wl_pointer = Some(pointer);
+-            }
+-        }
+-    }
+-}
+-
+ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
+     fn event(
+         this: &mut Self,
+-        _: &wl_keyboard::WlKeyboard,
++        keyboard: &wl_keyboard::WlKeyboard,
+         event: wl_keyboard::Event,
+         _: &(),
+         _: &Connection,
+@@ -1619,6 +1553,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
+     ) {
+         let client = this.get_client();
+         let mut state = client.borrow_mut();
++        if state.wl_keyboard.as_ref() != Some(keyboard) { return; }
+         match event {
+             wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                 state.repeat.characters_per_second = rate as u32;
+@@ -1948,6 +1883,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
+     ) {
+         let client = this.get_client();
+         let mut state = client.borrow_mut();
++        if state.wl_pointer.as_ref() != Some(wl_pointer) { return; }
+ 
+         match event {
+             wl_pointer::Event::Enter {
+@@ -2298,7 +2234,7 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
+ {
+     fn event(
+         this: &mut Self,
+-        _: &zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
++        gesture: &zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
+         event: <zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1 as Proxy>::Event,
+         _: &(),
+         _: &Connection,
+@@ -2308,6 +2244,7 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
+ 
+         let client = this.get_client();
+         let mut state = client.borrow_mut();
++        if state.pinch_gesture.as_ref() != Some(gesture) { return; }
+ 
+         let Some(window) = state.mouse_focused_window.clone() else {
+             return;
+@@ -2827,3 +2764,5 @@ mod tests {
+         );
+     }
+ }
++
++include!("zui_seat_runtime.rs");
+diff --git a/crates/gpui_linux/src/linux/wayland/seat_selection.rs b/crates/gpui_linux/src/linux/wayland/seat_selection.rs
+new file mode 100644
+index 0000000..2e03961
+--- /dev/null
++++ b/crates/gpui_linux/src/linux/wayland/seat_selection.rs
+@@ -0,0 +1,141 @@
++//! Primary-seat selection. Names are compatibility hints, not authorization.
++use std::collections::BTreeMap;
++
++pub(crate) fn synthetic(name: &str) -> bool {
++    ["Cua-Agent", "Cua-Test-Agent"].iter().any(|prefix| {
++        name == *prefix || name.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with('-'))
++    })
++}
++
++pub(crate) struct Entry<T> {
++    pub(crate) seat: T,
++    pub(crate) name: Option<String>,
++    pub(crate) capabilities: u32,
++}
++
++pub(crate) struct Seats<T> {
++    entries: BTreeMap<u32, Entry<T>>,
++    selected: Option<u32>,
++}
++
++impl<T: Clone + PartialEq> Seats<T> {
++    pub(crate) fn new() -> Self { Self { entries: BTreeMap::new(), selected: None } }
++    pub(crate) fn insert(&mut self, id: u32, seat: T, name: Option<String>) {
++        self.entries.entry(id).or_insert(Entry { seat, name, capabilities: 0 });
++        self.select();
++    }
++    fn eligible(entry: &Entry<T>) -> bool {
++        entry.name.as_deref().is_some_and(|name| !name.is_empty() && !synthetic(name))
++    }
++    fn select(&mut self) {
++        if self.selected.is_some_and(|id| self.entries.get(&id).is_some_and(Self::eligible)) {
++            return;
++        }
++        self.selected = self.entries.iter().find(|(_, entry)| Self::eligible(entry)).map(|(id, _)| *id);
++    }
++    pub(crate) fn name(&mut self, seat: &T, name: String) {
++        if let Some(entry) = self.entries.values_mut().find(|entry| &entry.seat == seat) {
++            entry.name = Some(name);
++        }
++        self.select();
++    }
++    pub(crate) fn capabilities(&mut self, seat: &T, capabilities: u32) {
++        if let Some(entry) = self.entries.values_mut().find(|entry| &entry.seat == seat) {
++            entry.capabilities = capabilities;
++        }
++    }
++    pub(crate) fn current(&self) -> Option<(T, u32)> {
++        self.entries.get(&self.selected?).map(|entry| (entry.seat.clone(), entry.capabilities))
++    }
++    pub(crate) fn contains(&self, seat: &T) -> bool {
++        self.entries.values().any(|entry| &entry.seat == seat)
++    }
++    pub(crate) fn remove(&mut self, id: u32) -> Option<T> {
++        let entry = self.entries.remove(&id)?;
++        self.select();
++        Some(entry.seat)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn agent_names_are_excluded_including_future_lanes() {
++        for name in ["Cua-Agent", "Cua-Agent-2", "Cua-Agent-12", "Cua-Test-Agent", "Cua-Test-Agent-3"] {
++            assert!(synthetic(name));
++        }
++        for name in ["seat0", "seat1", "Cua-Agency", "Cua-AgentX"] { assert!(!synthetic(name)); }
++    }
++    #[test]
++    fn unknown_name_cannot_take_input_before_name_arrives() {
++        let mut seats = Seats::new();
++        seats.insert(5, 5, None);
++        seats.capabilities(&5, 3);
++        assert_eq!(seats.current(), None);
++        seats.name(&5, "Cua-Agent".into());
++        assert_eq!(seats.current(), None);
++    }
++    #[test]
++    fn startup_order_does_not_select_agent() {
++        for order in [[1, 2, 3], [3, 2, 1], [2, 1, 3]] {
++            let mut seats = Seats::new();
++            for id in order { seats.insert(id, id, None); }
++            for id in order { seats.capabilities(&id, 3); }
++            for id in order { seats.name(&id, if id == 1 { "seat0" } else { "Cua-Agent" }.into()); }
++            assert_eq!(seats.current(), Some((1, 3)));
++        }
++    }
++    #[test]
++    fn ordinary_hotplug_does_not_replace_selected_seat() {
++        let mut seats = Seats::new();
++        seats.insert(20, 20, Some("seat0".into()));
++        seats.capabilities(&20, 3);
++        seats.insert(1, 1, Some("seat1".into()));
++        assert_eq!(seats.current(), Some((20, 3)));
++    }
++    #[test]
++    fn capability_changes_are_scoped_to_identity() {
++        let mut seats = Seats::new();
++        seats.insert(1, 1, Some("seat0".into()));
++        seats.insert(2, 2, Some("Cua-Agent".into()));
++        seats.capabilities(&1, 3);
++        seats.capabilities(&2, 0);
++        assert_eq!(seats.current(), Some((1, 3)));
++        seats.capabilities(&1, 0);
++        assert_eq!(seats.current(), Some((1, 0)));
++    }
++    #[test]
++    fn removal_selects_only_named_ordinary_fallback() {
++        let mut seats = Seats::new();
++        seats.insert(1, 1, Some("seat0".into()));
++        seats.insert(2, 2, Some("Cua-Agent".into()));
++        seats.insert(3, 3, None);
++        assert_eq!(seats.remove(1), Some(1));
++        assert_eq!(seats.current(), None);
++        seats.name(&3, "seat1".into());
++        assert_eq!(seats.current(), Some((3, 0)));
++    }
++    #[test]
++    fn reused_registry_id_has_no_inherited_name_or_capabilities() {
++        let mut seats = Seats::new();
++        seats.insert(1, 100, Some("seat0".into()));
++        seats.capabilities(&100, 3);
++        seats.remove(1);
++        seats.insert(1, 200, None);
++        seats.name(&100, "seat0".into());
++        seats.capabilities(&100, 3);
++        assert_eq!(seats.current(), None);
++        seats.name(&200, "Cua-Agent".into());
++        assert_eq!(seats.current(), None);
++    }
++    #[test]
++    fn removing_agent_does_not_change_physical_capabilities() {
++        let mut seats = Seats::new();
++        seats.insert(1, 1, Some("seat0".into()));
++        seats.capabilities(&1, 3);
++        seats.insert(2, 2, Some("Cua-Agent".into()));
++        seats.remove(2);
++        assert_eq!(seats.current(), Some((1, 3)));
++    }
++}
+diff --git a/crates/gpui_linux/src/linux/wayland/zui_seat_runtime.rs b/crates/gpui_linux/src/linux/wayland/zui_seat_runtime.rs
+new file mode 100644
+index 0000000..d7203f5
+--- /dev/null
++++ b/crates/gpui_linux/src/linux/wayland/zui_seat_runtime.rs
+@@ -0,0 +1,134 @@
++// Included by GPUI's Wayland client, after its normal definitions.
++#[path = "seat_selection.rs"]
++mod noches_seat_selection;
++
++#[derive(Default)]
++struct NochesSeatProbe {
++    names: std::collections::BTreeMap<u32, String>,
++}
++impl Dispatch<wl_seat::WlSeat, u32> for NochesSeatProbe {
++    fn event(state: &mut Self, _: &wl_seat::WlSeat, event: wl_seat::Event,
++             id: &u32, _: &Connection, _: &QueueHandle<Self>) {
++        if let wl_seat::Event::Name { name } = event { state.names.insert(*id, name); }
++    }
++}
++fn noches_seat_names(conn: &Connection, globals: &GlobalList) -> std::collections::BTreeMap<u32, String> {
++    // Use a separate queue before WaylandClientState exists. No physical input
++    // object is acquired until all initial seat names have arrived.
++    let mut queue = conn.new_event_queue::<NochesSeatProbe>();
++    let qh = queue.handle();
++    let mut probe = NochesSeatProbe::default();
++    let mut handles = Vec::new();
++    globals.contents().with_list(|list| {
++        for global in list.iter().filter(|global| global.interface == "wl_seat") {
++            handles.push(globals.registry().bind::<wl_seat::WlSeat, _, _>(
++                global.name, wl_seat_version(global.version), &qh, global.name));
++        }
++    });
++    queue.roundtrip(&mut probe).expect("Wayland seat-name discovery failed");
++    for seat in handles { seat.release(); }
++    probe.names
++}
++
++impl WaylandClientState {
++    fn noches_drop_pointer(&mut self) {
++        if let Some(gesture) = self.pinch_gesture.take() { gesture.destroy(); }
++        if let Some(cursor) = self.cursor_shape_device.take() { cursor.destroy(); }
++        if let Some(pointer) = self.wl_pointer.take() { pointer.release(); }
++        self.mouse_focused_window = None;
++        self.mouse_location = None;
++        self.cursor_hidden_window = None;
++        self.button_pressed = None;
++        self.continuous_scroll_delta = None;
++        self.discrete_scroll_delta = None;
++        self.scroll_event_received = false;
++        self.pinch_scale = 1.0;
++    }
++    fn noches_drop_keyboard(&mut self) {
++        if let Some(input) = self.text_input.take() { input.destroy(); }
++        if let Some(keyboard) = self.wl_keyboard.take() { keyboard.release(); }
++        self.repeat.current_id = self.repeat.current_id.wrapping_add(1);
++        self.repeat.current_keycode = None;
++        self.keyboard_focused_window = None;
++        self.keymap_state = None;
++        self.compose_state = None;
++        self.pre_edit_text = None;
++        self.ime_pre_edit = None;
++        self.composing = false;
++        self.last_ime_cursor_rectangle = None;
++        self.enter_token = None;
++        self.modifiers = Modifiers::default();
++        self.capslock = Capslock { on: false };
++    }
++    fn noches_drop_seat_devices(&mut self) {
++        self.noches_drop_pointer();
++        self.noches_drop_keyboard();
++        if let Some(device) = self.data_device.take() { device.release(); }
++        if let Some(device) = self.primary_selection.take() { device.destroy(); }
++        self.data_offers.clear();
++        self.primary_data_offer = None;
++        self.drag.data_offer = None;
++        self.drag.window = None;
++        self.serial_tracker = SerialTracker::new();
++    }
++    fn noches_refresh_seat(&mut self, qh: &QueueHandle<WaylandClientStatePtr>) {
++        let Some((seat, bits)) = self.noches_seats.current() else {
++            self.noches_drop_seat_devices();
++            // Retain the old wl_seat resource, with no input children, until a
++            // replacement arrives. Global removal does not destroy resources.
++            return;
++        };
++        if seat != self.wl_seat {
++            self.noches_drop_seat_devices();
++            if !self.noches_seats.contains(&self.wl_seat) { self.wl_seat.release(); }
++            self.wl_seat = seat.clone();
++            self.globals.seat = seat.clone();
++        }
++        if self.data_device.is_none() {
++            self.data_device = self.globals.data_device_manager.as_ref()
++                .map(|manager| manager.get_data_device(&seat, qh, ()));
++        }
++        if self.primary_selection.is_none() {
++            self.primary_selection = self.globals.primary_selection_manager.as_ref()
++                .map(|manager| manager.get_device(&seat, qh, ()));
++        }
++        let capabilities = wl_seat::Capability::from_bits_truncate(bits);
++        if capabilities.contains(wl_seat::Capability::Keyboard) {
++            if self.wl_keyboard.is_none() {
++                self.wl_keyboard = Some(seat.get_keyboard(qh, ()));
++                self.text_input = self.globals.text_input_manager.as_ref()
++                    .map(|manager| manager.get_text_input(&seat, qh, ()));
++            }
++        } else if self.wl_keyboard.is_some() {
++            self.noches_drop_keyboard();
++        }
++        if capabilities.contains(wl_seat::Capability::Pointer) {
++            if self.wl_pointer.is_none() {
++                let pointer = seat.get_pointer(qh, ());
++                self.cursor_shape_device = self.globals.cursor_shape_manager.as_ref()
++                    .map(|manager| manager.get_pointer(&pointer, qh, ()));
++                self.pinch_gesture = self.globals.gesture_manager.as_ref()
++                    .map(|manager| manager.get_pinch_gesture(&pointer, qh, ()));
++                self.wl_pointer = Some(pointer);
++            }
++        } else if self.wl_pointer.is_some() {
++            self.noches_drop_pointer();
++        }
++    }
++}
++
++impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
++    fn event(this: &mut Self, seat: &wl_seat::WlSeat, event: wl_seat::Event,
++             _: &(), _: &Connection, qh: &QueueHandle<Self>) {
++        let client = this.get_client();
++        let mut state = client.borrow_mut();
++        match event {
++            wl_seat::Event::Name { name } => state.noches_seats.name(seat, name),
++            wl_seat::Event::Capabilities { capabilities: WEnum::Value(capabilities) } => {
++                state.noches_seats.capabilities(seat, capabilities.bits());
++            }
++            _ => return,
++        }
++        state.noches_refresh_seat(qh);
++    }
++}
