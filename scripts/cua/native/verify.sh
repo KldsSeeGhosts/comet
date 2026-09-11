@@ -6,7 +6,7 @@ CUA="$(realpath "${2:?Cua checkout required}")"
 mkdir -p "$ROOT/native-test-results"
 exec > >(tee "$ROOT/native-test-results/verify.log") 2>&1
 sudo apt-get update -qq
-sudo apt-get install -y --no-install-recommends libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype-dev libvulkan-dev libasound2-dev libssl-dev libdbus-1-dev libx11-dev libxi-dev libxtst-dev libxcb1-dev libclang-dev pkg-config clang cmake ninja-build
+sudo apt-get install -y --no-install-recommends libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype-dev libvulkan-dev libasound2-dev libssl-dev libdbus-1-dev libx11-dev libxi-dev libxtst-dev libxcb1-dev libclang-dev libwebkit2gtk-4.1-dev libjson-glib-dev pkg-config clang cmake ninja-build
 rustup toolchain install 1.97.1 --profile minimal --component rustfmt
 export RUSTUP_TOOLCHAIN=1.97.1
 export CARGO_BUILD_JOBS=2
