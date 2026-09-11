@@ -429,6 +429,7 @@ async fn handle_call(
         match Driver::spawn(state.driver_path.as_ref(), &state.daemon_socket).await {
             Ok(driver) => runtime.driver = Some(driver),
             Err(err) => {
+                tracing::warn!(error = %err, "computer-use driver spawn failed");
                 state.clean_runtime(&mut runtime, false).await;
                 return error(err);
             }
@@ -439,8 +440,16 @@ async fn handle_call(
         )
         .await;
         if !matches!(result, Ok(Ok(()))) {
+            let detail = match &result {
+                Err(_) => format!("handshake timed out after {}s", START_TIMEOUT.as_secs()),
+                Ok(Err(err)) => format!("handshake failed: {err}"),
+                Ok(Ok(())) => unreachable!(),
+            };
+            tracing::warn!(error = %detail, "computer-use driver init failed");
             state.clean_runtime(&mut runtime, false).await;
-            return error("Could not initialize cua-driver; check installation and desktop access");
+            return error(format!(
+                "Could not initialize cua-driver: {detail}"
+            ));
         }
     }
     let driver = runtime.driver.as_mut().expect("initialized");
@@ -536,7 +545,15 @@ impl Driver {
                 .map_err(|e| format!("Cannot start {} serve: {e}", exe.display()))?;
             if let Some(mut stderr) = daemon.stderr.take() {
                 tokio::spawn(async move {
-                    let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+                    let mut line = String::new();
+                    let mut reader = BufReader::new(&mut stderr);
+                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let trimmed = line.trim_end();
+                        if !trimmed.is_empty() {
+                            tracing::warn!(target: "cua-driver-serve", "{trimmed}");
+                        }
+                        line.clear();
+                    }
                 });
             }
             // Wait for the daemon's socket to accept before proxying into it.
@@ -566,7 +583,15 @@ impl Driver {
         let stdout = child.stdout.take().ok_or("driver stdout missing")?;
         if let Some(mut stderr) = child.stderr.take() {
             tokio::spawn(async move {
-                let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+                let mut line = String::new();
+                let mut reader = BufReader::new(&mut stderr);
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        tracing::warn!(target: "cua-driver-mcp", "{trimmed}");
+                    }
+                    line.clear();
+                }
             });
         }
         Ok(Self {
