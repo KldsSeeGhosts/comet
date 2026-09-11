@@ -3,7 +3,7 @@
 # icon, and systemd user service. Mirrors the ProjectX dev/prod split.
 #
 # Variants:
-#   dev:  cargo build --release --features dev -> zeron-dev
+#   dev:  cargo build --features dev -> zeron-dev  (debug profile; --release opts in)
 #         app_id "zeron-dev", data dir ~/.zeron-dev, IPC 27655, zeron-dev.service
 #   prod: cargo build --release -> zeron
 #         app_id "zeron", data dir ~/.zeron, IPC 27654, zeron.service
@@ -11,7 +11,11 @@
 # Variant is chosen by the checked-out branch: `dev` -> dev, clean `main` ->
 # prod. Other branches or a detached HEAD require an explicit --dev.
 #
-# Usage: ./install.sh [--dev | --prod] [--with-tests]
+# Dev installs the incremental debug build (target/debug) by default — thin LTO
+# and symbol stripping are wasted on per-iteration rebuilds. Pass --release for
+# a pre-merge optimized check. Prod is always release.
+#
+# Usage: ./install.sh [--dev | --prod] [--release] [--with-tests]
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -59,6 +63,7 @@ repoint_current() {
 }
 
 variant=""
+release=false
 with_tests=false
 
 while [[ $# -gt 0 ]]; do
@@ -79,12 +84,16 @@ while [[ $# -gt 0 ]]; do
             variant="prod"
             shift
             ;;
+        --release)
+            release=true
+            shift
+            ;;
         --with-tests)
             with_tests=true
             shift
             ;;
         -h|--help)
-            echo "Usage: ./install.sh [--dev | --prod] [--with-tests]"
+            echo "Usage: ./install.sh [--dev | --prod] [--release] [--with-tests]"
             exit 0
             ;;
         *)
@@ -108,6 +117,7 @@ if [[ -z "$variant" ]]; then
 fi
 
 if [[ "$variant" == "prod" ]]; then
+    release=true
     if [[ "$current_branch" != "main" ]]; then
         echo "error: production build is only allowed on clean main branch (current branch: ${current_branch:-detached})" >&2
         exit 1
@@ -117,6 +127,14 @@ if [[ "$variant" == "prod" ]]; then
         echo "error: production build requires a clean git working tree (uncommitted or untracked changes detected)" >&2
         exit 1
     fi
+fi
+
+if [[ "$release" == true ]]; then
+    profile_args=(--release)
+    target_profile="release"
+else
+    profile_args=()
+    target_profile="debug"
 fi
 
 bin_dir="$HOME/.local/bin"
@@ -212,13 +230,13 @@ chmod 644 "$unit_tmp"
 
 # --- build ---
 if [[ "$with_tests" == true ]]; then
-    cargo test --all-targets --locked "${feature_args[@]}"
+    cargo test --all-targets --locked "${profile_args[@]}" "${feature_args[@]}"
 fi
-cargo build --release --locked -p zeron "${feature_args[@]}"
+cargo build --locked "${profile_args[@]}" -p zeron "${feature_args[@]}"
 
 # --- install binary into versioned app dir, repoint current ---
 mkdir -p "$target_ver_dir"
-install_atomic "target/release/zeron" "$target_bin" 755
+install_atomic "target/$target_profile/zeron" "$target_bin" 755
 repoint_current "$app_root" "$target_ver_dir"
 # PATH entry -> the variant's current build.
 ln -sf "$target_ver_dir/zeron" "$bin_dir/$name"
@@ -239,7 +257,7 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
 fi
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 
-echo "Installed $variant variant:"
+echo "Installed $variant variant ($target_profile build):"
 echo "  binary:  $bin_dir/$name -> $target_bin"
 echo "  desktop: $target_desktop (app_id $app_id)"
 echo "  icon:    $icons_dir/.../$name.{svg,png}"

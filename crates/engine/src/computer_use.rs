@@ -2,8 +2,13 @@
 //!
 //! A lease covers one active turn, not the lifetime of a parked Pi process.
 //! Interrupts, disconnected callers and turn boundaries cancel outstanding work
-//! before reaping the private Linux driver and releasing that lease.
+//! before reaping the private Linux driver and releasing that lease. Approval
+//! is session-scoped: it survives that teardown so a resumed turn re-acquires
+//! the lease and driver without asking again. On a real host the serve daemon
+//! carries the existing-profile grant only once that approval exists; metadata
+//! asked before approval runs on a daemon spawned without the grant.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -21,6 +26,7 @@ const RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEANUP_TIMEOUT: Duration = Duration::from_millis(750);
+const DESCRIBE_NAMES_LIMIT: usize = 32;
 
 // New driver tools need an explicit review before the agent can invoke them.
 const ACTIONS: &[&str] = &[
@@ -84,6 +90,7 @@ fn error(message: impl ToString) -> Value {
 
 pub struct ComputerUseManager {
     lease: Arc<Mutex<Option<String>>>,
+    approvals: Arc<Mutex<HashSet<String>>>,
     device_id: String,
     // Tests inject an executable rather than modifying the process environment.
     driver_path: Option<PathBuf>,
@@ -93,9 +100,17 @@ impl ComputerUseManager {
     pub fn new(device_id: String) -> Self {
         Self {
             lease: Arc::new(Mutex::new(None)),
+            approvals: Arc::new(Mutex::new(HashSet::new())),
             device_id,
             driver_path: None,
         }
+    }
+
+    /// Revoke session computer-use approval for a specific chat.
+    ///
+    /// Returns true if an approval grant was present and removed.
+    pub fn forget_computer_use_approval(&self, chat_id: &str) -> bool {
+        lock(&self.approvals).remove(chat_id)
     }
 
     pub async fn start_bridge(
@@ -122,11 +137,14 @@ impl ComputerUseManager {
         // Private endpoint for the per-run serve daemon that owns the agent
         // cursor overlay runloop; the MCP child proxies through it.
         let daemon_socket = dir.path().join("driver.sock");
+        let granted = lock(&self.approvals).contains(chat_id);
         let state = Arc::new(BridgeState {
+            chat_id: chat_id.to_string(),
             owner: format!("chat {chat_id}, run {run_id}"),
             label: format!("noches-{}", uuid::Uuid::new_v4()),
             device_id: self.device_id.clone(),
             lease: self.lease.clone(),
+            approvals: self.approvals.clone(),
             request_input,
             driver_path: self.driver_path.clone(),
             daemon_socket,
@@ -135,7 +153,10 @@ impl ComputerUseManager {
                 cancel: Arc::new(CancellationToken::new()),
             }),
             stop: CancellationToken::new(),
-            runtime: AsyncMutex::new(Runtime::default()),
+            runtime: AsyncMutex::new(Runtime {
+                granted,
+                ..Runtime::default()
+            }),
         });
         let task_state = state.clone();
         let task = tokio::spawn(async move {
@@ -183,17 +204,22 @@ struct Turn {
 #[derive(Default)]
 struct Runtime {
     driver: Option<Driver>,
-    // One whole-turn grant covers inspection, input and desktop control.
+    // One session-wide grant covers inspection, input and desktop control.
+    // It survives per-turn driver/lease teardown so a resumed turn does not
+    // re-ask. A denial stays per-turn and resets here, so a fresh turn may
+    // ask again.
     granted: bool,
     denied: bool,
     lease_held: bool,
 }
 
 struct BridgeState {
+    chat_id: String,
     owner: String,
     label: String,
     device_id: String,
     lease: Arc<Mutex<Option<String>>>,
+    approvals: Arc<Mutex<HashSet<String>>>,
     request_input: RequestInput,
     driver_path: Option<PathBuf>,
     daemon_socket: PathBuf,
@@ -235,7 +261,13 @@ impl BridgeState {
                 *owner = None;
             }
         }
-        *runtime = Runtime::default();
+        // The positive grant is session/chat-scoped and survives teardown; everything
+        // else (driver, lease marker, a denial) belongs to the turn or attempt.
+        let granted = lock(&self.approvals).contains(&self.chat_id);
+        *runtime = Runtime {
+            granted,
+            ..Runtime::default()
+        };
     }
 
     fn active(&self, turn: &CancellationToken) -> bool {
@@ -355,14 +387,13 @@ async fn approve(state: &BridgeState, runtime: &mut Runtime, action: &str) -> Cu
     if runtime.denied {
         return Err("Computer use denied for this turn".into());
     }
-    if runtime.granted {
+    if lock(&state.approvals).contains(&state.chat_id) {
+        runtime.granted = true;
         return Ok(());
     }
+    runtime.granted = false;
     let id = uuid::Uuid::new_v4().to_string();
-    let question = format!(
-        "Allow computer use on host {} for this turn? Requested action: {action}. One approval covers inspecting and controlling apps, pointer and keyboard input, screenshots and clipboard access on that host for the rest of this turn, including visible desktop control.",
-        state.device_id
-    );
+    let question = approval_question(&state.device_id, action);
     let answers = (state.request_input)(vec![UserInputQuestion {
         id: id.clone(),
         header: "Computer use".into(),
@@ -376,6 +407,7 @@ async fn approve(state: &BridgeState, runtime: &mut Runtime, action: &str) -> Cu
         .iter()
         .any(|a| a.question_id == id && a.labels == ["Allow"])
     {
+        lock(&state.approvals).insert(state.chat_id.clone());
         runtime.granted = true;
         Ok(())
     } else {
@@ -405,12 +437,76 @@ async fn handle_call(
         return error("Reserved session/policy arguments are not accepted");
     }
     map.insert("session".into(), json!(state.label));
+    let requested_names = if action == "describe" {
+        let has_name = map.contains_key("name");
+        let has_names = map.contains_key("names");
+        if has_name && has_names {
+            return error("describe accepts either name or names, not both");
+        }
+        if !has_name && !has_names {
+            return error("describe requires either name or names");
+        }
+        if let Some(unexpected) = map
+            .keys()
+            .find(|k| k.as_str() != "name" && k.as_str() != "names" && k.as_str() != "session")
+        {
+            return error(format!("Unexpected argument for describe: {unexpected}"));
+        }
+        if has_name {
+            let Some(name_str) = map.get("name").and_then(Value::as_str) else {
+                return error("args.name must be a string");
+            };
+            if !ACTIONS.contains(&name_str) {
+                return error(format!("Action is not exposed by Noches: {name_str}"));
+            }
+            vec![name_str.to_string()]
+        } else {
+            let Some(arr) = map.get("names").and_then(Value::as_array) else {
+                return error("args.names must be an array of action names");
+            };
+            if arr.is_empty() {
+                return error("args.names must not be empty");
+            }
+            if arr.len() > DESCRIBE_NAMES_LIMIT {
+                return error(format!(
+                    "args.names cannot exceed {DESCRIBE_NAMES_LIMIT} actions"
+                ));
+            }
+            let mut names = Vec::with_capacity(arr.len());
+            for item in arr {
+                let Some(item_str) = item.as_str() else {
+                    return error("args.names must contain only string action names");
+                };
+                if !ACTIONS.contains(&item_str) {
+                    return error(format!("Action is not exposed by Noches: {item_str}"));
+                }
+                names.push(item_str.to_string());
+            }
+            names
+        }
+    } else {
+        Vec::new()
+    };
     let mut runtime = state.runtime.lock().await;
     if !state.active(turn) {
         return error("Computer use is parked or cancelled; start a new turn");
     }
     let metadata = matches!(action, "help" | "describe" | "health_report");
     if !metadata {
+        // A daemon started for metadata before approval runs without the
+        // existing-profile grant. Restart it ungracefully before touching the
+        // lease so the approved action runs on a granted daemon. Injected
+        // fixtures run no daemon and skip this entirely.
+        if let Some(false) = runtime.driver.as_ref().and_then(Driver::daemon_grant) {
+            state.clean_runtime(&mut runtime, false).await;
+        }
+        // The cleanup must not leave an ungranted daemon behind; if one
+        // survives, fail closed instead of routing the action through it.
+        if let Some(false) = runtime.driver.as_ref().and_then(Driver::daemon_grant) {
+            return error(
+                "An ungranted daemon is still running after cleanup; restart computer use and start a new turn",
+            );
+        }
         if !runtime.lease_held {
             let mut lease = lock(&state.lease);
             if let Some(owner) = lease.as_ref() {
@@ -420,16 +516,26 @@ async fn handle_call(
             runtime.lease_held = true;
         }
         if let Err(err) = approve(state, &mut runtime, action).await {
-            // A first-use denial must not reserve the desktop for a parked chat.
+            // A denial must not reserve the desktop for a parked chat.
             if !runtime.granted {
-                *lock(&state.lease) = None;
-                runtime.lease_held = false;
+                let denied = runtime.denied;
+                state.clean_runtime(&mut runtime, false).await;
+                runtime.denied = denied;
             }
             return error(err);
         }
     }
     if runtime.driver.is_none() {
-        match Driver::spawn(state.driver_path.as_ref(), &state.daemon_socket).await {
+        // Metadata runs before approval on an ungranted daemon; once approval
+        // exists (persisted or freshly given this turn) the daemon gets the
+        // grant. There is no pre-approval daemon with the grant.
+        match Driver::spawn(
+            state.driver_path.as_ref(),
+            &state.daemon_socket,
+            runtime.granted,
+        )
+        .await
+        {
             Ok(driver) => runtime.driver = Some(driver),
             Err(err) => {
                 tracing::warn!(error = %err, "computer-use driver spawn failed");
@@ -454,14 +560,10 @@ async fn handle_call(
         }
     }
     let driver = runtime.driver.as_mut().expect("initialized");
-    let result = if action == "help" || action == "describe" {
-        driver
-            .catalog(if action == "describe" {
-                args.get("name").and_then(Value::as_str)
-            } else {
-                None
-            })
-            .await
+    let result = if action == "help" {
+        driver.catalog(None).await
+    } else if action == "describe" {
+        driver.catalog(Some(&requested_names)).await
     } else {
         driver.call(action, args).await
     };
@@ -485,9 +587,19 @@ struct Driver {
     // The serve daemon that owns the agent cursor overlay runloop. Present
     // only for the real driver; injected test fixtures stay on direct mcp.
     daemon: Option<Child>,
+    // Whether that daemon was spawned with --grant existing-profile. Fixed
+    // at spawn and only meaningful when daemon is Some; the engine tracks
+    // this explicitly instead of reading the child's argv back.
+    existing_profile_granted: bool,
 }
 
 impl Driver {
+    /// Grant state of the live serve daemon, if this driver runs one.
+    /// Drivers without a daemon (injected fixtures) return None.
+    fn daemon_grant(&self) -> Option<bool> {
+        self.daemon.as_ref().map(|_| self.existing_profile_granted)
+    }
+
     fn base_command(exe: &std::path::Path) -> Command {
         let mut command = Command::new(exe);
         command
@@ -522,27 +634,47 @@ impl Driver {
         command
     }
 
-    async fn spawn(path: Option<&PathBuf>, daemon_socket: &PathBuf) -> CuaResult<Self> {
+    /// Pure argument construction for the real driver's serve daemon, so
+    /// tests can assert policy-critical flags without spawning a process.
+    fn serve_command(exe: &std::path::Path, daemon_socket: &PathBuf, grant: bool) -> Command {
+        let mut command = Self::base_command(exe);
+        command
+            .arg("serve")
+            .arg("--socket")
+            .arg(daemon_socket)
+            .arg("--permission-mode")
+            .arg("standard");
+        // The engine's own approval question already disclosed attaching
+        // to an existing logged-in Chromium profile; this narrow grant
+        // admits only that standard-mode boundary. It is not unrestricted
+        // mode and does not bypass driver-level refusals. A daemon started
+        // for metadata before approval runs without it.
+        if grant {
+            command.arg("--grant").arg("existing-profile");
+        }
+        command
+            // serve owns the overlay; it does not read stdin.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null());
+        command
+    }
+
+    async fn spawn(
+        path: Option<&PathBuf>,
+        daemon_socket: &PathBuf,
+        grant_existing_profile: bool,
+    ) -> CuaResult<Self> {
         let exe = match path {
             Some(path) => path.clone(),
             None => resolve_driver_exe()?,
         };
         // The real driver runs as a per-run serve daemon plus an mcp proxy so
         // the agent cursor overlay has a UI runloop. Injected test fixtures
-        // only implement stdio mcp, so they keep the single-process path.
-        let (daemon, mcp_socket) = if path.is_none() {
+        // only implement stdio mcp, so they keep the single-process path and
+        // have no daemon whose grant state could matter.
+        let (daemon, mcp_socket, existing_profile_granted) = if path.is_none() {
             remove_socket_if_present(daemon_socket)?;
-            let mut daemon = Self::base_command(&exe);
-            daemon
-                .arg("serve")
-                .arg("--socket")
-                .arg(daemon_socket)
-                .arg("--permission-mode")
-                .arg("standard")
-                // serve owns the overlay; it does not read stdin.
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null());
-            let mut daemon = daemon
+            let mut daemon = Self::serve_command(&exe, daemon_socket, grant_existing_profile)
                 .spawn()
                 .map_err(|e| format!("Cannot start {} serve: {e}", exe.display()))?;
             if let Some(mut stderr) = daemon.stderr.take() {
@@ -574,9 +706,15 @@ impl Driver {
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            (Some(daemon), Some(daemon_socket.clone()))
+            (
+                Some(daemon),
+                Some(daemon_socket.clone()),
+                grant_existing_profile,
+            )
         } else {
-            (None, None)
+            // Injected fixtures record true: they run no serve daemon, so the
+            // ungranted-daemon restart logic in handle_call never applies.
+            (None, None, true)
         };
         let mut child = Self::mcp_command(&exe, mcp_socket.as_ref())
             .spawn()
@@ -602,6 +740,7 @@ impl Driver {
             reader: BufReader::new(stdout),
             next_id: 0,
             daemon,
+            existing_profile_granted,
         })
     }
 
@@ -650,27 +789,57 @@ impl Driver {
             .await
     }
 
-    async fn catalog(&mut self, name: Option<&str>) -> CuaResult<Value> {
-        if name.is_some_and(|name| !ACTIONS.contains(&name)) {
-            return Err("Action is not exposed by Noches".into());
-        }
+    async fn catalog(&mut self, filter: Option<&[String]>) -> CuaResult<Value> {
         let list = self.request("tools/list", json!({})).await?;
-        let tools: Vec<_> = list
-            .get("tools")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|tool| {
-                tool.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|n| ACTIONS.contains(&n) && name.is_none_or(|wanted| n == wanted))
-            })
-            .cloned()
-            .collect();
-        Ok(
-            json!({"content":[{"type":"text","text":"Available managed computer-use tools. Use describe with args.name for a schema."}],
-            "structuredContent":{"tools":tools}}),
-        )
+        let tools: Vec<_> = match filter {
+            Some(wanted) => {
+                let available = list
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|tool| {
+                        tool.get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|n| ACTIONS.contains(&n))
+                    })
+                    .collect::<Vec<_>>();
+                let mut ordered = Vec::new();
+                for name in wanted {
+                    if let Some(tool) = available
+                        .iter()
+                        .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+                    {
+                        if !ordered
+                            .iter()
+                            .any(|t: &Value| t.get("name").and_then(Value::as_str) == Some(name))
+                        {
+                            ordered.push((*tool).clone());
+                        }
+                    }
+                }
+                ordered
+            }
+            None => list
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| ACTIONS.contains(&n))
+                })
+                .cloned()
+                .collect(),
+        };
+        let text = if filter.is_some() {
+            "Requested managed computer-use schemas. Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer; only scope=desktop with explicit disruption approval may use the real seat."
+        } else {
+            "Available managed computer-use tools. Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer; only scope=desktop with explicit disruption approval may use the real seat. Use describe with args.name or args.names for schemas."
+        };
+        Ok(json!({"content":[{"type":"text","text":text}],
+            "structuredContent":{"tools":tools}}))
     }
 
     async fn kill(&mut self) -> CuaResult<()> {
@@ -689,6 +858,12 @@ impl Driver {
         }
         Ok(())
     }
+}
+
+fn approval_question(device_id: &str, action: &str) -> String {
+    format!(
+        "Allow computer use on host {device_id} for this session? Requested action: {action}. One approval covers inspecting and controlling apps, pointer and keyboard input, screenshots and clipboard access on that host for the rest of this session, including visible desktop control. It also lets the driver attach DevTools to an existing logged-in Chromium-family browser profile when a tool requests browser_prepare on it.",
+    )
 }
 
 fn remove_socket_if_present(path: &std::path::Path) -> CuaResult<()> {

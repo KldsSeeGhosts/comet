@@ -38,14 +38,23 @@ real Rust implementations and connects them to the existing tool handlers:
   pointer actions through the normal authorized tool dispatch path.
 - `wayland/mod.rs`: selected-output screencopy and a fix for another output's
   mode event overwriting the legacy selected output's dimensions.
+- `wayland/hyprland.rs` and `wayland/hyprland_input.rs`: resolve the active
+  Hyprland instance by matching its IPC peer to `WAYLAND_DISPLAY`. Noches can
+  keep running across a compositor relogin without using an obsolete inherited
+  `HYPRLAND_INSTANCE_SIGNATURE`.
+- `wayland/hyprland_compatibility.rs`: admit the installed
+  `zen-browser-bin 1.22b-1` package to exact-window independent-seat input.
+- `platform-linux/src/tools/impl_.rs` and `wayland/hyprland_input.rs`: route
+  `type_text` through the same background transaction as hotkeys and key
+  presses, with bounded all-ASCII prevalidation and partial-delivery records.
 - `cua-driver-core/src/action_target.rs`: preserve a named Linux desktop target
   rather than rejecting it or dropping its identity.
 
 The driver installer checks every expected source anchor before writing,
 backs up originals under the Cua checkout's `.git`, and verifies hashes on a
 second invocation. Unrelated local edits outside those anchors survive.
-`wayland/hyprland.rs` is not edited, so the existing screen-size patch remains.
-The installer refuses source drift or edits made after installation rather than
+The runtime repair edits separate anchors in `wayland/hyprland.rs`, so the
+existing screen-size patch remains. The installer refuses source drift or edits made after installation rather than
 resetting the repository or silently overwriting newer work.
 
 ## Build and install on the desktop
@@ -104,9 +113,10 @@ Then use coordinates measured from that PNG and the returned layout token:
 ```
 
 Repeat the observation for DP-2 and target DP-2 explicitly. Do not add monitor
-origins to PNG coordinates. The driver binds the physical input to the selected
-output and converts coordinates to global logical space only for the synthetic
-cursor overlay. For the stated layout, DP-1's native center maps to logical
+origins to PNG coordinates. The driver binds a compositor virtual pointer to
+the selected output. Hyprland routes it through the ordinary seat, so it moves
+the user's visible cursor and can change pointer focus. Noches refuses this
+route unless the user explicitly allows disruption. For the stated layout, DP-1's native center maps to logical
 `3584,720`; DP-2's center maps to `1152,648` when its compositor-reported logical
 size is `2304x1296`. The implementation uses xdg-output logical sizes, not a
 rounded integer scale or a combined framebuffer bounding box.
@@ -120,8 +130,12 @@ Named-display pointer operations cover move, click, right/double click through
 click's button/count, line scrolling, and a left-button drag within one output.
 Rotated outputs, cross-output drags, modified desktop clicks, and non-line
 scroll units are explicitly outside this initial repair. Use exact window
-targets for keyboard operations and existing window-local operations. The
-working per-window Hyprland plugin route is unchanged.
+targets for keyboard operations and existing window-local operations. Prefer
+browser tools for web tasks because CDP actions do not move the physical cursor
+or foreground the browser. Zen uses the exact-window Hyprland route because it
+does not expose Chromium DevTools. A background Zen window may share its process
+with the active Zen window. The plugin compares exact surfaces rather than
+rejecting every top-level owned by that process.
 
 ## Verification and remaining host checks
 

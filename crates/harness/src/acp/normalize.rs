@@ -23,19 +23,7 @@ fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_owned()
 }
 
-/// Truncate on a char boundary, marking the cut so the UI can say "truncated".
-pub(crate) fn cap_text(text: &str, cap: usize) -> String {
-    if text.len() <= cap {
-        return text.to_owned();
-    }
-    let mut end = cap;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = text[..end].to_owned();
-    out.push_str("\n… [truncated]");
-    out
-}
+pub(crate) use crate::cap_text;
 
 /// The text of a `ContentBlock` (`{type: "text", text}`); non-text blocks
 /// (image, audio, resource, resource_link) render as nothing.

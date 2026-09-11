@@ -50,18 +50,41 @@ if [[ -f "$DRIVER" ]]; then cp -L --reflink=auto "$DRIVER" "$BACKUP/cua-driver.b
 if [[ -f "$HOME/.local/bin/zeron-dev" ]]; then cp -L --reflink=auto "$HOME/.local/bin/zeron-dev" "$BACKUP/zeron-dev.before"; fi
 python3 "$ROOT/scripts/cua/native/apply_cua.py" "$CUA" --check
 python3 "$ROOT/scripts/cua/native/apply_cua.py" "$CUA"
+python3 "$ROOT/scripts/cua/native/apply_hyprland_runtime.py" "$CUA" --check
+python3 "$ROOT/scripts/cua/native/apply_hyprland_runtime.py" "$CUA"
+python3 "$ROOT/scripts/cua/native/apply_zen_background.py" "$CUA" --check
+python3 "$ROOT/scripts/cua/native/apply_zen_background.py" "$CUA"
+python3 "$ROOT/scripts/cua/native/apply_hyprland_text.py" "$CUA" --check
+python3 "$ROOT/scripts/cua/native/apply_hyprland_text.py" "$CUA"
+python3 "$ROOT/scripts/cua/native/apply_hyprland.py" "$CUA" --check
+python3 "$ROOT/scripts/cua/native/apply_hyprland.py" "$CUA"
+python3 "$ROOT/scripts/cua/native/apply_hyprland_same_client.py" "$CUA" --check
+python3 "$ROOT/scripts/cua/native/apply_hyprland_same_client.py" "$CUA"
+PLUGIN_ROOT="$CUA/libs/cua-driver/hyprland-plugin"
+PLUGIN_BUILD="$CUA/.git/noches-cua-build/hyprland-plugin"
+cmake -S "$PLUGIN_ROOT" -B "$PLUGIN_BUILD" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+  -DCUA_HYPRLAND_BUILD_PLUGIN=ON -DCUA_HYPRLAND_EXPECTED_VERSION=0.56.2 \
+  -DCUA_HYPRLAND_INPUT=ON -DCUA_HYPRLAND_TEST_INPUT=OFF \
+  -DCUA_HYPRLAND_INPUT_TRACE=OFF -DCUA_HYPRLAND_TEST_OPERATOR_KEY=
+cmake --build "$PLUGIN_BUILD"
+ctest --test-dir "$PLUGIN_BUILD" --output-on-failure --no-tests=error
 (
   cd "$DRIVER_ROOT"
   cargo test --target-dir "$DRIVER_ROOT/target" -p platform-linux --lib noches_display
+  cargo test --target-dir "$DRIVER_ROOT/target" -p platform-linux --lib wayland::hyprland::tests
+  cargo test --target-dir "$DRIVER_ROOT/target" -p platform-linux --lib wayland::hyprland_input::tests
+  cargo test --target-dir "$DRIVER_ROOT/target" -p platform-linux --lib wayland::hyprland_compatibility::tests
   cargo test --target-dir "$DRIVER_ROOT/target" -p cua-driver-core --lib action_target
   cargo build --release --target-dir "$DRIVER_ROOT/target" -p cua-driver
 )
 (
   cd "$ROOT"
+  node --experimental-vm-modules --test crates/harness/tests/noches-cua.test.mjs
   cargo build --locked --release --features dev --target-dir "$ROOT/target"
   cargo tree --locked --features dev -i gpui_linux
 )
-sha256sum "$DRIVER" "$ROOT/target/release/zeron"
+sha256sum "$DRIVER" "$ROOT/target/release/zeron" "$PLUGIN_BUILD/cua-hyprland-plugin.so"
 if ((INSTALL)); then
   cd "$ROOT"
   ./install.sh
@@ -73,7 +96,9 @@ if ((INSTALL)); then
   cmp "$ROOT/target/release/zeron" "$HOME/.local/bin/zeron-dev"
   cmp "$ROOT/target/release/zeron" "/proc/$PID/exe"
   sha256sum "$ROOT/target/release/zeron" "$HOME/.local/bin/zeron-dev" "/proc/$PID/exe"
-  echo 'Dev binary installation verified. Test physical input and desktop targeting on both outputs.'
+  echo "Dev binary installation verified. Repaired Hyprland plugin staged at $PLUGIN_BUILD/cua-hyprland-plugin.so."
+  echo 'The loaded compositor module is unchanged until a deliberate fresh-session replacement.'
 else
-  echo 'Both builds completed. No service or compositor was restarted. Use --install to install and restart Noches dev.'
+  echo 'Noches, Cua Driver, and the repaired Hyprland plugin built successfully.'
+  echo 'No service or compositor was restarted. Use --install to install and restart Noches dev.'
 fi

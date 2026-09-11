@@ -17,20 +17,25 @@ implementation is `crates/engine/src/computer_use.rs`.
 ## Permissions and ownership
 
 - The first app inspection or control request asks through Noches' native
-  question UI. One approval covers the engine host for the current turn:
+  question UI. One approval covers the engine host for the current session:
   inspecting and controlling apps, pointer and keyboard input, screenshots
   and clipboard access, including visible desktop control. It is not a
-  per-app allowlist.
+  per-app allowlist. A denial lasts until the turn ends; a fresh turn may
+  ask again.
 - One chat at a time can hold this engine's desktop lease. It covers the
   whole active turn, including pauses between tool calls, rather than just
   individual clicks. Other chats receive a busy error.
 - Turn completion closes the driver session, reaps the driver and releases
-  the lease. A parked Pi process keeps its bridge socket, but no desktop
-  permissions or driver. The next turn needs fresh approval.
+  the lease. A parked Pi process keeps its bridge socket and its approval,
+  but no desktop lease or driver. The next turn re-acquires both without
+  asking again.
 - On a real host the engine runs `cua-driver serve` behind the MCP child for
-  the length of the turn. The daemon owns the agent cursor overlay runloop,
-  so the synthetic cursor renders on screen instead of only updating in
-  memory. Both processes are reaped before the lease is released.
+  the length of the turn. Metadata asked before approval starts a daemon
+  without `--grant existing-profile`; that daemon never has the grant, and
+  it is replaced by a granted daemon once approval exists. The daemon owns
+  the agent cursor overlay runloop, so the synthetic
+  cursor renders on screen instead of only updating in memory. Both
+  processes are reaped before the lease is released.
 - Stop, a disconnected tool caller, transport failure or timeout cancels
   outstanding work. The Linux driver process is killed and reaped before
   its lease is released. Already delivered input cannot be undone. Unknown
@@ -39,10 +44,15 @@ implementation is `crates/engine/src/computer_use.rs`.
   configuration changes, recordings and unreviewed actions are not exposed.
   `help` and `describe` use MCP `tools/list`, not nonexistent driver tools.
 
-Driver authorization stays in `standard` mode. Inherited `CUA_*` environment
-settings are removed before launching the child, then standard mode and
-Wayland support are set explicitly. Driver-level permission refusals remain
-errors; a Noches grant does not bypass them.
+Driver authorization stays in `standard` mode. A daemon started after
+approval carries the narrow `--grant existing-profile`, which only admits
+attaching DevTools to an existing logged-in Chromium-family profile after
+the user approved computer use for the session; a pre-approval metadata
+daemon never carries the grant and is replaced by a granted one when
+approval arrives. Inherited `CUA_*` environment settings are removed
+before launching the child, then standard mode, that grant and Wayland
+support are set explicitly. Driver-level permission refusals remain errors;
+a Noches grant does not bypass them.
 
 The socket directory is private, mode 0700, and the socket is mode 0600.
 Each run gets a distinct connection and identity. No computer-use endpoint

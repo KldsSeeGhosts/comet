@@ -1,0 +1,17 @@
+diff --git a/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp b/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp
+--- a/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp
++++ b/libs/cua-driver/hyprland-plugin/src/input_experiment.cpp
+@@ -483,9 +483,10 @@ struct InputExperiment::Impl {
+         if (!surface) return true;
+         const auto pointer = g_pSeatManager->m_state.pointerFocus.lock();
+         const auto keyboard = g_pSeatManager->m_state.keyboardFocus.lock();
+-        // Conservative per-client refusal avoids toolkit-global cross-window state.
+-        return (pointer && pointer->client() == surface->client()) ||
+-            (keyboard && keyboard->client() == surface->client());
++        // A client may own several top-levels. Independent seats can target one
++        // while the ordinary seat remains on another. Refuse only the exact
++        // surface, where two seats would contend for the same widget state.
++        return pointer == surface || keyboard == surface;
+     }
+     bool agent_conflict(const Client& c) const {
+         if (c.route == InputRoute::primary_foreground)

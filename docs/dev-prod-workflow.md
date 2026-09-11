@@ -7,7 +7,7 @@ production binary, engine, chats, or windows.
 | | Development | Production |
 |---|---|---|
 | Branch | `dev`, or `--dev` on a topic branch | clean `main` |
-| Build | `cargo build --release --features dev` | `cargo build --release` |
+| Build | `cargo build --features dev` (debug; `--release` for pre-merge checks) | `cargo build --release` |
 | Binary | `~/.local/bin/zeron-dev` → `~/.zeron-dev/app/<ver>/zeron` | `~/.local/bin/zeron` → `~/.zeron/app/<ver>/zeron` |
 | Desktop ID | `zeron-dev` | `zeron` |
 | Wayland app_id | `zeron-dev` | `zeron` |
@@ -25,11 +25,22 @@ port (`dirs_data_dir` / `default_ipc_port` in `apps/zeron/src/main.rs`).
 
 ```sh
 git switch dev
+./dev.sh                    # build -> install -> restart zeron-dev.service -> relaunch window
+./dev.sh --watch            # same, on every source change (needs cargo-watch)
+```
+
+`./dev.sh` is the iteration loop. It installs the **debug** build — thin LTO
+and symbol stripping belong to distribution, not to every edit. Deps still
+compile at `opt-level = 2` (`[profile.dev.package."*"]`), so gpui stays fast;
+only workspace crates rebuild unoptimized. `.cargo/config.toml` sets mold as
+the linker and sccache as the rustc wrapper, so repeated and cross-worktree
+builds stay cheap.
+
+```sh
+cargo check -p zeron --features dev      # fastest compile verification
 cargo test --all-targets --features dev
 cargo clippy --all-targets --features dev -- -D warnings
-./install.sh --dev            # or bare ./install.sh on the dev branch
-systemctl --user restart zeron-dev.service
-gtk-launch zeron-dev          # or: ZERON_DATA_DIR=~/.zeron-dev zeron-dev
+./install.sh --dev --release            # optimized pre-merge check
 ```
 
 `./install.sh` selects the variant from the current branch; `--dev` permits
@@ -50,7 +61,9 @@ production window and its live agent sessions. Both engines may run at once
 
 ## Promotion
 
-1. Verify the installed dev build end to end.
+1. Verify the installed dev build end to end (`./dev.sh`), then run one
+   `./install.sh --dev --release` to catch release-only breakage (LTO
+   monomorphization, stripped panics).
 2. Commit on `dev`, push to `origin/dev`, open a PR `dev` → `main`.
 3. Merge when the milestone lands. In a clean `main` checkout run
    `./install.sh --prod --with-tests`, then `systemctl --user restart

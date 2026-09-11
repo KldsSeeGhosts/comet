@@ -1,0 +1,16 @@
+# Build settings for Noches development.
+#
+# - sccache caches compiled deps across worktrees/agents (each worktree has its
+#   own target/ dir, so object-level reuse would otherwise be impossible).
+# - mold replaces the default linker: for a large GPUI binary, link time is a
+#   sizable fraction of every incremental rebuild.
+#
+# Requires `sccache`, `mold`, and `clang` on PATH (all in the Arch repos).
+# Delete the rustflags/linker lines to restore the default linker.
+
+[build]
+rustc-wrapper = "sccache"
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
