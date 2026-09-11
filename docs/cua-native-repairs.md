@@ -2,7 +2,8 @@
 
 These are source changes, not the earlier diagnostic-only commits. The initial
 source baselines are ZUI `07fd941ad72e7edc812fed317aab66adb69fa8cc` and Cua
-`4af83697b8425944d668c543851ef6ae3639a130`, driver 0.27.0.
+`4af83697b8425944d668c543851ef6ae3639a130`, driver 0.27.0. Cua `f82bef47`
+integrates the driver changes below as tracked source.
 
 ## What changes
 
@@ -52,10 +53,17 @@ real Rust implementations and connects them to the existing tool handlers:
 
 The driver installer checks every expected source anchor before writing,
 backs up originals under the Cua checkout's `.git`, and verifies hashes on a
-second invocation. Unrelated local edits outside those anchors survive.
-The runtime repair edits separate anchors in `wayland/hyprland.rs`, so the
-existing screen-size patch remains. The installer refuses source drift or edits made after installation rather than
-resetting the repository or silently overwriting newer work.
+second invocation. A checkout that already contains the integrated repair is
+recognized by its semantic markers and custom files, so `--check` and apply
+become no-ops there; partial integration fails closed. When an install record
+exists but its hashes no longer match, the mismatch is accepted as upstream
+integration only if every recorded file is tracked and clean at git HEAD, which
+identifies a checkout advanced to the integrated commit; an uncommitted edit
+made after installation is refused. Otherwise the installer refuses source
+drift rather than resetting the repository or silently overwriting newer work.
+Unrelated local edits outside those anchors survive. The runtime repair edits
+separate anchors in `wayland/hyprland.rs`, so the existing screen-size patch
+remains.
 
 ## Build and install on the desktop
 
@@ -142,8 +150,13 @@ rejecting every top-level owned by that process.
 The `Cua native fixes` workflow compiles the actual patched Linux platform code,
 runs the display and target-normalization tests, compiles the GPUI Wayland
 backend, runs eight seat-selection regressions, and checks Noches with the
-vendored dependency. It retains logs as `native-test-results`. Installer tests
-cover preflight, preservation, idempotence, source drift, and write rollback.
+vendored dependency. It retains logs as `native-test-results`. The installer
+suites (run locally by `build_native.sh`, in the `Cua installer tests`
+workflow against both the pinned legacy baseline and the integrated checkout,
+and in the native verify path) cover preflight, preservation, idempotence,
+source drift, write rollback, read-only `--check`, integrated-source detection,
+partial-integration refusal, missing-record fail-closed diagnostics, and the
+stale-record upgrade from an older baseline.
 
 These checks are not a live reproduction of the reported full-desktop freeze.
 The remote desktop connection was offline during implementation. Installation,

@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
-"""Route type_text through the existing Hyprland background transaction."""
+"""Route type_text through the existing Hyprland background transaction.
+
+A checkout that already carries the upstream-committed repair is detected from
+semantic markers, so `--check` and apply become no-ops there. Partial
+integration fails closed. Older unintegrated baselines still go through the
+anchor plan below. When an install record exists but its hashes no longer
+match, the mismatch is only accepted as upstream integration if every recorded
+file is tracked and clean at git HEAD; a local edit made after installation is
+never silently accepted.
+"""
 from pathlib import Path
 import argparse
 import hashlib
 import json
+import subprocess
 import tempfile
 
 
@@ -113,6 +123,78 @@ BACKGROUND_CLIENT_TEST = '''    #[test]
 
 '''
 
+# Each group must match as a whole. Whitespace is ignored so rustfmt reflows
+# and equivalent formatting do not look like drift. Forbidden fragments catch a
+# checkout that kept the foreground-only text path next to the routed one.
+INTEGRATION_GROUPS = (
+    ("libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_input.rs", (
+        "pub(crate) fn execute_background_text(",
+        'ensure!(!actions.is_empty(), "background text must not be empty");',
+        "fn execute_text_actions(actions: Vec<Action>, route: DeliveryRoute, mut dispatch: impl FnMut(Action) -> Result<Value>,)",
+        "execute_text_actions(actions, route, |action|",
+        "fn background_text_reports_background_delivery_for_every_key()",
+        "fn production_background_text_key_reaches_the_compositor()",
+        "|| !matches!(&action, Action::Activate),",
+    ), (
+        "fn execute_text_actions(actions: Vec<Action>, mut dispatch: impl FnMut(Action) -> Result<Value>,)",
+        "let route = DeliveryRoute::Foreground;",
+        "|| !matches!(&action, Action::Activate | Action::TextKey { .. }),",
+    )),
+    ("libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs", (
+        "crate::wayland::hyprland_input::execute_background_text(",
+        'Ok(_) => return isolated_hyprland_refusal("isolated text must not be empty"),',
+    ), ()),
+)
+
+
+def _compacted(text: str) -> str:
+    return "".join(text.split())
+
+
+def integration_state(root: Path) -> tuple[str, str]:
+    """Return ("full" | "none" | "partial", detail) for the text repair."""
+    complete, partial, absent = [], [], []
+    for relative, required, forbidden in INTEGRATION_GROUPS:
+        path = root / relative
+        if not path.is_file():
+            absent.append(relative)
+            continue
+        text = _compacted(path.read_text())
+        present = [marker for marker in required if _compacted(marker) in text]
+        stale = [marker for marker in forbidden if _compacted(marker) in text]
+        if len(present) == len(required) and not stale:
+            complete.append(relative)
+        elif not present:
+            absent.append(relative)
+        else:
+            partial.append(relative)
+    if complete and not partial and not absent:
+        return "full", ""
+    if not complete and not partial:
+        return "none", ""
+    detail = []
+    if partial:
+        detail.append("incomplete marker sets in " + ", ".join(partial))
+    if complete and absent:
+        detail.append("missing or unmarked " + ", ".join(absent))
+    return "partial", "; ".join(detail)
+
+
+def tracked_clean_at_head(root: Path, paths: tuple[str, ...]) -> bool:
+    """True when every path is tracked and unmodified relative to git HEAD."""
+    commands = (
+        ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", *paths],
+        ["git", "-C", str(root), "diff", "--quiet", "HEAD", "--", *paths],
+    )
+    for command in commands:
+        try:
+            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return False
+        if result.returncode != 0:
+            return False
+    return True
+
 
 def replace_once(source: str, old: str, new: str) -> str:
     if source.count(new) == 1:
@@ -208,7 +290,7 @@ fn execute_actions_routed(''')
     return {wayland: source, tools: tool_source}
 
 
-def refresh_parent_stamps(root: Path, changes: dict[Path, str]) -> None:
+def refresh_parent_stamps(root: Path, paths) -> None:
     """Record final digests where this repair layers over earlier repairs."""
     for name in ["noches-cua-output-patch.json", "noches-cua-hyprland-runtime.json"]:
         stamp = root / ".git" / name
@@ -216,7 +298,7 @@ def refresh_parent_stamps(root: Path, changes: dict[Path, str]) -> None:
             continue
         record = json.loads(stamp.read_text())
         updated = False
-        for path in changes:
+        for path in paths:
             relative = str(path.relative_to(root))
             if relative in record.get("files", {}):
                 record["files"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -234,15 +316,34 @@ def main() -> None:
     stamp = root / ".git/noches-cua-hyprland-text.json"
     if not (root / ".git").is_dir():
         raise SystemExit("Expected an ordinary Cua Git checkout, not a linked worktree")
+    state, detail = integration_state(root)
+    if state == "partial":
+        raise SystemExit(f"Hyprland background-text repair is only partially integrated ({detail}); reconcile manually")
+    integrated = state == "full"
     if stamp.exists():
         record = json.loads(stamp.read_text())
-        for relative, digest in record["files"].items():
-            if hashlib.sha256((root / relative).read_bytes()).hexdigest() != digest:
-                raise SystemExit(f"Patched file changed since install: {relative}; reconcile manually")
+        changed = [relative for relative, digest in record["files"].items()
+                   if not (root / relative).is_file()
+                   or hashlib.sha256((root / relative).read_bytes()).hexdigest() != digest]
+        if changed:
+            if integrated and tracked_clean_at_head(root, tuple(record["files"])):
+                print("Cua checkout has the upstream-committed background-text repair; stale install record ignored")
+                return
+            raise SystemExit(f"Patched file changed since install: {changed[0]}; reconcile manually")
+        if integrated:
+            if not args.check:
+                refresh_parent_stamps(root, tuple(root / relative for relative, *_ in INTEGRATION_GROUPS))
+            print("Hyprland background-text repair already installed; hashes verified")
+            return
+        raise SystemExit("Install record hashes match, but the background-text repair is not fully integrated; reconcile manually")
+    if integrated:
+        print("Cua checkout already contains the background-text repair; nothing to apply")
+        return
     changes = plan(root)
     pending = {path: source for path, source in changes.items() if path.read_text() != source}
     if not pending:
-        refresh_parent_stamps(root, changes)
+        if not args.check:
+            refresh_parent_stamps(root, changes)
         print("Hyprland background-text repair already installed; hashes verified")
         return
     if args.check:

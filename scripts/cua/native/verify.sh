@@ -13,6 +13,16 @@ export CARGO_BUILD_JOBS=2
 export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_PROFILE_DEV_OPT_LEVEL=0
 export CARGO_PROFILE_TEST_DEBUG=0
+# Installer regression suites run against this checkout. The legacy revision is
+# the pinned baseline the anchor installers were written for; the integrated
+# revision is the upstream commit that already carries the repairs. Suites skip
+# the revision a checkout does not contain.
+export CUA_PATCH_TEST_SOURCE="$CUA"
+export CUA_PATCH_TEST_LEGACY=4af83697b8425944d668c543851ef6ae3639a130
+export CUA_PATCH_TEST_INTEGRATED=f82bef47563b35ab8986560a5c3fd531f8f32de7
+python3 -m unittest discover -s "$ROOT/scripts/cua" -p 'test_native_patches.py' -v
+python3 -m unittest discover -s "$ROOT/scripts/cua" -p 'test_hyprland_runtime_patch.py' -v
+python3 -m unittest discover -s "$ROOT/scripts/cua" -p 'test_native_installers.py' -v
 python3 "$ROOT/scripts/cua/native/apply_cua.py" "$CUA" --check
 python3 "$ROOT/scripts/cua/native/apply_cua.py" "$CUA"
 python3 "$ROOT/scripts/cua/native/apply_cua.py" "$CUA"

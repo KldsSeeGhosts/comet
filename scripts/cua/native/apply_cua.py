@@ -3,15 +3,109 @@
 
 All anchors are checked before any write. Existing files are backed up first.
 The user's hyprland.rs screen-size patch is deliberately untouched.
+
+A checkout that already carries the upstream-committed repair is detected from
+semantic markers plus the custom files, so `--check` and apply become no-ops
+there. Partial integration fails closed. Older unintegrated baselines still go
+through the anchor plan below. When an install record exists but its hashes no
+longer match, the mismatch is only accepted as upstream integration if every
+recorded file is tracked and clean at git HEAD; a local edit made after
+installation is never silently accepted.
 """
 from pathlib import Path
 import argparse
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 
 HERE = Path(__file__).resolve().parent
+DRIVER = Path("libs/cua-driver/rust/crates")
+# Each group must match as a whole. Whitespace is ignored so rustfmt reflows
+# and equivalent formatting do not look like drift.
+INTEGRATION_GROUPS = (
+    (DRIVER / "platform-linux/src/wayland/mod.rs", (
+        "pub mod noches_display;",
+        "outputs: noches_display::Outputs,",
+        "state.outputs.remove(*name);",
+        "state.outputs.global(registry, name, &interface, version, qh);",
+        "capture_via_screencopy_selected",
+        "state.outputs.verify(display)?",
+        "captured dimensions disagree with selected output",
+        "flags.contains(wl_output::Mode::Current)",
+    )),
+    (DRIVER / "cua-driver-core/src/action_target.rs", (
+        "target cannot be combined with legacy display_id",
+        "display_id.len() > 256",
+        "char::is_control",
+        'object.insert("display_id"',
+        "fn named_display_survives_normalization()",
+    )),
+    (DRIVER / "platform-linux/src/tools/impl_.rs", (
+        "if let Some(result) = noches_desktop_tool(",
+        "noches_display_definition(&mut def);",
+        'include!("noches_desktop.rs");',
+    )),
+    (DRIVER / "platform-linux/src/wayland/noches_display.rs", (
+        "pub struct Display",
+        "pub(super) struct Outputs",
+        "pub(super) fn verify(&self, display: &Display)",
+        "pub fn layout_token(&self)",
+    )),
+    (DRIVER / "platform-linux/src/tools/noches_desktop.rs", (
+        "fn noches_display_definition(def: &mut ToolDef)",
+        "async fn noches_desktop_tool(name: &str",
+    )),
+)
+
+
+def _compacted(text: str) -> str:
+    return "".join(text.split())
+
+
+def integration_state(root: Path) -> tuple[str, str]:
+    """Return ("full" | "none" | "partial", detail) for the output repair."""
+    complete, partial, absent = [], [], []
+    for rel, markers in INTEGRATION_GROUPS:
+        path = root / rel
+        if not path.is_file():
+            absent.append(str(rel))
+            continue
+        text = _compacted(path.read_text())
+        missing = [marker for marker in markers if _compacted(marker) not in text]
+        if not missing:
+            complete.append(str(rel))
+        elif len(missing) == len(markers):
+            absent.append(str(rel))
+        else:
+            partial.append(str(rel))
+    if complete and not partial and not absent:
+        return "full", ""
+    if not complete and not partial:
+        return "none", ""
+    detail = []
+    if partial:
+        detail.append("incomplete marker sets in " + ", ".join(partial))
+    if complete and absent:
+        detail.append("missing or unmarked " + ", ".join(absent))
+    return "partial", "; ".join(detail)
+
+
+def tracked_clean_at_head(root: Path, paths: tuple[str, ...]) -> bool:
+    """True when every path is tracked and unmodified relative to git HEAD."""
+    commands = (
+        ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", *paths],
+        ["git", "-C", str(root), "diff", "--quiet", "HEAD", "--", *paths],
+    )
+    for command in commands:
+        try:
+            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return False
+        if result.returncode != 0:
+            return False
+    return True
 
 
 def replace(source: str, before: str, after: str) -> str:
@@ -129,12 +223,24 @@ def main() -> None:
     stamp = root / ".git/noches-cua-output-patch.json"
     if not (root / ".git").is_dir():
         raise SystemExit("Expected an ordinary Cua Git checkout, not a linked worktree")
+    state, detail = integration_state(root)
+    if state == "partial":
+        raise SystemExit(f"Cua output repair is only partially integrated ({detail}); reconcile manually")
+    integrated = state == "full"
     if stamp.exists():
         record = json.loads(stamp.read_text())
-        for rel, digest in record["files"].items():
-            if hashlib.sha256((root / rel).read_bytes()).hexdigest() != digest:
-                raise SystemExit(f"Patched file changed since install: {rel}; reconcile manually")
+        changed = [rel for rel, digest in record["files"].items()
+                   if not (root / rel).is_file()
+                   or hashlib.sha256((root / rel).read_bytes()).hexdigest() != digest]
+        if changed:
+            if integrated and tracked_clean_at_head(root, tuple(record["files"])):
+                print("Cua checkout has the upstream-committed output changes; stale install record ignored")
+                return
+            raise SystemExit(f"Patched file changed since install: {changed[0]}; reconcile manually")
         print("Cua output patch already installed; hashes verified")
+        return
+    if integrated:
+        print("Cua checkout already contains the output changes; nothing to apply")
         return
     changes = plan(root)
     if args.check:

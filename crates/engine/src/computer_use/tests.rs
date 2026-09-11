@@ -107,27 +107,43 @@ fn approval_question_discloses_existing_profile_devtools_attachment() {
 }
 
 fn manager(dir: &Path) -> ComputerUseManager {
+    manager_with_initialize(
+        dir,
+        r#"{"protocolVersion":"2024-11-05","serverInfo":{"name":"python-fixture","version":"1.2.3"},"capabilities":{"tools":{}},"instructions":"FIXTURE_INSTRUCTIONS_SENTINEL"}"#,
+    )
+}
+
+fn manager_with_initialize(dir: &Path, initialize: &str) -> ComputerUseManager {
     let path = dir.join("driver.py");
     std::fs::write(&path, r#"#!/usr/bin/python3
 import json, os, sys, time
 from pathlib import Path
+here = Path(__file__).parent
 log = Path(__file__).with_suffix('.log')
+init = json.loads((here / 'driver.init.json').read_text())
 for line in sys.stdin:
     req = json.loads(line)
     with log.open('a') as f:
         f.write(json.dumps(dict(req, pid=os.getpid())) + '\n')
     if 'id' not in req: continue
-    if req['method'] == 'initialize': result = {'protocolVersion':'2024-11-05'}
+    if req['method'] == 'initialize': result = init
     elif req['method'] == 'tools/list':
-        result = {'tools':[{'name':'click','inputSchema':{'type':'object'}}, {'name':'list_windows','inputSchema':{'type':'object'}}, {'name':'set_config'}]}
+        result = {'tools':[{'name':'click','inputSchema':{'type':'object'}}, {'name':'list_windows','inputSchema':{'type':'object'}}, {'name':'set_config'}],
+                  'schema_version':'1', 'capability_version':'1',
+                  'enforcement_adapters':[{'id':'fixture.adapter','state':'active'}]}
     else:
         assert req['method'] == 'tools/call'
         args = req['params']['arguments']
         if args.get('block'): time.sleep(60)
+        if isinstance(args.get('refusal'), dict):
+            structured = dict(args['refusal'])
+        else:
+            structured = {'args':args,'pid':os.getpid()}
         result = {'content':[{'type':'text','text':'你好'}, {'type':'image','mimeType':'image/png','data':'cG5n'}],
-                  'structuredContent':{'args':args,'pid':os.getpid()}, 'isError':args.get('refuse', False)}
+                  'structuredContent':structured, 'isError':args.get('refuse', False)}
     print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
 "#).unwrap();
+    std::fs::write(dir.join("driver.init.json"), initialize).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut manager = ComputerUseManager::new("test-host".into());
@@ -172,6 +188,16 @@ async fn call(socket: &Path, action: &str, args: Value) -> Value {
     })
     .await
     .expect("test bridge timed out")
+}
+
+/// Fixture request count by MCP method, as observed by the driver process.
+fn request_count(dir: &Path, method: &str) -> usize {
+    std::fs::read_to_string(dir.join("driver.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value.get("method").and_then(Value::as_str) == Some(method))
+        .count()
 }
 
 #[tokio::test]
@@ -249,6 +275,464 @@ async fn full_results_permissions_and_turn_lease() {
     bridge_a.finish().await;
     bridge_b.finish().await;
     assert!(!a.exists());
+}
+
+#[tokio::test]
+async fn structured_refusal_normalizes_to_error_and_preserves_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let (socket, bridge) = manager
+        .start_bridge(
+            "refuse",
+            "refuse",
+            approval(true, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // Replays the audited noches_session_export browser refusal verbatim: the
+    // driver returned status=refused without setting the tool-level
+    // execution-error flag, and nested every refusal field.
+    let refusal = json!({
+        "status": "refused",
+        "refusal": {
+            "code": "browser_consent_required",
+            "message": "this standalone browser profile requires explicit existing-profile approval before Cua can inspect its DevTools endpoint",
+            "detail": {
+                "next_action": "browser_prepare",
+                "reason": "consumer_profile_endpoint_requires_grant",
+                "supported_strategies": ["existing_profile"],
+            },
+        },
+    });
+    let result = call(&socket, "get_browser_state", json!({"refusal": refusal})).await;
+    assert_eq!(
+        result["isError"], true,
+        "a structured refusal is a failed tool execution: {result}"
+    );
+    assert_eq!(
+        result["structuredContent"], refusal,
+        "the nested refusal payload must be preserved verbatim"
+    );
+    assert_eq!(
+        result["content"][0]["text"], "你好",
+        "normalization must not replace the driver's evidence"
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn effect_refused_normalizes_with_its_driver_error_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let (socket, bridge) = manager
+        .start_bridge(
+            "effect-refuse",
+            "effect-refuse",
+            approval(true, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // Replays the audited `effect: refused` trace, which arrived with isError
+    // already set; the refusal payload must survive normalization untouched.
+    let outcome = json!({
+        "code": "background_unavailable",
+        "detail": "client_not_qualified",
+        "effect": "refused",
+        "ok": false,
+        "reason": "client_not_qualified",
+        "route": "synthetic_events",
+        "verified": false,
+    });
+    let result = call(
+        &socket,
+        "click",
+        json!({"refusal": outcome, "refuse": true}),
+    )
+    .await;
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(result["structuredContent"], outcome);
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn partial_unknown_and_unverifiable_outcomes_are_not_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let (socket, bridge) = manager
+        .start_bridge(
+            "uncertain",
+            "uncertain",
+            approval(true, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    for status in ["partial", "unknown", "unverifiable"] {
+        let result = call(
+            &socket,
+            "click",
+            json!({"refusal": {"status": status, "delivery_id": "d1"}}),
+        )
+        .await;
+        assert_ne!(
+            result["isError"], true,
+            "{status} delivery is uncertain, not a failed execution: {result}"
+        );
+        assert_eq!(result["structuredContent"]["status"], status);
+        assert_eq!(result["structuredContent"]["delivery_id"], "d1");
+    }
+    // `effect: unverifiable` is the documented outcome-only variant.
+    let effect = call(
+        &socket,
+        "click",
+        json!({"refusal": {"effect": "unverifiable", "delivery_id": "d2"}}),
+    )
+    .await;
+    assert_ne!(effect["isError"], true, "{effect}");
+    assert_eq!(effect["structuredContent"]["effect"], "unverifiable");
+    bridge.finish().await;
+}
+
+#[test]
+fn driver_outcome_precedence_is_consistent_for_is_error_and_status() {
+    use DriverOutcome::*;
+    let cases = [
+        (json!({"structuredContent": {"status": "refused"}}), Refused),
+        (
+            json!({"isError": true, "structuredContent": {"status": "refused"}}),
+            Refused,
+        ),
+        (
+            json!({"isError": true, "structuredContent": {"effect": "refused"}}),
+            Refused,
+        ),
+        (
+            json!({"isError": true, "structuredContent": {"refused": true}}),
+            Refused,
+        ),
+        (json!({"structuredContent": {"status": "error"}}), Error),
+        (json!({"structuredContent": {"status": "failed"}}), Error),
+        (json!({"isError": true}), Error),
+        (
+            json!({"structuredContent": {"status": "cancelled"}}),
+            Cancelled,
+        ),
+        (
+            json!({"isError": true, "structuredContent": {"status": "cancelled"}}),
+            Cancelled,
+        ),
+        (json!({"structuredContent": {"status": "partial"}}), Partial),
+        (
+            json!({"isError": true, "structuredContent": {"status": "partial"}}),
+            Error,
+        ),
+        (json!({"structuredContent": {"status": "unknown"}}), Unknown),
+        (
+            json!({"isError": true, "structuredContent": {"status": "unknown"}}),
+            Error,
+        ),
+        (
+            json!({"structuredContent": {"status": "unverifiable"}}),
+            Unverifiable,
+        ),
+        (
+            json!({"isError": true, "structuredContent": {"effect": "unverifiable"}}),
+            Error,
+        ),
+        (
+            json!({"structuredContent": {"status": "delivered"}}),
+            Delivered,
+        ),
+    ];
+    for (result, expected) in cases {
+        assert_eq!(
+            classify_driver_outcome(&result),
+            expected,
+            "result: {result}"
+        );
+    }
+}
+
+#[test]
+fn normalizer_promotes_only_refusals_and_errors() {
+    let refused = normalize_driver_outcome(json!({
+        "structuredContent": {"status": "refused", "refusal": {"code": "denied"}}
+    }));
+    assert_eq!(refused["isError"], true);
+    let uncertain = normalize_driver_outcome(json!({
+        "structuredContent": {"effect": "unverifiable", "delivery_id": "d1"}
+    }));
+    assert!(
+        uncertain.get("isError").is_none(),
+        "uncertain delivery must stay non-error: {uncertain}"
+    );
+}
+
+#[tokio::test]
+async fn help_retains_initialize_metadata_and_exact_executable_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let exe = dir.path().join("driver.py");
+    let canonical_exe = std::fs::canonicalize(&exe).unwrap();
+    let expected_sha = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(&canonical_exe).unwrap())
+    );
+    let (socket, bridge) = manager
+        .start_bridge(
+            "metadata",
+            "metadata",
+            approval(false, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let help = call(&socket, "help", json!({})).await;
+    assert_ne!(help["isError"], true, "{help}");
+    let driver = &help["structuredContent"]["driver"];
+    assert_eq!(driver["protocolVersion"], "2024-11-05");
+    assert_eq!(driver["serverInfo"]["name"], "python-fixture");
+    assert_eq!(driver["serverInfo"]["version"], "1.2.3");
+    assert_eq!(driver["capabilities"]["tools"], json!({}));
+    assert_eq!(driver["executable"]["path"], json!(exe.to_string_lossy()));
+    assert_eq!(
+        driver["executable"]["canonicalPath"],
+        json!(canonical_exe.to_string_lossy())
+    );
+    assert_eq!(driver["executable"]["sha256"], json!(expected_sha));
+    assert_eq!(driver["instructions"]["present"], true);
+    assert!(driver["instructions"]["bytes"].as_u64().unwrap() > 0);
+    assert!(
+        !serde_json::to_string(&help)
+            .unwrap()
+            .contains("FIXTURE_INSTRUCTIONS_SENTINEL"),
+        "raw server instructions must not reach the result: {help}"
+    );
+    // health_report carries the same trusted metadata for diagnostics.
+    let health = call(&socket, "health_report", json!({})).await;
+    assert_ne!(health["isError"], true, "{health}");
+    assert_eq!(
+        health["structuredContent"]["driver"]["executable"]["sha256"],
+        json!(expected_sha)
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn invalid_initialize_metadata_fails_the_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager_with_initialize(
+        dir.path(),
+        r#"{"serverInfo":{"name":"fixture"},"capabilities":{}}"#,
+    );
+    let (socket, bridge) = manager
+        .start_bridge(
+            "bad-init",
+            "bad-init",
+            approval(true, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let result = call(&socket, "list_windows", json!({})).await;
+    assert_eq!(result["isError"], true, "{result}");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("protocolVersion"),
+        "handshake failure must name the invalid field: {text}"
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn unsupported_negotiated_protocol_version_fails_the_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager_with_initialize(
+        dir.path(),
+        r#"{"protocolVersion":"1999-01-01","serverInfo":{"name":"python-fixture","version":"1.2.3"},"capabilities":{"tools":{"listChanged":false}}}"#,
+    );
+    let (socket, bridge) = manager
+        .start_bridge(
+            "bad-protocol",
+            "bad-protocol",
+            approval(true, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let result = call(&socket, "help", json!({})).await;
+    assert_eq!(result["isError"], true, "{result}");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("unsupported MCP protocol version 1999-01-01"),
+        "handshake failure must name the negotiated version: {text}"
+    );
+    assert!(
+        text.contains("2025-06-18"),
+        "the failure must name a supported version: {text}"
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn symlinked_driver_reports_invocation_and_canonical_executable_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("driver.py");
+    let invocation = dir.path().join("driver-link");
+    let mut manager = manager(dir.path());
+    std::os::unix::fs::symlink(&target, &invocation).unwrap();
+    manager.driver_path = Some(invocation.clone());
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    let expected_sha = format!("{:x}", Sha256::digest(std::fs::read(&target).unwrap()));
+
+    let (socket, bridge) = manager
+        .start_bridge(
+            "symlink",
+            "symlink",
+            approval(false, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let help = call(&socket, "help", json!({})).await;
+    assert_ne!(help["isError"], true, "{help}");
+    let executable = &help["structuredContent"]["driver"]["executable"];
+    assert_eq!(executable["path"], json!(invocation.to_string_lossy()));
+    assert_eq!(
+        executable["canonicalPath"],
+        json!(canonical.to_string_lossy()),
+        "canonical target must be reported, not only the symlink path"
+    );
+    assert_eq!(
+        executable["sha256"],
+        json!(expected_sha),
+        "the digest must cover the symlink target"
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn stable_tool_list_is_cached_with_contract_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let (socket, bridge) = manager
+        .start_bridge(
+            "cache",
+            "cache",
+            approval(false, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let help = call(&socket, "help", json!({})).await;
+    assert_ne!(help["isError"], true, "{help}");
+    let structured = &help["structuredContent"];
+    assert_eq!(structured["schema_version"], "1");
+    assert_eq!(structured["capability_version"], "1");
+    assert_eq!(
+        structured["enforcement_adapters"][0]["id"],
+        "fixture.adapter"
+    );
+    assert_eq!(request_count(dir.path(), "tools/list"), 1);
+
+    let describe = call(
+        &socket,
+        "describe",
+        json!({"names": ["list_windows", "click"]}),
+    )
+    .await;
+    assert_ne!(describe["isError"], true, "{describe}");
+    assert_eq!(describe["structuredContent"]["schema_version"], "1");
+    assert_eq!(describe["structuredContent"]["capability_version"], "1");
+    assert_eq!(
+        describe["structuredContent"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let help_again = call(&socket, "help", json!({})).await;
+    assert_ne!(help_again["isError"], true, "{help_again}");
+    assert_eq!(
+        request_count(dir.path(), "tools/list"),
+        1,
+        "an absent listChanged defaults to false and reuses one tools/list per live driver"
+    );
+
+    // The cache belongs to the driver, not the bridge: a fresh turn on the
+    // same bridge rediscovers the schema.
+    bridge.turn_ended().await;
+    bridge.turn_started();
+    let restarted = call(&socket, "help", json!({})).await;
+    assert_ne!(restarted["isError"], true, "{restarted}");
+    assert_eq!(
+        request_count(dir.path(), "tools/list"),
+        2,
+        "a fresh driver must discover tools/list again"
+    );
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn tool_list_capability_semantics_drive_the_cache() {
+    // MCP omits `listChanged` when the server cannot change its list, so the
+    // real cua-driver `capabilities: {tools: {}}` handshake caches. An absent
+    // tools capability or `listChanged: true` must keep discovering.
+    for (capabilities, expected) in [
+        (json!({"tools": {"listChanged": true}}), 2),
+        (json!({}), 2),
+        (json!({"tools": {"listChanged": false}}), 1),
+        (json!({"tools": {}}), 1),
+    ] {
+        let label = capabilities.to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let initialize = json!({
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {"name": "python-fixture", "version": "1.2.3"},
+            "capabilities": capabilities.clone(),
+        })
+        .to_string();
+        let manager = manager_with_initialize(dir.path(), &initialize);
+        let (socket, bridge) = manager
+            .start_bridge(
+                "capability",
+                "capability",
+                approval(false, Arc::new(AtomicUsize::new(0))),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let help = call(&socket, "help", json!({})).await;
+            assert_ne!(help["isError"], true, "{help}");
+        }
+        assert_eq!(
+            request_count(dir.path(), "tools/list"),
+            expected,
+            "capabilities {label} must produce {expected} tools/list requests"
+        );
+        bridge.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn running_executable_identity_and_hash_follow_the_executed_image() {
+    let current = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let expected = format!("{:x}", Sha256::digest(std::fs::read(&current).unwrap()));
+    let pid = std::process::id();
+    assert_eq!(
+        running_executable_sha256(pid, &current).await.unwrap(),
+        expected,
+        "the reported digest must come from the running image"
+    );
+    let other = current.with_file_name("definitely-not-the-running-binary");
+    let error = running_executable_sha256(pid, &other).await.unwrap_err();
+    assert!(
+        error.contains("instead of"),
+        "a process running another file must be refused: {error}"
+    );
 }
 
 #[tokio::test]

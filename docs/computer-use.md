@@ -43,6 +43,10 @@ implementation is `crates/engine/src/computer_use.rs`.
 - The engine stamps its own session label. Session lifecycle tools,
   configuration changes, recordings and unreviewed actions are not exposed.
   `help` and `describe` use MCP `tools/list`, not nonexistent driver tools.
+- `help` and `health_report` expose the MCP handshake contract the engine
+  retained: negotiated protocol version, server identity, capabilities, and
+  the exact executable path and SHA-256 actually spawned. Optional server
+  instructions are retained as a digest only and never reach a model prompt.
 
 Driver authorization stays in `standard` mode. A daemon started after
 approval carries the narrow `--grant existing-profile`, which only admits
@@ -73,10 +77,23 @@ to install the adapter prevents that Pi process from starting.
 Full MCP text, images and structured results reach the adapter. Structured
 results are both retained in tool details and included in model-readable
 text, so accessibility tokens and delivery facts survive. Combined text is
-capped at 50KB or 2000 lines. Larger text is saved in a private temporary
-file, with its path in the tool result. These local result files remain
-available until removed or cleaned by the operating system. Treat them as
-sensitive app content.
+capped at 50KB or 2000 lines. A truncated result is exported as two private
+files: `result.txt` holds the human-readable text and `result.json` holds a
+valid JSON document with the action and full structured content. The
+directory is mode 0700 and both files are mode 0600, and the tool result
+carries both paths. These local result files remain available until removed
+or cleaned by the operating system. Treat them as sensitive app content.
+
+The adapter normalizes the driver's structured outcome model. A structured
+refusal (`status: refused`, `effect: refused`, or `refused: true`) becomes a
+failed Pi tool execution while the full refusal payload, reason code,
+permitted next action and approval metadata stay in the result. The audited
+driver nests those fields under `refusal: {code, message, detail: {reason,
+next_action, supported_strategies}}`; the adapter reads that layout and the
+older flat one. A refusal classification outranks the generic `isError` flag,
+while partial, unknown and unverifiable deliveries stay non-errors only when
+the driver did not set `isError`. Uncertain deliveries report uncertain
+delivery and are never replayed automatically.
 
 ## Installation and limits
 

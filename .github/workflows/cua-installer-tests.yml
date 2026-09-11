@@ -5,41 +5,79 @@ on:
     paths:
       - '.github/workflows/cua-installer-tests.yml'
       - 'scripts/cua/test_native_patches.py'
+      - 'scripts/cua/test_hyprland_runtime_patch.py'
+      - 'scripts/cua/test_native_installers.py'
       - 'scripts/cua/build_native.sh'
-      - 'scripts/cua/native/apply_cua.py'
-      - 'scripts/cua/native/cua/**'
+      - 'scripts/cua/native/**'
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
   group: cua-installer-tests-${{ github.ref }}
   cancel-in-progress: true
+env:
+  CUA_LEGACY_REV: 4af83697b8425944d668c543851ef6ae3639a130
+  CUA_INTEGRATED_REV: f82bef47563b35ab8986560a5c3fd531f8f32de7
 jobs:
   installer:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - name: Check out the legacy Cua baseline
+        uses: actions/checkout@v4
         with:
           repository: trycua/cua
           ref: 4af83697b8425944d668c543851ef6ae3639a130
-          path: .native/cua
+          path: .native/cua-legacy
           sparse-checkout: libs/cua-driver/rust
           persist-credentials: false
-      - name: Test source preservation and rollback
+      - name: Check out the integrated Cua repair
+        uses: actions/checkout@v4
+        with:
+          repository: KldsSeeGhosts/cua
+          ref: f82bef47563b35ab8986560a5c3fd531f8f32de7
+          path: .native/cua-integrated
+          sparse-checkout: libs/cua-driver/rust
+          persist-credentials: false
+      - name: Test installer sources against the legacy baseline
         env:
-          CUA_PATCH_TEST_SOURCE: ${{ github.workspace }}/.native/cua
+          CUA_PATCH_TEST_SOURCE: ${{ github.workspace }}/.native/cua-legacy
+          CUA_PATCH_TEST_LEGACY: 4af83697b8425944d668c543851ef6ae3639a130
+          CUA_PATCH_TEST_INTEGRATED: f82bef47563b35ab8986560a5c3fd531f8f32de7
         run: |
           set -euo pipefail
           mkdir -p installer-evidence
-          python3 -m unittest discover -s scripts/cua -p test_native_patches.py -v 2>&1 | tee installer-evidence/installer-tests.log
+          python3 -m unittest discover -s scripts/cua -p test_native_patches.py -v 2>&1 | tee installer-evidence/native-patches-legacy.log
+          python3 -m unittest discover -s scripts/cua -p test_hyprland_runtime_patch.py -v 2>&1 | tee installer-evidence/hyprland-runtime-legacy.log
+          python3 -m unittest discover -s scripts/cua -p test_native_installers.py -v 2>&1 | tee installer-evidence/native-installers-legacy.log
+      - name: Test installer sources against the integrated checkout
+        env:
+          CUA_PATCH_TEST_SOURCE: ${{ github.workspace }}/.native/cua-integrated
+          CUA_PATCH_TEST_LEGACY: 4af83697b8425944d668c543851ef6ae3639a130
+          CUA_PATCH_TEST_INTEGRATED: f82bef47563b35ab8986560a5c3fd531f8f32de7
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/cua -p test_native_patches.py -v 2>&1 | tee installer-evidence/native-patches-integrated.log
+          python3 -m unittest discover -s scripts/cua -p test_hyprland_runtime_patch.py -v 2>&1 | tee installer-evidence/hyprland-runtime-integrated.log
+          python3 -m unittest discover -s scripts/cua -p test_native_installers.py -v 2>&1 | tee installer-evidence/native-installers-integrated.log
+      - name: Check scripts and bundle the patch kit
+        run: |
+          set -euo pipefail
           bash -n scripts/cua/build_native.sh
           bash scripts/cua/build_native.sh --help
-          python3 -m py_compile scripts/cua/native/apply_cua.py scripts/cua/native/vendor_zui.py
-          tar --exclude=__pycache__ -czf installer-evidence/native-patch-kit.tar.gz scripts/cua/native scripts/cua/test_native_patches.py scripts/cua/build_native.sh
+          python3 -m py_compile scripts/cua/native/*.py \
+            scripts/cua/test_native_patches.py \
+            scripts/cua/test_hyprland_runtime_patch.py \
+            scripts/cua/test_native_installers.py
+          tar --exclude=__pycache__ -czf installer-evidence/native-patch-kit.tar.gz \
+            scripts/cua/native \
+            scripts/cua/test_native_patches.py \
+            scripts/cua/test_hyprland_runtime_patch.py \
+            scripts/cua/test_native_installers.py \
+            scripts/cua/build_native.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:

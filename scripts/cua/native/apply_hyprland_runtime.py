@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
-"""Make Hyprland IPC and Cua input survive a compositor relogin."""
+"""Make Hyprland IPC and Cua input survive a compositor relogin.
+
+A checkout that already carries the upstream-committed repair is detected from
+semantic markers, so `--check` and apply become no-ops there. Partial
+integration fails closed. Older unintegrated baselines still go through the
+anchor plan below. When an install record exists but its hashes no longer
+match, the mismatch is only accepted as upstream integration if every recorded
+file is tracked and clean at git HEAD; a local edit made after installation is
+never silently accepted.
+"""
 from pathlib import Path
 import argparse
 import hashlib
 import json
+import subprocess
 import tempfile
 
 
@@ -140,6 +150,79 @@ NEW_INPUT = '''fn socket_path(lane: usize) -> Result<PathBuf> {
 }
 '''
 
+# Each group must match as a whole. Whitespace is ignored so rustfmt reflows
+# and equivalent formatting do not look like drift. Forbidden fragments catch
+# a checkout that kept the old resolver next to the new one.
+INTEGRATION_GROUPS = (
+    ("libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland.rs", (
+        "fn hyprland_runtime_root() -> Result<PathBuf>",
+        "fn valid_instance_signature(signature: &str) -> bool",
+        "fn instance_candidates() -> Result<Vec<PathBuf>>",
+        "too many Hyprland instance candidates",
+        "pub(super) fn active_instance_dir_with_timeout(timeout: Duration) -> Result<PathBuf>",
+        "no Hyprland IPC socket belongs to the WAYLAND_DISPLAY compositor",
+        "multiple Hyprland IPC sockets belong to the WAYLAND_DISPLAY compositor",
+        'let path = active_instance_dir_with_timeout(timeout)?.join(".socket.sock");',
+    ), (
+        "fn ipc_path() -> Result<PathBuf>",
+        'Ok(runtime.join("hypr").join(signature).join(".socket.sock"))',
+    )),
+    ("libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_input.rs", (
+        "Ok(super::hyprland::active_instance_dir_with_timeout(TIMEOUT)?.join(protocol().socket_name(lane)?))",
+    ), (
+        'Ok(runtime.join("hypr").join(signature).join(protocol().socket_name(lane)?))',
+    )),
+)
+
+
+def _compacted(text: str) -> str:
+    return "".join(text.split())
+
+
+def integration_state(root: Path) -> tuple[str, str]:
+    """Return ("full" | "none" | "partial", detail) for the runtime repair."""
+    complete, partial, absent = [], [], []
+    for relative, required, forbidden in INTEGRATION_GROUPS:
+        path = root / relative
+        if not path.is_file():
+            absent.append(relative)
+            continue
+        text = _compacted(path.read_text())
+        present = [marker for marker in required if _compacted(marker) in text]
+        stale = [marker for marker in forbidden if _compacted(marker) in text]
+        if len(present) == len(required) and not stale:
+            complete.append(relative)
+        elif not present:
+            absent.append(relative)
+        else:
+            partial.append(relative)
+    if complete and not partial and not absent:
+        return "full", ""
+    if not complete and not partial:
+        return "none", ""
+    detail = []
+    if partial:
+        detail.append("incomplete marker sets in " + ", ".join(partial))
+    if complete and absent:
+        detail.append("missing or unmarked " + ", ".join(absent))
+    return "partial", "; ".join(detail)
+
+
+def tracked_clean_at_head(root: Path, paths: tuple[str, ...]) -> bool:
+    """True when every path is tracked and unmodified relative to git HEAD."""
+    commands = (
+        ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", *paths],
+        ["git", "-C", str(root), "diff", "--quiet", "HEAD", "--", *paths],
+    )
+    for command in commands:
+        try:
+            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return False
+        if result.returncode != 0:
+            return False
+    return True
+
 
 def transform(source: str, old: str, new: str) -> str:
     if source.count(new) == 1 and source.count(old) == 0:
@@ -168,12 +251,26 @@ def main() -> None:
     stamp = root / ".git/noches-cua-hyprland-runtime.json"
     if not (root / ".git").is_dir():
         raise SystemExit("Expected an ordinary Cua Git checkout, not a linked worktree")
+    state, detail = integration_state(root)
+    if state == "partial":
+        raise SystemExit(f"Hyprland runtime repair is only partially integrated ({detail}); reconcile manually")
+    integrated = state == "full"
     if stamp.exists():
         record = json.loads(stamp.read_text())
-        for relative, digest in record["files"].items():
-            if hashlib.sha256((root / relative).read_bytes()).hexdigest() != digest:
-                raise SystemExit(f"Patched file changed since install: {relative}; reconcile manually")
+        changed = [relative for relative, digest in record["files"].items()
+                   if not (root / relative).is_file()
+                   or hashlib.sha256((root / relative).read_bytes()).hexdigest() != digest]
+        if changed:
+            if integrated and tracked_clean_at_head(root, tuple(record["files"])):
+                print("Cua checkout has the upstream-committed runtime repair; stale install record ignored")
+                return
+            raise SystemExit(f"Patched file changed since install: {changed[0]}; reconcile manually")
+        if not integrated:
+            raise SystemExit("Install record hashes match, but the runtime repair is not fully integrated; reconcile manually")
         print("Hyprland runtime repair already installed; hashes verified")
+        return
+    if integrated:
+        print("Cua checkout already contains the runtime repair; nothing to apply")
         return
     changes = plan(root)
     if args.check:

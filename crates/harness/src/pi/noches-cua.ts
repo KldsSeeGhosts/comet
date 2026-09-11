@@ -20,6 +20,122 @@ const DESKTOP_POINTER_ACTIONS = new Set([
   "mouse_drag", "mouse_button_up", "scroll", "move_cursor",
 ]);
 
+export type CuaOutcome =
+  | "success" | "refused" | "error" | "partial" | "unknown" | "unverifiable" | "cancelled";
+
+const REFUSAL_STATUSES = new Set(["refused", "denied", "rejected", "blocked", "forbidden"]);
+const ERROR_STATUSES = new Set(["error", "failed", "failure"]);
+const PARTIAL_STATUSES = new Set(["partial", "partially_delivered", "incomplete"]);
+const UNKNOWN_STATUSES = new Set(["unknown", "unobserved", "indeterminate"]);
+const UNVERIFIABLE_STATUSES = new Set(["unverifiable", "unverified"]);
+const CANCELLED_STATUSES = new Set(["cancelled", "canceled"]);
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function structuredRecord(result: BridgeResult): Record<string, unknown> | undefined {
+  return objectRecord(result.structuredContent);
+}
+
+function normalizedToken(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value.toLowerCase() : undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string" && value.length > 0);
+}
+
+/**
+ * A structured refusal outranks the generic MCP execution-error flag: a
+ * refusal reported as `isError` is still an exact refusal, not a generic
+ * error. `effect: "refused"` is the outcome-only variant of the same signal.
+ */
+function refusedOutcome(structured: Record<string, unknown> | undefined): boolean {
+  const status = normalizedToken(structured?.status);
+  const effect = normalizedToken(structured?.effect);
+  return (status !== undefined && REFUSAL_STATUSES.has(status))
+    || structured?.refused === true
+    || (effect !== undefined && REFUSAL_STATUSES.has(effect));
+}
+
+/**
+ * Classify the driver's structured outcome. A refusal and an explicit error
+ * are failed executions; partial, unknown and unverifiable deliveries are
+ * uncertain outcomes that stay non-errors only while the driver did not set
+ * the execution-error flag.
+ */
+export function classifyOutcome(result: BridgeResult): CuaOutcome {
+  const structured = structuredRecord(result);
+  const status = normalizedToken(structured?.status);
+  const effect = normalizedToken(structured?.effect);
+  const driverIsError = result.isError === true;
+  if (refusedOutcome(structured)) return "refused";
+  if ((status && ERROR_STATUSES.has(status)) || (effect && ERROR_STATUSES.has(effect))) return "error";
+  if ((status && CANCELLED_STATUSES.has(status)) || (effect && CANCELLED_STATUSES.has(effect))) return "cancelled";
+  const uncertain = status && PARTIAL_STATUSES.has(status) ? "partial" as const
+    : status && UNKNOWN_STATUSES.has(status) ? "unknown" as const
+    : status && UNVERIFIABLE_STATUSES.has(status) ? "unverifiable" as const
+    : effect && UNVERIFIABLE_STATUSES.has(effect) ? "unverifiable" as const
+    : effect === "partial" ? "partial" as const
+    : effect === "unknown" ? "unknown" as const
+    : undefined;
+  if (uncertain) return driverIsError ? "error" : uncertain;
+  return driverIsError ? "error" : "success";
+}
+
+interface RefusalFields {
+  code?: string;
+  message?: string;
+  reason?: string;
+  nextAction?: string;
+  approvals: string[];
+}
+
+/**
+ * Read the driver's refusal payload. The audited export nests it as
+ * `refusal: {code, message, detail: {next_action, reason, supported_strategies}}`
+ * under `status: "refused"`; older drivers may put the same fields at the top
+ * level. Both layouts are read without rewriting the nested record.
+ */
+function refusalFields(structured: Record<string, unknown> | undefined): RefusalFields {
+  const refusal = objectRecord(structured?.refusal);
+  const detail = objectRecord(refusal?.detail);
+  const approvals: string[] = [];
+  if (detail?.approval_required === true || structured?.approval_required === true) {
+    approvals.push("approval_required");
+  }
+  if (detail?.browser_consent_required === true || structured?.browser_consent_required === true) {
+    approvals.push("browser_consent_required");
+  }
+  const required = firstString(detail?.required_approval, structured?.required_approval);
+  if (required) approvals.push(`required_approval=${required}`);
+  const strategies = detail?.supported_strategies ?? structured?.supported_strategies;
+  if (Array.isArray(strategies)) {
+    const names = strategies.filter((name): name is string => typeof name === "string" && name.length > 0);
+    if (names.length) approvals.push(`supported_strategies=${names.join(",")}`);
+  }
+  return {
+    code: firstString(refusal?.code, structured?.reason_code, structured?.code),
+    message: firstString(refusal?.message, structured?.message),
+    reason: firstString(detail?.reason, structured?.reason, structured?.refusal_reason),
+    nextAction: firstString(detail?.next_action, structured?.next_action),
+    approvals,
+  };
+}
+
+function refusalSummary(structured: Record<string, unknown> | undefined): string {
+  const { code, message, reason, nextAction, approvals } = refusalFields(structured);
+  const head = code ? `Computer-use refused (${code})` : "Computer-use refused";
+  const parts = [`${head}: ${message ?? "the action was not executed."}`];
+  if (reason && reason !== code) parts.push(`Reason: ${reason}.`);
+  if (nextAction) parts.push(`Next action: ${nextAction}.`);
+  if (approvals.length) parts.push(`Approval: ${approvals.join(", ")}.`);
+  return parts.join(" ");
+}
+
 export function bridgeArgs(action: string, args: Record<string, unknown>): Record<string, unknown> {
   const forwarded = { ...args };
   delete forwarded.allow_user_input_disruption;
@@ -91,21 +207,23 @@ export function toolResult(result: BridgeResult, action: string) {
     if (part.type === "image" && part.data) images.push({ type: "image", data: part.data, mimeType: part.mimeType ?? "image/png" });
   }
 
-  // Preserve full raw text for the secure truncation file
-  const rawAllParts = [...rawTextParts];
-  if (result.structuredContent != null) {
-    rawAllParts.push(JSON.stringify(result.structuredContent));
-  }
-  const rawFullText = rawAllParts.join("\n\n") || "Computer-use call returned no text.";
+  const structuredObj = structuredRecord(result);
+  const outcome = classifyOutcome(result);
+  // The adapter marks a structured refusal as a failed tool execution while
+  // preserving the driver's payload; uncertain deliveries keep their outcome.
+  const driverIsError = outcome === "refused" || outcome === "error" || result.isError === true;
+
+  // Human-readable text for the truncation export. Structured data goes to a
+  // separate valid-JSON file so a truncated result stays machine-readable.
+  const rawText = rawTextParts.join("\n\n") || "Computer-use call returned no text.";
 
   const text: string[] = [];
-  const tools = action === "help" && result.structuredContent && typeof result.structuredContent === "object"
-    ? (result.structuredContent as { tools?: Array<{ name?: unknown }> }).tools
+  const tools = action === "help"
+    ? (structuredObj as { tools?: Array<{ name?: unknown }> } | undefined)?.tools
     : undefined;
 
   if (tools) {
     const names = tools.map(tool => tool.name).filter((name): name is string => typeof name === "string");
-    text.length = 0;
     text.push(
       `Available actions: ${names.join(", ")}\n` +
       `Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer; ` +
@@ -113,35 +231,35 @@ export function toolResult(result: BridgeResult, action: string) {
       `Use describe with args.name or args.names for schemas. Do not parse help output with shell commands.`
     );
   } else if (action === "get_window_state") {
-    const structuredObj = result.structuredContent && typeof result.structuredContent === "object" && !Array.isArray(result.structuredContent)
-      ? (result.structuredContent as Record<string, unknown>)
-      : undefined;
     const hasElements = Array.isArray(structuredObj?.elements);
-    const isError = Boolean(result.isError);
-
-    if (isError) {
-      // Keep refusal/error text and structured content
+    if (driverIsError || !hasElements) {
+      // Keep refusal/error text and structured content.
       text.push(...rawTextParts);
       if (result.structuredContent != null) {
         text.push(JSON.stringify(result.structuredContent));
       }
-    } else if (hasElements) {
+    } else {
       // Shape get_window_state results so the model does not receive the same accessibility tree twice.
       // Suppress the redundant driver markdown text and exclude tree_markdown from the serialized structured copy.
       const { tree_markdown: _discard, ...structuredWithoutTreeMd } = structuredObj!;
       text.push(JSON.stringify(structuredWithoutTreeMd));
-    } else {
-      text.push(...rawTextParts);
-      if (result.structuredContent != null) {
-        text.push(JSON.stringify(result.structuredContent));
-      }
     }
   } else {
-    // Preserve other actions' result fidelity completely
+    // Preserve other actions' result fidelity completely.
     text.push(...rawTextParts);
     if (result.structuredContent != null) {
       text.push(JSON.stringify(result.structuredContent));
     }
+  }
+
+  if (outcome === "refused") {
+    text.unshift(refusalSummary(structuredObj));
+  } else if (outcome === "partial" || outcome === "unknown" || outcome === "unverifiable") {
+    // Uncertain delivery is not a failure; say so instead of letting the
+    // model read a successful call. Never replay uncertain input.
+    text.unshift(
+      `Computer-use outcome: ${outcome}. Delivery was not verified; do not replay it. Inspect the current state before proceeding.`
+    );
   }
 
   const fullText = text.join("\n\n") || "Computer-use call returned no text.";
@@ -150,13 +268,15 @@ export function toolResult(result: BridgeResult, action: string) {
   if (truncated.truncated) {
     const dir = mkdtempSync(join(tmpdir(), "noches-cua-result-"));
     chmodSync(dir, 0o700);
-    const path = join(dir, "result.txt");
-    writeFileSync(path, rawFullText, { mode: 0o600, flag: "wx" });
-    visible += `\n\n[Output truncated. Full text and structured result: ${path}]`;
+    const textPath = join(dir, "result.txt");
+    const jsonPath = join(dir, "result.json");
+    writeFileSync(textPath, rawText, { mode: 0o600, flag: "wx" });
+    writeFileSync(jsonPath, JSON.stringify({ action, structuredContent: result.structuredContent ?? null }, null, 2), { mode: 0o600, flag: "wx" });
+    visible += `\n\n[Output truncated. Full text: ${textPath}; structured result: ${jsonPath}]`;
   }
   return {
     content: [{type: "text" as const, text: visible}, ...images],
-    details: { action, structuredContent: result.structuredContent ?? null, driverIsError: result.isError === true },
+    details: { action, structuredContent: result.structuredContent ?? null, driverIsError, driverOutcome: outcome },
   };
 }
 

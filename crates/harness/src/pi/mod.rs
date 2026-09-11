@@ -1404,16 +1404,16 @@ pub(crate) fn supervise_session_task(
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(err) = handle.await {
-            if err.is_panic() {
-                let panic_payload = err.into_panic();
-                let message = crate::extract_panic_message(&*panic_payload);
-                let _ = event_tx
-                    .send(Err(HarnessError::Protocol(format!(
-                        "Pi session loop panicked: {message}"
-                    ))))
-                    .await;
-            }
+        if let Err(err) = handle.await
+            && err.is_panic()
+        {
+            let panic_payload = err.into_panic();
+            let message = crate::extract_panic_message(&*panic_payload);
+            let _ = event_tx
+                .send(Err(HarnessError::Protocol(format!(
+                    "Pi session loop panicked: {message}"
+                ))))
+                .await;
         }
     })
 }
@@ -3110,7 +3110,7 @@ mod tests {
         let normal_task = tokio::spawn(async {});
         supervise_session_task(normal_task, event_tx);
         let event = event_rx.recv().await;
-        assert!(matches!(event, None));
+        assert!(event.is_none());
     }
 
     #[tokio::test]
@@ -3123,7 +3123,7 @@ mod tests {
         let supervisor = supervise_session_task(task, event_tx);
         let _ = supervisor.await;
         let event = event_rx.recv().await;
-        assert!(matches!(event, None));
+        assert!(event.is_none());
     }
 
     #[test]
