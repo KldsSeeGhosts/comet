@@ -1,4 +1,6 @@
 // Included by impl_.rs so desktop input uses the existing session cursor helpers.
+const NOCHES_POINTER_PATH: &str = "wayland_desktop";
+
 fn noches_display_definition(def: &mut ToolDef) {
     def.input_schema["properties"]["display_id"] = json!({"type":"string","minLength":1,"maxLength":256,
         "description":"Hyprland output name from get_screen_size.displays, e.g. DP-1. primary is a compatibility alias. Screenshot coordinates are native pixels LOCAL to this output."});
@@ -28,7 +30,10 @@ fn noches_action(name: &str, args: &Value) -> anyhow::Result<(f64, f64, crate::w
     let action = match name {
         "move_cursor" => Action::Move,
         "click" => {
-            let button = match args.get("button").and_then(Value::as_str).unwrap_or("left") {
+            let button_name = match args.get("button") {
+                None => "left", Some(Value::String(value)) => value.as_str(), _ => anyhow::bail!("button must be a string"),
+            };
+            let button = match button_name {
                 "left"=>272, "right"=>273, "middle"=>274, _=>anyhow::bail!("unknown button"),
             };
             Action::Click { button, count: integer(args,"count",1,3)? }
@@ -123,16 +128,27 @@ async fn noches_desktop_tool(name: &str, args: &mut Value, state: Option<&Arc<To
             reveal_pointer_action_for(state,&resolve_cursor_key(args),ex,ey,false).await;
         }
         metadata["effect"] = json!("unverifiable");
-        metadata["path"] = json!("wayland_output_bound");
+        metadata["path"] = json!(NOCHES_POINTER_PATH);
+        metadata["output_bound"] = json!(true);
         metadata["scope"] = json!("desktop");
         Ok(ToolResult::text(format!("{name} sent to {}; inspect the same display to verify.",display.display_id)).with_structured(metadata))
     }.await;
-    Some(result.unwrap_or_else(|error| ToolResult::error(error.to_string()).with_structured(json!({"code":"display_action_failed","display_id":selected}))))
+    Some(result.unwrap_or_else(|error| ToolResult::error(if inspect { error.to_string() } else { format!("{error}. Input may have partially completed; inspect before retrying.") }).with_structured(json!({"code":"display_action_failed","display_id":selected}))))
 }
 
 #[cfg(test)]
 mod noches_display_tool_tests {
     use super::*;
+    #[test] fn output_bound_pointer_has_a_publishable_action_record() {
+        use cua_driver_core::action_record::ActionExecutionRecord;
+        let args = json!({"scope":"desktop", "display_id":"DP-1", "x":0, "y":0});
+        let data = json!({"path":NOCHES_POINTER_PATH, "effect":"unverifiable", "scope":"desktop"});
+        let record = ActionExecutionRecord::from_legacy("click", &args, &data).unwrap();
+        record.public_result().unwrap().validate_invariants().unwrap();
+    }
+    #[test] fn invalid_button_type_is_not_silently_a_left_click() {
+        assert!(noches_action("click",&json!({"x":0,"y":0,"button":42})).is_err());
+    }
     #[test] fn rejects_wrong_coordinate_types() {
         assert!(noches_action("click",&json!({"x":"0","y":0})).is_err());
     }
