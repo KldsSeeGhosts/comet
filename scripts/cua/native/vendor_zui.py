@@ -73,6 +73,9 @@ def main():
     patch = '[patch."https://github.com/zeronsh/zui"]'
     if patch in content:
         raise SystemExit('Existing ZUI patch table needs manual reconciliation')
+    if 'exclude' in tomllib.loads(content)['workspace']:
+        raise SystemExit('Existing workspace exclusions need manual reconciliation')
+    content = content.replace('[workspace]\n', '[workspace]\nexclude = ["vendor/gpui_linux"]\n', 1)
     shutil.copytree(native, target)
     (target / 'Cargo.toml').write_text(manifest)
     (target / 'NOCHES-PATCH.md').write_text(
