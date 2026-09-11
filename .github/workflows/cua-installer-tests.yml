@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 env:
   CUA_LEGACY_REV: 4af83697b8425944d668c543851ef6ae3639a130
-  CUA_INTEGRATED_REV: f82bef47563b35ab8986560a5c3fd531f8f32de7
+  CUA_INTEGRATED_REV: a84d5a415edbba7781d97a2c6ae8ce22e8535f65
 jobs:
   installer:
     runs-on: ubuntu-24.04
@@ -38,15 +38,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: KldsSeeGhosts/cua
-          ref: f82bef47563b35ab8986560a5c3fd531f8f32de7
+          ref: ${{ env.CUA_INTEGRATED_REV }}
           path: .native/cua-integrated
           sparse-checkout: libs/cua-driver/rust
+          ssh-key: ${{ secrets.CUA_INSTALLER_READ_KEY }}
           persist-credentials: false
       - name: Test installer sources against the legacy baseline
         env:
           CUA_PATCH_TEST_SOURCE: ${{ github.workspace }}/.native/cua-legacy
           CUA_PATCH_TEST_LEGACY: 4af83697b8425944d668c543851ef6ae3639a130
-          CUA_PATCH_TEST_INTEGRATED: f82bef47563b35ab8986560a5c3fd531f8f32de7
+          CUA_PATCH_TEST_INTEGRATED: ${{ env.CUA_INTEGRATED_REV }}
         run: |
           set -euo pipefail
           mkdir -p installer-evidence
@@ -57,7 +58,7 @@ jobs:
         env:
           CUA_PATCH_TEST_SOURCE: ${{ github.workspace }}/.native/cua-integrated
           CUA_PATCH_TEST_LEGACY: 4af83697b8425944d668c543851ef6ae3639a130
-          CUA_PATCH_TEST_INTEGRATED: f82bef47563b35ab8986560a5c3fd531f8f32de7
+          CUA_PATCH_TEST_INTEGRATED: ${{ env.CUA_INTEGRATED_REV }}
         run: |
           set -euo pipefail
           python3 -m unittest discover -s scripts/cua -p test_native_patches.py -v 2>&1 | tee installer-evidence/native-patches-integrated.log
