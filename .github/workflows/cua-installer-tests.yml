@@ -34,15 +34,16 @@ jobs:
           CUA_PATCH_TEST_SOURCE: ${{ github.workspace }}/.native/cua
         run: |
           set -euo pipefail
-          mkdir -p .evidence
-          python3 -m unittest discover -s scripts/cua -p test_native_patches.py -v 2>&1 | tee .evidence/installer-tests.log
+          mkdir -p installer-evidence
+          python3 -m unittest discover -s scripts/cua -p test_native_patches.py -v 2>&1 | tee installer-evidence/installer-tests.log
           bash -n scripts/cua/build_native.sh
           bash scripts/cua/build_native.sh --help
           python3 -m py_compile scripts/cua/native/apply_cua.py scripts/cua/native/vendor_zui.py
-          tar --exclude=__pycache__ -czf .evidence/native-patch-kit.tar.gz scripts/cua/native scripts/cua/test_native_patches.py scripts/cua/build_native.sh
+          tar --exclude=__pycache__ -czf installer-evidence/native-patch-kit.tar.gz scripts/cua/native scripts/cua/test_native_patches.py scripts/cua/build_native.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-installer-evidence
-          path: .evidence
+          path: installer-evidence
+          if-no-files-found: error
           retention-days: 7
