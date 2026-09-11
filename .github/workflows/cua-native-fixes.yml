@@ -1,0 +1,44 @@
+name: Cua native fixes
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/cua-native-fixes.yml'
+      - 'scripts/cua/native/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zeronsh/zui
+          ref: 07fd941ad72e7edc812fed317aab66adb69fa8cc
+          path: .native/zui
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: trycua/cua
+          ref: 4af83697b8425944d668c543851ef6ae3639a130
+          path: .native/cua
+          sparse-checkout: |
+            libs/cua-driver/rust
+            libs/cua-driver/hyprland-plugin
+          persist-credentials: false
+      - name: Package pinned sources for offline review
+        run: |
+          tar --exclude=.git -czf native-sources.tar.gz -C .native zui cua
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cua-native-pinned-sources
+          path: native-sources.tar.gz
+          retention-days: 3
+      - name: Apply and verify native patches
+        if: hashFiles('scripts/cua/native/verify.sh') != ''
+        run: bash scripts/cua/native/verify.sh .native/zui .native/cua
