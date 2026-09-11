@@ -44,6 +44,18 @@ fn approval(allow: bool, count: Arc<AtomicUsize>) -> RequestInput {
     })
 }
 
+#[test]
+fn stale_daemon_socket_is_removed_idempotently() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("driver.sock");
+    std::fs::write(&socket, b"stale").unwrap();
+
+    remove_socket_if_present(&socket).unwrap();
+    remove_socket_if_present(&socket).unwrap();
+
+    assert!(!socket.exists());
+}
+
 async fn call(socket: &Path, action: &str, args: Value) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut stream = UnixStream::connect(socket).await.unwrap();
@@ -283,5 +295,10 @@ async fn installed_driver_metadata_smoke() {
     );
     bridge.turn_ended().await;
     assert!(lock(&manager.lease).is_none());
+
+    bridge.turn_started();
+    let restarted = call(&socket, "health_report", json!({})).await;
+    assert_ne!(restarted["isError"], true, "{restarted}");
+    bridge.turn_ended().await;
     bridge.finish().await;
 }

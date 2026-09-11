@@ -226,6 +226,9 @@ impl BridgeState {
                 return;
             }
         }
+        if let Err(err) = remove_socket_if_present(&self.daemon_socket) {
+            tracing::warn!(error = %err, path = %self.daemon_socket.display(), "computer-use daemon socket cleanup failed");
+        }
         if runtime.lease_held {
             let mut owner = lock(&self.lease);
             if owner.as_deref() == Some(self.owner.as_str()) {
@@ -447,9 +450,7 @@ async fn handle_call(
             };
             tracing::warn!(error = %detail, "computer-use driver init failed");
             state.clean_runtime(&mut runtime, false).await;
-            return error(format!(
-                "Could not initialize cua-driver: {detail}"
-            ));
+            return error(format!("Could not initialize cua-driver: {detail}"));
         }
     }
     let driver = runtime.driver.as_mut().expect("initialized");
@@ -530,6 +531,7 @@ impl Driver {
         // the agent cursor overlay has a UI runloop. Injected test fixtures
         // only implement stdio mcp, so they keep the single-process path.
         let (daemon, mcp_socket) = if path.is_none() {
+            remove_socket_if_present(daemon_socket)?;
             let mut daemon = Self::base_command(&exe);
             daemon
                 .arg("serve")
@@ -686,6 +688,14 @@ impl Driver {
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+}
+
+fn remove_socket_if_present(path: &std::path::Path) -> CuaResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("Could not remove stale {}: {err}", path.display())),
     }
 }
 

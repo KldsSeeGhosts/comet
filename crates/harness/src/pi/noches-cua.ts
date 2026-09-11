@@ -100,11 +100,12 @@ export default function (pi: ExtensionAPI) {
     description: "Use the engine host's desktop through Noches. Pass action and args. 'help' lists supported tools; 'describe' with args.name returns a schema. Text output is capped at 50KB or 2000 lines; full truncated results are saved to a private file.",
     promptSnippet: "noches_cua: Inspect and control the engine host's desktop with native Noches approval and cancellation.",
     promptGuidelines: [
-      "Use noches_cua for desktop automation inside Noches; the direct cua tool is disabled.",
+      "Use noches_cua for desktop automation inside Noches; the direct cua tool is disabled. Do NOT shell out to hyprctl, wmctrl, or xdotool for window/app control - use noches_cua (list_windows, get_window_state, bring_to_front, set_window_frame) instead. Reserve bash for non-desktop work.",
       "Use noches_cua help and describe to inspect current tool schemas. Observe a specific window before acting, use fresh element tokens, and verify the postcondition after each action.",
       "One noches_cua approval covers the host for the whole turn, including foreground and desktop delivery. A denial lasts until the turn ends; do not retry the same action after one.",
       "noches_cua sessions and cleanup belong to the engine. Do not set session authority fields or call session lifecycle tools. Approvals expire when the turn finishes.",
       "If noches_cua reports cancellation or unknown delivery, do not repeat the action automatically. Previously delivered input cannot be undone.",
+      "On Hyprland 0.55+ `hyprctl dispatch <name> <args>` is removed; it is now a Lua shorthand for `hl.dispatch(...)`. If a task genuinely needs a compositor action noches_cua lacks (e.g. moving a window to a workspace), run `hyprctl eval 'hl.dispatch(hl.dsp.<fn>({ ... }))'` - never the positional form.",
     ],
     parameters: Type.Object({
       action: Type.String({ description: "Action name, help, or describe." }),
