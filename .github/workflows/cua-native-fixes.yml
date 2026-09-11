@@ -3,6 +3,7 @@ on:
   push:
     branches: [dev]
     paths:
+      - '.cargo/**'
       - '.github/workflows/cua-native-fixes.yml'
       - 'scripts/cua/native/**'
       - 'vendor/gpui_linux/**'
