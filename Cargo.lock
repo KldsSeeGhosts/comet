@@ -11810,6 +11810,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui-base",
+ "gpui_linux",
  "gpui_platform",
  "gpui_tokio",
  "image",

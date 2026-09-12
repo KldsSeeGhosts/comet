@@ -26,6 +26,7 @@ use wayland_protocols::{
     wp::fractional_scale::v1::client::wp_fractional_scale_v1,
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
 };
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
@@ -104,6 +105,9 @@ pub struct WaylandWindowState {
     app_id: Option<String>,
     appearance: WindowAppearance,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
+    /// ext-background-effect blur object — used when the compositor dropped
+    /// `org_kde_kwin_blur_manager` for the staging successor.
+    ext_blur: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -599,6 +603,7 @@ impl WaylandWindowState {
             surface,
             app_id: options.app_id,
             blur: None,
+            ext_blur: None,
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -630,8 +635,15 @@ impl WaylandWindowState {
     }
 
     pub fn is_transparent(&self) -> bool {
-        self.decorations == WindowDecorations::Client
-            || self.background_appearance != WindowBackgroundAppearance::Opaque
+        // A window only has transparent pixels when the app asks for a
+        // see-through background, or when CSD margins (a nonzero client
+        // inset) leave shadow/rounding space unpainted. A client-decorated
+        // Opaque window paints edge-to-edge — presenting it with an alpha
+        // channel only invites compositor-side translucency treatments
+        // (Hyprland `opacity` rules over blurred wallpaper) to wash the
+        // shell, which is how Electron/Chromium opaque surfaces stay solid.
+        self.background_appearance != WindowBackgroundAppearance::Opaque
+            || f32::from(self.inset()) > 0.0
     }
 
     fn update_subpixel_layout(&mut self) {
@@ -692,6 +704,9 @@ impl Drop for WaylandWindow {
         // Destroy blur first, this has no dependencies.
         if let Some(blur) = &state.blur {
             blur.release();
+        }
+        if let Some(ext_blur) = &state.ext_blur {
+            ext_blur.destroy();
         }
 
         // Decorations must be destroyed before the xdg state.
@@ -1288,6 +1303,24 @@ impl WaylandWindowStatePtr {
             if let Some(viewport) = &state.viewport {
                 viewport
                     .set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
+            }
+            // The ext-background-effect blur region is explicit surface-local
+            // geometry, not a whole-surface flag like the KWin object - it does
+            // not follow resizes, so re-stamp it to the new surface size or a
+            // freshly tiled window keeps blur only over its initial bounds.
+            if let Some(ref effect) = state.ext_blur {
+                let region = state
+                    .globals
+                    .compositor
+                    .create_region(&state.globals.qh, ());
+                region.add(
+                    0,
+                    0,
+                    f32::from(size.width) as i32,
+                    f32::from(size.height) as i32,
+                );
+                effect.set_blur_region(Some(&region));
+                region.destroy();
             }
         }
     }
@@ -1974,11 +2007,14 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         opaque_area.size.height,
     );
 
-    // Note that rounded corners make this rectangle API hard to work with.
-    // As this is common when using CSD, let's just disable this API.
-    if state.background_appearance == WindowBackgroundAppearance::Opaque
-        && state.decorations == WindowDecorations::Server
-    {
+    // Rounded corners make this rectangle API hard to work with, so it is
+    // still skipped for Blurred windows. For Opaque windows every painted
+    // pixel is solid, though — and declaring it matters beyond the damage
+    // optimization: compositors that fade or blur "transparent" windows by
+    // default (Hyprland `opacity` windowrules + `decoration:blur`) exempt a
+    // surface whose opaque region covers it, which is how Electron/Chromium
+    // shells stay solid under those rules.
+    if state.background_appearance == WindowBackgroundAppearance::Opaque {
         // Promise the compositor that this region of the window surface
         // contains no transparent pixels. This allows the compositor to skip
         // updating whatever is behind the surface for better performance.
@@ -1987,8 +2023,9 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         state.surface.set_opaque_region(None);
     }
 
+    let want_blur = state.background_appearance == WindowBackgroundAppearance::Blurred;
     if let Some(ref blur_manager) = state.globals.blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
+        if want_blur {
             if state.blur.is_none() {
                 let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
                 state.blur = Some(blur);
@@ -2000,6 +2037,29 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
             if let Some(b) = state.blur.take() {
                 b.release()
             }
+        }
+    } else if let Some(ref effect_manager) = state.globals.background_effect_manager {
+        // The staging successor to `org_kde_kwin_blur_manager` (Hyprland 0.55+,
+        // KWin 6.7+): get a per-surface effect object, then mark the whole
+        // surface region for blur. `set_blur_region` is double-buffered — it
+        // applies on the next surface commit, which the renderer drives.
+        if want_blur {
+            if state.ext_blur.is_none() {
+                let effect = effect_manager.get_background_effect(
+                    &state.surface,
+                    &state.globals.qh,
+                    (),
+                );
+                state.ext_blur = Some(effect);
+            }
+            if let Some(ref effect) = state.ext_blur {
+                effect.set_blur_region(Some(&region));
+            }
+        } else if let Some(effect) = state.ext_blur.take() {
+            // Clear the blur region before dropping the object so the effect
+            // does not linger on a reused surface id.
+            effect.set_blur_region(None);
+            effect.destroy();
         }
     }
 

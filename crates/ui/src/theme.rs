@@ -777,14 +777,20 @@ impl TerminalColors {
 impl Theme {
     // ---- numbers drive layout (px) ----
     /// Frost translucency over the blurred window background (macOS vibrancy).
-    /// Opaque elsewhere: Linux/Windows get no compositor-blur guarantee, and a
-    /// merely transparent window would show raw desktop through the sidebar.
-    /// Darkness matched by eye to a reference Electron app's dark glass. That
-    /// scrim is 0.76 over `hsl(0 0% 3%)`, but it sits on Electron's
+    /// Opaque elsewhere *by default*: a merely transparent window would show
+    /// raw desktop through the sidebar. Linux gets glass only when the running
+    /// Wayland compositor advertises a background-blur interface — see
+    /// [`compositor_window_blur_supported`]; other Linux/Windows sessions stay
+    /// opaque. Darkness matched by eye to a reference Electron app's dark
+    /// glass. That scrim is 0.76 over `hsl(0 0% 3%)`, but it sits on Electron's
     /// `under-window` vibrancy MATERIAL, which pre-darkens the blur; our bare
     /// backdrop blur has no material layer, so the scrim runs heavier to land
     /// on the same perceived tone (see [`Theme::glass`]).
-    pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.80 } else { 1.0 };
+    ///
+    /// 0.80 let a bright desktop wash the whole window out (user report -
+    /// "faded"); 0.90 is the original frost density: the blur stays visible
+    /// in the chrome while content keeps its contrast.
+    pub const GLASS_ALPHA: f32 = 0.90;
     /// Light-mode frost alpha — glass-forward, like dark mode.
     ///
     /// A light tint controls the blur less than a dark one: the desktop's
@@ -793,8 +799,10 @@ impl Theme {
     /// background for its labels (macOS light sidebars do the same — their
     /// vibrancy material is mostly white). Floating cards compensate further:
     /// see [`Self::glass_overlay`], where light coverage steps up to keep menu
-    /// text legible over an unknown backdrop.
-    pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(target_os = "macos") { 0.80 } else { 1.0 };
+    /// text legible over an unknown backdrop. Like [`Self::GLASS_ALPHA`], this
+    /// is the tint's coverage whenever glass is painted — whether it *is*
+    /// painted is decided by [`compositor_window_blur_supported`].
+    pub const GLASS_ALPHA_LIGHT: f32 = 0.90;
     /// Main-panel header height (zeron `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
     /// The unified window titlebar (traffic lights + cluster + tabs). Content
@@ -829,11 +837,18 @@ impl Theme {
     pub const TEXT_STACK_GAP: f32 = 1.0;
 
     /// The selected theme's shell tint painted over the blurred window
-    /// background (macOS glass). Keeping the hue theme-owned matters when a
-    /// user forces frost onto a palette authored for an opaque workbench: a
-    /// fixed Zeron grey would erase that palette's identity.
+    /// background (macOS glass, and Linux/Wayland compositors that can blur).
+    /// Keeping the hue theme-owned matters when a user forces frost onto a
+    /// palette authored for an opaque workbench: a fixed Zeron grey would erase
+    /// that palette's identity.
+    ///
+    /// Returns the opaque `surface` tone when glass is off — either because the
+    /// user pinned Opaque or because this platform/compositor cannot blur the
+    /// window background (see [`compositor_window_blur_supported`]).
     pub fn glass(&self) -> Hsla {
-        if self.surface_treatment == SurfaceTreatment::Opaque {
+        if self.surface_treatment == SurfaceTreatment::Opaque
+            || !compositor_window_blur_supported()
+        {
             return self.surface;
         }
         let base = match self.appearance {
@@ -927,7 +942,7 @@ impl Theme {
     /// white (the elevation ladder on an opaque page) — over glass it read as
     /// a solid slab in front of the frosted blur, so it thins to a
     /// translucent tint there (0.6 and then 0.45 both still read too bright
-    /// over the 0.80 frost — lowered on user request). Dark's 3% white wash
+    /// over the 0.90 frost — lowered on user request). Dark's 3% white wash
     /// is already glass-native.
     pub fn input_glass_bg(&self) -> Hsla {
         if !self.is_frost() {
@@ -963,9 +978,10 @@ impl Theme {
 
     /// How the platform should composite the window behind our paint.
     ///
-    /// Only dark macOS wants the blurred desktop — light chrome is opaque by
-    /// design ([`Self::GLASS_ALPHA_LIGHT`]), so it keeps opaque compositing
-    /// (subpixel-friendly, no vibrancy cost for a blur nothing shows). This is
+    /// Any appearance on a blur-capable host wants the blurred desktop (see
+    /// [`compositor_window_blur_supported`]); opaque platforms and the pinned
+    /// Opaque treatment keep opaque compositing (subpixel-friendly, no
+    /// vibrancy cost for a blur nothing shows). This is
     /// a method rather than a constant because it has to be *re-applied* after
     /// every theme swap: gpui's macOS backend tears the `NSVisualEffectView`
     /// out of the hierarchy whenever the value is anything but `Blurred`, and
@@ -1418,6 +1434,30 @@ impl Default for Theme {
 }
 
 impl Global for Theme {}
+
+/// Whether the platform can blur the region behind a translucent window.
+///
+/// macOS always can (vibrancy is an AppKit material). On Linux the answer comes
+/// from the vendored `gpui_linux` Wayland client, which records whether the
+/// compositor advertised `org_kde_kwin_blur_manager` or
+/// `ext_background_effect_manager_v1` during registry setup. Windows and
+/// compositors without a blur interface report false, so [`Theme::glass`] and
+/// [`Theme::window_background_appearance`] keep the window opaque rather than
+/// letting the raw desktop show through an unblurred transparent shell.
+fn compositor_window_blur_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        gpui_linux::compositor_blur_supported()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
 
 fn system_sans() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -2489,17 +2529,25 @@ mod tests {
         set_current_appearance(Appearance::Dark);
     }
 
-    /// Both appearances are glass-forward on macOS. Light frost runs heavier
-    /// than dark's (a light tint controls the blur less), and floating cards
-    /// step their tint coverage up in light so menu text stays on a
-    /// known-enough background — assert both relationships so the frost and
-    /// the overlay can't drift apart.
+    /// Both appearances are glass-forward where the platform can blur the
+    /// window. Light frost runs heavier than dark's (a light tint controls the
+    /// blur less), and floating cards step their tint coverage up in light so
+    /// menu text stays on a known-enough background — assert both relationships
+    /// so the frost and the overlay can't drift apart.
+    ///
+    /// Whether `glass()` is translucent at all is host-dependent (off macOS it
+    /// needs a compositor that can blur — see
+    /// [`compositor_window_blur_supported`]). This test runs headless, so it
+    /// keys the assertions off [`Theme::is_glass`] rather than assuming a
+    /// platform: where glass is unavailable both appearances must be opaque,
+    /// where it is available the dark/light relationship must hold.
     #[test]
     fn both_appearances_stay_frosted_and_light_runs_heavier() {
-        if Theme::GLASS_ALPHA < 1.0 {
-            let (dark, light) = (Theme::dark(), Theme::light());
+        let (dark, light) = (Theme::dark(), Theme::light());
+        if dark.is_glass() {
+            assert!(light.is_glass(), "light is glass-forward like dark");
             assert!(dark.glass().a < 1.0, "dark keeps its translucent frost");
-            assert!(light.glass().a < 1.0, "light is glass-forward like dark");
+            assert!(light.glass().a < 1.0, "light keeps its translucent frost");
             assert!(
                 light.glass().a > dark.glass().a - f32::EPSILON,
                 "a light tint dominates the blur less, so it must not run looser than dark"
@@ -2509,8 +2557,9 @@ mod tests {
                 "light floating cards need more coverage over blur for legible rows"
             );
         } else {
-            assert_eq!(Theme::light().glass().a, 1.0);
-            assert_eq!(Theme::dark().glass().a, 1.0);
+            assert_eq!(dark.glass(), dark.surface);
+            assert_eq!(light.glass(), light.surface);
+            assert!(!light.is_glass());
         }
     }
 

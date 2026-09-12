@@ -69,6 +69,9 @@ use wayland_protocols::{
     wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
 };
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1, ext_background_effect_surface_v1,
+};
 use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blur_manager};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
@@ -216,6 +219,11 @@ pub struct Globals {
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
+    /// The staging `ext-background-effect-v1` manager — the successor interface
+    /// compositors (Hyprland 0.55+, KWin 6.7+) advertise instead of
+    /// `org_kde_kwin_blur_manager`. Either can request window blur.
+    pub background_effect_manager:
+        Option<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
@@ -258,6 +266,7 @@ impl Globals {
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            background_effect_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
@@ -708,13 +717,25 @@ impl WaylandClient {
         let compositor_gpu = detect_compositor_gpu();
         let gpu_context = Rc::new(RefCell::new(None));
 
-        let seat = noches_seats.current()
-            .expect("Wayland exposed no named ordinary input seat").0;
+        let seat = noches_seats
+            .current()
+            .expect("Wayland exposed no named ordinary input seat")
+            .0;
         let globals = Globals::new(
             globals,
             common.foreground_executor.clone(),
             qh.clone(),
             seat.clone(),
+        );
+
+        // Record whether the compositor can blur a translucent window BEFORE
+        // the theme layer is ever asked for a background appearance. The app
+        // reads this via `crate::compositor_blur_supported` to decide between a
+        // blurred and an opaque window; requesting blur where unsupported would
+        // leave a transparent window showing the raw desktop. Either the legacy
+        // KWin interface or the staging ext-background-effect one qualifies.
+        crate::set_compositor_blur_supported(
+            globals.blur_manager.is_some() || globals.background_effect_manager.is_some(),
         );
 
         let data_device = globals
@@ -1299,6 +1320,8 @@ delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDec
 delegate_noop!(WaylandClientStatePtr: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(WaylandClientStatePtr: ignore xdg_positioner::XdgPositioner);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur_manager::OrgKdeKwinBlurManager);
+delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1);
+delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1);
 delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);

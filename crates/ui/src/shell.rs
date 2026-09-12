@@ -8860,10 +8860,16 @@ impl Render for Shell {
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
+                let glass = Theme::of(cx).is_glass();
+                let content_bg = Theme::of(cx).bg;
                 // No inset cards (user request): the conversation column sits
                 // flush and unbordered, the transcript directly on the frost
                 // glass; the changes pane is a flush left-bordered glass panel
-                // (built inside `render_right_pane`).
+                // (built inside `render_right_pane`). Opaque surfaces still
+                // split into the theme's two tones — the column paints `bg`
+                // over the root `surface` so themes whose shell sits below
+                // their content (Claude) keep that elevation; on glass the
+                // column stays transparent and the frost carries through.
                 let main = if main_transition.is_some() {
                     div()
                         .h_full()
@@ -8881,6 +8887,7 @@ impl Render for Shell {
                     .flex()
                     .flex_row()
                     .overflow_hidden()
+                    .when(!glass, |el| el.bg(content_bg))
                     .child(main)
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (zeron
@@ -8916,7 +8923,10 @@ impl Render for Shell {
                 // spanning the FULL window height (under the traffic lights,
                 // through the titlebar, down to the bottom edge). Its width
                 // rides the same tween as the sidebar, so the tone melts away
-                // with the collapse instead of vanishing in a frame.
+                // with the collapse instead of vanishing in a frame. The wash
+                // is glass-only: on opaque surfaces the column paints the flat
+                // `surface` tone so themes whose sidebar sits darker than the
+                // content (Claude) aren't lifted the wrong way.
                 let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
                 // Hairline on its right edge — full height like the tone,
                 // so the sidebar column reads as its own surface.
@@ -8926,7 +8936,7 @@ impl Render for Shell {
                     .bottom_0()
                     .left_0()
                     .w(px(sidebar_now))
-                    .bg(crate::theme::wash(0.05))
+                    .when(glass, |el| el.bg(crate::theme::wash(0.05)))
                     .border_r_1()
                     .border_color(border_color);
                 // The content row spans the FULL window height — the titlebar

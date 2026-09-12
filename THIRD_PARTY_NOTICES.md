@@ -31,6 +31,7 @@ by Zeron. Their names identify the corresponding palette adaptations.
 
 | Theme project | Audited revision | License and upstream notice |
 | --- | --- | --- |
+| Claude (claude.ai / Claude Desktop) | `claude-desktop-v1` | Palette adapted from Anthropic's published design tokens for interoperability; Anthropic retains all rights to the Claude brand and marks. Not affiliated with or endorsed by Anthropic. |
 | Visual Studio Code Dark+/Light+ | `e33d147d4c0fa65ce17cb73ec9d798f064b4bf1f` | [MIT](https://github.com/microsoft/vscode/blob/e33d147d4c0fa65ce17cb73ec9d798f064b4bf1f/LICENSE.txt) |
 | Catppuccin for VS Code | `befc9e6fc41980f4241408f7049755d47c06ff45` | [MIT](https://github.com/catppuccin/vscode/blob/befc9e6fc41980f4241408f7049755d47c06ff45/LICENSE) |
 | Tokyo Night VS Code Theme | `7c0f11eaef322f293621ca7befe462214b7ea468` | [MIT](https://github.com/tokyo-night/tokyo-night-vscode-theme/blob/7c0f11eaef322f293621ca7befe462214b7ea468/LICENSE.txt) |
