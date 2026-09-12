@@ -166,6 +166,7 @@ struct Inner {
     /// Engine-owned computer-use bridge: device-wide desktop lease, per-run
     /// socket, approvals, and driver cleanup (docs/computer-use.md).
     computer_use: ComputerUseManager,
+    session_views: crate::session_view::SessionViews,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -181,10 +182,25 @@ pub struct SessionsEngine {
 }
 
 impl SessionsEngine {
+    pub fn session_views(&self) -> crate::session_view::SessionViews {
+        self.inner.session_views.clone()
+    }
+
+    pub(crate) fn remember_native_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
+        self.inner
+            .remember_harness_session(chat_id, session_id, cwd);
+    }
+
+    pub(crate) fn chat_is_empty(&self, chat_id: &str) -> Result<bool, EngineError> {
+        let handle = self.doc_handle(chat_id)?;
+        Ok(handle.doc().read_entries()?.is_empty() && handle.doc().read_commands()?.is_empty())
+    }
+
     pub fn new(
         device_id: String,
         journal: Arc<RunJournal>,
         registry: Arc<HarnessRegistry>,
+        session_views: crate::session_view::SessionViews,
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
         let computer_use = ComputerUseManager::new(device_id.clone());
@@ -203,6 +219,7 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 computer_use,
+                session_views,
             }),
         }
     }
@@ -357,6 +374,7 @@ impl SessionsEngine {
         mut message_id: Option<String>,
         startup_retry: bool,
     ) -> Result<String, EngineError> {
+        let _ownership = self.inner.session_views.chat_permit(chat_id)?;
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
@@ -538,6 +556,7 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
+        let _ownership = self.inner.session_views.chat_permit(chat_id)?;
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
@@ -597,10 +616,18 @@ impl SessionsEngine {
         Ok(SteerOutcome::Accepted)
     }
 
-    /// Interrupt the live run, if any. The run settles with a synthetic
-    /// `Done{interrupted}` and its streaming entry stamped `aborted`; this waits
-    /// (bounded) for that settlement so callers observe a consistent doc.
+    /// Interrupt the live run and await stream EOF after backend teardown.
+    /// A synthetic Done settles the document, but does not release the run.
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+        self.interrupt_with_timeout(chat_id, std::time::Duration::from_secs(15))
+            .await
+    }
+
+    async fn interrupt_with_timeout(
+        &self,
+        chat_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool, EngineError> {
         let target = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -623,13 +650,17 @@ impl SessionsEngine {
         // … plus the engine-side grace deadline in the run task, so a harness that
         // ignores its token still settles with a synthesized Done{interrupted}.
         let _ = cancel.send(true);
-        // Bounded settle wait (the run task appends Done + stamps `aborted`).
-        for _ in 0..500 {
-            if !self.is_live(chat_id, &run_id) {
-                break;
+        tokio::time::timeout(timeout, async {
+            while self.is_live(chat_id, &run_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .map_err(|_| {
+            EngineError::Other(
+                "Resident backend has not released the session; handoff refused".into(),
+            )
+        })?;
         Ok(true)
     }
 
@@ -638,6 +669,9 @@ impl SessionsEngine {
     /// `set_thinking_level`). Returns `true` when the change went out on the
     /// live mailbox; `false` means the next dispatch should restart+resume.
     pub fn apply_options(&self, chat_id: &str, config: &zeron_proto::ChatConfig) -> bool {
+        let Ok(_ownership) = self.inner.session_views.chat_permit(chat_id) else {
+            return false;
+        };
         let mut runs = lock(&self.inner.runs);
         let Some(handle) = runs.get_mut(chat_id) else {
             return false;
@@ -677,6 +711,7 @@ impl SessionsEngine {
         chat_id: &str,
         message_id: &str,
     ) -> Result<String, EngineError> {
+        let _ownership = self.inner.session_views.chat_permit(chat_id)?;
         let handle = self.doc_handle(chat_id)?;
         // Settle any live run BEFORE counting: its appends must not race the
         // turn count, and the fork must never run under a live writer.
@@ -720,6 +755,7 @@ impl SessionsEngine {
     /// before it, the new doc gets the entry prefix through it, and the new
     /// chat resumes the fork on its next prompt. Returns the new chat id.
     pub async fn fork_chat(&self, chat_id: &str, message_id: &str) -> Result<String, EngineError> {
+        let _ownership = self.inner.session_views.chat_permit(chat_id)?;
         let handle = self.doc_handle(chat_id)?;
         let entries = handle
             .doc()
@@ -794,6 +830,7 @@ impl SessionsEngine {
         chat_id: &str,
         turns_to_remove: usize,
     ) -> Result<String, EngineError> {
+        self.inner.session_views.ensure_chat_owned(chat_id)?;
         let ws = self
             .inner
             .workspace()
@@ -925,7 +962,10 @@ impl SessionsEngine {
                         .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
                 })
                 .unwrap_or(false);
-            let will_resume = fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME;
+            let will_resume = fresh
+                && prompt.is_some()
+                && attempts < MAX_AUTO_RESUME
+                && self.inner.session_views.ensure_chat_owned(&chat_id).is_ok();
 
             let note = if will_resume {
                 "Run interrupted by engine restart — resuming"
@@ -1502,7 +1542,7 @@ fn finish_segment<'a>(
 }
 
 /// `~` / `~/…` → this host's home directory. Anything else passes through.
-fn expand_home(cwd: &str) -> String {
+pub(crate) fn expand_home(cwd: &str) -> String {
     match cwd.strip_prefix("~") {
         Some("") => crate::repos::home_dir().to_string_lossy().into_owned(),
         Some(rest) if rest.starts_with('/') => crate::repos::home_dir()
@@ -1582,8 +1622,11 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
+    let backend_interrupt = controls.interrupt.clone();
     let mut stream = match harness.run(request, controls).await {
-        Ok(stream) => stream,
+        // Teardown drains the stream after the main loop may already have seen
+        // EOF. Native adapters use unfold, which panics if polled after EOF.
+        Ok(stream) => stream.fuse(),
         Err(err) => {
             let message = err.to_string();
             inner.publish(
@@ -1601,11 +1644,11 @@ async fn drive_run(
                     session_id: None,
                 },
             );
-            inner.remove_run(&chat_id, &run_id);
-            inner.set_status(&chat_id, SessionStatus::Errored, false);
             if let Some(bridge) = bridge.take() {
                 bridge.finish().await;
             }
+            inner.remove_run(&chat_id, &run_id);
+            inner.set_status(&chat_id, SessionStatus::Errored, false);
             return;
         }
     };
@@ -2233,6 +2276,8 @@ async fn drive_run(
             if let Some(bridge) = bridge.take() {
                 bridge.finish().await;
             }
+            backend_interrupt.cancel();
+            while stream.next().await.is_some() {}
             inner.remove_run(&chat_id, &run_id);
             let engine = SessionsEngine {
                 inner: inner.clone(),
@@ -2435,6 +2480,12 @@ async fn drive_run(
         }
     };
 
+    // Done is a turn boundary, not process teardown. Native drivers close
+    // their event senders only after child shutdown. Keep the run registered
+    // until EOF; interrupt callers time out visibly rather than double-write.
+    backend_interrupt.cancel();
+    while stream.next().await.is_some() {}
+
     // Any subagent still streaming when the run ends freezes as-is: the
     // parent process is gone, so nothing more can arrive on this stream.
     for (parent_id, sink) in subagents.drain() {
@@ -2535,6 +2586,143 @@ mod tests {
             resume: None,
             attachments: Vec::new(),
             worktree: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn synthetic_done_does_not_release_a_resident_backend() {
+        use super::*;
+        use zeron_harness::{Harness, HarnessError};
+        struct HeldStream(Mutex<Option<mpsc::Receiver<Result<AgentEvent, HarnessError>>>>);
+        #[async_trait::async_trait]
+        impl Harness for HeldStream {
+            fn id(&self) -> HarnessId {
+                HarnessId::Mock
+            }
+            fn display_name(&self) -> &str {
+                "Held stream"
+            }
+            fn supports_steering(&self) -> bool {
+                true
+            }
+            fn steering_mode(&self) -> zeron_proto::SteeringMode {
+                zeron_proto::SteeringMode::StepBoundary
+            }
+            fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
+                &[]
+            }
+            async fn models(&self) -> Result<Vec<zeron_proto::Model>, HarnessError> {
+                Ok(vec![])
+            }
+            async fn run(
+                &self,
+                _: RunRequest,
+                _: RunControls,
+            ) -> Result<
+                futures::stream::BoxStream<'static, Result<AgentEvent, HarnessError>>,
+                HarnessError,
+            > {
+                let rx = lock(&self.0).take().unwrap();
+                Ok(futures::stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|event| (event, rx))
+                })
+                .boxed())
+            }
+        }
+        for delay_eof in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(HeldStream(Mutex::new(Some(rx)))));
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(),
+            registry,
+            HarnessId::Mock,
+            None,
+            "org",
+            "user",
+        )
+        .unwrap();
+        core.workspace
+            .create_chat(
+                "chat",
+                None,
+                Some(&core.device_id),
+                None,
+                Some("/tmp".into()),
+            )
+            .unwrap();
+        core.workspace
+            .rename_chat("chat", "Teardown fixture")
+            .unwrap();
+        let run = core
+            .sessions
+            .dispatch("chat", HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        let error = core
+            .sessions
+            .session_views()
+            .open(
+                core.sessions.clone(),
+                core.workspace.clone(),
+                core.terminals.clone(),
+                "chat".into(),
+                80,
+                24,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("busy"), "{error}");
+        assert!(core.sessions.is_live("chat", &run));
+        tx.send(Ok(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        }))
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while core.sessions.turn_in_flight("chat") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if !delay_eof {
+            drop(tx);
+            core.sessions.interrupt_with_timeout("chat", std::time::Duration::from_secs(1))
+                .await.unwrap();
+            assert!(!core.sessions.is_live("chat", &run));
+            core.doc_host.shutdown_workers().await;
+            continue;
+        }
+        let result = core
+            .sessions
+            .interrupt_with_timeout("chat", std::time::Duration::from_millis(3300))
+            .await;
+        assert!(result.is_err());
+        // The engine's 3-second synthetic Done has settled the journal, but the
+        // backend still owns its stream and must prevent a replacement writer.
+        assert!(
+            core.sessions
+                .inner
+                .journal
+                .stale_sessions()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(core.sessions.is_live("chat", &run));
+        drop(tx);
+        assert!(
+            core.sessions
+                .interrupt_with_timeout("chat", std::time::Duration::from_secs(1))
+                .await
+                .unwrap()
+        );
+        assert!(!core.sessions.is_live("chat", &run));
+        core.doc_host.shutdown_workers().await;
         }
     }
 

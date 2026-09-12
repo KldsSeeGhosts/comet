@@ -30,6 +30,7 @@ pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
+pub mod session_view;
 pub mod source_control;
 pub mod spaces;
 pub mod terminals;
@@ -213,7 +214,10 @@ impl EngineCore {
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
-        let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        let session_views = session_view::SessionViews::load(
+            &profile.store_root().join("session-handoffs.json"), store.clone(),
+        )?;
+        let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone(), session_views);
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {

@@ -934,7 +934,13 @@ impl WorkspaceHost {
     /// The caller (rpc layer) tears down live runs / doc-host handles for the
     /// returned chat ids.
     pub fn delete_space(&self, space_id: &str) -> Result<DeletedSpace, EngineError> {
-        Ok(self.mutate(|doc| doc.delete_space(space_id))?)
+        self.mutate(|doc| {
+            let spaces = doc.read_spaces()?;
+            if spaces.len() <= 1 && spaces.iter().any(|space| space.id == space_id) {
+                return Err(EngineError::Other("cannot delete the last workspace".into()));
+            }
+            Ok(doc.delete_space(space_id)?)
+        })
     }
 
     /// Synced seen marker (any device; LWW + monotonic guard in the doc layer).
@@ -1621,6 +1627,28 @@ mod tests {
             host.watch_spaces().borrow()[0].name.as_deref(),
             Some("Renamed")
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_workspace_deletion_preserves_the_last_workspace() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig { device_id:"test-device".into(),device_name:"Test".into(),
+                platform:"linux".into(),org_id:"test-org".into(),user_id:"test-user".into(),edge:None },
+        ).unwrap();
+        host.create_space("one","test-device","/one",None,false).unwrap();
+        assert!(host.delete_space("one").unwrap_err().to_string().contains("last workspace"));
+        host.create_space("two","test-device","/two",None,false).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = ["one","two"].into_iter().map(|id| {
+            let host = host.clone(); let barrier = barrier.clone();
+            std::thread::spawn(move || { barrier.wait(); host.delete_space(id).is_ok() })
+        }).collect();
+        assert_eq!(threads.into_iter().map(|thread|usize::from(thread.join().unwrap())).sum::<usize>(),1);
+        assert_eq!(host.read(|doc|doc.read_spaces()).unwrap().len(),1);
+        assert!(host.delete_space("already-absent").is_ok());
     }
 
     #[test]

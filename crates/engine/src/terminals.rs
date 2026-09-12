@@ -43,6 +43,9 @@ struct LiveTerminal {
     seq: u64,
     last_active_at: std::time::Instant,
     exited: bool,
+    managed: bool,
+    identity: Option<ProcessIdentity>,
+    termination: tokio::sync::watch::Receiver<Option<Result<u32, String>>>,
 }
 
 impl LiveTerminal {
@@ -76,6 +79,110 @@ impl LiveTerminal {
         self.seq += 1;
         self.seq
     }
+}
+
+/// Linux process identity and PTY session, used only for read-only recovery checks.
+/// Recovered terminals are never signalled by PID.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProcessIdentity {
+    boot: String,
+    pid: u32,
+    started: u64,
+    session: u32,
+}
+
+pub(crate) fn boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_owned())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+impl ProcessIdentity {
+    fn capture(pid: u32) -> Option<Self> {
+        let (session, started, _) = process_stat(pid).ok().flatten()?;
+        // portable-pty creates a new session. Refuse ambiguous group ownership.
+        if session != pid {
+            return None;
+        }
+        Some(Self {
+            boot: boot_id()?,
+            pid,
+            started,
+            session,
+        })
+    }
+
+    pub(crate) fn ensure_dead(&self) -> Result<(), EngineError> {
+        let current = boot_id()
+            .ok_or_else(|| EngineError::Other("Cannot verify the CLI boot identity".into()))?;
+        if self.boot != current {
+            return Ok(());
+        }
+        if process_stat(self.pid)?
+            .is_some_and(|(_, started, state)| started == self.started && state != "Z")
+        {
+            return Err(EngineError::Other(
+                "Recovered CLI is still running; terminate it before retrying CloseSessionTerminal"
+                    .into(),
+            ));
+        }
+        // The leader can exit while a tool still holds its PTY session.
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if process_stat(pid)?
+                .is_some_and(|(session, _, state)| session == self.session && state != "Z")
+            {
+                return Err(EngineError::Other(
+                    "CLI process session still has live members; chat remains CLI-owned".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn process_stat(pid: u32) -> Result<Option<(u32, u64, String)>, EngineError> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let fields: Vec<_> = stat
+        .rsplit_once(')')
+        .ok_or_else(|| EngineError::Other("Invalid process identity".into()))?
+        .1
+        .split_whitespace()
+        .collect();
+    let parse_error = || EngineError::Other("Invalid process identity".into());
+    let session = fields
+        .get(3)
+        .ok_or_else(parse_error)?
+        .parse()
+        .map_err(|_| parse_error())?;
+    let started = fields
+        .get(19)
+        .ok_or_else(parse_error)?
+        .parse()
+        .map_err(|_| parse_error())?;
+    Ok(Some((
+        session,
+        started,
+        fields.first().ok_or_else(parse_error)?.to_string(),
+    )))
 }
 
 struct TerminalsInner {
@@ -149,7 +256,41 @@ impl Terminals {
         rows: u16,
         shell: Option<&str>,
     ) -> Result<TerminalSession, EngineError> {
-        if lock(&self.inner.sessions).len() >= MAX_TERMINALS {
+        let shell = shell.map(str::to_string).unwrap_or_else(selected_shell);
+        let args = if cfg!(windows) {
+            vec![]
+        } else {
+            vec!["-l".to_string()]
+        };
+        self.open_command(cwd, cols, rows, &shell, &args, &[], false)
+    }
+
+    /// Spawn a managed native session directly. Arguments are never interpreted by a shell.
+    pub fn open_argv(
+        &self,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        program: &str,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> Result<TerminalSession, EngineError> {
+        self.open_command(cwd, cols, rows, program, args, env, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_command(
+        &self,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        shell: &str,
+        args: &[String],
+        env: &[(String, String)],
+        managed: bool,
+    ) -> Result<TerminalSession, EngineError> {
+        let mut sessions = lock(&self.inner.sessions);
+        if sessions.len() >= MAX_TERMINALS {
             return Err(EngineError::Other(format!(
                 "Too many open terminals (maximum {MAX_TERMINALS})"
             )));
@@ -160,30 +301,26 @@ impl Terminals {
             ));
         }
 
-        let shell = shell.map(str::to_string).unwrap_or_else(selected_shell);
-        let shell_name = std::path::Path::new(&shell)
+        let shell_name = std::path::Path::new(shell)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| shell.clone());
+            .unwrap_or_else(|| shell.to_owned());
 
         let pty = native_pty_system();
         let pair = pty
             .openpty(clamp_size(cols, rows))
             .map_err(|e| EngineError::Other(format!("could not open a pty: {e}")))?;
-        let mut cmd = CommandBuilder::new(&shell);
-        if !cfg!(windows) {
-            cmd.arg("-l"); // login shell — the user's real PATH/profile
-        }
+        let mut cmd = CommandBuilder::new(shell);
+        cmd.args(args);
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Zeron");
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| EngineError::Other(format!("could not spawn {shell_name}: {e}")))?;
-        drop(pair.slave);
-        let killer = child.clone_killer();
+        cmd.env_remove("NOCHES_CUA_SOCKET");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        // Acquire fallible PTY handles before spawning, so failure cannot leak a child.
         let reader = pair
             .master
             .try_clone_reader()
@@ -192,8 +329,24 @@ impl Terminals {
             .master
             .take_writer()
             .map_err(|e| EngineError::Other(format!("pty writer: {e}")))?;
-
+        let mut child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| EngineError::Other(format!("could not spawn {shell_name}: {e}")))?;
+        let identity = child.process_id().and_then(ProcessIdentity::capture);
+        drop(pair.slave);
+        let killer = child.clone_killer();
         let id = new_id();
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("pty-read-{id}"))
+            .spawn(move || read_pty(reader, raw_tx))
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(EngineError::Other(format!("pty reader thread: {error}")));
+        }
+        let (terminated, termination) = tokio::sync::watch::channel(None);
         let session = Arc::new(Mutex::new(LiveTerminal {
             master: pair.master,
             writer,
@@ -204,16 +357,23 @@ impl Terminals {
             seq: 0,
             last_active_at: std::time::Instant::now(),
             exited: false,
+            managed,
+            identity,
+            termination,
         }));
-        lock(&self.inner.sessions).insert(id.clone(), session.clone());
+        sessions.insert(id.clone(), session.clone());
 
         // Raw PTY bytes: blocking reader thread → batcher task (12ms windows).
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        std::thread::Builder::new()
-            .name(format!("pty-read-{id}"))
-            .spawn(move || read_pty(reader, raw_tx))
-            .map_err(|e| EngineError::Other(format!("pty reader thread: {e}")))?;
-        let wait = tokio::task::spawn_blocking(move || child.wait());
+        let wait = tokio::task::spawn_blocking(move || {
+            let result = child.wait();
+            terminated.send_replace(Some(
+                result
+                    .as_ref()
+                    .map(|status| status.exit_code())
+                    .map_err(ToString::to_string),
+            ));
+            result
+        });
         tokio::spawn(pump_output(Arc::downgrade(&session), raw_rx, wait));
 
         Ok(TerminalSession {
@@ -228,6 +388,18 @@ impl Terminals {
             .get(terminal_id)
             .cloned()
             .ok_or_else(|| EngineError::Other("Terminal not found".into()))
+    }
+
+    pub(crate) fn process_identity(
+        &self,
+        terminal_id: &str,
+    ) -> Result<Option<ProcessIdentity>, EngineError> {
+        let session = self.session(terminal_id)?;
+        Ok(lock(&session).identity.clone())
+    }
+
+    pub(crate) fn contains(&self, terminal_id: &str) -> bool {
+        lock(&self.inner.sessions).contains_key(terminal_id)
     }
 
     /// Replay (from `after_seq`, bounded 1MB window) then live tail. The stream
@@ -294,10 +466,65 @@ impl Terminals {
 
     /// Kill the shell (if still running) and drop the session + replay buffer.
     pub fn close(&self, terminal_id: &str) -> Result<(), EngineError> {
-        let session = lock(&self.inner.sessions)
+        let mut sessions = lock(&self.inner.sessions);
+        if sessions.get(terminal_id).is_some_and(|s| lock(s).managed) {
+            return Err(EngineError::Other(
+                "Use CloseSessionTerminal to hydrate this chat".into(),
+            ));
+        }
+        let session = sessions
             .remove(terminal_id)
             .ok_or_else(|| EngineError::Other("Terminal not found".into()))?;
         dispose(&session, true);
+        Ok(())
+    }
+
+    /// Termination is acknowledged by child.wait(), not by output EOF or kill delivery.
+    /// Keep the managed replay buffer until hydration succeeds, so close can be retried.
+    pub async fn terminate_and_wait(&self, terminal_id: &str) -> Result<(), EngineError> {
+        let session = self.session(terminal_id)?;
+        let mut termination = {
+            let mut live = lock(&session);
+            let termination = live.termination.clone();
+            if termination.borrow().is_none() {
+                live.killer
+                    .kill()
+                    .map_err(|e| EngineError::Other(format!("Terminal kill failed: {e}")))?;
+            }
+            termination
+        };
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(result) = termination.borrow().clone() {
+                    return result.map(|_| ()).map_err(EngineError::Other);
+                }
+                termination
+                    .changed()
+                    .await
+                    .map_err(|_| EngineError::Other("Terminal waiter disappeared".into()))?;
+            }
+        })
+        .await
+        .map_err(|_| {
+            EngineError::Other("Terminal termination timed out; chat remains CLI-owned".into())
+        })??;
+        if let Some(identity) = &lock(&session).identity {
+            identity.ensure_dead()?;
+        }
+        Ok(())
+    }
+
+    pub fn forget_terminated(&self, terminal_id: &str) -> Result<(), EngineError> {
+        let mut sessions = lock(&self.inner.sessions);
+        let session = sessions
+            .get(terminal_id)
+            .ok_or_else(|| EngineError::Other("Terminal not found".into()))?;
+        if !matches!(*lock(session).termination.borrow(), Some(Ok(_))) {
+            return Err(EngineError::Other(
+                "Terminal termination is not confirmed".into(),
+            ));
+        }
+        sessions.remove(terminal_id);
         Ok(())
     }
 
@@ -417,7 +644,81 @@ async fn reaper_task(inner: Weak<TerminalsInner>) {
         let mut sessions = lock(&inner.sessions);
         sessions.retain(|_, session| {
             let session = lock(session);
-            !(session.exited && session.last_active_at.elapsed() > EXITED_TTL)
+            session.managed || !(session.exited && session.last_active_at.elapsed() > EXITED_TTL)
         });
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovered_identity_never_signals_a_recycled_pid() {
+        let pid = std::process::id();
+        let (_, started, _) = process_stat(pid).unwrap().unwrap();
+        let recycled = ProcessIdentity {
+            boot: boot_id().unwrap(),
+            pid,
+            started: started + 1,
+            session: u32::MAX,
+        };
+        recycled.ensure_dead().unwrap();
+        assert_eq!(process_stat(pid).unwrap().unwrap().1, started);
+        let original = ProcessIdentity {
+            started,
+            ..recycled
+        };
+        assert!(original.ensure_dead().is_err());
+    }
+
+    #[tokio::test]
+    async fn argv_environment_and_process_termination_are_real() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminals = Terminals::new();
+        let cwd = dir.path().to_str().unwrap();
+        let literal = "spaces ; $(touch should-not-exist) `touch also-not`";
+        let session = terminals
+            .open_argv(
+                cwd,
+                80,
+                24,
+                "/bin/sh",
+                &[
+                    "-c".into(),
+                    "printf '%s|%s' \"$1\" \"$FIXTURE_ENV\"; read -r line".into(),
+                    "fixture".into(),
+                    literal.into(),
+                ],
+                &[("FIXTURE_ENV".into(), "env is literal".into())],
+            )
+            .unwrap();
+        let mut output = terminals.subscribe(&session.id, None).unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !String::from_utf8_lossy(&bytes).contains("env is literal") {
+                match output.recv().await.unwrap() {
+                    TerminalEvent::Data { data, .. } => bytes.extend(BASE64.decode(data).unwrap()),
+                    TerminalEvent::Exit { .. } => panic!("fixture exited before input"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains(literal));
+        assert!(!dir.path().join("should-not-exist").exists());
+        assert!(!dir.path().join("also-not").exists());
+        assert!(terminals.forget_terminated(&session.id).is_err());
+        terminals.terminate_and_wait(&session.id).await.unwrap();
+        terminals.terminate_and_wait(&session.id).await.unwrap();
+        terminals.forget_terminated(&session.id).unwrap();
+        assert!(!terminals.any_open());
+        assert!(
+            terminals
+                .open_argv(cwd, 80, 24, "/no/such/native-cli", &[], &[])
+                .is_err()
+        );
+        assert!(!terminals.any_open());
     }
 }

@@ -810,6 +810,15 @@ async fn delete_space_cascades_chats_and_sessions() {
     let core = assemble(&tmp.path().join("data"));
     core.workspace
         .create_space(
+            "space-kept",
+            &core.device_id,
+            &tmp.path().to_string_lossy(),
+            None,
+            false,
+        )
+        .expect("remaining workspace");
+    core.workspace
+        .create_space(
             "space-1",
             &core.device_id,
             &folder.to_string_lossy(),
@@ -833,7 +842,9 @@ async fn delete_space_cascades_chats_and_sessions() {
     assert!(deleted.existed);
     assert_eq!(deleted.chat_ids, vec!["chat-1".to_string()]);
     assert!(core.workspace.chat("chat-1").expect("read").is_none());
-    assert!(core.workspace.read_spaces().expect("spaces").is_empty());
+    let remaining = core.workspace.read_spaces().expect("spaces");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, "space-kept");
     core.shutdown().await;
 }
 

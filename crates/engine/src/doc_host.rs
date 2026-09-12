@@ -853,6 +853,33 @@ impl DocHost {
         let _ = self.inner.uploads.set(uploads);
     }
 
+    /// Persist a native Pi image inside the existing attachment read boundary.
+    pub(crate) fn store_native_image(&self, data: &str, mime: &str) -> Result<String, crate::EngineError> {
+        use std::io::Write;
+        const MAX: usize = 24 * 1024 * 1024;
+        let invalid = |message: &str| crate::EngineError::Other(message.into());
+        if data.len() > MAX / 3 * 4 + 4 { return Err(invalid("Native image exceeds 24 MiB")); }
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data)
+            .map_err(|_| invalid("Native image has invalid base64"))?;
+        if bytes.len() > MAX { return Err(invalid("Native image exceeds 24 MiB")); }
+        let extension = match mime {
+            "image/png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => "png",
+            "image/jpeg" if bytes.starts_with(b"\xff\xd8\xff") => "jpg",
+            "image/gif" if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => "gif",
+            "image/webp" if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") => "webp",
+            _ => return Err(invalid("Native image format is unsupported or does not match its MIME type")),
+        };
+        let uploads = self.inner.uploads.get().ok_or_else(|| invalid("Attachment store is unavailable"))?;
+        std::fs::create_dir_all(uploads.dir())?;
+        let path = uploads.dir().join(format!("native-{:x}.{extension}", Sha256::digest(&bytes)));
+        let mut staged = tempfile::NamedTempFile::new_in(uploads.dir())?;
+        staged.write_all(&bytes)?;
+        staged.as_file().sync_all()?;
+        staged.persist(&path).map_err(|error| crate::EngineError::Other(error.to_string()))?;
+        std::fs::File::open(uploads.dir())?.sync_all()?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
     /// Wire the peer-link cache (engine assembly, edge runtimes only) — the
     /// transport for queued attachment transfers to a remote host.
     pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
