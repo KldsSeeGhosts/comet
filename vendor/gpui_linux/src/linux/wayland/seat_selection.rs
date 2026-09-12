@@ -47,6 +47,10 @@ impl<T: Clone + PartialEq> Seats<T> {
     pub(crate) fn current(&self) -> Option<(T, u32)> {
         self.entries.get(&self.selected?).map(|entry| (entry.seat.clone(), entry.capabilities))
     }
+    pub(crate) fn agents(&self) -> Vec<(u32, T, u32)> {
+        self.entries.iter().filter(|(_, entry)| entry.name.as_deref().is_some_and(synthetic))
+            .map(|(id, entry)| (*id, entry.seat.clone(), entry.capabilities)).collect()
+    }
     pub(crate) fn contains(&self, seat: &T) -> bool {
         self.entries.values().any(|entry| &entry.seat == seat)
     }

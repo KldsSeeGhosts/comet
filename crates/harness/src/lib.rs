@@ -157,6 +157,7 @@ pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
 pub mod pi;
+pub mod provider_history;
 pub mod shell_env;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
@@ -361,22 +362,67 @@ pub use pi::PiHarness;
 // ---------------------------------------------------------------------------
 
 /// Reap the child: graceful SIGTERM first, SIGKILL after `kill_grace`.
-/// (`kill_on_drop` remains the last-resort backstop.)
+/// Return only with a confirmed exit status. Wait errors keep teardown pending
+/// so stream EOF cannot falsely authorize a replacement run.
 pub(crate) async fn shutdown_child(
     child: &mut tokio::process::Child,
     kill_grace: std::time::Duration,
 ) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
+    let pid = child.id();
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(error) => tracing::warn!(?pid, %error, "child exit check failed; teardown unconfirmed"),
     }
-    if let Some(pid) = child.id() {
+    if let Some(pid) = pid {
         send_signal(pid, Signal::Term);
-        if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
+        if confirmed_child_wait(child.wait(), kill_grace, Some(pid), "SIGTERM").await {
             return;
         }
     }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+    if let Err(error) = child.start_kill() {
+        tracing::warn!(?pid, %error, "child kill failed; still waiting for confirmed exit");
+    }
+
+    let mut retry_delay = std::time::Duration::from_millis(100);
+    let max_delay = std::time::Duration::from_secs(5);
+    // Keep borrowing the child until reaping succeeds. Bound each wait and the
+    // retry rate, not total teardown time: a deadline is not proof of exit.
+    while !confirmed_child_wait(child.wait(), max_delay, pid, "SIGKILL").await {
+        tracing::warn!(
+            ?pid,
+            retry_ms = retry_delay.as_millis() as u64,
+            "child teardown unconfirmed; retaining handle and retrying wait"
+        );
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = (retry_delay * 2).min(max_delay);
+    }
+}
+
+async fn confirmed_child_wait(
+    wait: impl std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+    timeout: std::time::Duration,
+    pid: Option<u32>,
+    phase: &'static str,
+) -> bool {
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(Ok(status)) => {
+            tracing::debug!(?pid, phase, %status, "child reaped");
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(?pid, phase, %error, "child wait failed; exit remains unconfirmed");
+            false
+        }
+        Err(_) => {
+            tracing::debug!(
+                ?pid,
+                phase,
+                "child wait timed out; exit remains unconfirmed"
+            );
+            false
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -400,6 +446,129 @@ pub(crate) fn send_signal(pid: u32, signal: Signal) {
 #[cfg(not(unix))]
 pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
     // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Stdio};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::{Child, ChildStdin, Command};
+    use tokio::time::{Instant, timeout};
+
+    #[tokio::test]
+    async fn wait_requires_inner_success() {
+        for error in [
+            std::io::Error::other("injected wait failure"),
+            std::io::Error::from_raw_os_error(libc::ECHILD),
+        ] {
+            assert!(
+                !confirmed_child_wait(
+                    std::future::ready(Err(error)),
+                    Duration::from_secs(1),
+                    None,
+                    "test",
+                )
+                .await
+            );
+        }
+        assert!(
+            !confirmed_child_wait(
+                std::future::pending(),
+                Duration::from_millis(1),
+                None,
+                "test",
+            )
+            .await
+        );
+        // A nonzero exit is still a successful reap.
+        assert!(
+            confirmed_child_wait(
+                std::future::ready(Ok(ExitStatus::from_raw(7 << 8))),
+                Duration::from_secs(1),
+                None,
+                "test",
+            )
+            .await
+        );
+    }
+
+    async fn ready_shell(script: &str) -> (Child, ChildStdin) {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn disposable shell");
+        // Hold stdin outside Child so wait() cannot close the shell's read loop.
+        let stdin = child.stdin.take().expect("piped stdin");
+        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let mut ready = String::new();
+        timeout(Duration::from_secs(5), stdout.read_line(&mut ready))
+            .await
+            .expect("shell readiness timeout")
+            .expect("shell readiness read");
+        assert_eq!(ready, "ready\n");
+        (child, stdin)
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaps_on_term() {
+        let (mut child, _stdin) =
+            ready_shell("trap 'exit 23' TERM; printf 'ready\\n'; while :; do read -r line; done")
+                .await;
+        timeout(
+            Duration::from_secs(5),
+            shutdown_child(&mut child, Duration::from_secs(2)),
+        )
+        .await
+        .expect("shutdown timeout");
+        let status = child.try_wait().expect("wait").expect("reaped");
+        assert_eq!(status.code(), Some(23));
+        assert_eq!(child.id(), None);
+    }
+
+    #[tokio::test]
+    async fn shutdown_escalates_to_kill_after_grace() {
+        let (mut child, _stdin) =
+            ready_shell("trap '' TERM; printf 'ready\\n'; while :; do read -r line; done").await;
+        let grace = Duration::from_millis(100);
+        let started = Instant::now();
+        timeout(Duration::from_secs(5), shutdown_child(&mut child, grace))
+            .await
+            .expect("shutdown timeout");
+        assert!(started.elapsed() >= grace);
+        let status = child.try_wait().expect("wait").expect("reaped");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(child.id(), None);
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent_for_reaped_child() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn disposable shell");
+        let status = timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("exit timeout")
+            .expect("wait");
+        assert_eq!(status.code(), Some(7));
+        for _ in 0..2 {
+            timeout(
+                Duration::from_secs(1),
+                shutdown_child(&mut child, Duration::from_secs(2)),
+            )
+            .await
+            .expect("already-reaped shutdown timeout");
+            assert_eq!(child.try_wait().expect("wait"), Some(status));
+        }
+    }
 }
 
 #[cfg(test)]

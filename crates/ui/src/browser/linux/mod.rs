@@ -85,17 +85,16 @@ fn helper_path() -> Result<std::path::PathBuf, String> {
 impl BrowserData {
     fn worker(&self) -> Result<Arc<Worker>, String> {
         let mut current = self.0.lock().unwrap();
-        if let Some(worker) = current.upgrade() {
-            if worker
+        if let Some(worker) = current.upgrade()
+            && worker
                 .child
                 .lock()
                 .unwrap()
                 .try_wait()
                 .map_err(|e| e.to_string())?
                 .is_none()
-            {
-                return Ok(worker);
-            }
+        {
+            return Ok(worker);
         }
         let mut child = Command::new(helper_path()?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
             .map_err(|e| format!("Could not start WebKitGTK: {e}. Install the WebKitGTK 4.1 runtime for your distribution."))?;
@@ -349,12 +348,12 @@ impl super::BrowserSurface {
                 if page.error.is_some() {
                     page.loading = false;
                 }
-                if !self.address.focus_handle(cx).is_focused(window) {
-                    if let Some(url) = &page.url {
-                        if self.address.read(cx).text() != url {
-                            self.address
-                                .update(cx, |input, cx| input.set_text(url.clone(), cx));
-                        }
+                if !self.address.focus_handle(cx).is_focused(window)
+                    && let Some(url) = &page.url
+                {
+                    if self.address.read(cx).text() != url {
+                        self.address
+                            .update(cx, |input, cx| input.set_text(url.clone(), cx));
                     }
                     self.address_edited = false;
                 }
@@ -570,21 +569,20 @@ impl super::BrowserSurface {
         cx.notify();
     }
     pub(super) fn linux_choose_menu(&mut self, index: usize, cx: &mut gpui::Context<Self>) {
-        if let Some(native) = &mut self.native {
-            if let Some(item) = native
+        if let Some(native) = &mut self.native
+            && let Some(item) = native
                 .menu
                 .as_ref()
                 .and_then(|m| m["items"].get(index))
                 .filter(|i| i["enabled"].as_bool().unwrap_or(false))
-            {
-                let action = item["action"].as_str().unwrap_or("");
-                if action == "text" {
-                    if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                        native.command(json!({"cmd":"text","text":text}));
-                    }
-                } else {
-                    native.command(json!({"cmd":action}));
+        {
+            let action = item["action"].as_str().unwrap_or("");
+            if action == "text" {
+                if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    native.command(json!({"cmd":"text","text":text}));
                 }
+            } else {
+                native.command(json!({"cmd":action}));
             }
         }
         self.linux_dismiss_menu(cx);

@@ -12,6 +12,10 @@ members = [
     "crates/rpc",
     "crates/update",
     "crates/ui",
+    "crates/workspace",
+    "crates/local-api",
+    "crates/orchestration",
+    "crates/shell-hooks",
     "crates/syntax",
     "apps/zeron",
 ]
@@ -32,6 +36,10 @@ zeron-engine = { path = "crates/engine" }
 zeron-rpc = { path = "crates/rpc" }
 zeron-update = { path = "crates/update" }
 zeron-ui = { path = "crates/ui" }
+zeron-workspace = { path = "crates/workspace" }
+zeron-local-api = { path = "crates/local-api" }
+zeron-orchestration = { path = "crates/orchestration" }
+zeron-shell-hooks = { path = "crates/shell-hooks" }
 zeron-syntax = { path = "crates/syntax" }
 zeron-theme = { path = "crates/theme" }
 

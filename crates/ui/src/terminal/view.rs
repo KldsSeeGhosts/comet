@@ -12,8 +12,9 @@
 //!   colors — paint never changes layout), and the cursor block.
 
 use gpui::{
-    App, Bounds, Entity, GlobalElementId, Hsla, LayoutId, Modifiers, PaintQuad, Pixels, ShapedLine,
-    SharedString, Style, TextRun, Window, fill, font, outline, point, px, relative, size,
+    App, Bounds, ElementInputHandler, Entity, GlobalElementId, Hsla, LayoutId, Modifiers,
+    PaintQuad, Pixels, ShapedLine, SharedString, Style, TextRun, Window, fill, font, outline,
+    point, px, relative, size,
 };
 
 use crate::theme::{Appearance, Theme, rgb_to_hsl};
@@ -279,6 +280,25 @@ pub fn keystroke_bytes(
     }
 }
 
+/// Keydown handles terminal commands, not text. The platform input handler
+/// owns printable commits so composition cannot send the same character twice.
+pub fn keydown_bytes(
+    key: &str,
+    key_char: Option<&str>,
+    mods: &Modifiers,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
+    if !mods.control && !mods.alt {
+        match key {
+            "enter" | "backspace" | "tab" | "escape" | "up" | "down" | "right" | "left"
+            | "home" | "end" | "insert" | "delete" | "pageup" | "pagedown" | "f1" | "f2" | "f3"
+            | "f4" | "f5" | "f6" | "f7" | "f8" | "f9" | "f10" | "f11" | "f12" => {}
+            _ => return None,
+        }
+    }
+    keystroke_bytes(key, key_char, mods, app_cursor)
+}
+
 /// Ctrl-key encoding (caret notation).
 fn control_bytes(key: &str) -> Option<Vec<u8>> {
     let mut chars = key.chars();
@@ -377,6 +397,7 @@ pub struct TerminalPrepaint {
     /// Grid cell advance, so paint can place segments by column.
     cell_w: Pixels,
     cursor: Option<PaintQuad>,
+    marked: Option<(gpui::Point<Pixels>, ShapedLine, PaintQuad)>,
 }
 
 impl gpui::IntoElement for TerminalElement {
@@ -458,6 +479,10 @@ impl gpui::Element for TerminalElement {
             bounds.top() + px(TERM_PADDING),
         );
         let snapshot = self.panel.update(cx, |panel, cx| {
+            if !self.focused {
+                panel.cancel_composition();
+            }
+            panel.composition_layout = None;
             panel.on_grid_metrics(
                 super::panel::GridGeometry {
                     bounds,
@@ -478,12 +503,15 @@ impl gpui::Element for TerminalElement {
                 lines: Vec::new(),
                 cell_w,
                 cursor: None,
+                marked: None,
             };
         };
 
         let mut bg_quads = Vec::new();
         let mut sel_quads = Vec::new();
         let mut lines = Vec::with_capacity(snapshot.lines.len());
+        // Theme inputs behind shaping, resolved once: the shape cache key.
+        let theme_fp = super::panel::theme_paint_fingerprint(&theme);
 
         for (row_ix, row) in snapshot.lines.iter().enumerate() {
             let y = origin.y + line_h * row_ix as f32;
@@ -534,7 +562,14 @@ impl gpui::Element for TerminalElement {
                     _ => {}
                 }
             }
-            lines.push(shape_row(row, &theme, &mono, font_size, window));
+            // Shaped text comes from the panel's per-row cache: unchanged rows
+            // (same content fingerprint) reuse their segments instead of
+            // re-shaping every frame. Backgrounds and selection above stay
+            // per-frame — they are quads, not layout.
+            let row_fp = snapshot.fingerprints.get(row_ix).copied().unwrap_or(0);
+            lines.push(self.panel.update(cx, |panel, _| {
+                panel.shaped_row(theme_fp, row_fp, row, &theme, &mono, font_size, window)
+            }));
         }
 
         let cursor = snapshot.cursor.map(|c| {
@@ -553,12 +588,49 @@ impl gpui::Element for TerminalElement {
             }
         });
 
+        let marked = self.panel.update(cx, |panel, cx| {
+            let text: SharedString = panel.marked_text(cx)?.to_owned().into();
+            let cursor = panel.input_cursor_bounds(cx)?;
+            let line = window.text_system().shape_line(
+                text.clone(),
+                font_size,
+                &[TextRun {
+                    len: text.len(),
+                    font: mono.clone(),
+                    color: theme.terminal.foreground,
+                    background_color: None,
+                    underline: Some(gpui::UnderlineStyle {
+                        color: Some(theme.terminal.foreground),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    strikethrough: None,
+                }],
+                None,
+            );
+            // Keep the preedit on the cursor row, shifting left near the edge.
+            let origin = point(
+                cursor
+                    .left()
+                    .min(bounds.right() - line.width - px(TERM_PADDING))
+                    .max(bounds.left()),
+                cursor.top(),
+            );
+            let background = fill(
+                Bounds::new(origin, size(line.width.max(cell_w), line_h)),
+                theme.terminal.background,
+            );
+            panel.composition_layout = Some((origin, line.clone()));
+            Some((origin, line, background))
+        });
+
         TerminalPrepaint {
             bg_quads,
             sel_quads,
             lines,
             cell_w,
             cursor,
+            marked,
         }
     }
 
@@ -572,6 +644,12 @@ impl gpui::Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let focus = self.panel.read(cx).focus_handle();
+        window.handle_input(
+            &focus,
+            ElementInputHandler::new(bounds, self.panel.clone()),
+            cx,
+        );
         let line_h = px(TERM_LINE_HEIGHT);
         let origin = point(
             bounds.left() + px(TERM_PADDING),
@@ -601,6 +679,10 @@ impl gpui::Element for TerminalElement {
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
             }
+            if let Some((origin, line, background)) = prepaint.marked.take() {
+                window.paint_quad(background);
+                let _ = line.paint(origin, line_h, gpui::TextAlign::Left, None, window, cx);
+            }
         });
     }
 }
@@ -622,7 +704,10 @@ impl gpui::Element for TerminalElement {
 /// and every other glyph is its own segment pinned at its own column. Wide
 /// spacers are still skipped — the wide glyph covers both columns, and the
 /// NEXT segment re-pins regardless.
-fn shape_row(
+///
+/// Pure in row content + theme + font, which is what lets the panel cache its
+/// output per row fingerprint (selection is a quad overlay, never shaped).
+pub(super) fn shape_row(
     row: &[CellSnapshot],
     theme: &Theme,
     mono: &gpui::Font,

@@ -41,13 +41,20 @@ systemctl --user restart zeron-dev.service
 
 if [[ "$launch" == true ]]; then
     # Drop the old dev window, then relaunch. Match on the dev app_id only —
-    # never kill production `zeron` windows.
+    # never kill production `zeron` windows. Terminate by pid: this setup's
+    # hyprctl dispatch shim rejects `closewindow address:...`, and a surviving
+    # window keeps the control-plane instance lock, wedging the relaunched
+    # UI's API bind.
     if command -v hyprctl >/dev/null 2>&1; then
         hyprctl clients -j 2>/dev/null \
-            | jq -r '.[] | select(.class == "zeron-dev") | .address' \
-            | while read -r addr; do
-                hyprctl dispatch closewindow "address:$addr" >/dev/null 2>&1 || true
+            | jq -r '.[] | select(.class == "zeron-dev") | .pid' \
+            | while read -r pid; do
+                [[ -n "$pid" ]] && kill -TERM "$pid" 2>/dev/null || true
             done
+        for _ in 1 2 3 4 5; do
+            hyprctl clients -j 2>/dev/null | jq -e 'any(.class == "zeron-dev")' >/dev/null 2>&1 || break
+            sleep 0.4
+        done
     fi
     gtk-launch zeron-dev >/dev/null 2>&1 &
 fi

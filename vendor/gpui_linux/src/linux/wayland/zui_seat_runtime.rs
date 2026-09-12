@@ -72,6 +72,7 @@ impl WaylandClientState {
         self.serial_tracker = SerialTracker::new();
     }
     fn noches_refresh_seat(&mut self, qh: &QueueHandle<WaylandClientStatePtr>) {
+        self.agent_refresh(qh);
         let Some((seat, bits)) = self.noches_seats.current() else {
             self.noches_drop_seat_devices();
             // Retain the old wl_seat resource, with no input children, until a
@@ -121,6 +122,19 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
     fn event(this: &mut Self, seat: &wl_seat::WlSeat, event: wl_seat::Event,
              _: &(), _: &Connection, qh: &QueueHandle<Self>) {
         let client = this.get_client();
+        // Cancel before dropping devices, while their target surfaces still
+        // exist and can receive key-up, modifier reset and drag cleanup.
+        let cancel = match &event {
+            wl_seat::Event::Capabilities { capabilities: WEnum::Value(capabilities) } =>
+                !capabilities.contains(wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard),
+            wl_seat::Event::Name { .. } => true,
+            _ => false,
+        };
+        if cancel {
+            let ids: Vec<_> = client.borrow().noches_seats.agents().into_iter()
+                .filter(|(_, known, _)| known == seat).map(|(id, _, _)| id).collect();
+            for id in ids { this.agent_cancel(Some(id)); }
+        }
         let mut state = client.borrow_mut();
         match event {
             wl_seat::Event::Name { name } => state.noches_seats.name(seat, name),

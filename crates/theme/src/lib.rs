@@ -370,11 +370,7 @@ impl AccentRoles {
             if appearance.is_dark() { 0.28 } else { 0.18 },
         );
         let deep = primary.mix(
-            if appearance.is_dark() {
-                Color::BLACK
-            } else {
-                Color::BLACK
-            },
+            Color::BLACK,
             if appearance.is_dark() { 0.18 } else { 0.26 },
         );
         Self {
@@ -400,8 +396,8 @@ pub struct ThemeSelection {
 impl Default for ThemeSelection {
     fn default() -> Self {
         Self {
-            light: "zeron-light".into(),
-            dark: "zeron-dark".into(),
+            light: "claude-light".into(),
+            dark: "claude-dark".into(),
         }
     }
 }
@@ -811,7 +807,7 @@ mod tests {
     #[test]
     fn builtins_have_complete_provenance_and_no_validation_errors() {
         let registry = ThemeRegistry::builtin();
-        assert_eq!(registry.families.len(), 19);
+        assert_eq!(registry.families.len(), 20);
         assert!(registry.variant("zeron-light").is_some());
         assert!(registry.variant("zeron-dark").is_some());
         let errors: Vec<_> = registry
@@ -830,7 +826,7 @@ mod tests {
             .iter()
             .map(|family| family.variants.len())
             .sum::<usize>();
-        assert_eq!(variants, 30);
-        assert_eq!(variants * VisualFixture::ALL.len(), 300);
+        assert_eq!(variants, 32);
+        assert_eq!(variants * VisualFixture::ALL.len(), 320);
     }
 }

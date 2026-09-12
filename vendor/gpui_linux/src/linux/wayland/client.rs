@@ -69,6 +69,9 @@ use wayland_protocols::{
     wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
 };
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1, ext_background_effect_surface_v1,
+};
 use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blur_manager};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
@@ -216,6 +219,11 @@ pub struct Globals {
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
+    /// The staging `ext-background-effect-v1` manager — the successor interface
+    /// compositors (Hyprland 0.55+, KWin 6.7+) advertise instead of
+    /// `org_kde_kwin_blur_manager`. Either can request window blur.
+    pub background_effect_manager:
+        Option<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
@@ -258,6 +266,7 @@ impl Globals {
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            background_effect_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
@@ -308,6 +317,10 @@ pub(crate) struct WaylandClientState {
     pub compositor_gpu: Option<CompositorGpuHint>,
     wl_seat: wl_seat::WlSeat,
     noches_seats: noches_seat_selection::Seats<wl_seat::WlSeat>,
+    agent_seats: HashMap<u32, agent_seat::AgentSeat>,
+    agent_windows: std::collections::HashSet<ObjectId>,
+    pub(crate) agent_dispatch: Option<agent_seat::AgentDispatch>,
+    agent_registration: Option<agent_seat::AgentRegistration>,
     wl_pointer: Option<wl_pointer::WlPointer>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
@@ -422,6 +435,7 @@ impl WaylandClientStatePtr {
     }
 
     pub fn enable_ime(&self) {
+        if self.agent_input_active() { return; }
         let client = self.get_client();
         let mut state = client.borrow_mut();
         state.ime_enabled = Some(true);
@@ -448,6 +462,7 @@ impl WaylandClientStatePtr {
     }
 
     pub fn disable_ime(&self) {
+        if self.agent_input_active() { return; }
         let client = self.get_client();
         let mut state = client.borrow_mut();
         state.ime_enabled = Some(false);
@@ -464,6 +479,7 @@ impl WaylandClientStatePtr {
     }
 
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        if self.agent_input_active() { return; }
         let client = self.get_client();
         let mut state = client.borrow_mut();
         if state.pre_edit_text.is_some() {
@@ -506,7 +522,12 @@ impl WaylandClientStatePtr {
 
     pub fn drop_window(&self, surface_id: &ObjectId) {
         let client = self.get_client();
+        // A window going away must not leave agent seats holding its surface:
+        // cancel as a Leave while the window can still receive the matching
+        // MouseUp/KeyUp/exit effects.
+        self.agent_cancel_surface(surface_id);
         let mut state = client.borrow_mut();
+        state.agent_windows.remove(surface_id);
         let closed_window = state.windows.remove(surface_id).unwrap();
         if let Some(window) = state.mouse_focused_window.take()
             && !window.ptr_eq(&closed_window)
@@ -708,13 +729,25 @@ impl WaylandClient {
         let compositor_gpu = detect_compositor_gpu();
         let gpu_context = Rc::new(RefCell::new(None));
 
-        let seat = noches_seats.current()
-            .expect("Wayland exposed no named ordinary input seat").0;
+        let seat = noches_seats
+            .current()
+            .expect("Wayland exposed no named ordinary input seat")
+            .0;
         let globals = Globals::new(
             globals,
             common.foreground_executor.clone(),
             qh.clone(),
             seat.clone(),
+        );
+
+        // Record whether the compositor can blur a translucent window BEFORE
+        // the theme layer is ever asked for a background appearance. The app
+        // reads this via `crate::compositor_blur_supported` to decide between a
+        // blurred and an opaque window; requesting blur where unsupported would
+        // leave a transparent window showing the raw desktop. Either the legacy
+        // KWin interface or the staging ext-background-effect one qualifies.
+        crate::set_compositor_blur_supported(
+            globals.blur_manager.is_some() || globals.background_effect_manager.is_some(),
         );
 
         let data_device = globals
@@ -783,6 +816,10 @@ impl WaylandClient {
             compositor_gpu,
             wl_seat: seat,
             noches_seats,
+            agent_seats: HashMap::default(),
+            agent_windows: std::collections::HashSet::new(),
+            agent_dispatch: None,
+            agent_registration: None,
             wl_pointer: None,
             wl_keyboard: None,
             pinch_gesture: None,
@@ -925,6 +962,7 @@ impl LinuxClient for WaylandClient {
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         let mut state = self.0.borrow_mut();
 
+        anyhow::ensure!(state.agent_dispatch.is_none(), "native window creation during background input is unsupported");
         // Popups name their parent explicitly. Other kinds are parented to the focused window.
         let (parent, popup_grab) = match &params.kind {
             WindowKind::AnchoredPopup(options) => {
@@ -961,6 +999,7 @@ impl LinuxClient for WaylandClient {
         let appearance = state.common.appearance;
         let compositor_gpu = state.compositor_gpu.take();
 
+        let agent_window = params.app_id.as_deref() == Some("zeron-dev");
         let (window, surface_id) = WaylandWindow::new(
             handle,
             state.globals.clone(),
@@ -977,12 +1016,22 @@ impl LinuxClient for WaylandClient {
         if window.0.toplevel().is_some() {
             state.consume_startup_activation_token(&window.0.surface());
         }
+        if agent_window {
+            state.agent_windows.insert(surface_id.clone());
+            if state.agent_registration.is_none() {
+                state.agent_registration = agent_seat::AgentRegistration::create().log_err();
+            }
+            let qh = state.globals.qh.clone();
+            state.agent_refresh(&qh);
+            state.agent_publish();
+        }
         state.windows.insert(surface_id, window.0.clone());
 
         Ok(Box::new(window))
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
+        if self.0.borrow().agent_dispatch.is_some() { return; }
         let mut state = self.0.borrow_mut();
 
         let need_update = state.cursor_style != Some(style)
@@ -1023,6 +1072,7 @@ impl LinuxClient for WaylandClient {
     }
 
     fn hide_cursor_until_mouse_moves(&self) {
+        if self.0.borrow().agent_dispatch.is_some() { return; }
         self.0.borrow_mut().hide_cursor_until_mouse_moves();
     }
 
@@ -1031,6 +1081,7 @@ impl LinuxClient for WaylandClient {
     }
 
     fn open_uri(&self, uri: &str) {
+        if self.0.borrow().agent_dispatch.is_some() { return; }
         let mut state = self.0.borrow_mut();
         if let (Some(activation), Some(window)) = (
             state.globals.activation.clone(),
@@ -1049,6 +1100,7 @@ impl LinuxClient for WaylandClient {
     }
 
     fn reveal_path(&self, path: PathBuf) {
+        if self.0.borrow().agent_dispatch.is_some() { return; }
         let mut state = self.0.borrow_mut();
         if let (Some(activation), Some(window)) = (
             state.globals.activation.clone(),
@@ -1088,6 +1140,7 @@ impl LinuxClient for WaylandClient {
     }
 
     fn write_to_primary(&self, item: gpui::ClipboardItem) {
+        if self.0.borrow().agent_dispatch.is_some() { return; }
         let mut state = self.0.borrow_mut();
         let (Some(primary_selection_manager), Some(primary_selection)) = (
             state.globals.primary_selection_manager.clone(),
@@ -1108,6 +1161,7 @@ impl LinuxClient for WaylandClient {
     }
 
     fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
+        if self.0.borrow().agent_dispatch.is_some() { return; }
         let mut state = self.0.borrow_mut();
         let (Some(data_device_manager), Some(data_device)) = (
             state.globals.data_device_manager.clone(),
@@ -1240,6 +1294,9 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
         qh: &QueueHandle<Self>,
     ) {
         let client = this.get_client();
+        if let wl_registry::Event::GlobalRemove { name } = &event {
+            this.agent_cancel(Some(*name));
+        }
         let mut state = client.borrow_mut();
 
         match event {
@@ -1299,6 +1356,8 @@ delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDec
 delegate_noop!(WaylandClientStatePtr: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(WaylandClientStatePtr: ignore xdg_positioner::XdgPositioner);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur_manager::OrgKdeKwinBlurManager);
+delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1);
+delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1);
 delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
@@ -1552,8 +1611,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
         _: &QueueHandle<Self>,
     ) {
         let client = this.get_client();
+        if matches!(&event, wl_keyboard::Event::Enter { .. }) {
+            let physical = client.borrow().wl_keyboard.as_ref() == Some(keyboard);
+            if physical { this.agent_cancel_all(); }
+        }
         let mut state = client.borrow_mut();
         if state.wl_keyboard.as_ref() != Some(keyboard) { return; }
+        let _origin = crate::InputOriginGuard::enter(crate::InputOrigin::Physical);
         match event {
             wl_keyboard::Event::RepeatInfo { rate, delay } => {
                 state.repeat.characters_per_second = rate as u32;
@@ -1591,6 +1655,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             wl_keyboard::Event::Enter { surface, .. } => {
                 state.keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.enter_token = Some(());
+                state.agent_publish();
 
                 if let Some(window) = state.keyboard_focused_window.clone() {
                     drop(state);
@@ -1600,6 +1665,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             wl_keyboard::Event::Leave { surface, .. } => {
                 let keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.keyboard_focused_window = None;
+                state.agent_publish();
                 state.enter_token.take();
                 // Prevent keyboard events from repeating after opening e.g. a file chooser and closing it quickly
                 state.repeat.current_id += 1;
@@ -1882,8 +1948,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
         _: &QueueHandle<Self>,
     ) {
         let client = this.get_client();
+        if matches!(&event, wl_pointer::Event::Enter { .. }) {
+            let physical = client.borrow().wl_pointer.as_ref() == Some(wl_pointer);
+            if physical { this.agent_cancel_all(); }
+        }
         let mut state = client.borrow_mut();
         if state.wl_pointer.as_ref() != Some(wl_pointer) { return; }
+        let _origin = crate::InputOriginGuard::enter(crate::InputOrigin::Physical);
 
         match event {
             wl_pointer::Event::Enter {
@@ -1900,6 +1971,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
 
                 if let Some(window) = get_window(&mut state, &surface.id()) {
                     state.mouse_focused_window = Some(window.clone());
+                    state.agent_publish();
 
                     if state.enter_token.is_some() {
                         state.enter_token = None;
@@ -1938,6 +2010,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         modifiers: state.modifiers,
                     });
                     state.mouse_focused_window = None;
+                    state.agent_publish();
                     state.mouse_location = None;
                     state.button_pressed = None;
                     state.cursor_hidden_window = None;
@@ -2766,3 +2839,6 @@ mod tests {
 }
 
 include!("zui_seat_runtime.rs");
+
+#[path = "agent_seat.rs"]
+mod agent_seat;

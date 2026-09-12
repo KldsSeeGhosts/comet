@@ -11,6 +11,7 @@ publish.workspace = true
 dev = ["zeron-harness/dev"]
 
 [dependencies]
+zeron-shell-hooks.workspace = true
 zeron-preview.workspace = true
 zeron-proto.workspace = true
 zeron-doc.workspace = true

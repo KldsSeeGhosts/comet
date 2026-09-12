@@ -28,6 +28,9 @@ required-features = ["browser-fixture"]
 [dependencies]
 url = "2"
 zeron-proto.workspace = true
+zeron-workspace.workspace = true
+zeron-local-api.workspace = true
+zeron-orchestration.workspace = true
 similar.workspace = true
 zeron-doc.workspace = true
 zeron-engine.workspace = true
@@ -74,6 +77,10 @@ image = { version = "0.25", default-features = false, features = ["png", "ico", 
 
 [target.'cfg(target_os = "linux")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Vendored Linux platform backend — queried for Wayland compositor blur support
+# so the theme can decide between a blurred and an opaque window. This is the
+# `[patch]`-ed crate (not a workspace dep), so it takes a plain path.
+gpui_linux = { path = "../../vendor/gpui_linux" }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

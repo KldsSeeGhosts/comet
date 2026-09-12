@@ -250,8 +250,7 @@ impl BrowserSurface {
                     while let Some(value) = updates.recv().await {
                         if let Ok(snapshot) =
                             serde_json::from_value::<zeron_proto::PreviewSnapshot>(value)
-                        {
-                            if this
+                            && this
                                 .update(cx, |this, cx| {
                                     #[cfg(target_os = "macos")]
                                     for service in &snapshot.services {
@@ -264,9 +263,8 @@ impl BrowserSurface {
                                     cx.notify();
                                 })
                                 .is_err()
-                            {
-                                return;
-                            }
+                        {
+                            return;
                         }
                     }
                 }

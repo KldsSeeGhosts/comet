@@ -115,7 +115,7 @@ fn details(usage: Option<ContextUsage>) -> String {
 fn format_compact(tokens: u64) -> String {
     const K: f64 = 1_000.0;
     const M: f64 = 1_000_000.0;
-    if tokens >= 10_000 && tokens < 1_000_000 {
+    if (10_000..1_000_000).contains(&tokens) {
         format!("{:.1}K", tokens as f64 / K)
     } else if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / M)
@@ -260,12 +260,12 @@ impl Render for UsageCard {
                     div()
                         .w(relative(fraction))
                         .h_full()
-                        .bg(component_color(&theme, kind)),
+                        .bg(component_color(theme, kind)),
                 );
             }
             card = card.child(bar);
             let rows = breakdown.iter().map(|(kind, tokens)| {
-                let dot = component_color(&theme, *kind);
+                let dot = component_color(theme, *kind);
                 div()
                     .flex()
                     .items_center()

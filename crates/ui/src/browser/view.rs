@@ -44,15 +44,14 @@ impl BrowserSurface {
         {
             if event.prefer_character_input
                 && let Some(text) = &event.keystroke.key_char
+                && let Some(native) = &self.native
             {
-                if let Some(native) = &self.native {
-                    native.command(serde_json::json!({"cmd":"commit","text":text}));
-                }
+                native.command(serde_json::json!({"cmd":"commit","text":text}));
                 cx.stop_propagation();
                 return;
             }
-            if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt {
-                if let Some(native) = &self.native {
+            if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt
+                && let Some(native) = &self.native {
                     match event.keystroke.key.as_str() {
                         "c" | "x" => {
                             native.command(serde_json::json!({"cmd":if event.keystroke.key=="c" {"copy"} else {"cut"}}));
@@ -71,7 +70,6 @@ impl BrowserSurface {
                         _ => {}
                     }
                 }
-            }
             self.linux_key(&event.keystroke, true);
             cx.stop_propagation();
             return;

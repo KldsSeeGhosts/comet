@@ -2497,7 +2497,7 @@ fn optional_string(value: &Value, names: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn map_tool_call(name: &str, args: &Value) -> ToolCall {
+pub(crate) fn map_tool_call(name: &str, args: &Value) -> ToolCall {
     match name.to_ascii_lowercase().as_str() {
         "bash" | "exec" => ToolCall::Exec {
             command: string_field(args, &["command", "cmd"]),
@@ -2633,7 +2633,7 @@ fn todo_items_from_result(result: Option<&Value>) -> Option<Vec<TodoItem>> {
     (!items.is_empty() || result.pointer("/details/tasks").is_some()).then_some(items)
 }
 
-fn tool_diff(call: Option<&ToolCall>, result: Option<&Value>) -> Option<ToolDiff> {
+pub(crate) fn tool_diff(call: Option<&ToolCall>, result: Option<&Value>) -> Option<ToolDiff> {
     let path = match call? {
         ToolCall::EditFile { path, .. } | ToolCall::WriteFile { path, .. } => path.clone(),
         _ => return None,

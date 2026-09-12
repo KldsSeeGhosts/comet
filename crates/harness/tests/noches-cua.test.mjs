@@ -124,7 +124,8 @@ test('nested browser refusal becomes a Pi execution error without losing evidenc
   assert.deepEqual(result.details.structuredContent, refusal);
   assert.match(result.content[0].text, /Computer-use refused \(browser_consent_required\): this standalone browser profile/);
   assert.match(result.content[0].text, /Reason: consumer_profile_endpoint_requires_grant\./);
-  assert.match(result.content[0].text, /Next action: browser_prepare\./);
+  assert.match(result.content[0].text, /Set up the browser and DevTools manually/);
+  assert.doesNotMatch(result.content[0].text, /Next action: browser_prepare/);
   assert.match(result.content[0].text, /Approval: supported_strategies=existing_profile\./);
   assert.match(result.content[0].text, /"code":"browser_consent_required"/);
   assert.match(result.content[0].text, /"next_action":"browser_prepare"/);
@@ -238,31 +239,73 @@ test('help is compact and does not spill its schema catalog to disk', () => {
     structuredContent: { tools, driver: { instructions: 'RAW_SERVER_INSTRUCTIONS_PROSE' } },
   }, 'help');
   assert.match(result.content[0].text, /Available actions: action_0/);
-  assert.match(result.content[0].text, /synthetic agent cursor/);
+  assert.match(result.content[0].text, /Physical focus, mouse and keyboard must remain untouched/);
   assert.match(result.content[0].text, /Do not parse help output with shell commands/);
   assert.doesNotMatch(result.content[0].text, /Full text and structured result/);
   assert.doesNotMatch(result.content[0].text, /RAW_SERVER_INSTRUCTIONS_PROSE/);
 });
 
-test('disruptive desktop and foreground routes require explicit user opt-in', () => {
-  assert.throws(
-    () => module.namespace.bridgeArgs('click', { target: { kind: 'desktop', display_id: 'DP-2' } }),
-    /real pointer or change keyboard focus/,
-  );
-  assert.throws(
-    () => module.namespace.bridgeArgs('type_text', { delivery_mode: 'foreground' }),
-    /real pointer or change keyboard focus/,
-  );
-  assert.equal(
-    JSON.stringify(module.namespace.bridgeArgs('click', {
-      target: { kind: 'desktop', display_id: 'DP-2' }, allow_user_input_disruption: true,
-    })),
-    JSON.stringify({ target: { kind: 'desktop', display_id: 'DP-2' } }),
-  );
-  assert.equal(
-    JSON.stringify(module.namespace.bridgeArgs('browser_navigate', { target_id: 'b1', tab_id: 't1', url: 'https://x.com' })),
-    JSON.stringify({ target_id: 'b1', tab_id: 't1', url: 'https://x.com' }),
-  );
+test('strict adapter policy rejects desktop, foreground and hidden disruptive routes', () => {
+  const denied = [
+    ['click', { delivery_mode: ' ForeGround ' }],
+    ['click', { delivery_mode: 'automatic' }],
+    ['click', { delivery_mode: null }],
+    ['click', { allow_user_input_disruption: true }],
+    ['list_windows', { allow_user_input_disruption: false }],
+    ['click', { scope: 'unknown' }],
+    ['click', { target: { kind: 'window', window_id: 8 } }],
+    ['click', { target: { kind: 'unknown' } }],
+    ['click', { display_id: 'DP-1' }],
+    ['browser_prepare', { strategy: { kind: 'existing_profile' }, allow_launch: false }],
+    ['browser_prepare', { attach_only: true, auto_setup: false }],
+    ['browser_prepare', { allow_launch: true, profile: { mode: 'isolated_new' } }],
+    ['browser_dialog', { action: 'accept', delivery_mode: 'background' }],
+    ['browser_dialog', { action: 'dismiss' }],
+    ['get_desktop_state', { delivery_mode: 'FOREGROUND' }],
+  ];
+  for (const action of ['click', 'double_click', 'right_click', 'drag', 'scroll', 'move_cursor', 'type_text', 'press_key', 'hotkey']) {
+    denied.push([action, { scope: 'DeSkToP' }], [action, { target: { kind: ' Desktop ' } }]);
+  }
+  for (const action of ['bring_to_front', 'launch_app', 'kill_app', 'set_window_frame', 'mouse_button_down', 'mouse_drag', 'mouse_button_up', 'invoke_menu', 'clipboard_write']) {
+    denied.push([action, { delivery_mode: 'background' }]);
+  }
+  for (const [action, args] of denied) {
+    assert.throws(() => module.namespace.bridgeArgs(action, { pid: 42, window_id: 7, ...args }), /forbidden|disabled|must be|requires|restricted|Only browser_dialog/, `${action} ${JSON.stringify(args)}`);
+  }
+  for (const args of [{ pid: 42 }, { pid: 42, window_id: 0 }, { pid: '42', window_id: 7 }]) {
+    assert.throws(() => module.namespace.bridgeArgs('click', args), /exact positive integer/);
+  }
+});
+
+test('valid bounded background input is pinned and read-only desktop capture remains available', () => {
+  for (const action of ['click', 'double_click', 'right_click', 'drag', 'scroll', 'type_text', 'press_key', 'hotkey']) {
+    const args = { pid: 42, window_id: 7, delivery_mode: ' Background ' };
+    assert.equal(module.namespace.bridgeArgs(action, args).delivery_mode, 'background');
+    assert.equal(args.delivery_mode, ' Background ', 'caller args must not be mutated');
+    assert.equal(module.namespace.bridgeArgs(action, { pid: 42, window_id: 7 }).delivery_mode, 'background');
+  }
+  for (const [action, args] of [
+    ['get_desktop_state', { scope: 'desktop', display_id: 'DP-1' }],
+    ['get_screen_size', {}],
+    ['clipboard_read', {}],
+    ['browser_navigate', { target_id: 'b1', tab_id: 't1', url: 'https://example.com' }],
+    ['browser_dialog', { target_id: 'b1', tab_id: 't1', action: 'inspect' }],
+    ['move_cursor', { pid: 42, window_id: 7, x: 10, y: 20 }],
+    ['set_value', { pid: 42, window_id: 7, element_token: 's1:1', value: 'hello' }],
+  ]) {
+    assert.equal(JSON.stringify(module.namespace.bridgeArgs(action, args)), JSON.stringify(args));
+  }
+});
+
+test('policy denial happens before the adapter opens a bridge connection', { timeout: 5000 }, async () => {
+  let tool;
+  module.namespace.default({ on() {}, getActiveTools: () => [], setActiveTools() {}, registerTool(definition) { tool = definition; } });
+  let connections = 0;
+  await withServer(() => { connections++; }, async () => {
+    await assert.rejects(tool.execute('t', { action: 'mouse_button_down', args: { pid: 42, window_id: 7 } }), /forbidden/);
+    await assert.rejects(tool.execute('t', { action: 'browser_prepare', args: { allow_launch: false } }), /manually/);
+    assert.equal(connections, 0);
+  });
 });
 
 test('get_window_state shapes structured elements, excludes tree_markdown and suppresses redundant markdown text', () => {
@@ -331,31 +374,18 @@ test('promptGuidelines carry managed keyboard, browser and profile guidance', ()
     registerTool(definition) { guidelines.push(...definition.promptGuidelines); },
   });
   const all = guidelines.join('\n');
-  // Isolated background keyboard: focus child first, then minimal keyboard args.
   const kb = guidelines.find(line => line.includes('isolated background keyboard'));
-  assert.ok(kb, 'isolated background keyboard guidance exists');
+  assert.ok(kb);
   assert.match(kb, /click the child/);
   assert.match(kb, /element token or coordinates/);
-  assert.match(kb, /only pid\/window_id\/text/);
-  assert.match(kb, /only pid\/window_id\/key/);
-  assert.match(kb, /rejected/);
-  assert.doesNotMatch(kb, /delivery_mode/);
-  // Omnibox focus uses an explicit keys/modifiers shape with pid/window_id.
-  const omnibox = guidelines.find(line => line.includes('omnibox'));
-  assert.ok(omnibox, 'omnibox guidance exists');
-  assert.match(omnibox, /hotkey \(keys:\["ctrl","l"\]/);
-  assert.match(omnibox, /key:"l", modifiers:\["ctrl"\]/);
-  assert.match(omnibox, /pid\/window_id/);
-  assert.doesNotMatch(omnibox, /key ctrl\+l/i);
-  // Profile guidance: isolated_new default, existing_profile only when needed.
-  const profile = guidelines.find(line => line.includes('isolated_new'));
-  assert.ok(profile, 'browser_prepare profile guidance exists');
-  assert.match(profile, /isolated_new/);
-  assert.match(profile, /existing_profile/);
-  assert.match(profile, /logged-in profile data/);
-  // Compositor exception and synthetic cursor text still present.
-  assert.match(all, /hl\.dispatch/);
-  assert.match(all, /synthetic agent cursor/);
+  assert.match(kb, /pid\/window_id\/text/);
+  assert.match(kb, /pid\/window_id\/key/);
+  assert.match(kb, /forces background delivery/);
+  assert.match(all, /set up the browser and DevTools manually/);
+  assert.match(all, /no guaranteed attach-only route/);
+  assert.match(all, /Physical focus, mouse and keyboard must remain untouched/);
+  assert.match(all, /Never bypass its policy/);
+  assert.doesNotMatch(all, /allow_user_input_disruption=true|hl\.dispatch|including foreground|with explicit disruption approval/);
 });
 
 test('describe formats multiple schemas without help compaction', () => {

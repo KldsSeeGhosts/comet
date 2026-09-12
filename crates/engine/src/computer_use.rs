@@ -85,6 +85,177 @@ const ACTIONS: &[&str] = &[
     "get_agent_cursor_state",
 ];
 
+const NON_DISRUPTIVE_POLICY: &str = "Only non-disruptive computer use is allowed. Physical focus, mouse and keyboard must remain untouched. Desktop capture is read-only. Supported window input uses background delivery with an exact pid/window_id; unsupported background routes must refuse, never fall back to foreground.";
+
+const BLOCKED_ACTIONS: &[&str] = &[
+    "bring_to_front",
+    "launch_app",
+    "kill_app",
+    "set_window_frame",
+    "mouse_button_down",
+    "mouse_drag",
+    "mouse_button_up",
+    "invoke_menu",
+    "clipboard_write",
+];
+const WINDOW_INPUT_ACTIONS: &[&str] = &[
+    "click",
+    "double_click",
+    "right_click",
+    "drag",
+    "scroll",
+    "type_text",
+    "press_key",
+    "hotkey",
+];
+
+/// This check runs before acquiring a lease, asking approval or starting the driver.
+/// The reviewed driver routes must still verify the target and refuse unsupported
+/// background delivery. A session grant cannot relax this policy.
+fn validate_non_disruptive(
+    action: &str,
+    map: &mut serde_json::Map<String, Value>,
+) -> CuaResult<()> {
+    if map.contains_key("allow_user_input_disruption") {
+        return Err("Disruption overrides are forbidden, regardless of session approval".into());
+    }
+    if let Some(mode) = map.get("delivery_mode") {
+        if !mode
+            .as_str()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("background"))
+        {
+            return Err(
+                "delivery_mode must be background; foreground and unknown modes are forbidden"
+                    .into(),
+            );
+        }
+        map.insert("delivery_mode".into(), json!("background"));
+    }
+    if let Some(scope) = map.get("scope") {
+        let scope = scope.as_str().map(|s| s.trim().to_ascii_lowercase());
+        if !matches!(scope.as_deref(), Some("window" | "desktop")) {
+            return Err("scope must be window or desktop".into());
+        }
+        map.insert("scope".into(), json!(scope.unwrap()));
+    }
+    let desktop_capture = matches!(action, "get_desktop_state" | "get_screen_size");
+    if let Some(target) = map.get_mut("target") {
+        let target = target.as_object_mut().ok_or("target must be an object")?;
+        let kind = target
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_ascii_lowercase());
+        if !matches!(kind.as_deref(), Some("window" | "desktop")) {
+            return Err("target.kind must be window or desktop".into());
+        }
+        if kind.as_deref() == Some("desktop") && !desktop_capture {
+            return Err("Desktop input is forbidden, including keyboard input".into());
+        }
+        target.insert("kind".into(), json!(kind.unwrap()));
+    }
+    if !desktop_capture
+        && (map.get("scope") == Some(&json!("desktop"))
+            || map.contains_key("display_id")
+            || map.contains_key("expected_layout"))
+    {
+        return Err(
+            "Desktop routes are restricted to read-only get_desktop_state/get_screen_size".into(),
+        );
+    }
+    if action == "browser_prepare" {
+        // The audited schema has no attach-only switch. allow_launch=false
+        // still permits existing-profile setup through global keyboard input.
+        return Err("browser_prepare is disabled: the driver has no guaranteed attach-only, non-disruptive route. Set up the browser and DevTools manually, then use get_browser_state. Automatic setup and launch are forbidden.".into());
+    }
+    if BLOCKED_ACTIONS.contains(&action) {
+        return Err(format!(
+            "{action} is forbidden: no verified non-disruptive background route"
+        ));
+    }
+    if action == "browser_dialog" && map.get("action").and_then(Value::as_str) != Some("inspect") {
+        return Err("Only browser_dialog action=inspect is allowed; resolving native browser dialogs can change physical focus. Handle the dialog manually.".into());
+    }
+    if WINDOW_INPUT_ACTIONS.contains(&action) || matches!(action, "set_value" | "move_cursor") {
+        // Do not infer an active window or trust an alternate target to select it.
+        for key in ["pid", "window_id"] {
+            if !map
+                .get(key)
+                .and_then(Value::as_u64)
+                .is_some_and(|n| n > 0 && n <= 9_007_199_254_740_991)
+            {
+                return Err(format!(
+                    "{action} requires an exact positive integer {key} for background input"
+                ));
+            }
+        }
+        if map.contains_key("target") {
+            return Err(
+                "Window input requires top-level pid/window_id, not an alternate target".into(),
+            );
+        }
+        if WINDOW_INPUT_ACTIONS.contains(&action) {
+            map.insert("delivery_mode".into(), json!("background"));
+        }
+    }
+    Ok(())
+}
+
+/// Driver schemas can suggest unsafe fallback routes. Keep their structure but
+/// replace prose with the engine policy and narrow exposed delivery modes.
+fn managed_schema(mut tool: Value) -> Value {
+    fn strip_prose(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.remove("description");
+                for value in map.values_mut() {
+                    strip_prose(value);
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(strip_prose),
+            _ => {}
+        }
+    }
+    strip_prose(&mut tool);
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    tool["description"] = json!(if name == "browser_prepare" {
+        "Disabled: no guaranteed attach-only route. Set up the browser and DevTools manually, then use get_browser_state."
+    } else if BLOCKED_ACTIONS.contains(&name.as_str()) {
+        "Disabled: no verified non-disruptive background route."
+    } else {
+        NON_DISRUPTIVE_POLICY
+    });
+    if let Some(properties) = tool
+        .pointer_mut("/inputSchema/properties")
+        .and_then(Value::as_object_mut)
+    {
+        if name == "browser_dialog" {
+            properties.insert(
+                "action".into(),
+                json!({"type":"string", "enum":["inspect"]}),
+            );
+        }
+        if properties.contains_key("delivery_mode") {
+            properties.insert(
+                "delivery_mode".into(),
+                json!({"type":"string", "enum":["background"], "default":"background"}),
+            );
+        }
+        if properties.contains_key("scope")
+            && !matches!(name.as_str(), "get_desktop_state" | "get_screen_size")
+        {
+            properties.insert(
+                "scope".into(),
+                json!({"type":"string", "enum":["window"], "default":"window"}),
+            );
+        }
+    }
+    tool
+}
+
 pub type RequestInput =
     Arc<dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync>;
 
@@ -492,7 +663,7 @@ struct Turn {
 #[derive(Default)]
 struct Runtime {
     driver: Option<Driver>,
-    // One session-wide grant covers inspection, input and desktop control.
+    // One session-wide grant covers inspection and permitted background input.
     // It survives per-turn driver/lease teardown so a resumed turn does not
     // re-ask. A denial stays per-turn and resets here, so a fresh turn may
     // ask again.
@@ -724,6 +895,9 @@ async fn handle_call(
     {
         return error("Reserved session/policy arguments are not accepted");
     }
+    if let Err(reason) = validate_non_disruptive(action, map) {
+        return error(format!("{reason}. {NON_DISRUPTIVE_POLICY}"));
+    }
     map.insert("session".into(), json!(state.label));
     let requested_names = if action == "describe" {
         let has_name = map.contains_key("name");
@@ -848,6 +1022,7 @@ async fn handle_call(
         }
     }
     let driver = runtime.driver.as_mut().expect("initialized");
+    let marker_pid = args.get("pid").and_then(Value::as_u64);
     let result = if action == "help" {
         driver.catalog(None).await
     } else if action == "describe" {
@@ -862,7 +1037,9 @@ async fn handle_call(
         driver.call(action, args).await
     };
     match result {
-        Ok(result) => normalize_driver_outcome(result),
+        Ok(result) => {
+            attach_seat_marker_evidence(normalize_driver_outcome(result), marker_pid)
+        }
         Err(err) => {
             turn.cancel();
             state.clean_runtime(&mut runtime, false).await;
@@ -1230,11 +1407,21 @@ impl Driver {
                 .cloned()
                 .collect(),
         };
-        let text = if filter.is_some() {
-            "Requested managed computer-use schemas. Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer; only scope=desktop with explicit disruption approval may use the real seat."
-        } else {
-            "Available managed computer-use tools. Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer; only scope=desktop with explicit disruption approval may use the real seat. Use describe with args.name or args.names for schemas."
-        };
+        let tools = tools
+            .into_iter()
+            .filter(|tool| {
+                // Describe can explain a disabled action, but help must not advertise it.
+                filter.is_some()
+                    || tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| {
+                            name != "browser_prepare" && !BLOCKED_ACTIONS.contains(&name)
+                        })
+            })
+            .map(managed_schema)
+            .collect();
+        let text = NON_DISRUPTIVE_POLICY;
         // Keep the tools/list top-level contract metadata (`schema_version`,
         // `capability_version`, enforcement inventory) alongside the filtered
         // managed tools; the negotiated contract is part of the result.
@@ -1269,7 +1456,7 @@ impl Driver {
 
 fn approval_question(device_id: &str, action: &str) -> String {
     format!(
-        "Allow computer use on host {device_id} for this session? Requested action: {action}. One approval covers inspecting and controlling apps, pointer and keyboard input, screenshots and clipboard access on that host for the rest of this session, including visible desktop control. It also lets the driver attach DevTools to an existing logged-in Chromium-family browser profile when a tool requests browser_prepare on it.",
+        "Allow computer use on host {device_id} for this session? Requested action: {action}. One approval covers inspection, screenshots, clipboard reads and supported background input for the rest of this session. Physical focus, mouse and keyboard must remain untouched; foreground delivery and desktop input are forbidden even after approval. The driver may attach DevTools to an existing logged-in Chromium-family browser profile only if it is already configured. Browser setup and launch must be done manually.",
     )
 }
 
@@ -1279,6 +1466,62 @@ fn remove_socket_if_present(path: &std::path::Path) -> CuaResult<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("Could not remove stale {}: {err}", path.display())),
     }
+}
+
+/// The dev GPUI app publishes an agent-seat compatibility marker at
+/// `$XDG_RUNTIME_DIR/noches-gpui-input/<pid>`. Its payload line is one JSON
+/// object `{"state":"ready"|"primary_client_busy","reason":..,"pid":..}`;
+/// older builds wrote a bare state token, which still parses. The identity
+/// header lines above the payload are ignored.
+fn parse_agent_seat_marker(contents: &str) -> Option<Value> {
+    let payload = contents
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    if payload.starts_with('{') {
+        let value: Value = serde_json::from_str(payload).ok()?;
+        value
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|state| !state.trim().is_empty())?;
+        Some(value)
+    } else if matches!(payload, "ready" | "primary_client_busy") {
+        // Legacy payload: the state token alone, without reason or pid.
+        Some(json!({ "state": payload }))
+    } else {
+        None
+    }
+}
+
+/// Reads the marker of the GPUI process a refused action targeted, so the
+/// reason a client was not qualified survives into the caller's evidence.
+fn agent_seat_marker(pid: u64) -> Option<Value> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe {
+            libc::geteuid()
+        })));
+    let contents = std::fs::read_to_string(
+        runtime.join("noches-gpui-input").join(pid.to_string()),
+    )
+    .ok()?;
+    parse_agent_seat_marker(&contents)
+}
+
+/// Enriches a refused window action with the target's agent-seat marker. A
+/// background refusal then names whether the physical seat held the window
+/// (`primary_client_busy`/`physical_seat_present`) or the target never
+/// qualified (`no_qualified_target`), instead of only a driver-side token.
+fn attach_seat_marker_evidence(mut result: Value, pid: Option<u64>) -> Value {
+    if classify_driver_outcome(&result) == DriverOutcome::Refused
+        && let Some(marker) = pid.and_then(agent_seat_marker)
+        && let Some(structured) =
+            result.get_mut("structuredContent").and_then(Value::as_object_mut)
+    {
+        structured.insert("agentSeatMarker".into(), marker);
+    }
+    result
 }
 
 fn resolve_driver_exe() -> CuaResult<PathBuf> {

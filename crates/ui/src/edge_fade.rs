@@ -32,6 +32,8 @@ pub fn edge_faded(band: f32, top: bool, bottom: bool, child: impl IntoElement) -
     }
 }
 
+pub type OverflowCallback = Box<dyn Fn(&App) -> (bool, bool)>;
+
 pub struct EdgeFaded {
     band: f32,
     band_top: Option<f32>,
@@ -43,7 +45,7 @@ pub struct EdgeFaded {
     left: bool,
     right: bool,
     scroll_y: Option<ScrollHandle>,
-    overflow_y: Option<Box<dyn Fn(&App) -> (bool, bool)>>,
+    overflow_y: Option<OverflowCallback>,
     scroll_x: Option<ScrollHandle>,
     child: AnyElement,
 }

@@ -26,14 +26,17 @@ use crate::theme::Theme;
 use super::parser::{Block, BlockTree, InlineRun, TableAlign};
 use super::veil::{RowVeil, apply_veil, slice_spans};
 
-/// Gap between markdown blocks inside one message (zeron mdBlockGap).
-pub const MD_BLOCK_GAP: f32 = 12.0;
-/// Body text size / line height (zeron: 14px / 22px).
-pub const MD_TEXT_SIZE: f32 = 14.0;
-pub const MD_LINE_HEIGHT: f32 = 22.0;
+/// Gap between markdown blocks inside one message (reference: ~14px between
+/// paragraphs at the 15px prose scale).
+pub const MD_BLOCK_GAP: f32 = 14.0;
+/// Body text size / line height (reference Code-mode prose: 15px / 1.65).
+pub const MD_TEXT_SIZE: f32 = 15.0;
+pub const MD_LINE_HEIGHT: f32 = 25.0;
 /// Code block metrics — height is `lines × CODE_LINE_HEIGHT + padding + header`.
-pub const CODE_TEXT_SIZE: f32 = 12.5;
-pub const CODE_LINE_HEIGHT: f32 = 18.0;
+/// Reference: 13px code on a 19px leading (cds `--font-size-code` /
+/// `--leading-code`).
+pub const CODE_TEXT_SIZE: f32 = 13.0;
+pub const CODE_LINE_HEIGHT: f32 = 19.0;
 pub const CODE_PADDING_X: f32 = 12.0;
 pub const CODE_PADDING_Y: f32 = 10.0;
 const CODE_HEADER_HEIGHT: f32 = 28.0;
@@ -94,15 +97,18 @@ pub struct RenderOptions {
 /// Copy-button wiring for one row's code blocks: the handler writes the code
 /// to the clipboard and flips a transient per-row "Copied" state owned by the
 /// transcript entity; `copied_ix` is the block currently showing feedback.
+pub type CopyHandler = Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)>;
+type LinkHandler = Rc<dyn Fn(&str, &mut Window, &mut gpui::App) -> bool>;
+
 #[derive(Clone)]
 pub struct CopyUi {
-    pub handler: Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)>,
+    pub handler: CopyHandler,
     pub copied_ix: Option<usize>,
 }
 
 #[derive(Clone)]
 pub struct LinkUi {
-    pub handler: Rc<dyn Fn(&str, &mut Window, &mut gpui::App) -> bool>,
+    pub handler: LinkHandler,
 }
 
 type HoverHandler = Rc<dyn Fn(bool, &mut Window, &mut gpui::App)>;
@@ -118,7 +124,7 @@ pub struct CodeUi {
     pub fit_content: bool,
     pub scroll: gpui::ScrollHandle,
     pub scrollbar: Option<CodeScrollbarUi>,
-    pub toggle_fit: Rc<dyn Fn(&mut Window, &mut gpui::App)>,
+    pub toggle_fit: ReleaseHandler,
     pub viewport_hover: HoverHandler,
     pub drag_move: PointerHandler,
 }
@@ -351,11 +357,10 @@ pub fn render_block(
             highlight,
         ),
         Block::BlockQuote { children } => div()
-            // Accent-tinted quote: indigo rail + a whisper of the same hue
-            // behind it (the inline-code treatment, dialed down).
+            // Reference quote: a quiet hairline rail, no tinted plate, body
+            // color text.
             .border_l_2()
-            .border_color(theme.accent.opacity(0.6))
-            .bg(theme.accent.opacity(0.05))
+            .border_color(theme.border)
             .rounded_tr(px(6.0))
             .rounded_br(px(6.0))
             .pl(px(12.0))
@@ -364,7 +369,7 @@ pub fn render_block(
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .text_color(theme.text_muted)
+            .text_color(theme.text)
             .children(children.iter().enumerate().map(|(ci, child)| {
                 render_block(
                     child,
@@ -385,16 +390,16 @@ pub fn render_block(
             .flex_col()
             .gap(px(4.0))
             .children(items.iter().enumerate().map(|(item_ix, item)| {
-                // Accent markers (the inline-code hue): ordered numbers as
-                // tinted text, unordered as a REAL 5px disc — the glyph "•"
-                // reads too small at 14px.
+                // Reference markers are monochrome: ordered numbers render in
+                // the body color, unordered as a real 5px disc in the faint
+                // tone (the glyph "•" reads too small at 15px).
                 let marker: gpui::AnyElement = match ordered_start {
                     Some(start) => div()
                         .flex_none()
                         .min_w(px(18.0))
                         .text_size(crate::typography::ui_rems(MD_TEXT_SIZE))
                         .line_height(crate::typography::ui_rems(MD_LINE_HEIGHT))
-                        .text_color(theme.accent)
+                        .text_color(theme.text)
                         .child(SharedString::from(format!("{}.", start + item_ix as u64)))
                         .into_any_element(),
                     None => div()
@@ -410,7 +415,7 @@ pub fn render_block(
                                 .w(px(5.0))
                                 .h(px(5.0))
                                 .rounded_full()
-                                .bg(theme.accent),
+                                .bg(theme.text_faint),
                         )
                         .into_any_element(),
                 };
@@ -448,14 +453,14 @@ pub fn render_block(
     }
 }
 
-/// Tight monochrome heading scale (zeron: h2 ≈ 16px semibold; headings step
-/// down quickly toward body size).
+/// Heading scale measured off the reference (h1 22px, h2 18px, h3 16px — all
+/// weight 500, sentence case).
 fn heading_metrics(level: u8) -> (f32, f32) {
     match level {
-        1 => (19.0, 27.0),
-        2 => (16.0, 24.0),
-        3 => (15.0, 22.0),
-        _ => (14.0, 22.0),
+        1 => (22.0, 29.0),
+        2 => (18.0, 25.0),
+        3 => (16.0, 23.0),
+        _ => (15.0, 25.0),
     }
 }
 
@@ -621,8 +626,8 @@ fn render_table(
 }
 
 /// Flattened inline runs: one string + gpui `TextRun`s + clickable link ranges
-/// + inline-code ranges (their rounded washes are painted by a canvas UNDER
-/// the text — `TextRun::background_color` can only paint square boxes).
+/// and inline-code ranges. A canvas paints rounded backgrounds under the text;
+/// `TextRun::background_color` only paints square boxes.
 /// `text` is a `SharedString` so cached reuse across frames is an Arc clone.
 pub struct FlatText {
     pub text: SharedString,
@@ -638,11 +643,17 @@ pub fn inline_code_text(theme: &Theme) -> Hsla {
 pub fn inline_code_wash(theme: &Theme) -> Hsla {
     theme.code_wash
 }
-/// Rounded-wash geometry: small radius on a slightly inset box (paint-only —
-/// x extends 2px past the glyphs, y insets 2px from the 22px line box).
-pub const INLINE_CODE_RADIUS: f32 = 4.5;
-pub const INLINE_CODE_PAD_X: f32 = 2.0;
-pub const INLINE_CODE_INSET_Y: f32 = 2.0;
+/// Hyperlink tone. The reference renders prose links in the same blue family
+/// as its code keywords (dark #6db2f7), so the theme's keyword slot carries
+/// it for both appearances.
+fn link_color(theme: &Theme) -> Hsla {
+    theme.syntax.keyword
+}
+/// Rounded-wash geometry: the reference chip pads the glyphs by ~5px on each
+/// side and paints the full line box tall (no vertical inset).
+pub const INLINE_CODE_RADIUS: f32 = 5.0;
+pub const INLINE_CODE_PAD_X: f32 = 5.0;
+pub const INLINE_CODE_INSET_Y: f32 = 0.0;
 
 /// Flatten inline runs into shaped-text inputs. Pure given a theme.
 pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> FlatText {
@@ -650,7 +661,8 @@ pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> Fl
         runs,
         theme,
         if bold_default {
-            FontWeight::SEMIBOLD
+            // Heading base weight (reference: 500).
+            FontWeight::MEDIUM
         } else {
             FontWeight::NORMAL
         },
@@ -675,6 +687,8 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         } else {
             font(theme.font_sans.clone())
         };
+        // Headings carry weight 500 in the reference ("two weights only" in
+        // its own docs); strong runs never drop below semibold.
         f.weight = if run.style.bold && base_weight.0 < FontWeight::SEMIBOLD.0 {
             FontWeight::SEMIBOLD
         } else {
@@ -685,14 +699,13 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         } else {
             FontStyle::Normal
         };
-        // Links stay monochrome — foreground with an underline (zeron's md
-        // theme underlines in the text color; indigo is reserved for primary
-        // actions).
         let is_link = run.style.link.is_some();
-        // Inline code uses the spectrum's code tone; everything else
-        // stays the monochrome foreground.
+        // Inline code uses the theme's code tone, links the keyword blue,
+        // everything else stays the monochrome foreground.
         let color = if run.style.code {
             inline_code_text(theme)
+        } else if is_link {
+            link_color(theme)
         } else {
             theme.text
         };
@@ -726,7 +739,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             // only be a square box.
             background_color: None,
             underline: is_link.then_some(UnderlineStyle {
-                color: Some(theme.text_muted),
+                color: Some(link_color(theme)),
                 thickness: px(1.0),
                 wavy: false,
             }),
@@ -1163,7 +1176,8 @@ fn text_element(
     theme: &Theme,
 ) -> AnyElement {
     let weight = if bold_default {
-        FontWeight::SEMIBOLD
+        // Reference headings ride weight 500, not semibold.
+        FontWeight::MEDIUM
     } else {
         FontWeight::NORMAL
     };
@@ -1328,7 +1342,6 @@ fn render_code_block(
             .pr(px(5.0))
             .border_b_1()
             .border_color(theme.border)
-            .bg(crate::theme::ink(0.02))
             .flex()
             .flex_row()
             .items_center()
@@ -1426,7 +1439,7 @@ fn render_code_block(
     };
 
     let scrollbar = (!fit_content)
-        .then(|| code_ui.as_ref())
+        .then_some(code_ui.as_ref())
         .flatten()
         .and_then(|ui| {
             let bar = ui.scrollbar.as_ref()?;
@@ -1490,9 +1503,9 @@ fn render_code_block(
             opts.row_key
         )))
         .rounded(px(10.0))
-        // Faint white wash over the near-black panel ≈ #101010 (zeron's code
-        // surface), with the hairline border.
-        .bg(crate::theme::ink(0.035))
+        // 3% white over the #161617 panel ≈ the reference's #1c1c1d code
+        // surface, with the hairline border.
+        .bg(crate::theme::ink(0.03))
         .border_1()
         .border_color(theme.border)
         .overflow_hidden()
@@ -1829,8 +1842,9 @@ mod tests {
         assert_eq!(flat.links, vec![(3..7, "https://x.dev".to_string())]);
         let total: usize = flat.runs.iter().map(|r| r.len).sum();
         assert_eq!(total, flat.text.len());
-        // Links stay monochrome (foreground + underline), never accent-tinted.
-        assert_eq!(flat.runs[1].color, theme.text);
+        // Links ride the reference's code-keyword blue family (prose links
+        // match inline code hue), never the accent.
+        assert_eq!(flat.runs[1].color, link_color(&theme));
         assert!(flat.runs[1].underline.is_some());
         assert_eq!(flat.runs[2].font.weight, FontWeight::SEMIBOLD);
     }

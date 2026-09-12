@@ -36,7 +36,7 @@ CPU fell from 3.36% on main to 2.48% with the fix.
 This is not a claim of zero animation overhead. During typing, main-thread CPU
 was 15.83%, versus 14.77% on main (+1.06 percentage points). Total process CPU
 was about 20% higher during that phase, which includes rendering the additional
-animation frames. That work is bounded by the 180ms animation and ends when it
+animation frames. That work is bounded by the collapse animation (COLLAPSE, 200ms) and ends when it
 settles. Focused idle includes caret blinking. The unfocused samples are near
 `/proc` counter resolution; a 0.1-point difference is not meaningful.
 

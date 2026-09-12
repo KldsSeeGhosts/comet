@@ -53,6 +53,11 @@ use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
 use zeron_syntax::LanguageId as Lang;
 
+// Subcomponents: the ActivePlanHud's plan-state derivation (rendered by the
+// chat view) and this list's vertical overlay scrollbar.
+pub mod plan_hud;
+mod scrollbar;
+
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
 // ---------------------------------------------------------------------------
@@ -89,7 +94,7 @@ const CHIP_HEADER_HEIGHT: f32 = CHIP_CARD_HEIGHT - 2.0;
 /// Shared columns keep the group summary, tool labels, and expanded text aligned.
 const ACTIVITY_GUTTER_WIDTH: f32 = 26.0;
 const ACTIVITY_TEXT_GAP: f32 = 4.0;
-const TOOL_TEXT_SIZE: f32 = 12.0;
+const TOOL_TEXT_SIZE: f32 = 14.0;
 
 /// Signed list scroll step for a pointer near a viewport edge.
 ///
@@ -129,7 +134,7 @@ const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 /// (user report) — past the cap the bubble clips and grows a chevron.
 pub const USER_COLLAPSED_LINES: usize = 5;
 /// The user bubble's line box.
-pub const USER_LINE_HEIGHT: f32 = 22.0;
+pub const USER_LINE_HEIGHT: f32 = 25.0;
 /// Conservative first-frame soft-wrap proxy for the fixed-width long-prompt
 /// bubble. The final decision uses the wrapped `StyledText` layout, but this
 /// fallback lets clearly long prompts render their affordance immediately
@@ -2435,6 +2440,8 @@ pub struct Transcript {
     bottom_clearance: f32,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
+    /// Vertical overlay scrollbar hover/drag state (right edge).
+    scrollbar: scrollbar::TranscriptScrollbarState,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
     /// strip (zeron chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
@@ -2643,6 +2650,7 @@ impl Transcript {
             rail_enabled,
             bottom_clearance: 0.0,
             rail_hover: None,
+            scrollbar: scrollbar::TranscriptScrollbarState::default(),
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
@@ -2947,6 +2955,137 @@ impl Transcript {
             })
             .ok();
         });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Vertical overlay scrollbar (see transcript/scrollbar.rs)
+    // ---------------------------------------------------------------------------
+
+    /// The list's live scrollbar frame: track top (window coords) plus thumb
+    /// metrics, `None` while the content fits the viewport or no layout has
+    /// measured it yet.
+    fn scrollbar_frame(&self) -> (f32, Option<crate::popover::MenuScrollbarMetrics>) {
+        let bounds = self.list.viewport_bounds();
+        let max = f32::from(self.list.max_offset_for_scrollbar().y).max(0.0);
+        let negative = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+        (
+            f32::from(bounds.top()),
+            scrollbar::metrics(f32::from(bounds.size.height), max, negative),
+        )
+    }
+
+    fn apply_scrollbar_offset(&mut self, scroll_top: f32) {
+        self.list
+            .set_offset_from_scrollbar(gpui::point(px(0.0), px(-scroll_top)));
+    }
+
+    /// Distance-derived chrome after scrollbar-driven viewport movement. The
+    /// wheel path defers this to the next effect cycle (the list holds a
+    /// borrow during its handler); scrollbar offsets apply inline because
+    /// `set_offset_from_scrollbar` never re-enters `handle_scroll`.
+    fn refresh_after_viewport_input(&mut self, cx: &mut Context<Self>) {
+        let distance = self.distance_from_bottom();
+        self.last_scroll_distance = distance;
+        self.show_jump_button = distance > SCROLL_BUTTON_THRESHOLD_PX && !self.pinned;
+        cx.notify();
+    }
+
+    fn on_viewport_hover(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scrollbar.set_viewport_hovered(*hovered) {
+            cx.notify();
+        }
+    }
+
+    fn on_scrollbar_rail_hover(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scrollbar.set_bar_hovered(*hovered) {
+            cx.notify();
+        }
+    }
+
+    fn on_scrollbar_press(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (track_top, metrics) = self.scrollbar_frame();
+        let Some(metrics) = metrics else {
+            return;
+        };
+        // User input owns the viewport, exactly like the wheel path: drop the
+        // pending replay anchor and the collapse scroll, release the own-turn
+        // hold, and break the tail pin before the first dragged offset lands.
+        self.begin_scroll_navigation();
+        // Freeze the content height so streaming growth cannot resize the
+        // thumb mid-drag (`max_offset_for_scrollbar` reports the same frozen
+        // value the offset mapping uses).
+        self.list.scrollbar_drag_started();
+        let scroll_top = self.scrollbar.press(metrics, track_top, f32::from(event.position.y));
+        self.apply_scrollbar_offset(scroll_top);
+        self.refresh_after_viewport_input(cx);
+        // A press on the rail is not a text-selection gesture.
+        cx.stop_propagation();
+    }
+
+    fn on_scrollbar_drag_move(
+        &mut self,
+        event: &gpui::DragMoveEvent<scrollbar::ScrollbarDrag>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (track_top, metrics) = self.scrollbar_frame();
+        let Some(metrics) = metrics else {
+            return;
+        };
+        let Some(scroll_top) =
+            self.scrollbar
+                .drag(metrics, track_top, f32::from(event.event.position.y))
+        else {
+            return;
+        };
+        self.apply_scrollbar_offset(scroll_top);
+        self.refresh_after_viewport_input(cx);
+    }
+
+    fn on_scrollbar_release(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.scrollbar.release() {
+            return;
+        }
+        self.list.scrollbar_drag_ended();
+        // Arriving at the end re-engages the tail pin — the wheel path's
+        // restick-at-bottom; anywhere else the user keeps the viewport.
+        if self.distance_from_bottom() <= AT_BOTTOM_PX {
+            self.pinned = true;
+        }
+        self.refresh_after_viewport_input(cx);
+    }
+
+    /// The right-edge overlay: hit strip + hairline track + thumb, armed
+    /// while the transcript is hovered or a drag holds it. Painted after the
+    /// message rail; the SHELL's jump pill is a later sibling of this whole
+    /// outlet, so the pill still wins where they could overlap.
+    fn render_scrollbar(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.scrollbar.visible() {
+            return None;
+        }
+        let (_, metrics) = self.scrollbar_frame();
+        let metrics = metrics?;
+        Some(
+            self.scrollbar
+                .render_rail("transcript-scrollbar", theme, &metrics)
+                .on_hover(cx.listener(Self::on_scrollbar_rail_hover))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_scrollbar_press))
+                .on_drag(
+                    scrollbar::ScrollbarDrag,
+                    |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| scrollbar::ScrollbarDragGhost)
+                    },
+                )
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_scrollbar_release))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_scrollbar_release))
+                .into_any_element(),
+        )
     }
 
     fn on_selection_mouse_move(
@@ -3442,8 +3581,7 @@ impl Transcript {
             }
             self.own_turn_last_tick = None;
         } else if anchored
-            && err <= OWN_SEND_GLIDE_SNAP_PX
-            && err >= -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
+            && (-(OWN_SEND_SCROLL_SLACK_PX + 2.0)..=OWN_SEND_GLIDE_SNAP_PX).contains(&err)
         {
             // At the hold — or resting inside the slack under it (a restick
             // that fired at the true bottom): land WITHOUT pulling the view
@@ -4324,6 +4462,8 @@ impl Transcript {
     /// collapsing the bubble to min-content width (one character per line).
     /// A plain height clip preserves the original bubble width calculation and
     /// never feeds measured layout back into the virtualized list.
+    // Keep the render callback signature local to this UI component.
+    #[allow(clippy::too_many_arguments)]
     fn render_user_body(
         &mut self,
         row_id: &SharedString,
@@ -4460,6 +4600,8 @@ impl Transcript {
 
     /// A plain text link aligned with the message's left edge, following the
     /// continuation ellipsis when collapsed. No pill, border, or button wash.
+    // Keep the render callback signature local to this UI component.
+    #[allow(clippy::too_many_arguments)]
     fn render_user_expander(
         &mut self,
         row_id: &SharedString,
@@ -4728,7 +4870,7 @@ impl Transcript {
             if !live {
                 return None;
             }
-            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
+            let elapsed = (now.timestamp_millis() - last.created_at).max(0) / 1000;
             (false, false, elapsed, flavour_seed(doc_id))
         } else {
             let chat_id = self.chat_id.clone()?;
@@ -4918,7 +5060,7 @@ impl Transcript {
                                 .rounded(px(Theme::BUBBLE_RADIUS))
                                 .px(px(16.0))
                                 .py(px(10.0))
-                                .text_size(crate::typography::ui_rems(14.0))
+                                .text_size(crate::typography::ui_rems(15.0))
                                 .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
                                 .text_color(theme.text)
                                 .when(pending, |el| el.opacity(0.65))
@@ -5218,7 +5360,7 @@ impl Transcript {
             .map(|(_, ix)| *ix);
         let row_key = row_id.clone();
         let entity = cx.weak_entity();
-        let handler: Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)> =
+        let handler: render::CopyHandler =
             Rc::new(move |ix, code, _window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
                 let row_key = row_key.clone();
@@ -6988,6 +7130,10 @@ impl Render for Transcript {
             });
         }
         let rail = self.render_rail(cx);
+        let scrollbar_rail = {
+            let theme = Theme::of(cx).clone();
+            self.render_scrollbar(&theme, cx)
+        };
         // The scroll-to-bottom pill is rendered by the SHELL (conversation
         // region overlay): it must float just above the composer and paint
         // OVER the bottom fade gradient, which is a later sibling of this
@@ -7019,9 +7165,14 @@ impl Render for Transcript {
             list_el.into_any_element()
         };
         let root = div()
+            .id("transcript-viewport")
             .relative()
             .size_full()
             .min_h_0()
+            // Hover over the transcript arms the overlay scrollbar (the
+            // active-drag suppression in gpui's hover is why the rail also
+            // counts its own grab as visibility).
+            .on_hover(cx.listener(Self::on_viewport_hover))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(Self::on_selection_mouse_down),
@@ -7029,12 +7180,16 @@ impl Render for Transcript {
             .on_mouse_move(cx.listener(Self::on_selection_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
+            // Captured scrollbar drags keep tracking anywhere in the window,
+            // like the code-fence scrollbars' drag moves.
+            .on_drag_move(cx.listener(Self::on_scrollbar_drag_move))
             // FIRST child ⇒ paints first: clears the frame's markdown text-
             // selection registry before any row's text elements re-register
             // (document paint order = selection order; see markdown/render.rs).
             .child(crate::markdown::render::selection_frame_reset())
             .child(content)
-            .child(rail);
+            .child(rail)
+            .children(scrollbar_rail);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
         if let Some(preview) = self.attachment_preview.clone() {
@@ -7671,7 +7826,7 @@ mod tests {
             tools[0].detail.as_deref(),
             Some(ToolDetail::Thought { lines, .. }) if !lines.is_empty()
         ));
-        let summary = tool_group_summary(&tools);
+        let summary = tool_group_summary(tools);
         assert!(summary.starts_with("Thought 2 times"), "{summary}");
         assert!(summary.contains("2 commands"), "{summary}");
 
@@ -7687,7 +7842,7 @@ mod tests {
         let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
             panic!("expected a tool group");
         };
-        assert_eq!(tool_group_summary(&tools), "Thought process");
+        assert_eq!(tool_group_summary(tools), "Thought process");
 
         // Empty reasoning renders nothing.
         let entry = assistant(

@@ -107,6 +107,7 @@ impl Harness for HeldHarness {
         }
         let mut finish = self.finish.subscribe();
         let mut steering = controls.steering;
+        let interrupt = controls.interrupt.clone();
         let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
             harness: HarnessId::Mock,
             model: "mock-1".into(),
@@ -118,6 +119,16 @@ impl Harness for HeldHarness {
         let done = futures::stream::once(async move {
             loop {
                 tokio::select! {
+                    _ = interrupt.cancelled() => {
+                        // The interrupt contract: emit the interrupted Done,
+                        // then end the stream so teardown is observable.
+                        return Ok(AgentEvent::Done {
+                            status: DoneStatus::Interrupted,
+                            result: None,
+                            error: None,
+                            session_id: Some("sess-queue".into()),
+                        });
+                    }
                     _ = finish.recv() => {
                         return Ok(AgentEvent::Done {
                             status: DoneStatus::Completed,

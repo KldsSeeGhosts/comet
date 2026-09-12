@@ -15,9 +15,13 @@ interface BridgeResult {
   isError?: boolean;
 }
 
-const DESKTOP_POINTER_ACTIONS = new Set([
-  "click", "double_click", "right_click", "drag", "mouse_button_down",
-  "mouse_drag", "mouse_button_up", "scroll", "move_cursor",
+const NON_DISRUPTIVE_POLICY = "Only non-disruptive computer use is allowed. Physical focus, mouse and keyboard must remain untouched. Desktop capture is read-only. Supported window input uses background delivery with an exact pid/window_id; unsupported background routes must refuse, never fall back to foreground.";
+const BLOCKED_ACTIONS = new Set([
+  "bring_to_front", "launch_app", "kill_app", "set_window_frame",
+  "mouse_button_down", "mouse_drag", "mouse_button_up", "invoke_menu", "clipboard_write",
+]);
+const WINDOW_INPUT_ACTIONS = new Set([
+  "click", "double_click", "right_click", "drag", "scroll", "type_text", "press_key", "hotkey",
 ]);
 
 export type CuaOutcome =
@@ -131,26 +135,52 @@ function refusalSummary(structured: Record<string, unknown> | undefined): string
   const head = code ? `Computer-use refused (${code})` : "Computer-use refused";
   const parts = [`${head}: ${message ?? "the action was not executed."}`];
   if (reason && reason !== code) parts.push(`Reason: ${reason}.`);
-  if (nextAction) parts.push(`Next action: ${nextAction}.`);
+  if (nextAction === "browser_prepare") {
+    parts.push("Set up the browser and DevTools manually, then use get_browser_state. Automatic browser preparation is disabled.");
+  } else if (nextAction) {
+    // Preserve the original recommendation in the structured evidence, not as
+    // adapter instructions that might suggest activating the physical seat.
+    parts.push("Driver suggestions do not override the non-disruptive policy.");
+  }
   if (approvals.length) parts.push(`Approval: ${approvals.join(", ")}.`);
   return parts.join(" ");
 }
 
 export function bridgeArgs(action: string, args: Record<string, unknown>): Record<string, unknown> {
   const forwarded = { ...args };
-  delete forwarded.allow_user_input_disruption;
-  const target = args.target as { kind?: unknown } | undefined;
-  const desktopPointer = DESKTOP_POINTER_ACTIONS.has(action)
-    && (target?.kind === "desktop" || args.scope === "desktop");
-  const foreground = args.delivery_mode === "foreground";
-  if ((desktopPointer || foreground) && args.allow_user_input_disruption !== true) {
-    throw new Error(
-      "This route can move the user's real pointer or change keyboard focus. " +
-      "Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer; " +
-      "only scope=desktop with explicit disruption approval may use the real seat. " +
-      "Use browser or background window actions instead. Only after the user explicitly allows disruption, " +
-      "retry with allow_user_input_disruption=true.",
-    );
+  const deny = (reason: string): never => { throw new Error(`${reason}. ${NON_DISRUPTIVE_POLICY}`); };
+  const token = (value: unknown) => typeof value === "string" ? value.trim().toLowerCase() : undefined;
+  if ("allow_user_input_disruption" in args) deny("Disruption overrides are forbidden, regardless of session approval");
+  if ("delivery_mode" in args) {
+    if (token(args.delivery_mode) !== "background") deny("delivery_mode must be background; foreground and unknown modes are forbidden");
+    forwarded.delivery_mode = "background";
+  }
+  if ("scope" in args) {
+    const scope = token(args.scope);
+    if (scope !== "window" && scope !== "desktop") deny("scope must be window or desktop");
+    forwarded.scope = scope;
+  }
+  const desktopCapture = action === "get_desktop_state" || action === "get_screen_size";
+  if ("target" in args) {
+    const target = objectRecord(args.target);
+    if (!target) deny("target must be an object");
+    const kind = token(target!.kind);
+    if (kind !== "window" && kind !== "desktop") deny("target.kind must be window or desktop");
+    if (kind === "desktop" && !desktopCapture) deny("Desktop input is forbidden, including keyboard input");
+    forwarded.target = { ...target, kind };
+  }
+  if (!desktopCapture && (forwarded.scope === "desktop" || "display_id" in args || "expected_layout" in args)) {
+    deny("Desktop routes are restricted to read-only get_desktop_state/get_screen_size");
+  }
+  if (action === "browser_prepare") deny("browser_prepare is disabled: the driver has no guaranteed attach-only, non-disruptive route. Set up the browser and DevTools manually, then use get_browser_state. Automatic setup and launch are forbidden");
+  if (BLOCKED_ACTIONS.has(action)) deny(`${action} is forbidden: no verified non-disruptive background route`);
+  if (action === "browser_dialog" && args.action !== "inspect") deny("Only browser_dialog action=inspect is allowed; resolving native browser dialogs can change physical focus. Handle the dialog manually");
+  if (WINDOW_INPUT_ACTIONS.has(action) || action === "set_value" || action === "move_cursor") {
+    for (const key of ["pid", "window_id"]) {
+      if (!Number.isSafeInteger(args[key]) || (args[key] as number) <= 0) deny(`${action} requires an exact positive integer ${key} for background input`);
+    }
+    if ("target" in args) deny("Window input requires top-level pid/window_id, not an alternate target");
+    if (WINDOW_INPUT_ACTIONS.has(action)) forwarded.delivery_mode = "background";
   }
   return forwarded;
 }
@@ -226,8 +256,7 @@ export function toolResult(result: BridgeResult, action: string) {
     const names = tools.map(tool => tool.name).filter((name): name is string => typeof name === "string");
     text.push(
       `Available actions: ${names.join(", ")}\n` +
-      `Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer; ` +
-      `only scope=desktop with explicit disruption approval may use the real seat.\n` +
+      `${NON_DISRUPTIVE_POLICY}\n` +
       `Use describe with args.name or args.names for schemas. Do not parse help output with shell commands.`
     );
   } else if (action === "get_window_state") {
@@ -295,23 +324,20 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "noches_cua",
     label: "Computer use",
-    description: "Use the engine host's desktop through Noches. Pass action and args. Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer; only scope=desktop with explicit disruption approval may use the real seat. Browser actions work in the background. 'help' returns a compact action list; 'describe' with args.name or args.names returns schemas.",
+    description: `Use the engine host's desktop through Noches. Pass action and args. ${NON_DISRUPTIVE_POLICY} 'help' returns a compact action list; 'describe' with args.name or args.names returns schemas.`,
     promptSnippet: "noches_cua: Inspect and control the engine host's desktop with native Noches approval and cancellation.",
     promptGuidelines: [
-      "Use noches_cua for desktop automation inside Noches; the direct cua tool is disabled. Do NOT shell out to hyprctl, wmctrl, or xdotool for window/app control - use noches_cua (list_windows, get_window_state, bring_to_front, set_window_frame) instead. Reserve bash for non-desktop work.",
-      "Do not call help as a first step when the needed action is named here. Use describe with args.name or args.names for only the schemas you need. Never read, crop, or parse screenshots with shell or Python commands.",
-      "For browser work, use list_windows, get_browser_state, browser_prepare when requested by a structured refusal, then browser_navigate/browser_click/browser_type. Browser screenshots come from get_browser_state with include_screenshot=true and do not foreground the browser. Do not use desktop screenshots or pixel clicks for tabs, URLs, or web content.",
-      "Prefer browser actions, then background window actions with an exact pid/window_id. Observe only when the action needs a fresh semantic ref or element token. Verify the final requested state once. Do not take a screenshot after every action unless the result is unknown.",
-      "Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer. Only scope=desktop (or target.kind='desktop') pointer actions and delivery_mode='foreground' can commandeer the user's real pointer or keyboard focus on Wayland. They require explicit disruption approval from the user and allow_user_input_disruption=true. Never infer disruption permission from ordinary computer-use approval.",
-      "If the user allows disruptive desktop input, call get_screen_size first. Select a returned display_id, capture it with get_desktop_state, use output-local native pixels, and echo layout_token as expected_layout. Do not add monitor origins or apply scale again.",
-      "For isolated background keyboard input into a child window: first click the child (via its element token or coordinates), then call type_text with only pid/window_id/text and press_key with only pid/window_id/key. Targeted text/key arguments are rejected; keyboard input goes through the focused child window.",
-      "In a browser, focus the omnibox with hotkey (keys:[\"ctrl\",\"l\"] plus the browser pid/window_id); alternatively press_key with key:\"l\", modifiers:[\"ctrl\"], pid/window_id. This is the robust way to focus the omnibox before typing a URL; do not rely on bare typing reaching it.",
-      "For routine Chromium automation prefer browser_prepare with an isolated_new profile. Use existing_profile only when signed-in or user-profile state is required, because it exposes the user's logged-in profile data.",
-      "Keep keyboard actions window-scoped with an exact pid/window_id. Do not reuse desktop PNG coordinates for window-scoped actions. If exact background targeting is unavailable, report that limitation instead of silently falling back to global input.",
-      "One noches_cua approval covers the host for the whole session, including foreground and desktop delivery across turns. A denial lasts until the turn ends; do not retry the same action after one.",
-      "noches_cua sessions and cleanup belong to the engine. Do not set session authority fields or call session lifecycle tools. The desktop lease and driver release when a turn finishes and re-acquire silently on the next turn; only the approval persists.",
+      "Use noches_cua for desktop automation inside Noches; the direct cua tool is disabled. Never bypass its policy through shell commands, compositor IPC or another automation tool. Reserve bash for non-desktop work.",
+      "Use describe with args.name or args.names for only the schemas you need. Never read, crop, or parse screenshots with shell or Python commands.",
+      NON_DISRUPTIVE_POLICY,
+      "Browser preparation is disabled because the driver has no guaranteed attach-only route. Ask the user to set up the browser and DevTools manually, then use get_browser_state and typed browser actions. Do not follow driver suggestions to run browser_prepare, launch a browser or switch to foreground delivery.",
+      "Browser screenshots come from get_browser_state with include_screenshot=true. Use browser_navigate/browser_click/browser_type for web content, not desktop input or omnibox shortcuts.",
+      "Prefer browser actions, then supported background window actions with an exact pid/window_id. Use fresh semantic refs or element tokens when required. Verify the final requested state. Background delivery is not proof of success; preserve driver refusals and report unsupported native targets.",
+      "For isolated background keyboard input into a child window, first click the child via its element token or coordinates with an exact pid/window_id. Then call type_text with pid/window_id/text or press_key with pid/window_id/key. The engine forces background delivery. Never fall back to the physical keyboard.",
+      "Stateful mouse holds, activation, launch, app termination, window rearrangement, menu invocation and clipboard writes are disabled. A single background drag remains available when the driver supports it. Desktop screenshots and clipboard reads do not authorize desktop input.",
+      "One approval covers only non-disruptive inspection and supported background input across turns. Disruption overrides are forbidden. A denial lasts until the turn ends; do not retry the same action after one.",
+      "noches_cua sessions and cleanup belong to the engine. Do not set session authority fields or call session lifecycle tools. The lease and driver release when a turn finishes; only approval persists.",
       "If noches_cua reports cancellation or unknown delivery, do not repeat the action automatically. Previously delivered input cannot be undone.",
-      "On Hyprland 0.55+ `hyprctl dispatch <name> <args>` is removed; it is now a Lua shorthand for `hl.dispatch(...)`. If a task genuinely needs a compositor action noches_cua lacks (e.g. moving a window to a workspace), run `hyprctl eval 'hl.dispatch(hl.dsp.<fn>({ ... }))'` - never the positional form.",
     ],
     parameters: Type.Object({
       action: Type.String({ description: "Action name, help, or describe." }),

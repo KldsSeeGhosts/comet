@@ -101,14 +101,12 @@ impl CheckpointFetcher for FixedFetcher {
 // ── server-side script helpers ──────────────────────────────────────────────
 
 async fn expect_kind(end: &mut ServerEnd, kind: u8) -> wire::WireFrame {
-    loop {
-        let bytes = end.rx.recv().await.expect("client hung up");
-        let frame = decode(&bytes).expect("client sent undecodable frame");
-        if frame.kind == kind {
-            return frame;
-        }
-        panic!("expected frame {kind:#x}, got {:#x}", frame.kind);
+    let bytes = end.rx.recv().await.expect("client hung up");
+    let frame = decode(&bytes).expect("client sent undecodable frame");
+    if frame.kind == kind {
+        return frame;
     }
+    panic!("expected frame {kind:#x}, got {:#x}", frame.kind);
 }
 
 async fn send(end: &ServerEnd, kind: u8, header: serde_json::Value, payload: &[u8]) {
@@ -974,6 +972,8 @@ fn empty_state_json() -> serde_json::Value {
 /// and must narrate the outage (Disconnected event + disconnect counters) —
 /// the UI-truth signal the pill and Queued badges ride on.
 #[tokio::test(start_paused = true)]
+// The std mutex deliberately serializes these timing-sensitive tests across their awaits.
+#[allow(clippy::await_holding_lock)]
 async fn drops_and_refused_dials_deliver_the_push_exactly_once() {
     let _serial = lock(&PATH_AND_TIMING);
     let (pipe1, mut end1) = pipe_pair();
@@ -1068,6 +1068,8 @@ async fn drops_and_refused_dials_deliver_the_push_exactly_once() {
 /// — reset-on-join alone hot-looped at 250ms forever. A session that stays
 /// healthy past STABLE_RESET earns the fresh 250ms base again.
 #[tokio::test(start_paused = true)]
+// The std mutex deliberately serializes these timing-sensitive tests across their awaits.
+#[allow(clippy::await_holding_lock)]
 async fn connect_and_die_sessions_grow_backoff_until_a_stable_session_resets_it() {
     let _serial = lock(&PATH_AND_TIMING);
     let mut pipes = Vec::new();
@@ -1155,6 +1157,8 @@ async fn connect_and_die_sessions_grow_backoff_until_a_stable_session_resets_it(
 /// the online event un-parks it IMMEDIATELY (event-driven recovery, not
 /// timer luck).
 #[tokio::test(start_paused = true)]
+// The std mutex deliberately serializes these timing-sensitive tests across their awaits.
+#[allow(clippy::await_holding_lock)]
 async fn os_offline_parks_dials_and_the_online_event_unparks_immediately() {
     let _serial = lock(&PATH_AND_TIMING);
     let (pipe1, mut end1) = pipe_pair();

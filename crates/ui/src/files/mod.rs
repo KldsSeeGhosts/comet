@@ -426,6 +426,7 @@ impl Render for FilesSurface {
 }
 
 impl FilesSurface {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: Entity<AppState>,
         chat_id: String,
@@ -450,6 +451,7 @@ impl FilesSurface {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_editor(
         state: Entity<AppState>,
         chat_id: String,
@@ -475,6 +477,7 @@ impl FilesSurface {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_presentation(
         state: Entity<AppState>,
         chat_id: String,
@@ -493,6 +496,7 @@ impl FilesSurface {
                 .with_text_metrics(11.0, 16.0)
         });
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
+            ComposerInputEvent::SubmissionOrigin(_) => {}
             ComposerInputEvent::Edited => this.on_search_edited(cx),
             ComposerInputEvent::Submitted
             | ComposerInputEvent::ModifiedSubmitted

@@ -973,6 +973,9 @@ fn forwardable(method: &str) -> bool {
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
+            | methods::OPEN_SESSION_TERMINAL
+            | methods::CLOSE_SESSION_TERMINAL
+            | methods::GET_SESSION_VIEW
             | methods::SUBSCRIBE_TERMINAL
             | methods::WRITE_TERMINAL
             | methods::RESIZE_TERMINAL
@@ -2210,6 +2213,33 @@ impl RpcService for EngineRpc {
                     .open_with_shell(&cwd, p.cols, p.rows, p.shell.as_deref())
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&session)
+            }
+            methods::OPEN_SESSION_TERMINAL => {
+                let p: OpenTerminalParams = parse_params(params)?;
+                let terminal = self.sessions.session_views().open(
+                    self.sessions.clone(), self.workspace.clone(), self.terminals.clone(),
+                    p.chat_id, p.cols, p.rows,
+                ).await.map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&terminal)
+            }
+            methods::CLOSE_SESSION_TERMINAL => {
+                let p: ChatParams = parse_params(params)?;
+                let outcome = self.sessions.session_views().close(
+                    self.sessions.clone(), self.workspace.clone(), self.doc_host.clone(),
+                    self.terminals.clone(), p.chat_id,
+                ).await.map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&outcome)
+            }
+            methods::GET_SESSION_VIEW => {
+                let p: ChatParams = parse_params(params)?;
+                let chat = self.workspace.chat(&p.chat_id).map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("Chat not found".into()))?;
+                if chat.device_id != self.workspace.device_id() {
+                    return Err(RpcError::Failed("GetSessionView must run on the chat's host device".into()));
+                }
+                // The canonical provider identity comes from the Chat record;
+                // a live handoff overrides it inside SessionViews.
+                RpcReply::value(&self.sessions.session_views().view(&p.chat_id, Some(&chat)))
             }
             methods::SUBSCRIBE_TERMINAL => {
                 let p: SubscribeTerminalParams = parse_params(params)?;

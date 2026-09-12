@@ -1058,6 +1058,7 @@ fn flatten_foundation(
     resolved
 }
 
+#[allow(clippy::too_many_arguments)]
 fn harden_foreground(
     source: &NormalizedTheme,
     report: &mut ImportReport,

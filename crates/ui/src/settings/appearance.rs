@@ -1363,11 +1363,10 @@ impl AppearancePage {
                                         .on_click(cx.listener({
                                             let variant_id = variant_id.clone();
                                             move |this, _, _, cx| {
-                                                if let Some(dialog) = this.import_dialog.as_mut() {
-                                                    if !dialog.selected.remove(&variant_id) {
+                                                if let Some(dialog) = this.import_dialog.as_mut()
+                                                    && !dialog.selected.remove(&variant_id) {
                                                         dialog.selected.insert(variant_id.clone());
                                                     }
-                                                }
                                                 cx.notify();
                                             }
                                         })),
@@ -2352,11 +2351,11 @@ mod tests {
             registry
                 .variants_for(zeron_theme::Appearance::Light)
                 .count(),
-            10
+            11
         );
         assert_eq!(
             registry.variants_for(zeron_theme::Appearance::Dark).count(),
-            20
+            21
         );
     }
 

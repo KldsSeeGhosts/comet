@@ -38,7 +38,7 @@ pub fn record_key(key: &str, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> R
 #[derive(Debug, Clone)]
 pub enum ShortcutsEvent {
     /// The keymap changed — persist + re-apply.
-    KeymapChanged(KeymapConfig),
+    KeymapChanged(Box<KeymapConfig>),
     /// The composer send behavior changed — persist + re-apply.
     ComposerSendBehaviorChanged(ComposerSendBehavior),
 }
@@ -77,7 +77,7 @@ impl ShortcutsPage {
     }
 
     fn commit(&mut self, cx: &mut Context<Self>) {
-        cx.emit(ShortcutsEvent::KeymapChanged(self.keymap.clone()));
+        cx.emit(ShortcutsEvent::KeymapChanged(Box::new(self.keymap.clone())));
         cx.notify();
     }
 

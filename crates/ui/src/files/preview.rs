@@ -2702,8 +2702,7 @@ fn editor_comment_overlay_horizontal(layout: &EditorOverlayLayout) -> (f32, f32)
     let anchored_left =
         (layout.gutter_width - EDITOR_COMMENT_CARD_MARGIN).max(EDITOR_COMMENT_CARD_MARGIN);
     let anchored_width = (layout.viewport_width - anchored_left - EDITOR_COMMENT_CARD_MARGIN)
-        .min(EDITOR_COMMENT_CARD_WIDTH)
-        .max(0.0);
+        .clamp(0.0, EDITOR_COMMENT_CARD_WIDTH);
     if anchored_width >= EDITOR_COMMENT_CARD_MIN_ANCHORED_WIDTH {
         (anchored_left, anchored_width)
     } else {
@@ -2775,6 +2774,24 @@ fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
         Some(WorkspaceReadOnlyReason::NotRegularFile) | None => "This file cannot be previewed.",
     }
     .into()
+}
+
+#[cfg(test)]
+impl FilesSurface {
+    pub(crate) fn seed_pending_exit_test_document(&mut self, failed: bool) {
+        let mut document = FileDocument::loading(DocumentKey {
+            chat_id: "test".into(),
+            checkout_id: None,
+            path: "test.rs".into(),
+        });
+        document.revision = 1;
+        document.phase = if failed {
+            DocumentPhase::SaveFailed("offline".into())
+        } else {
+            DocumentPhase::Saving
+        };
+        self.preview.documents.insert("test.rs".into(), document);
+    }
 }
 
 #[cfg(test)]
@@ -3266,23 +3283,5 @@ mod tests {
 
         layout.viewport_width = 210.0;
         assert_eq!(editor_comment_overlay_horizontal(&layout), (8.0, 194.0));
-    }
-}
-
-#[cfg(test)]
-impl FilesSurface {
-    pub(crate) fn seed_pending_exit_test_document(&mut self, failed: bool) {
-        let mut document = FileDocument::loading(DocumentKey {
-            chat_id: "test".into(),
-            checkout_id: None,
-            path: "test.rs".into(),
-        });
-        document.revision = 1;
-        document.phase = if failed {
-            DocumentPhase::SaveFailed("offline".into())
-        } else {
-            DocumentPhase::Saving
-        };
-        self.preview.documents.insert("test.rs".into(), document);
     }
 }

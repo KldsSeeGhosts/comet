@@ -9,13 +9,22 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::settings::{self, SavePolicy};
 
 /// A bundled, virtual, or device-local interface font choice.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UiFontFamily {
-    #[default]
     Geist,
     GeistMono,
     System,
     Installed(String),
+}
+
+impl Default for UiFontFamily {
+    /// The reference app's interface face (Anthropic's variable sans, exposed
+    /// by fontconfig as "Anthropic Sans Variable"). Purely a *requested*
+    /// default: `resolve_effective` falls back to Geist/system when the
+    /// family is not installed on this device.
+    fn default() -> Self {
+        Self::Installed("Anthropic Sans Variable".into())
+    }
 }
 
 impl UiFontFamily {
