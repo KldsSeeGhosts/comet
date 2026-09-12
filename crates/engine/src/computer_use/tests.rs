@@ -242,14 +242,22 @@ async fn full_results_permissions_and_turn_lease() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert_eq!(call(&b, "list_windows", json!({})).await["isError"], true);
     assert_eq!(
-        call(&a, "click", json!({"pid":42,"refuse":true})).await["isError"],
+        call(&a, "click", json!({"pid":42,"window_id":7,"refuse":true})).await["isError"],
         true
     );
-    call(&a, "click", json!({"pid":42,"delivery_mode":"foreground"})).await;
+    assert_eq!(
+        call(
+            &a,
+            "click",
+            json!({"pid":42,"window_id":7,"delivery_mode":"foreground"})
+        )
+        .await["isError"],
+        true
+    );
     assert_eq!(
         count.load(Ordering::SeqCst),
         1,
-        "one grant covers the whole turn, including foreground delivery"
+        "a forbidden foreground request must not ask for another grant"
     );
     bridge_a.turn_ended().await;
     assert!(
@@ -348,7 +356,7 @@ async fn effect_refused_normalizes_with_its_driver_error_flag() {
     let result = call(
         &socket,
         "click",
-        json!({"refusal": outcome, "refuse": true}),
+        json!({"pid":42,"window_id":7,"refusal": outcome, "refuse": true}),
     )
     .await;
     assert_eq!(result["isError"], true, "{result}");
@@ -373,7 +381,7 @@ async fn partial_unknown_and_unverifiable_outcomes_are_not_errors() {
         let result = call(
             &socket,
             "click",
-            json!({"refusal": {"status": status, "delivery_id": "d1"}}),
+            json!({"pid":42,"window_id":7,"refusal": {"status": status, "delivery_id": "d1"}}),
         )
         .await;
         assert_ne!(
@@ -387,7 +395,7 @@ async fn partial_unknown_and_unverifiable_outcomes_are_not_errors() {
     let effect = call(
         &socket,
         "click",
-        json!({"refusal": {"effect": "unverifiable", "delivery_id": "d2"}}),
+        json!({"pid":42,"window_id":7,"refusal": {"effect": "unverifiable", "delivery_id": "d2"}}),
     )
     .await;
     assert_ne!(effect["isError"], true, "{effect}");
@@ -783,7 +791,7 @@ async fn denial_and_unreviewed_actions_fail_closed_without_holding_lease() {
 async fn blocked_call(socket: &Path, dir: &Path) -> (UnixStream, u64) {
     let mut stream = UnixStream::connect(socket).await.unwrap();
     stream
-        .write_all(b"{\"action\":\"click\",\"args\":{\"block\":true}}\n")
+        .write_all(b"{\"action\":\"click\",\"args\":{\"pid\":42,\"window_id\":7,\"block\":true}}\n")
         .await
         .unwrap();
     let pid = tokio::time::timeout(Duration::from_secs(5), async {
@@ -928,7 +936,7 @@ async fn positive_grant_persists_across_bridge_recreation_per_chat() {
         )
         .await
         .unwrap();
-    let res1 = call(&socket1, "click", json!({"pid": 42})).await;
+    let res1 = call(&socket1, "click", json!({"pid": 42,"window_id":7})).await;
     assert_eq!(res1["isError"], false);
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
@@ -950,7 +958,7 @@ async fn positive_grant_persists_across_bridge_recreation_per_chat() {
         )
         .await
         .unwrap();
-    let res2 = call(&socket2, "click", json!({"pid": 42})).await;
+    let res2 = call(&socket2, "click", json!({"pid": 42,"window_id":7})).await;
     assert_eq!(res2["isError"], false);
     assert_eq!(
         count.load(Ordering::SeqCst),
@@ -974,7 +982,7 @@ async fn positive_grant_persists_across_bridge_recreation_per_chat() {
         )
         .await
         .unwrap();
-    let res3 = call(&socket3, "click", json!({"pid": 42})).await;
+    let res3 = call(&socket3, "click", json!({"pid": 42,"window_id":7})).await;
     assert_eq!(res3["isError"], false);
     assert_eq!(
         count.load(Ordering::SeqCst),
@@ -1121,12 +1129,12 @@ async fn revocation_clears_stored_grant_and_forces_existing_and_new_bridges_to_r
         .unwrap();
 
     // First action prompts and grants session approval.
-    let res = call(&socket, "click", json!({"pid": 10})).await;
+    let res = call(&socket, "click", json!({"pid": 10,"window_id":7})).await;
     assert_eq!(res["isError"], false);
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
     // Second action in same bridge uses cached approval without prompt.
-    let res2 = call(&socket, "click", json!({"pid": 10})).await;
+    let res2 = call(&socket, "click", json!({"pid": 10,"window_id":7})).await;
     assert_eq!(res2["isError"], false);
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
@@ -1135,7 +1143,7 @@ async fn revocation_clears_stored_grant_and_forces_existing_and_new_bridges_to_r
     assert!(!manager.forget_computer_use_approval("chat-revoke"));
 
     // Existing bridge's next non-metadata action prompts again.
-    let res3 = call(&socket, "click", json!({"pid": 10})).await;
+    let res3 = call(&socket, "click", json!({"pid": 10,"window_id":7})).await;
     assert_eq!(res3["isError"], false);
     assert_eq!(count.load(Ordering::SeqCst), 2);
 
@@ -1153,7 +1161,7 @@ async fn revocation_clears_stored_grant_and_forces_existing_and_new_bridges_to_r
         .await
         .unwrap();
 
-    let res4 = call(&socket2, "click", json!({"pid": 10})).await;
+    let res4 = call(&socket2, "click", json!({"pid": 10,"window_id":7})).await;
     assert_eq!(res4["isError"], false);
     assert_eq!(count.load(Ordering::SeqCst), 3);
 
@@ -1163,11 +1171,210 @@ async fn revocation_clears_stored_grant_and_forces_existing_and_new_bridges_to_r
 fn assert_match_pointer_digest(text: &Value) {
     let s = text.as_str().unwrap();
     assert!(
-        s.contains("Ordinary window-scoped pointer actions use the synthetic agent cursor and do not move the user's pointer"),
-        "expected pointer digest in {s}"
+        s.contains(NON_DISRUPTIVE_POLICY),
+        "expected strict policy in {s}"
+    );
+    assert!(!s.contains("disruption approval"));
+}
+
+#[tokio::test]
+async fn strict_policy_denies_before_driver_lease_and_approval_even_after_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let count = Arc::new(AtomicUsize::new(0));
+    let (socket, bridge) = manager
+        .start_bridge(
+            "strict",
+            "strict",
+            approval(true, count.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let mut denied = vec![
+        (
+            "click",
+            json!({"pid":42,"window_id":7,"delivery_mode":" ForeGround "}),
+        ),
+        (
+            "click",
+            json!({"pid":42,"window_id":7,"delivery_mode":"automatic"}),
+        ),
+        (
+            "click",
+            json!({"pid":42,"window_id":7,"delivery_mode":null}),
+        ),
+        (
+            "click",
+            json!({"pid":42,"window_id":7,"allow_user_input_disruption":true}),
+        ),
+        ("list_windows", json!({"allow_user_input_disruption":false})),
+        ("click", json!({"pid":42})),
+        ("click", json!({"pid":42,"window_id":0})),
+        ("click", json!({"pid":42,"window_id":7,"scope":"automatic"})),
+        (
+            "click",
+            json!({"pid":42,"window_id":7,"target":{"kind":"window","window_id":8}}),
+        ),
+        (
+            "click",
+            json!({"pid":42,"window_id":7,"target":{"kind":"unknown"}}),
+        ),
+        ("click", json!({"pid":42,"window_id":7,"display_id":"DP-1"})),
+        (
+            "browser_prepare",
+            json!({"pid":42,"window_id":7,"strategy":{"kind":"existing_profile"},"allow_launch":false}),
+        ),
+        (
+            "browser_prepare",
+            json!({"pid":42,"attach_only":true,"auto_setup":false}),
+        ),
+        (
+            "browser_prepare",
+            json!({"allow_launch":true,"profile":{"mode":"isolated_new"}}),
+        ),
+        (
+            "browser_dialog",
+            json!({"action":"accept","delivery_mode":"background"}),
+        ),
+        ("browser_dialog", json!({"action":"dismiss"})),
+        ("browser_activate", json!({})),
+        ("get_desktop_state", json!({"delivery_mode":"FOREGROUND"})),
+    ];
+    for action in WINDOW_INPUT_ACTIONS.iter().chain(["move_cursor"].iter()) {
+        denied.push((*action, json!({"pid":42,"window_id":7,"scope":"DeSkToP"})));
+        denied.push((
+            *action,
+            json!({"pid":42,"window_id":7,"target":{"kind":" Desktop "}}),
+        ));
+    }
+    for action in BLOCKED_ACTIONS {
+        denied.push((
+            *action,
+            json!({"pid":42,"window_id":7,"delivery_mode":"background"}),
+        ));
+    }
+    for granted in [false, true] {
+        let before = request_count(dir.path(), "tools/call");
+        for (action, args) in &denied {
+            let result = call(&socket, action, args.clone()).await;
+            assert_eq!(result["isError"], true, "{action} {args}: {result}");
+        }
+        assert_eq!(
+            request_count(dir.path(), "tools/call"),
+            before,
+            "denials must not dispatch"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            usize::from(granted),
+            "denials must not ask approval"
+        );
+        if !granted {
+            assert_eq!(
+                request_count(dir.path(), "initialize"),
+                0,
+                "denials must not start a driver"
+            );
+            assert!(
+                lock(&manager.lease).is_none(),
+                "denials must not take the lease"
+            );
+            assert_eq!(
+                call(&socket, "list_windows", json!({})).await["isError"],
+                false
+            );
+        }
+    }
+    bridge.finish().await;
+}
+
+#[tokio::test]
+async fn supported_background_calls_and_read_only_desktop_capture_reach_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let count = Arc::new(AtomicUsize::new(0));
+    let (socket, bridge) = manager
+        .start_bridge(
+            "safe",
+            "safe",
+            approval(true, count.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    for action in WINDOW_INPUT_ACTIONS {
+        let args = json!({"pid":42,"window_id":7,"delivery_mode":" BackGROUND ","x":10,"y":20,"text":"hello","key":"a","keys":["ctrl","a"],"direction":"down","from_x":10,"from_y":20,"to_x":30,"to_y":40});
+        let result = call(&socket, action, args).await;
+        assert_eq!(result["isError"], false, "{action}: {result}");
+        assert_eq!(
+            result["structuredContent"]["args"]["delivery_mode"],
+            "background"
+        );
+    }
+    let result = call(&socket, "click", json!({"pid":42,"window_id":7})).await;
+    assert_eq!(
+        result["structuredContent"]["args"]["delivery_mode"], "background",
+        "omitted delivery must be pinned, not delegated to driver defaults"
+    );
+    for (action, args) in [
+        (
+            "get_desktop_state",
+            json!({"scope":"DESKTOP","display_id":"DP-1"}),
+        ),
+        ("get_screen_size", json!({})),
+        ("clipboard_read", json!({})),
+        (
+            "browser_navigate",
+            json!({"target_id":"b1","tab_id":"t1","url":"https://example.com"}),
+        ),
+        (
+            "browser_dialog",
+            json!({"target_id":"b1","tab_id":"t1","action":"inspect"}),
+        ),
+        (
+            "set_value",
+            json!({"pid":42,"window_id":7,"element_token":"s1:1","value":"hello"}),
+        ),
+        ("move_cursor", json!({"pid":42,"window_id":7,"x":10,"y":20})),
+    ] {
+        assert_eq!(
+            call(&socket, action, args).await["isError"],
+            false,
+            "{action}"
+        );
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    bridge.finish().await;
+}
+
+#[test]
+fn managed_schemas_remove_driver_foreground_fallback_advice() {
+    let schema = managed_schema(
+        json!({"name":"click","description":"Retry foreground", "inputSchema":{"properties":{"delivery_mode":{"description":"Activate first", "enum":["foreground","background"]},"scope":{"enum":["window","desktop"]}, "key":{"description":"Try bring_to_front"}}}}),
+    );
+    assert_eq!(schema["description"], NON_DISRUPTIVE_POLICY);
+    assert_eq!(
+        schema["inputSchema"]["properties"]["delivery_mode"]["enum"],
+        json!(["background"])
+    );
+    assert_eq!(
+        schema["inputSchema"]["properties"]["scope"]["enum"],
+        json!(["window"])
     );
     assert!(
-        s.contains("only scope=desktop with explicit disruption approval may use the real seat"),
-        "expected disruption guidance in {s}"
+        schema["inputSchema"]["properties"]["key"]
+            .get("description")
+            .is_none()
     );
+    let dialog = managed_schema(
+        json!({"name":"browser_dialog", "inputSchema":{"properties":{"action":{"enum":["inspect","accept","dismiss"]}}}}),
+    );
+    assert_eq!(
+        dialog["inputSchema"]["properties"]["action"]["enum"],
+        json!(["inspect"])
+    );
+    let question = approval_question("host", "click");
+    assert!(question.contains("forbidden even after approval"));
+    assert!(!question.contains("including visible desktop control"));
 }

@@ -1567,20 +1567,27 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        self.borrow()
-            .client
-            .get_client()
-            .borrow()
-            .mouse_location
-            .unwrap_or_default()
+        let window = self.borrow();
+        let client = window.client.get_client();
+        let state = client.borrow();
+        state.agent_dispatch.as_ref().filter(|input| input.surface == window.surface.id())
+            .map(|input| input.position).or(state.mouse_location).unwrap_or_default()
     }
 
     fn modifiers(&self) -> Modifiers {
-        self.borrow().client.get_client().borrow().modifiers
+        let window = self.borrow();
+        let client = window.client.get_client();
+        let state = client.borrow();
+        state.agent_dispatch.as_ref().filter(|input| input.surface == window.surface.id())
+            .map(|input| input.modifiers).unwrap_or(state.modifiers)
     }
 
     fn capslock(&self) -> Capslock {
-        self.borrow().client.get_client().borrow().capslock
+        let window = self.borrow();
+        let client = window.client.get_client();
+        let state = client.borrow();
+        state.agent_dispatch.as_ref().filter(|input| input.surface == window.surface.id())
+            .map(|input| input.capslock).unwrap_or(state.capslock)
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
@@ -1602,6 +1609,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn activate(&self) {
+        if self.borrow().client.agent_input_active() { return; }
         // Try to request an activation token. Even though the activation is likely going to be rejected,
         // KWin and Mutter can use the app_id to visually indicate we're requesting attention.
         let state = self.borrow();
@@ -1787,6 +1795,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn show_window_menu(&self, position: Point<Pixels>) {
+        if self.borrow().client.agent_input_active() { return; }
         let state = self.borrow();
         let serial = state.client.get_serial(SerialKind::MousePress);
         if let Some(toplevel) = state.surface_state.toplevel() {
@@ -1800,6 +1809,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn start_window_move(&self) {
+        if self.borrow().client.agent_input_active() { return; }
         let state = self.borrow();
         let serial = state.client.get_serial(SerialKind::MousePress);
         if let Some(toplevel) = state.surface_state.toplevel() {
@@ -1808,6 +1818,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn start_window_resize(&self, edge: gpui::ResizeEdge) {
+        if self.borrow().client.agent_input_active() { return; }
         let state = self.borrow();
         if let Some(toplevel) = state.surface_state.toplevel() {
             toplevel.resize(
