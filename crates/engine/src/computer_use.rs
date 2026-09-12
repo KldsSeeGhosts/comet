@@ -1022,6 +1022,7 @@ async fn handle_call(
         }
     }
     let driver = runtime.driver.as_mut().expect("initialized");
+    let marker_pid = args.get("pid").and_then(Value::as_u64);
     let result = if action == "help" {
         driver.catalog(None).await
     } else if action == "describe" {
@@ -1036,7 +1037,9 @@ async fn handle_call(
         driver.call(action, args).await
     };
     match result {
-        Ok(result) => normalize_driver_outcome(result),
+        Ok(result) => {
+            attach_seat_marker_evidence(normalize_driver_outcome(result), marker_pid)
+        }
         Err(err) => {
             turn.cancel();
             state.clean_runtime(&mut runtime, false).await;
@@ -1463,6 +1466,62 @@ fn remove_socket_if_present(path: &std::path::Path) -> CuaResult<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("Could not remove stale {}: {err}", path.display())),
     }
+}
+
+/// The dev GPUI app publishes an agent-seat compatibility marker at
+/// `$XDG_RUNTIME_DIR/noches-gpui-input/<pid>`. Its payload line is one JSON
+/// object `{"state":"ready"|"primary_client_busy","reason":..,"pid":..}`;
+/// older builds wrote a bare state token, which still parses. The identity
+/// header lines above the payload are ignored.
+fn parse_agent_seat_marker(contents: &str) -> Option<Value> {
+    let payload = contents
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    if payload.starts_with('{') {
+        let value: Value = serde_json::from_str(payload).ok()?;
+        value
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|state| !state.trim().is_empty())?;
+        Some(value)
+    } else if matches!(payload, "ready" | "primary_client_busy") {
+        // Legacy payload: the state token alone, without reason or pid.
+        Some(json!({ "state": payload }))
+    } else {
+        None
+    }
+}
+
+/// Reads the marker of the GPUI process a refused action targeted, so the
+/// reason a client was not qualified survives into the caller's evidence.
+fn agent_seat_marker(pid: u64) -> Option<Value> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe {
+            libc::geteuid()
+        })));
+    let contents = std::fs::read_to_string(
+        runtime.join("noches-gpui-input").join(pid.to_string()),
+    )
+    .ok()?;
+    parse_agent_seat_marker(&contents)
+}
+
+/// Enriches a refused window action with the target's agent-seat marker. A
+/// background refusal then names whether the physical seat held the window
+/// (`primary_client_busy`/`physical_seat_present`) or the target never
+/// qualified (`no_qualified_target`), instead of only a driver-side token.
+fn attach_seat_marker_evidence(mut result: Value, pid: Option<u64>) -> Value {
+    if classify_driver_outcome(&result) == DriverOutcome::Refused
+        && let Some(marker) = pid.and_then(agent_seat_marker)
+        && let Some(structured) =
+            result.get_mut("structuredContent").and_then(Value::as_object_mut)
+    {
+        structured.insert("agentSeatMarker".into(), marker);
+    }
+    result
 }
 
 fn resolve_driver_exe() -> CuaResult<PathBuf> {

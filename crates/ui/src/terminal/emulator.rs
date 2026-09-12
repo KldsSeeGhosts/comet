@@ -11,6 +11,10 @@
 //! than in the panel, because `Term` is what knows how to keep anchors on their
 //! text as output scrolls the grid underneath them.
 //!
+//! Painting is fed by [`Emulator::lines`], which keeps a per-row cache keyed by
+//! absolute line index: rows whose content fingerprint is unchanged reuse the
+//! previous snapshot instead of re-deriving it every frame.
+//!
 //! API notes for the pinned `alacritty_terminal 0.26` / `vte 0.15`:
 //! - `Processor::advance` consumes a byte slice; `Term` implements the
 //!   `vte::ansi::Handler` trait directly, so no event-loop machinery is needed.
@@ -20,6 +24,7 @@
 //!   [`Emulator::feed`] returns them so the panel can write them back.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -42,6 +47,39 @@ pub use alacritty_terminal::selection::SelectionType;
 /// Scrollback history kept client-side (lines). The engine's replay window is
 /// bounded separately (1 MiB); this only caps what stays scrollable in the UI.
 pub const SCROLLBACK_LINES: usize = 10_000;
+
+/// FNV-1a basis/prime for the render-cache fingerprints (shared with the
+/// panel's theme fingerprint so both caches mix identically).
+pub(crate) const ROW_HASH_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const ROW_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Fold one 64-bit lane into a running FNV-1a hash.
+pub(crate) fn fold_hash(mut hash: u64, value: u64) -> u64 {
+    for byte in value.to_le_bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(ROW_HASH_PRIME);
+    }
+    hash
+}
+
+/// Fold raw bytes into a running FNV-1a hash.
+pub(crate) fn fold_hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(ROW_HASH_PRIME);
+    }
+    hash
+}
+
+/// Upper bound on cached rows. Deep-history scrolling can touch every line in
+/// scrollback; past this the cache resets rather than growing without bound.
+const ROW_CACHE_MAX_ENTRIES: usize = 2048;
+
+/// One cached grid row: the content fingerprint the entry was built from and
+/// the derived snapshot cells (selection excluded — that is a per-frame
+/// overlay applied on the clone in [`Emulator::lines`]).
+struct RowCacheEntry {
+    fingerprint: u64,
+    cells: Vec<CellSnapshot>,
+}
 
 /// Viewport dimensions in cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +120,17 @@ pub enum CellColor {
     Indexed(u8),
     /// Direct 24-bit color.
     Rgb(u8, u8, u8),
+}
+
+/// A color's fingerprint lane: discriminant plus payload bits.
+fn color_bits(color: AnsiColor) -> u64 {
+    match color {
+        AnsiColor::Named(named) => named as usize as u64,
+        AnsiColor::Indexed(index) => 0x1_0000 | u64::from(index),
+        AnsiColor::Spec(AnsiRgb { r, g, b }) => {
+            0x2_0000 | u64::from(r) | (u64::from(g) << 8) | (u64::from(b) << 16)
+        }
+    }
 }
 
 fn map_color(color: AnsiColor) -> CellColor {
@@ -172,6 +221,15 @@ pub struct Emulator {
     capture: EventCapture,
     title: Option<String>,
     bell: bool,
+    /// Per-row render cache keyed by ABSOLUTE line index (0 = oldest line in
+    /// history). Every frame re-fingerprints the visible rows cheaply and only
+    /// re-snapshots rows whose contents changed — see [`Emulator::lines`].
+    row_cache: HashMap<usize, RowCacheEntry>,
+    /// History size the cache keys were last aligned to; growth shifts keys,
+    /// shrink (reflow, alt-screen swap, ClearHistory) resets the cache.
+    row_cache_history_base: usize,
+    /// Rows actually re-snapshotted — the cache-miss counter the tests read.
+    row_cache_builds: usize,
 }
 
 impl Emulator {
@@ -188,6 +246,9 @@ impl Emulator {
             capture,
             title: None,
             bell: false,
+            row_cache: HashMap::new(),
+            row_cache_history_base: 0,
+            row_cache_builds: 0,
         }
     }
 
@@ -210,6 +271,8 @@ impl Emulator {
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.term.resize(GridSize::new(cols, rows));
+        // Reflow moves every cell; cached rows are meaningless afterwards.
+        self.row_cache.clear();
     }
 
     pub fn cols(&self) -> usize {
@@ -349,13 +412,14 @@ impl Emulator {
 
     /// Snapshot one viewport row (0 = top) honoring the scrollback offset.
     pub fn line(&self, viewport_row: usize) -> Vec<CellSnapshot> {
-        self.line_inner(viewport_row, self.selection_range())
+        self.snapshot_row(viewport_row, self.selection_range())
     }
 
     /// The shared body of [`Self::line`], taking the selection range as an
-    /// argument so [`Self::lines`] resolves it once per frame rather than once
-    /// per row — `to_range` re-walks the grid for semantic and line selections.
-    fn line_inner(
+    /// argument so the cached [`Self::lines`] path resolves it once per frame
+    /// rather than once per row — `to_range` re-walks the grid for semantic and
+    /// line selections.
+    fn snapshot_row(
         &self,
         viewport_row: usize,
         selection: Option<SelectionRange>,
@@ -388,12 +452,101 @@ impl Emulator {
             .collect()
     }
 
-    /// All viewport rows, top to bottom.
-    pub fn lines(&self) -> Vec<Vec<CellSnapshot>> {
+    /// Grid line (viewport-relative) → absolute line index. Absolute indices
+    /// are stable while the user scrolls (scrolling moves the viewport, not the
+    /// grid), which is what makes them the render cache's key.
+    fn absolute_line(&self, viewport_row: usize) -> usize {
+        let offset = self.display_offset() as i32;
+        let line = Line(viewport_row as i32 - offset);
+        (line.0 - self.term.grid().topmost_line().0) as usize
+    }
+
+    /// Content fingerprint of one viewport row: every field [`CellSnapshot`]
+    /// derives from (char, both colors, all flag bits) folded with FNV-1a.
+    /// Equal fingerprints imply equal snapshot rows (selection excluded), the
+    /// guarantee the per-row render cache leans on. Pure, and cheap — no
+    /// allocation, no snapshot construction.
+    pub fn row_fingerprint(&self, viewport_row: usize) -> u64 {
+        let offset = self.display_offset() as i32;
+        let line = Line(viewport_row as i32 - offset);
+        let grid = self.term.grid();
+        let row = &grid[line];
+        // Width in the mix: a resized (truncated) row can never collide with
+        // its pre-resize entry, even before `resize` clears the cache.
+        let mut hash = fold_hash(ROW_HASH_BASIS, self.cols() as u64);
+        for col in 0..self.cols() {
+            let cell = &row[Column(col)];
+            hash = fold_hash(hash, u64::from(cell.c as u32));
+            hash = fold_hash(hash, color_bits(cell.fg));
+            hash = fold_hash(hash, color_bits(cell.bg));
+            hash = fold_hash(hash, u64::from(cell.flags.bits()));
+        }
+        hash
+    }
+
+    /// All viewport rows, top to bottom, through the per-row cache. Returns
+    /// each row's fingerprint alongside its snapshot so callers can key their
+    /// own derived state (shaped text) off it.
+    ///
+    /// Fingerprints are computed straight off the grid first; only rows whose
+    /// fingerprint differs from the cached entry are re-snapshotted. Entries
+    /// are keyed by absolute line index, so plain scrolling reuses everything;
+    /// when output grows the history the keys are re-based by the same delta
+    /// (a shrink moves indices unpredictably and resets the cache instead).
+    /// The grid itself is only ever read here, so stale reuse is impossible:
+    /// a fingerprint mismatch is always resolved against fresh cell data.
+    pub fn lines(&mut self) -> Vec<(u64, Vec<CellSnapshot>)> {
         let selection = self.selection_range();
-        (0..self.rows())
-            .map(|r| self.line_inner(r, selection))
-            .collect()
+        let history = self.term.grid().history_size();
+        if history >= self.row_cache_history_base {
+            let shift = history - self.row_cache_history_base;
+            if shift > 0 {
+                self.row_cache = self
+                    .row_cache
+                    .drain()
+                    .map(|(abs, entry)| (abs + shift, entry))
+                    .collect();
+            }
+        } else {
+            self.row_cache.clear();
+        }
+        self.row_cache_history_base = history;
+
+        let mut rows = Vec::with_capacity(self.rows());
+        for row_ix in 0..self.rows() {
+            let fingerprint = self.row_fingerprint(row_ix);
+            let abs = self.absolute_line(row_ix);
+            let hit = self
+                .row_cache
+                .get(&abs)
+                .is_some_and(|entry| entry.fingerprint == fingerprint && !entry.cells.is_empty());
+            if !hit {
+                let cells = self.snapshot_row(row_ix, None);
+                self.row_cache_builds += 1;
+                self.row_cache
+                    .insert(abs, RowCacheEntry { fingerprint, cells });
+            }
+            let mut cells = match self.row_cache.get(&abs) {
+                Some(entry) if !entry.cells.is_empty() => entry.cells.clone(),
+                _ => self.snapshot_row(row_ix, selection),
+            };
+            // Selection is an overlay: applied fresh on every frame.
+            if let Some(range) = selection {
+                let offset = self.display_offset() as i32;
+                let line = Line(row_ix as i32 - offset);
+                for (col, cell) in cells.iter_mut().enumerate() {
+                    cell.selected = range.contains(Point::new(line, Column(col)));
+                }
+            }
+            rows.push((fingerprint, cells));
+        }
+        // Drop entries for lines that left the grid (pruned scrollback).
+        let valid_lines = history + self.rows();
+        self.row_cache.retain(|abs, _| *abs < valid_lines);
+        if self.row_cache.len() > ROW_CACHE_MAX_ENTRIES {
+            self.row_cache.clear();
+        }
+        rows
     }
 
     /// Cursor in viewport coordinates; `None` when hidden or scrolled out.
@@ -758,5 +911,114 @@ mod tests {
         e.feed(&bytes[..1]);
         e.feed(&bytes[1..]);
         assert_eq!(e.row_text(0), "é");
+    }
+
+    // ---- per-row render cache ----
+
+    fn cached_row_text(rows: &[(u64, Vec<CellSnapshot>)], row: usize) -> String {
+        rows[row]
+            .1
+            .iter()
+            .filter(|c| !c.wide_spacer)
+            .map(|c| c.ch)
+            .collect::<String>()
+            .trim_end_matches(' ')
+            .to_string()
+    }
+
+    fn fingerprints(e: &mut Emulator) -> Vec<u64> {
+        e.lines().into_iter().map(|(fp, _)| fp).collect()
+    }
+
+    #[test]
+    fn unchanged_grid_snapshots_every_row_exactly_once() {
+        let mut e = emu(20, 4);
+        e.feed(b"alpha\r\nbeta");
+        let first = e.lines();
+        let builds = e.row_cache_builds;
+        assert!(builds > 0);
+        // Unchanged grid: no row re-snapshots, output identical.
+        let second = e.lines();
+        assert_eq!(e.row_cache_builds, builds);
+        assert_eq!(
+            first.into_iter().map(|(_, c)| c).collect::<Vec<_>>(),
+            second.into_iter().map(|(_, c)| c).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn row_edit_changes_only_that_rows_fingerprint() {
+        let mut e = emu(20, 4);
+        e.feed(b"alpha\r\nbeta\r\ngamma");
+        let before = fingerprints(&mut e);
+        e.feed(b"\x1b[2;1HX"); // overwrite one cell on row 1
+        let after = fingerprints(&mut e);
+        assert_eq!(before.len(), after.len());
+        for (row, (was, now)) in before.iter().zip(&after).enumerate() {
+            assert_eq!(
+                was != now,
+                row == 1,
+                "row {row}: fingerprint must only move on the edited row"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_invalidates_the_whole_cache() {
+        let mut e = emu(20, 4);
+        e.feed(b"keepme");
+        e.lines();
+        assert!(!e.row_cache.is_empty());
+        e.resize(30, 3);
+        assert!(e.row_cache.is_empty());
+    }
+
+    /// Scrolling and streaming output shift which absolute line each cache key
+    /// names; the cached path must never serve one row's data under another.
+    #[test]
+    fn scrollback_shifts_keep_cached_rows_correct() {
+        let mut e = emu(10, 3);
+        for i in 1..=8 {
+            e.feed(format!("line{i}\r\n").as_bytes());
+        }
+        e.lines();
+        // Scroll back into history: same absolute lines, moved viewport.
+        e.scroll(2);
+        let cached = e.lines();
+        for row in 0..e.rows() {
+            assert_eq!(cached_row_text(&cached, row), e.row_text(row));
+        }
+        // New output grows the history and shifts every absolute index.
+        e.scroll_to_bottom();
+        e.feed(b"more\r\n");
+        let cached = e.lines();
+        for row in 0..e.rows() {
+            assert_eq!(cached_row_text(&cached, row), e.row_text(row));
+        }
+    }
+
+    /// The reuse payoff: once a range of history has been painted, scrolling
+    /// across it rebuilds nothing — absolute indices are scroll-invariant.
+    #[test]
+    fn scrolling_through_painted_history_rebuilds_nothing() {
+        let mut e = emu(10, 3);
+        for i in 1..=8 {
+            e.feed(format!("line{i}\r\n").as_bytes());
+        }
+        e.lines();
+        let builds = e.row_cache_builds;
+        // Scrolling up first reveals unpainted lines: exactly those build.
+        e.scroll(2);
+        e.lines();
+        assert_eq!(e.row_cache_builds, builds + 2);
+        // Everything the viewport can now reach is painted: no more builds.
+        let builds = e.row_cache_builds;
+        e.scroll(-1);
+        e.lines();
+        e.scroll(1);
+        e.lines();
+        e.scroll_to_bottom();
+        e.lines();
+        assert_eq!(e.row_cache_builds, builds);
     }
 }

@@ -551,3 +551,81 @@ fn validates_values_and_detects_version_exhaustion_without_writes() {
         i64::MAX
     );
 }
+
+#[test]
+fn recovery_skips_undecodable_rows_and_recovers_the_rest() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let store = Store::open(&path).unwrap();
+    let good = store.team_create(spec(1)).unwrap();
+    let corrupt = store.team_create(spec(1)).unwrap();
+    let mismatched = store.team_create(spec(1)).unwrap();
+    let mut other_tree = spec(1);
+    other_tree.scope.worktree = "elsewhere".into();
+    let planted = store.team_create(other_tree).unwrap();
+    {
+        let inner = store.lock().unwrap();
+        inner
+            .db
+            // Valid JSON that decodes to no team, surviving the json_valid guard.
+            .execute("UPDATE teams SET data='null' WHERE id=?1", params![corrupt.id])
+            .unwrap();
+        inner
+            .db
+            .execute(
+                "UPDATE teams SET data=?1 WHERE id=?2",
+                params![serde_json::to_string(&good).unwrap(), mismatched.id],
+            )
+            .unwrap();
+        inner
+            .db
+            .execute(
+                "UPDATE teams SET id='renamed' WHERE id=?1",
+                params![planted.id],
+            )
+            .unwrap();
+    }
+    let recovered = store.recover_interrupted().unwrap();
+    assert_eq!(recovered, vec![{
+        let mut team = good.clone();
+        team.status = TeamStatus::Interrupted;
+        team
+    }]);
+    {
+        let inner = store.lock().unwrap();
+        assert_eq!(
+            inner
+                .db
+                .query_row(
+                    "SELECT data FROM teams WHERE id=?1",
+                    params![corrupt.id],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+            "null",
+            "the skipped row keeps its stored bytes"
+        );
+        for (id, status) in [(&mismatched.id, "running"), (&String::from("renamed"), "running")] {
+            assert_eq!(
+                inner
+                    .db
+                    .query_row(
+                        "SELECT json_extract(data,'$.status') FROM teams WHERE id=?1",
+                        params![id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                status
+            );
+        }
+    }
+    assert!(store.recover_interrupted().unwrap().is_empty());
+}
+
+#[test]
+fn store_directory_tracks_the_database_location() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path().join("state.sqlite")).unwrap();
+    assert_eq!(store.dir(), temp.path());
+    assert_eq!(memory().dir(), Path::new(""));
+}

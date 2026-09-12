@@ -320,12 +320,27 @@ impl Workspace {
         let events = cx.subscribe(&chat, move |this, _, event, cx| match event {
             ChatViewEvent::Focused => this.focus(id, cx),
             ChatViewEvent::HumanSubmitted(chat, proof) => this.control_mark_human_input(chat, *proof, cx),
-            ChatViewEvent::Selected(selected) => {
-                if this.layout.pane(id).is_some_and(|pane| pane.session_id != *selected) {
-                    this.apply(|layout| layout.compose(layout.revision, |draft| {
-                        draft.pane_mut(id).unwrap().session_id = selected.clone();
-                        Ok(())
-                    }), cx);
+            ChatViewEvent::Selected(selected) => match selected {
+                // A real switch to another chat lands in the layout.
+                Some(selected) => {
+                    if this.layout.pane(id).is_some_and(|pane| pane.session_id.as_deref() != Some(selected.as_str())) {
+                        this.apply(|layout| layout.compose(layout.revision, |draft| {
+                            draft.pane_mut(id).unwrap().session_id = Some(selected.clone());
+                            Ok(())
+                        }), cx);
+                    }
+                }
+                // None is not authoritative for a pane-owned session:
+                // apply_chats drops selections the engine has not confirmed
+                // yet (a just-created chat), and a real close clears the pane
+                // session explicitly. Re-assert the committed binding.
+                None => {
+                    let committed = this.layout.pane(id).and_then(|pane| pane.session_id.clone());
+                    if let Some(chat_id) = committed {
+                        if let Some(runtime) = this.panes.get(&id) {
+                            runtime.chat.update(cx, |pane, cx| pane.select(Some(chat_id), cx));
+                        }
+                    }
                 }
             }
         });

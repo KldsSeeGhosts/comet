@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -22,7 +22,8 @@ use super::Workspace;
 use crate::state::EngineHandle;
 use crate::terminal::panel::SessionViewStatus;
 
-/// Grants are minted only by human UI actions and expire with this window.
+/// Grants are minted only by human UI actions. Session input unlocks expire
+/// with `HUMAN_INPUT_TTL`.
 #[derive(Default)]
 pub(super) struct Consent {
     allow: BTreeSet<String>,
@@ -30,10 +31,13 @@ pub(super) struct Consent {
     sessions: BTreeMap<String, String>,
     reports: BTreeMap<String, (String, String, String)>,
     app_sessions: BTreeMap<String, (String, String)>,
-    human_input: BTreeSet<String>,
+    human_input: BTreeMap<String, Instant>,
     pending: Option<Deletion>,
     team_operations: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
+
+/// How long a real human submission keeps unlocking worktree creation.
+const HUMAN_INPUT_TTL: Duration = Duration::from_secs(15 * 60);
 
 struct Deletion {
     workspace: String,
@@ -47,8 +51,9 @@ impl Consent {
         self.allow.remove(workspace);
         self.orchestrate.remove(workspace);
         self.sessions.retain(|_, scope| scope != workspace);
+        self.prune_human_input();
         self.human_input
-            .retain(|session| self.sessions.contains_key(session));
+            .retain(|session, _| self.sessions.contains_key(session));
         self.app_sessions.retain(|_, (_, scope)| scope != workspace);
         self.reports
             .retain(|_, (_, _, session)| self.sessions.contains_key(session));
@@ -61,7 +66,21 @@ impl Consent {
         }
     }
 
-    fn verify_app_session(&self, workspace: &str, session: &str, capability: &str) -> Result<()> {
+    /// Drop input unlocks older than the window. Called whenever they are
+    /// minted, revoked, or checked so expired entries never authorize work.
+    fn prune_human_input(&mut self) {
+        if let Some(cutoff) = Instant::now().checked_sub(HUMAN_INPUT_TTL) {
+            self.human_input.retain(|_, minted| *minted >= cutoff);
+        }
+    }
+
+    fn verify_app_session(
+        &mut self,
+        workspace: &str,
+        session: &str,
+        capability: &str,
+    ) -> Result<()> {
+        self.prune_human_input();
         ensure!(
             self.app_sessions
                 .get(capability)
@@ -69,7 +88,7 @@ impl Consent {
             "denied: worktree creation requires a verified app-launched session with human UI consent"
         );
         ensure!(
-            self.human_input.contains(session),
+            self.human_input.contains_key(session),
             "denied: a human must submit input in this session before worktree creation"
         );
         Ok(())
@@ -115,6 +134,12 @@ impl Consent {
 const MAX_BATCH: usize = 64;
 const MAX_RECIPE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The instance lock is held by the outgoing UI during a restart swap, so a
+/// bind failure there is transient. Retry past the handoff window before
+/// surfacing the banner; a lock held this long means a real second instance.
+const BIND_ATTEMPTS: u32 = 12;
+const BIND_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl Workspace {
     /// Called only by genuine human composer/terminal submission handlers.
     /// API-injected prompts never invoke this method or unlock worktree creation.
@@ -125,7 +150,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.control_consent.sessions.contains_key(chat) {
-            self.control_consent.human_input.insert(chat.to_owned());
+            self.control_consent.prune_human_input();
+            self.control_consent
+                .human_input
+                .insert(chat.to_owned(), Instant::now());
             cx.notify();
         }
     }
@@ -141,13 +169,36 @@ impl Workspace {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Request>();
         let start = gpui_tokio::Tokio::spawn(cx, async move {
             // Acquire the instance lock before recovering interrupted runs.
-            let server =
-                ControlPlane::start(data_dir.clone(), crate::APP_ID.into(), sender).await?;
+            let mut server = None;
+            let mut locked = None;
+            for _ in 0..BIND_ATTEMPTS {
+                match ControlPlane::start(data_dir.clone(), crate::APP_ID.into(), sender.clone())
+                    .await
+                {
+                    Ok(started) => {
+                        server = Some(started);
+                        break;
+                    }
+                    // Only the lock race is worth retrying; everything else is
+                    // a permanent condition the banner must show immediately.
+                    Err(error) if zeron_local_api::is_instance_locked(&error) => {
+                        locked = Some(error);
+                        tokio::time::sleep(BIND_RETRY).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let Some(server) = server else {
+                return Err(locked.unwrap_or_else(|| anyhow::anyhow!("bind did not run")));
+            };
             let db = data_dir.join("orchestration.db");
             let store = tokio::task::spawn_blocking(move || -> Result<_> {
                 no_symlinks(&db)?;
                 let store = zeron_orchestration::Store::open(db)?;
-                store.recover_interrupted()?;
+                for team in store.recover_interrupted()? {
+                    // Interrupted teams are terminal; their capability files go too.
+                    remove_run_capabilities(store.dir(), &team.id);
+                }
                 Ok(store)
             })
             .await??;
@@ -373,6 +424,7 @@ impl Workspace {
     }
 
     fn control_commit(&mut self, draft: WorkspaceLayout, cx: &mut Context<Self>) -> Result<Value> {
+        check_new_labels(&self.layout, &draft)?;
         // A detached terminal still owns its session. Never discard or rebind its runtime.
         for id in pane_order(&self.layout) {
             let old = self.layout.pane(id).unwrap();
@@ -495,6 +547,7 @@ impl Workspace {
                 let dry_run = flag(params, "dryRun", "dry_run")?;
                 let draft = compose_plan(&self.layout, plan.context("plan is required")?, params)?;
                 if dry_run {
+                    check_new_labels(&self.layout, &draft)?;
                     return Ok(
                         json!({"dryRun": true, "revision": self.layout.revision, "layout": draft}),
                     );
@@ -507,6 +560,42 @@ impl Workspace {
                 let mut draft = self.layout.clone();
                 check_guard(&draft, params, false)?;
                 draft.move_pane(from, to, direction(params)?)?;
+                self.control_commit(draft, cx)
+            }
+            "tab.close" | "tab.move" | "tab.reorder" => {
+                let pane = one(&self.layout, target(params)?)?;
+                let (source_view, source_tab) = self
+                    .layout
+                    .pane_location(pane)
+                    .context("target disappeared")?;
+                let mut draft = self.layout.clone();
+                check_guard(&draft, params, false)?;
+                if method == "tab.close" {
+                    draft.close_tab(source_view, source_tab)?;
+                } else {
+                    let destination = one(&draft, required_str(params, "view")?)?;
+                    let (target_view, _) = draft
+                        .pane_location(destination)
+                        .context("target view disappeared")?;
+                    if method == "tab.move" {
+                        draft.move_tab(source_tab, target_view)?;
+                    } else {
+                        let before = params
+                            .get("before")
+                            .map(|_| one(&draft, required_str(params, "before")?))
+                            .transpose()?;
+                        let before = match before {
+                            Some(pane) => Some(
+                                draft
+                                    .pane_location(pane)
+                                    .context("before pane disappeared")?
+                                    .1,
+                            ),
+                            None => None,
+                        };
+                        draft.reorder_tab(source_tab, target_view, before)?;
+                    }
+                }
                 self.control_commit(draft, cx)
             }
             "agents.label" | "agents.group" => {
@@ -648,8 +737,31 @@ fn bool_param(params: &Value, key: &str) -> Result<bool> {
     }
 }
 
+/// Act verbs mutate agent work and always require the target workspace's
+/// per-workspace Allow grant, derived exactly as it is for agent.send.
+fn requires_allow_grant(method: &str) -> bool {
+    matches!(
+        method,
+        "agent.send" | "agent.stop" | "agent.interrupt" | "layout.stop"
+    )
+}
+
 fn flag(params: &Value, camel: &str, snake: &str) -> Result<bool> {
     Ok(bool_param(params, camel)? || bool_param(params, snake)?)
+}
+
+/// A gpui task is cancelled exactly when its handle drops, so replacing a
+/// watch must drop (cancel) the previous publisher before installing the new
+/// one. Resubscribing a topic never leaves duplicate SSE publishers behind.
+fn replace_watch(
+    watches: &mut BTreeMap<String, gpui::Task<()>>,
+    topic: &str,
+    task: gpui::Task<()>,
+) {
+    if let Some(previous) = watches.remove(topic) {
+        drop(previous);
+    }
+    watches.insert(topic.to_owned(), task);
 }
 
 fn explicit_ui(params: &Value) -> Result<PaneMode> {
@@ -684,6 +796,28 @@ fn new_pane(params: &Value, mode: PaneMode) -> Result<PaneState> {
         label: optional("label")?,
         group: optional("group")?,
     })
+}
+
+/// Creation requests (tab.split, compose, layout.run, team.run roles) may not
+/// claim a label that any pane in the current layout already uses.
+fn check_new_labels(current: &WorkspaceLayout, draft: &WorkspaceLayout) -> Result<()> {
+    let existing: BTreeSet<_> = pane_order(current)
+        .into_iter()
+        .filter_map(|id| current.pane(id).unwrap().label.clone())
+        .collect();
+    let mut fresh = BTreeSet::new();
+    for id in pane_order(draft) {
+        if current.pane(id).is_some() {
+            continue;
+        }
+        if let Some(label) = &draft.pane(id).unwrap().label {
+            ensure!(
+                !existing.contains(label) && fresh.insert(label.clone()),
+                "label {label:?} already exists; labels must be unique at creation"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn leaves<T: Copy>(node: &SplitNode<T>, result: &mut Vec<T>) {
@@ -950,13 +1084,15 @@ async fn agent(
     params: Value,
 ) -> Result<Value> {
     let is_send = method == "agent.send";
+    // Destructive act verbs need the same per-workspace Allow grant as send.
+    let gated = requires_allow_grant(method);
     let multi = bool_param(&params, "multi")?
         && matches!(
             method,
             "agent.send" | "agent.stop" | "agent.interrupt" | "layout.stop"
         );
     let (engine, targets) = this.update(cx, |this, cx| -> Result<_> {
-        if is_send {
+        if gated {
             this.control_allow(cx)?;
         }
         let ids = resolve(&this.layout, target(&params)?, multi)?;
@@ -976,14 +1112,16 @@ async fn agent(
                 .find(|c| &c.id == chat_id)
                 .context("unknown session")?
                 .clone();
-            if is_send {
+            if gated {
                 this.control_scope(
                     chat.space_id
                         .as_deref()
-                        .context("API sends require a workspace session")?,
+                        .context("denied: this verb requires a session that belongs to a workspace")?,
                     cx,
                     false,
                 )?;
+            }
+            if is_send {
                 ensure!(
                     pane.mode == PaneMode::Chat,
                     "denied: CLI-owned targets cannot receive API prompts"
@@ -1040,7 +1178,7 @@ async fn agent(
                 }
                 hub.publish(topic_for_task, json!({"closed": true, "resubscribe": true}));
             });
-            this.control_watches.insert(topic.clone(), task);
+            replace_watch(&mut this.control_watches, &topic, task);
             Ok(())
         })??;
         return Ok(serde_json::to_value(Subscription {
@@ -1133,7 +1271,7 @@ async fn agent(
     let mut results = Vec::new();
     for (id, chat, command) in commands {
         let allowed = this.update(cx, |this, cx| -> Result<()> {
-            if is_send {
+            if gated {
                 this.control_allow(cx)?;
                 let source = this.source.read(cx);
                 let row = source
@@ -1144,7 +1282,7 @@ async fn agent(
                 this.control_scope(
                     row.space_id
                         .as_deref()
-                        .context("session has no workspace")?,
+                        .context("denied: this verb requires a session that belongs to a workspace")?,
                     cx,
                     false,
                 )?;
@@ -1277,6 +1415,49 @@ fn no_symlinks(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Role report capabilities live in 0600 files under the orchestration store
+/// directory instead of the role prompt, so transcript readers cannot lift
+/// them. The role prompt carries only the file path.
+fn write_role_capability(dir: &Path, run: &str, label: &str, capability: &str) -> Result<PathBuf> {
+    let roles = run_roles_dir(dir, run)?;
+    ensure!(
+        !label.is_empty()
+            && !label.contains(['/', '\\'])
+            && label != "."
+            && label != "..",
+        "role label is not a safe capability file name"
+    );
+    let roles = roles.join("roles");
+    std::fs::create_dir_all(&roles)?;
+    let path = roles.join(format!("{label}.capability"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    std::io::Write::write_all(&mut file, capability.as_bytes())?;
+    Ok(path)
+}
+
+/// Best-effort cleanup once a team reaches a terminal state.
+fn remove_run_capabilities(dir: &Path, run: &str) {
+    if run_roles_dir(dir, run).is_ok() {
+        let _ = std::fs::remove_dir_all(dir.join("runs").join(run));
+    }
+}
+
+/// The run directory, refused unless the run id is a single safe path component.
+fn run_roles_dir(dir: &Path, run: &str) -> Result<PathBuf> {
+    ensure!(
+        !run.is_empty() && run.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
+        "run id must be ASCII letters, digits or hyphens"
+    );
+    Ok(dir.join("runs").join(run))
+}
+
 async fn recipe(
     this: &WeakEntity<Workspace>,
     cx: &mut AsyncApp,
@@ -1284,6 +1465,7 @@ async fn recipe(
     params: Value,
 ) -> Result<Value> {
     let dry_run = flag(&params, "dryRun", "dry_run")?;
+    let overwrite = bool_param(&params, "overwrite")?;
     let (root, layout) = this.update(cx, |this, cx| -> Result<_> {
         Ok((recipe_root(this, &params, cx)?, this.layout.clone()))
     })??;
@@ -1350,7 +1532,10 @@ async fn recipe(
                         bytes.len() as u64 <= MAX_RECIPE_BYTES,
                         "recipe exceeds size limit"
                     );
-                    // Publish a complete file without overwriting another instance's recipe.
+                    // Publish a complete file. Without overwrite, never replace
+                    // another instance's recipe; with it, the previous file is
+                    // unlinked inside this same critical section and the fresh
+                    // publication is linked into place.
                     let temporary = root.join(format!(".recipe-{}.tmp", uuid::Uuid::new_v4()));
                     let mut options = std::fs::OpenOptions::new();
                     options.write(true).create_new(true);
@@ -1363,7 +1548,19 @@ async fn recipe(
                     let result = file
                         .write_all(&bytes)
                         .and_then(|_| file.sync_all())
-                        .and_then(|_| std::fs::hard_link(&temporary, &path));
+                        .and_then(|_| {
+                            if overwrite {
+                                match std::fs::remove_file(&path) {
+                                    Ok(()) => std::fs::hard_link(&temporary, &path),
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                        std::fs::hard_link(&temporary, &path)
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            } else {
+                                std::fs::hard_link(&temporary, &path)
+                            }
+                        });
                     drop(file);
                     let _ = std::fs::remove_file(&temporary);
                     result.context("recipe already exists or cannot be created")?;
@@ -1407,6 +1604,7 @@ async fn recipe(
         check_guard(&this.layout, &params, false)?;
         let draft = remap_recipe(&this.layout, recipe, explicit_ui(&params)?)?;
         if dry_run {
+            check_new_labels(&this.layout, &draft)?;
             return Ok(json!({"dryRun": true, "revision": this.layout.revision, "layout": draft}));
         }
         this.control_commit(draft, cx)
@@ -1616,7 +1814,7 @@ async fn launch(
     } else {
         direction(&params)?
     };
-    let (engine, mut draft, revision, device, space) =
+    let (engine, original, revision, device, space) =
         this.update(cx, |this, cx| -> Result<_> {
             this.control_allow(cx)?;
             check_guard(&this.layout, &params, false)?;
@@ -1655,8 +1853,8 @@ async fn launch(
                 space,
             ))
         })??;
+    let mut draft = original.clone();
     let launches = if planned {
-        let current = draft.clone();
         draft = if named {
             let mut load_params = params.clone();
             load_params["dryRun"] = json!(true);
@@ -1668,9 +1866,9 @@ async fn launch(
             );
             serde_json::from_value(loaded["layout"].clone())?
         } else {
-            compose_plan(&current, plan.expect("inline plan"), &params)?
+            compose_plan(&original, plan.expect("inline plan"), &params)?
         };
-        prepare_planned_sessions(&current, &mut draft, mode)?
+        prepare_planned_sessions(&original, &mut draft, mode)?
     } else {
         let mut target_id = one(&draft, target(&params)?)?;
         let mut launches = Vec::new();
@@ -1711,6 +1909,7 @@ async fn launch(
         launches
     };
     if flag(&params, "dryRun", "dry_run")? {
+        check_new_labels(&original, &draft)?;
         return Ok(json!({"dryRun": true, "revision": revision, "layout": draft}));
     }
     let mut created = Vec::new();
@@ -1871,7 +2070,27 @@ async fn orchestration(
             ensure!(labels.insert(&role.label), "duplicate role label");
             let harness: zeron_proto::HarnessId = serde_json::from_value(json!(role.provider))?;
             let mut launch_params = params.clone();
-            launch_params.as_object_mut().unwrap().remove("spec");
+            {
+                let object = launch_params.as_object_mut().expect("params is an object");
+                // Placement belongs to the role launch itself; caller keys like
+                // `into` would otherwise reposition roles or abort the run.
+                // Unknown keys are ignored the same way layout.run ignores them.
+                for key in [
+                    "spec",
+                    "prompt",
+                    "into",
+                    "direction",
+                    "view",
+                    "tab",
+                    "pane",
+                    "index",
+                    "worktree",
+                    "to",
+                    "from",
+                ] {
+                    object.remove(key);
+                }
+            }
             launch_params["spaceId"] = json!(scope.workspace);
             launch_params["cwd"] = json!(scope.worktree);
             launch_params["count"] = json!(1);
@@ -1897,22 +2116,37 @@ async fn orchestration(
             return Ok(json!({"dryRun":true, "spec":spec}));
         }
         let launch_engine = engine(this, cx)?;
+        let store_dir = store.dir().to_path_buf();
         let create_store = store.clone();
         let team = cx
             .background_executor()
             .spawn(async move { create_store.team_create(spec) })
             .await?;
         let mut results = Vec::new();
+        let mut admitted_roles = Vec::new();
         let admitted: Result<()> = async {
-            for (role, mut launch_params) in team.roles.iter().zip(launches) {
+            for (role, launch_params) in team.roles.iter().zip(launches) {
                 let capability = uuid::Uuid::new_v4().to_string();
-                let prompt = format!("{}\n\nReport completion through team.report with id {}, scope {}, label {}, and reportCapability {}. Supply a report object with summary, and optional result_file.", role.prompt, team.id, serde_json::to_string(&scope)?, role.label, capability);
-                launch_params.as_object_mut().unwrap().remove("prompt");
+                // The capability never enters the prompt or the transcript;
+                // roles read it from a private file beside the store.
+                let capability_path =
+                    write_role_capability(&store_dir, &team.id, &role.label, &capability)?;
+                let prompt = format!(
+                    "{}\n\nReport completion through team.report with id {}, scope {}, label {}, reading your reportCapability from {} and passing it to noches team report with --capability-file {}. Supply a report object with summary, and optional result_file.",
+                    role.prompt,
+                    team.id,
+                    serde_json::to_string(&scope)?,
+                    role.label,
+                    capability_path.display(),
+                    capability_path.display()
+                );
                 let launched = launch(this, cx, "layout.run", launch_params).await?;
                 let session = launched["results"][0]["sessionId"].as_str().context("launch returned no session")?.to_owned();
                 let bind_store = store.clone(); let bind_scope = scope.clone(); let id = team.id.clone(); let label = role.label.clone(); let bound = session.clone();
                 cx.background_executor().spawn(async move { bind_store.bind_role_session(&bind_scope, &id, &label, &bound) }).await?;
                 results.push(launched);
+                admitted_roles.push(json!({"label": role.label, "sessionId": session,
+                    "capability": capability, "capabilityFile": capability_path}));
                 this.update(cx, |this, _| {
                     this.control_consent.reports.insert(capability, (team.id.clone(), role.label.clone(), session.clone()));
                 })?;
@@ -1945,6 +2179,7 @@ async fn orchestration(
             // Roll back process admission too, including when the grant was revoked.
             // These are exactly the sessions admitted by this failed operation.
             let failures = interrupt_team_roles(&launch_engine, &cancelled).await;
+            remove_run_capabilities(&store_dir, &team.id);
             bail!(
                 "team {} launch failed: {error}; run cancelled; created sessions: {}; interruption failures: {}",
                 team.id,
@@ -1952,7 +2187,7 @@ async fn orchestration(
                 json!(failures)
             );
         }
-        return Ok(json!({"id": team.id, "results":results, "completed":false}));
+        return Ok(json!({"id": team.id, "results":results, "roles":admitted_roles, "completed":false}));
     }
     if matches!(method, "coordination-state.watch" | "team.watch") {
         let watch_store = store.clone();
@@ -1986,7 +2221,7 @@ async fn orchestration(
                     }
                 }
             });
-            this.control_watches.insert(topic.clone(), task);
+            replace_watch(&mut this.control_watches, &topic, task);
             Ok(())
         })??;
         return Ok(serde_json::to_value(Subscription {
@@ -2030,6 +2265,7 @@ async fn orchestration(
             team.id,
             json!(failures)
         );
+        remove_run_capabilities(store.dir(), &team.id);
         return Ok(json!(team));
     }
     let operation = method.to_owned();
@@ -2049,8 +2285,8 @@ async fn orchestration(
                 "team.status" => Ok(json!(
                     store.team_get(&scope, id()?)?.context("unknown team")?
                 )),
-                "team.report" => Ok(json!(
-                    store.team_report(
+                "team.report" => {
+                    let team = store.team_report(
                         &scope,
                         id()?,
                         required_str(&params, "label")?,
@@ -2060,8 +2296,12 @@ async fn orchestration(
                         serde_json::from_value(
                             params.get("report").context("report required")?.clone()
                         )?
-                    )?
-                )),
+                    )?;
+                    if team.status == zeron_orchestration::TeamStatus::Completed {
+                        remove_run_capabilities(store.dir(), &team.id);
+                    }
+                    Ok(json!(team))
+                }
                 "coordination-state.get" => Ok(json!(store.coordination_get(&scope, key()?)?)),
                 "coordination-state.set" => Ok(json!(store.coordination_set(
                     &scope,
@@ -2142,7 +2382,7 @@ async fn workspace_control(
                 }
                 hub.publish("workspaces", json!({"closed":true,"resubscribe":true}));
             });
-            this.control_watches.insert(topic.clone(), task);
+            replace_watch(&mut this.control_watches, &topic, task);
             Ok(())
         })??;
         return Ok(serde_json::to_value(Subscription {
@@ -2514,7 +2754,7 @@ mod tests {
                 .verify_app_session("workspace", "session", "secret")
                 .is_err()
         );
-        consent.human_input.insert("session".into());
+        consent.human_input.insert("session".into(), Instant::now());
         assert!(
             consent
                 .verify_app_session("workspace", "session", "secret")
@@ -2537,7 +2777,7 @@ mod tests {
                 .is_err()
         );
         consent.revoke("workspace");
-        assert!(!consent.human_input.contains("session"));
+        assert!(!consent.human_input.contains_key("session"));
         assert!(
             consent
                 .verify_report("workspace", "team", "role", "report-secret")
@@ -2813,5 +3053,128 @@ mod tests {
             assert!(recipe_name(name).is_err());
         }
         assert!(recipe_name("review-grid_2").is_ok());
+    }
+
+    #[test]
+    fn destructive_act_verbs_require_the_same_allow_grant_as_send() {
+        for method in ["agent.send", "agent.stop", "agent.interrupt", "layout.stop"] {
+            assert!(requires_allow_grant(method), "{method} must be gated");
+        }
+        for method in [
+            "agent.read",
+            "agent.subscribe",
+            "agent.wait",
+            "agent.should-stop",
+            "layout.state",
+            "team.report",
+        ] {
+            assert!(!requires_allow_grant(method), "{method} stays ungated");
+        }
+        let mut consent = Consent::default();
+        assert!(consent.check("one", Some("one"), false).is_err());
+        consent.allow.insert("one".into());
+        // With the grant minted, the same check send uses admits the act verbs.
+        assert!(consent.check("one", Some("one"), false).is_ok());
+    }
+
+    #[test]
+    fn human_input_unlocks_expire_with_the_window() {
+        let mut consent = Consent::default();
+        consent
+            .sessions
+            .insert("session".into(), "workspace".into());
+        consent
+            .app_sessions
+            .insert("secret".into(), ("session".into(), "workspace".into()));
+        consent.human_input.insert("session".into(), Instant::now());
+        assert!(
+            consent
+                .verify_app_session("workspace", "session", "secret")
+                .is_ok()
+        );
+        if let Some(stale) = Instant::now().checked_sub(HUMAN_INPUT_TTL + Duration::from_secs(1)) {
+            consent.human_input.insert("session".into(), stale);
+            assert!(
+                consent
+                    .verify_app_session("workspace", "session", "secret")
+                    .is_err()
+            );
+            consent.prune_human_input();
+            assert!(!consent.human_input.contains_key("session"));
+        }
+        consent
+            .human_input
+            .insert("session".into(), Instant::now());
+        consent.revoke("workspace");
+        assert!(!consent.human_input.contains_key("session"));
+    }
+
+    #[test]
+    fn created_panes_cannot_claim_labels_already_in_use() {
+        let mut current = WorkspaceLayout::new();
+        let active = current.active_pane_id().unwrap();
+        current.pane_mut(active).unwrap().label = Some("reviewer".into());
+        let mut draft = current.clone();
+        let new = draft
+            .split_pane(active, Direction::Right, PaneState::default())
+            .unwrap();
+        draft.pane_mut(new).unwrap().label = Some("reviewer".into());
+        assert!(check_new_labels(&current, &draft).is_err());
+        draft.pane_mut(new).unwrap().label = Some("other".into());
+        assert!(check_new_labels(&current, &draft).is_ok());
+        // Two new panes claiming the same label collide with each other too.
+        let mut draft = current.clone();
+        let second = draft
+            .split_pane(active, Direction::Right, PaneState::default())
+            .unwrap();
+        draft.pane_mut(second).unwrap().label = Some("fresh".into());
+        let third = draft
+            .split_pane(second, Direction::Down, PaneState::default())
+            .unwrap();
+        draft.pane_mut(third).unwrap().label = Some("fresh".into());
+        assert!(check_new_labels(&current, &draft).is_err());
+        // Relabeling an existing pane never trips the creation check.
+        let mut relabeled = current.clone();
+        relabeled.pane_mut(active).unwrap().label = Some("fresh".into());
+        assert!(check_new_labels(&current, &relabeled).is_ok());
+        // A vanished label frees the name for new panes.
+        let mut draft = relabeled.clone();
+        let added = draft
+            .split_pane(active, Direction::Down, PaneState::default())
+            .unwrap();
+        draft.pane_mut(added).unwrap().label = Some("reviewer".into());
+        assert!(check_new_labels(&relabeled, &draft).is_ok());
+    }
+
+    #[test]
+    fn role_capability_files_are_private_and_cleanup_removes_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_role_capability(dir.path(), "run-1", "reviewer", "capability-secret").unwrap();
+        assert_eq!(
+            path,
+            dir.path().join("runs").join("run-1").join("roles").join("reviewer.capability")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "capability-secret"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // Path components are refused before touching the filesystem.
+        assert!(write_role_capability(dir.path(), "../escape", "r", "c").is_err());
+        assert!(write_role_capability(dir.path(), "run-1", "a/b", "c").is_err());
+        assert!(write_role_capability(dir.path(), "run-1", "..", "c").is_err());
+        assert!(!dir.path().join("escape").exists());
+        remove_run_capabilities(dir.path(), "run-1");
+        assert!(!dir.path().join("runs").join("run-1").exists());
+        remove_run_capabilities(dir.path(), "../escape");
+        assert!(dir.path().exists());
     }
 }

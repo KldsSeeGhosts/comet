@@ -68,6 +68,7 @@ fn dialects_do_not_confuse_tool_steps_with_idle_or_permission() {
         ("permission.asked", TurnEvent::PermissionRequested),
         ("permission.replied", TurnEvent::PermissionResolved),
         ("ui_prompt_start", TurnEvent::PermissionRequested),
+        ("session.error", TurnEvent::Interrupted),
         ("agent_end", TurnEvent::RunEnded),
         ("turn_end", TurnEvent::TurnStepCompleted),
         ("PreToolUse", TurnEvent::ToolStarted),
@@ -273,6 +274,33 @@ fn limits_bound_sessions_events_bodies_and_expiration() {
     );
 }
 
+#[test]
+fn permission_prompt_notifications_remap_and_plain_ones_do_not() {
+    let dir = TempDir::new().unwrap();
+    let mut receiver = HookReceiver::default();
+    let reg = receiver
+        .register(binding(dir.path(), "a", Provider::Claude))
+        .unwrap();
+    let asked = event(
+        &mut receiver,
+        &reg,
+        "ask",
+        "Notification",
+        json!({"notification_type":"permission_prompt"}),
+    );
+    assert_eq!(asked.kind, TurnEvent::PermissionRequested);
+    let note = event(&mut receiver, &reg, "note", "Notification", json!({}));
+    assert_eq!(note.kind, TurnEvent::Notification);
+    let other = event(
+        &mut receiver,
+        &reg,
+        "other",
+        "Notification",
+        json!({"notification_type":"idle_prompt"}),
+    );
+    assert_eq!(other.kind, TurnEvent::Notification);
+}
+
 fn options(dir: &Path, custom: bool) -> GenerationOptions {
     GenerationOptions {
         parent_dir: dir.canonicalize().unwrap(), hook_socket: dir.join("hooks.sock"),
@@ -352,13 +380,39 @@ fn queue_bounds_drains_and_skips_poison_and_symlinks() {
     for (n, e) in first.iter().enumerate() {
         assert_eq!(e["event_id"], n.to_string());
     }
+    // The poison event failed delivery once: it stays queued under a retry
+    // name that fresh admission ignores, instead of being quarantined.
+    let queued = |hooks: &GeneratedHooks| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(hooks.directory.join("queue"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let names = queued(&hooks);
+    assert_eq!(names.len(), 9);
+    assert_eq!(
+        names.iter().filter(|n| n.ends_with(".retry1")).count(),
+        1,
+        "{names:?}"
+    );
     assert!(notify(&hooks, &["--drain"]).status.success());
-    assert_eq!(received(dir.path()).len(), 15);
+    assert_eq!(received(dir.path()).len(), 16);
     assert_eq!(fs::read_to_string(outside).unwrap(), "untouched");
     assert_eq!(
-        fs::read_dir(hooks.directory.join("queue")).unwrap().count(),
-        0
+        fs::read_dir(hooks.directory.join("errors"))
+            .unwrap()
+            .count(),
+        1,
+        "the unparseable name is quarantined without consuming the delivery budget"
     );
+    // Every failed event is retried on a later drain and quarantined after
+    // its fifth failed delivery.
+    for _ in 0..4 {
+        assert!(notify(&hooks, &["--drain"]).status.success());
+    }
+    assert_eq!(queued(&hooks).len(), 0);
     assert_eq!(
         fs::read_dir(hooks.directory.join("errors"))
             .unwrap()
@@ -383,6 +437,143 @@ fn queue_bounds_drains_and_skips_poison_and_symlinks() {
     );
     assert!(!notify(&hooks, &["../../outside", "{}"]).status.success());
     assert!(!notify(&hooks, &["Stop", "not-json"]).status.success());
+}
+
+#[test]
+fn failed_delivery_requeues_then_retries_or_quarantines() {
+    let dir = TempDir::new().unwrap();
+    let mut receiver = HookReceiver::default();
+    let reg = receiver
+        .register(binding(dir.path(), "a", Provider::Claude))
+        .unwrap();
+    let mut opts = options(dir.path(), false);
+    opts.notifier_argv = Some(vec![
+        "/usr/bin/python3".into(),
+        "-c".into(),
+        "import json,sys,os; seen=[json.loads(l)['event_id'] for l in open(sys.argv[1])] \
+         if os.path.exists(sys.argv[1]) else []; e=json.load(sys.stdin); \
+         open(sys.argv[1],'a').write(json.dumps(e)+'\\n'); \
+         sys.exit(1 if e['event_id']=='dead' or (e['event_id']=='flaky' and 'flaky' not in seen) else 0)".into(),
+        dir.path().join("received.jsonl").to_string_lossy().into_owned(),
+    ]);
+    let hooks = generate(&reg, &opts).unwrap();
+    assert!(
+        notify(&hooks, &["Stop", "{\"noches_event_id\":\"flaky\"}"])
+            .status
+            .success()
+    );
+    // The first failed delivery renames the event; it is still queued and
+    // not quarantined.
+    let names: Vec<String> = fs::read_dir(hooks.directory.join("queue"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert_eq!(names[0].len(), 32 + ".retry1".len());
+    assert!(names[0].ends_with(".retry1"), "{names:?}");
+    assert_eq!(
+        fs::read_dir(hooks.directory.join("errors"))
+            .unwrap()
+            .count(),
+        0
+    );
+    // A later drain delivers the renamed event and cleans it from the queue.
+    assert!(notify(&hooks, &["--drain"]).status.success());
+    assert_eq!(
+        fs::read_dir(hooks.directory.join("queue")).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        received(dir.path())
+            .iter()
+            .filter(|e| e["event_id"] == "flaky")
+            .count(),
+        2
+    );
+    // Five failed deliveries in total quarantine the event instead of
+    // retrying forever.
+    assert!(
+        notify(&hooks, &["Poison", "{\"noches_event_id\":\"dead\"}"])
+            .status
+            .success()
+    );
+    for _ in 0..4 {
+        assert!(notify(&hooks, &["--drain"]).status.success());
+    }
+    assert_eq!(
+        fs::read_dir(hooks.directory.join("queue")).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(hooks.directory.join("errors"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn invalid_names_do_not_consume_the_drain_budget() {
+    let dir = TempDir::new().unwrap();
+    let mut receiver = HookReceiver::default();
+    let reg = receiver
+        .register(binding(dir.path(), "a", Provider::Claude))
+        .unwrap();
+    let hooks = generate(&reg, &options(dir.path(), true)).unwrap();
+    fs::create_dir(hooks.directory.join("drain.lock")).unwrap();
+    fs::write(
+        hooks.directory.join("queue/not-a-queue-name.json"),
+        "garbage",
+    )
+    .unwrap();
+    for n in 0..10 {
+        assert!(
+            notify(&hooks, &["Stop", &format!("{{\"noches_event_id\":\"{n}\"}}")])
+                .status
+                .success()
+        );
+    }
+    fs::remove_dir(hooks.directory.join("drain.lock")).unwrap();
+    assert!(notify(&hooks, &["--drain"]).status.success());
+    let first = received(dir.path());
+    assert_eq!(
+        first.len(),
+        10,
+        "the quarantined name must not consume a delivery slot"
+    );
+    for (n, e) in first.iter().enumerate() {
+        assert_eq!(e["event_id"], n.to_string());
+    }
+    assert_eq!(
+        fs::read_dir(hooks.directory.join("errors"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_dir(hooks.directory.join("queue")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn claude_hooks_register_only_real_claude_code_events() {
+    let dir = TempDir::new().unwrap();
+    let mut receiver = HookReceiver::default();
+    let reg = receiver
+        .register(binding(dir.path(), "a", Provider::Claude))
+        .unwrap();
+    let hooks = generate(&reg, &options(dir.path(), false)).unwrap();
+    let settings: Value = serde_json::from_slice(
+        &fs::read(hooks.directory.join("claude-settings.json")).unwrap(),
+    )
+    .unwrap();
+    let events = settings["hooks"].as_object().unwrap();
+    // Claude Code has no SubagentStart event; only SubagentStop exists.
+    assert!(!events.contains_key("SubagentStart"), "{events:?}");
+    for expected in ["SessionStart", "Stop", "SubagentStop", "Notification"] {
+        assert!(events.contains_key(expected), "{events:?}");
+    }
 }
 
 #[test]

@@ -104,7 +104,7 @@ display EXCLUDED. File paths refer to the reference repo.
   #090909 bg + full ANSI palette. Bounded 1MB replay window.
 
 ### 1.11 Changes / diff viewer
-- Unified patch -> file/hunk/line/notice rows; per-file Collapse 180ms, chevron rotate 200ms;
+- Unified patch -> file/hunk/line/notice rows; per-file Collapse 200ms on the reference ease-out, chevron rotate 200ms;
   +/- gutters; syntax highlight via time-sliced tokenizer (6ms budget); header "N Uncommitted
   changes / +a / -d / Partial snapshot"; states preparing/error+last/clean/list.
   Resolves by chat.checkout_id or device+cwd.

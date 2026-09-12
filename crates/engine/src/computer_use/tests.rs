@@ -478,6 +478,58 @@ fn normalizer_promotes_only_refusals_and_errors() {
     );
 }
 
+#[test]
+fn agent_seat_marker_parses_json_and_legacy_payloads() {
+    // Current vendor payload: identity header, then one JSON payload line.
+    let marker = parse_agent_seat_marker(concat!(
+        "noches-gpui-agent-seat-v1\n4242\n77\n9\n11\n",
+        "{\"state\":\"primary_client_busy\",\"reason\":\"physical_seat_present\",\"pid\":4242}\n"
+    ))
+    .unwrap();
+    assert_eq!(marker["state"], "primary_client_busy");
+    assert_eq!(marker["reason"], "physical_seat_present");
+    assert_eq!(marker["pid"], 4242);
+
+    // Backward compatibility: a bare legacy state token still parses, with
+    // no invented reason or pid.
+    let legacy = parse_agent_seat_marker(
+        "noches-gpui-agent-seat-v1\n1\n2\n3\n4\nprimary_client_busy\n",
+    )
+    .unwrap();
+    assert_eq!(legacy["state"], "primary_client_busy");
+    assert!(legacy.get("reason").is_none());
+    assert!(legacy.get("pid").is_none());
+    let ready = parse_agent_seat_marker("ready\n").unwrap();
+    assert_eq!(ready["state"], "ready");
+
+    // Empty, unknown-token and malformed payloads are no evidence at all.
+    assert_eq!(parse_agent_seat_marker(""), None);
+    assert_eq!(parse_agent_seat_marker("\n \n"), None);
+    assert_eq!(parse_agent_seat_marker("qualified_somewhere_else\n"), None);
+    assert_eq!(parse_agent_seat_marker("{\"state\":\"ready\" truncated\n"), None);
+    // JSON without a usable state token is rejected.
+    assert_eq!(parse_agent_seat_marker("{\"pid\":1}\n"), None);
+}
+
+#[test]
+fn refused_result_without_a_marker_is_left_untouched() {
+    // No GPUI process owns pid u64::MAX, so the marker read misses and the
+    // refusal evidence must survive verbatim.
+    let refused = json!({
+        "structuredContent": {"status": "refused", "code": "background_unavailable"},
+    });
+    assert_eq!(
+        attach_seat_marker_evidence(refused.clone(), Some(u64::MAX)),
+        refused
+    );
+    // Delivered results never gain a marker, whatever the target is.
+    let delivered = json!({"structuredContent": {"status": "delivered"}});
+    assert_eq!(
+        attach_seat_marker_evidence(delivered.clone(), Some(u64::MAX)),
+        delivered
+    );
+}
+
 #[tokio::test]
 async fn help_retains_initialize_metadata_and_exact_executable_hash() {
     let dir = tempfile::tempdir().unwrap();

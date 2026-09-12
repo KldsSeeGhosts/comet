@@ -25,6 +25,24 @@ pub(super) fn managed_provider(harness: HarnessId) -> Result<Provider, EngineErr
     }
 }
 
+/// The generated launcher and relay call one fixed interpreter path; no
+/// `/usr/bin/env` lookup runs in the hook child. Resolving it is a
+/// precondition of every handoff, so a missing interpreter must surface as a
+/// retryable error instead of RecoveryRequired.
+pub(super) fn resolve_python() -> Result<PathBuf, EngineError> {
+    let mut candidates: Vec<PathBuf> = ["/usr/bin/python3", "/usr/local/bin/python3", "/usr/bin/python"]
+        .into_iter().map(PathBuf::from).collect();
+    let paths = std::env::var_os("PATH")
+        .into_iter()
+        .chain(zeron_harness::shell_env::login_shell_path().map(ToOwned::to_owned));
+    for path in paths {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("python3")));
+    }
+    candidates.into_iter().find(|path| path.is_file()).ok_or_else(|| {
+        failed("handoff unavailable: no Python interpreter; install python3 and retry")
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum NativeActivity { Unknown, Busy, Idle, Permission, Ended }
@@ -81,7 +99,13 @@ impl HookRuntime {
         Ok(Self { state, root, socket, task })
     }
 
-    pub fn prepare(&self, chat: &str, command: &ResumeCommand, native_id: &str) -> Result<String, EngineError> {
+    pub fn prepare(
+        &self,
+        chat: &str,
+        command: &ResumeCommand,
+        native_id: &str,
+        python: &std::path::Path,
+    ) -> Result<String, EngineError> {
         let provider = managed_provider(command.harness)?;
         let binding = Binding {
             session_id: chat.into(), terminal_id: uuid::Uuid::new_v4().to_string(),
@@ -92,7 +116,7 @@ impl HookRuntime {
         let registration = state.receiver.register(binding).map_err(|e| failed(e.to_string()))?;
         let result = zeron_shell_hooks::generate(&registration, &GenerationOptions {
             parent_dir: self.root.path().canonicalize()?, hook_socket: self.socket.clone(),
-            python: PathBuf::from("/usr/bin/python3"), provider_executable: PathBuf::from(&command.program),
+            python: python.to_path_buf(), provider_executable: PathBuf::from(&command.program),
             instructions: String::new(), history_path: Some(command.history_path.clone()),
             path_prefix: vec![], notifier_argv: None,
         });
@@ -214,6 +238,12 @@ mod tests {
             HarnessId::Devin, HarnessId::Grok, HarnessId::Hermes, HarnessId::Opencode, HarnessId::Mock] {
             assert!(managed_provider(harness).is_err(), "{harness:?} has no verified lifecycle adapter");
         }
+    }
+
+    #[test]
+    fn python_resolution_finds_a_real_absolute_interpreter() {
+        let python = resolve_python().unwrap();
+        assert!(python.is_absolute() && python.is_file(), "{python:?}");
     }
 
     #[tokio::test]

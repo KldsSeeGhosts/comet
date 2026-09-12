@@ -6,7 +6,7 @@ mod identity;
 mod server;
 
 pub use client::{Client, InstanceStatus, ServerEvent, SubscriptionStream, discover_instances};
-pub use identity::{Manifest, SocketIdentity};
+pub use identity::{InstanceLockedError, Manifest, SocketIdentity, is_instance_locked};
 pub use server::{ControlPlane, EventHub, PublishedEvent, Request, Subscription};
 
 pub const PROTOCOL_VERSION: u32 = 1;

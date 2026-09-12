@@ -1303,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_without_ui_font_default_to_geist() {
+    fn settings_without_ui_font_use_the_requested_default() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             UiSettings::path(dir.path()),
@@ -1313,7 +1313,7 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(
             loaded.ui_font_family,
-            crate::typography::UiFontFamily::Geist
+            crate::typography::UiFontFamily::default()
         );
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);

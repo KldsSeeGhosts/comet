@@ -1286,8 +1286,21 @@ impl Theme {
         theme.cursor = model_color(colors.cursor);
         theme.caret = model_color(accent.caret);
         theme.danger_strong = model_color(colors.danger);
-        theme.code_text = model_color(accent.primary);
-        theme.code_wash = model_color(accent.wash);
+        // Inline-code chip: a variant may pin its own code tone + plate (the
+        // Claude family uses salmon on a neutral chip); otherwise keep the
+        // accent-tinted treatment other palettes are tuned around.
+        theme.code_text = variant
+            .syntax
+            .get("codeText")
+            .copied()
+            .map(model_color)
+            .unwrap_or_else(|| model_color(accent.primary));
+        theme.code_wash = variant
+            .syntax
+            .get("codeWash")
+            .copied()
+            .map(model_color)
+            .unwrap_or_else(|| model_color(accent.wash));
         theme.syntax = SyntaxPalette::from_variant(variant, theme.syntax);
         theme.diff_add = model_color(colors.diff_add);
         theme.diff_del = model_color(colors.diff_delete);
@@ -1596,10 +1609,11 @@ pub fn glass_selected_bg() -> Hsla {
 /// The user message bubble's plate: the same translucent wash family as
 /// [`glass_selected_bg`], one step softer — at the selection weight the
 /// bubble read too strong for settled content (user report), and an opaque
-/// plate before that read as a solid slab over glass.
+/// plate before that read as a solid slab over glass. Dark 6% lands on the
+/// reference app's measured bubble tone (#222223 over the #161617 panel).
 pub fn user_bubble_bg() -> Hsla {
     match current_appearance() {
-        Appearance::Dark => wash(0.08),
+        Appearance::Dark => wash(0.06),
         Appearance::Light => wash(0.04),
     }
 }

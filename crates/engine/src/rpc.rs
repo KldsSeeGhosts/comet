@@ -2237,7 +2237,9 @@ impl RpcService for EngineRpc {
                 if chat.device_id != self.workspace.device_id() {
                     return Err(RpcError::Failed("GetSessionView must run on the chat's host device".into()));
                 }
-                RpcReply::value(&self.sessions.session_views().get(&p.chat_id))
+                // The canonical provider identity comes from the Chat record;
+                // a live handoff overrides it inside SessionViews.
+                RpcReply::value(&self.sessions.session_views().view(&p.chat_id, Some(&chat)))
             }
             methods::SUBSCRIBE_TERMINAL => {
                 let p: SubscribeTerminalParams = parse_params(params)?;

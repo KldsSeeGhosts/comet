@@ -287,6 +287,9 @@ impl CubicBezier {
 pub const EASE_OUT_EXPO: CubicBezier = CubicBezier::new(0.16, 1.0, 0.3, 1.0);
 /// CSS `ease-out` — width/height transitions.
 pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
+/// The reference design system's ease-out — `cubic-bezier(0, 0, .2, 1)`.
+/// Snappier than CSS ease-out; what Claude's UI transitions actually ride.
+pub const EASE_CDS_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.2, 1.0);
 /// CSS `ease` — quick fades, menu/dialog pops.
 pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
 /// Sidebar resort glide — CSS `cubic-bezier(0.22, 1, 0.36, 1)` (used from M3b).
@@ -372,11 +375,11 @@ pub const SPLASH_OUT: MotionSpec = MotionSpec::new(500, EASE).with_delay(150);
 pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_OUT);
 /// Terminal tab drag-reorder sliding transforms: 150ms (§1.10).
 pub const TAB_SLIDE: MotionSpec = MotionSpec::new(150, EASE_OUT);
-/// Diff-pane per-file collapse: 180ms height (§1.11).
-pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_OUT);
+/// Diff-pane per-file collapse: 200ms on the reference ease-out (§1.11).
+pub const COLLAPSE: MotionSpec = MotionSpec::new(200, EASE_CDS_OUT);
 /// Diff-pane chevron rotate: 200ms (§1.11; approximated as a crossfade — gpui
 /// divs have no rotation transform at the pinned rev, same caveat as scale).
-pub const CHEVRON: MotionSpec = MotionSpec::new(200, EASE);
+pub const CHEVRON: MotionSpec = MotionSpec::new(200, EASE_CDS_OUT);
 /// Rail-tick / scroll-to-row glide: 500ms ease-in-out over the whole distance
 /// (Electron parity — the original rail rode the browser's native smooth
 /// scroll, a fixed-duration gentle ease, never percent-of-remaining).
@@ -858,8 +861,10 @@ mod tests {
         assert_eq!((SPLASH_OUT.duration_ms, SPLASH_OUT.delay_ms), (500, 150));
         assert_eq!(RESIZE.duration_ms, 200);
         assert_eq!(TAB_SLIDE.duration_ms, 150);
-        assert_eq!(COLLAPSE.duration_ms, 180);
+        assert_eq!(COLLAPSE.duration_ms, 200);
+        assert_eq!(COLLAPSE.curve, EASE_CDS_OUT);
         assert_eq!(CHEVRON.duration_ms, 200);
+        assert_eq!(CHEVRON.curve, EASE_CDS_OUT);
         assert_eq!(ZERON_PULSE.duration_ms, 2400);
         assert_eq!(GRADIENT_SPIN.duration_ms, 750);
         assert_eq!(EASE_OUT_EXPO, CubicBezier::new(0.16, 1.0, 0.3, 1.0));

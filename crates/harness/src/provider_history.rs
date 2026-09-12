@@ -400,6 +400,54 @@ mod tests {
         assert!(!args.iter().any(|a| a == "-c" || a == "--continue"));
     }
     #[test]
+    fn claude_resume_uses_the_session_uuid_and_keeps_model_and_effort() {
+        let session = "ad66b593-8b4e-4308-82b6-8d4a597e202c";
+        let config = ChatConfig {
+            harness: HarnessId::ClaudeCode,
+            model: Some("claude-sonnet-4-5".into()),
+            reasoning: Some(ReasoningLevel::High),
+            model_options: Default::default(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        };
+        let args = resume_args(&config, session).unwrap();
+        assert_eq!(
+            args,
+            [
+                "--resume=ad66b593-8b4e-4308-82b6-8d4a597e202c",
+                "--model",
+                "claude-sonnet-4-5",
+                "--effort",
+                "high"
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "-c" || a == "--continue" || a.contains("bypass")));
+        // Claude cannot preserve Pi's off/minimal thinking levels.
+        let mut off = config.clone();
+        off.reasoning = Some(ReasoningLevel::Off);
+        assert!(resume_args(&off, session).is_err());
+        // The resumed history must belong to the resumed UUID.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{session}.jsonl"));
+        std::fs::write(&path, format!(
+            "{{\"type\":\"user\",\"uuid\":\"a\",\"parentUuid\":null,\"sessionId\":\"{session}\",\
+             \"cwd\":\"/tmp\",\"timestamp\":1,\
+             \"message\":{{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":1}}}}\n"
+        ))
+        .unwrap();
+        let command = ResumeCommand {
+            program: "/bin/true".into(),
+            args,
+            env: vec![],
+            history_path: path,
+            session_id: session.into(),
+            cwd: "/tmp".into(),
+            harness: HarnessId::ClaudeCode,
+        };
+        let history = command.read_history().unwrap();
+        assert_eq!(history.identity, session);
+        assert_eq!(history.messages.len(), 1);
+    }
+    #[test]
     fn pi_walks_active_branch_and_rejects_torn_history() {
         let text = concat!(
             "{\"type\":\"session\",\"version\":3,\"id\":\"native\",\"cwd\":\"/tmp\"}\n",

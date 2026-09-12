@@ -58,7 +58,7 @@ pub const ACTIONS_ROW_HEIGHT: f32 = 46.0;
 /// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
 pub const PILL_BORDER_V: f32 = 2.0;
 /// Corner radius shared by the composer and the queue tray behind it.
-pub(crate) const COMPOSER_RADIUS: f32 = 26.0;
+pub(crate) const COMPOSER_RADIUS: f32 = 14.0;
 /// Expanded composer bounds, border-box: 76 + 46 + 2 = 124 when empty (the
 /// new-chat canvas), 260 + 46 + 2 = 308 at the content cap.
 pub const COMPOSER_MIN_HEIGHT: f32 = TEXTAREA_MIN + ACTIONS_ROW_HEIGHT + PILL_BORDER_V;
@@ -7051,10 +7051,10 @@ impl Render for Composer {
         let strip = self.render_attachment_strip(&theme, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
 
-        // The pill chrome (zeron composer.tsx): `rounded-[26px] border
-        // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
-        // a hairline over a faint wash, never a solid grey box. Picker chips,
-        // attach, and the send circle all live INSIDE the pill.
+        // The pill chrome (reference composer): `--cds-radius-composer` 12-14px
+        // with a hairline border over the raised input plate — a compact
+        // rounded field, not a floating capsule. Picker chips, attach, and
+        // the send circle all live INSIDE the pill.
         let pill_bg = theme.input_glass_bg();
         // No drop shadow on glass: it paints BEHIND the translucent fill and
         // shows through as an inner glow (theme.rs's card_selected_shadows
@@ -8131,11 +8131,12 @@ mod tests {
         assert!(visible > start && visible < target);
         // A delete during growth reverses from what is on screen, with no snap.
         let shrink = flip_morph_step(Some(grow), true, visible, 60.0, false, false).unwrap();
+        let total = motion::COLLAPSE.total().as_secs_f32() * 1000.0;
         assert_eq!(shrink.height(start, 60.0), visible);
-        assert!(shrink.height(start, 120.0) < visible);
-        assert_eq!(shrink.height(start, 240.0), start);
+        assert!(shrink.height(start, 60.0 + total * 0.5) < visible);
+        assert_eq!(shrink.height(start, 60.0 + total), start);
         assert_eq!(
-            flip_morph_step(Some(shrink), false, start, 240.0, false, false),
+            flip_morph_step(Some(shrink), false, start, 60.0 + total, false, false),
             None
         );
         // Toggling reduced motion also cancels an already running resize.
@@ -8161,9 +8162,10 @@ mod tests {
             prev = h;
         }
         // …and lands exactly on the target when done (and stays there).
-        assert_eq!(m.height(124.0, 180.0), 124.0);
-        assert!(m.done(180.0));
-        assert_eq!(m.height(124.0, 500.0), 124.0);
+        let total = motion::COLLAPSE.total().as_secs_f32() * 1000.0;
+        assert_eq!(m.height(124.0, total), 124.0);
+        assert!(m.done(total));
+        assert_eq!(m.height(124.0, total * 2.5), 124.0);
         // Collapse runs the same ramp downward.
         assert!(m.height(124.0, 90.0) > 49.0);
         let down = FlipMorph {
@@ -8278,9 +8280,12 @@ mod tests {
         // live value instead of finishing on a stale height.
         assert!(m.height(159.0, 90.0) > m.height(124.0, 90.0));
         // The eased progress is the actions-row fade: 0 at commit, 1 at rest.
+        // The settle sample rides the live COLLAPSE spec so a duration change
+        // cannot silently strand the boundary assertion.
+        let total = motion::COLLAPSE.total().as_secs_f32() * 1000.0;
         assert_eq!(m.progress(0.0), 0.0);
-        assert_eq!(m.progress(180.0), 1.0);
-        let mid = m.progress(90.0);
+        assert_eq!(m.progress(total), 1.0);
+        let mid = m.progress(total * 0.5);
         assert!(mid > 0.0 && mid < 1.0);
     }
 

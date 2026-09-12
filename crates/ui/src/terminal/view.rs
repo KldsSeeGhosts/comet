@@ -510,6 +510,8 @@ impl gpui::Element for TerminalElement {
         let mut bg_quads = Vec::new();
         let mut sel_quads = Vec::new();
         let mut lines = Vec::with_capacity(snapshot.lines.len());
+        // Theme inputs behind shaping, resolved once: the shape cache key.
+        let theme_fp = super::panel::theme_paint_fingerprint(&theme);
 
         for (row_ix, row) in snapshot.lines.iter().enumerate() {
             let y = origin.y + line_h * row_ix as f32;
@@ -560,7 +562,14 @@ impl gpui::Element for TerminalElement {
                     _ => {}
                 }
             }
-            lines.push(shape_row(row, &theme, &mono, font_size, window));
+            // Shaped text comes from the panel's per-row cache: unchanged rows
+            // (same content fingerprint) reuse their segments instead of
+            // re-shaping every frame. Backgrounds and selection above stay
+            // per-frame — they are quads, not layout.
+            let row_fp = snapshot.fingerprints.get(row_ix).copied().unwrap_or(0);
+            lines.push(self.panel.update(cx, |panel, _| {
+                panel.shaped_row(theme_fp, row_fp, row, &theme, &mono, font_size, window)
+            }));
         }
 
         let cursor = snapshot.cursor.map(|c| {
@@ -695,7 +704,10 @@ impl gpui::Element for TerminalElement {
 /// and every other glyph is its own segment pinned at its own column. Wide
 /// spacers are still skipped — the wide glyph covers both columns, and the
 /// NEXT segment re-pins regardless.
-fn shape_row(
+///
+/// Pure in row content + theme + font, which is what lets the panel cache its
+/// output per row fingerprint (selection is a quad overlay, never shaped).
+pub(super) fn shape_row(
     row: &[CellSnapshot],
     theme: &Theme,
     mono: &gpui::Font,

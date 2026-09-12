@@ -118,6 +118,34 @@ pub(crate) fn read_manifest(path: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
+/// The instance flock is held by another live process. Transient during a
+/// restart swap: the outgoing instance releases the lock when it exits, so
+/// bind attempts are safe to retry past that window.
+#[derive(Debug)]
+pub struct InstanceLockedError {
+    pub name: String,
+}
+
+impl std::fmt::Display for InstanceLockedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "instance {} is locked by another process",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for InstanceLockedError {}
+
+/// Whether a bind failure is the instance-lock race — the one startup failure
+/// that a short retry actually fixes.
+pub fn is_instance_locked(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<InstanceLockedError>().is_some())
+}
+
 fn pid_definitely_dead(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
@@ -157,10 +185,9 @@ impl Registration {
             "unsafe instance lock"
         );
         // The open file stays alive for the registration's whole lifetime.
-        ensure!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "instance {name} is locked by another process"
-        );
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(InstanceLockedError { name: name.clone() }.into());
+        }
 
         let socket_exists = match fs::symlink_metadata(&socket) {
             Ok(_) => true,

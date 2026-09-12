@@ -230,12 +230,12 @@ fn generate_inner(
     match provider {
         Provider::Claude => {
             let mut hooks = serde_json::Map::new();
+            // Claude Code has no SubagentStart event; only SubagentStop exists.
             for event in [
                 "SessionStart",
                 "SessionEnd",
                 "UserPromptSubmit",
                 "Stop",
-                "SubagentStart",
                 "SubagentStop",
                 "PermissionRequest",
                 "Notification",

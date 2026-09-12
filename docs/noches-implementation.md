@@ -143,3 +143,75 @@ socket transport tests, 10 durable orchestration tests, and the engine workspace
 cascade regression with a retained second workspace. The concurrent
 last-workspace deletion test also passed in the full development test run.
 These checks do not replace the final installed-application interaction pass.
+
+## Close-out verification round, September 12 (evening)
+
+A full audit pass over every Noches ticket produced the following fixes and
+verifications, all on `dev` with the debug dev build installed and restarted:
+
+- Consent model: `agent.stop`/`agent.interrupt`/`layout.stop` now require the
+  same per-workspace Allow grant as `agent.send`; the human-input unlock that
+  enables worktree creation expires after 15 minutes; team-role report
+  capabilities are no longer embedded in role prompts (transcript readers
+  cannot forge reports) — they are delivered per role as a 0600 capability
+  file plus the `team run` response, and `noches team report --capability-file`
+  consumes them.
+- Control plane: the instance-lock bind retries through the restart-swap
+  window (a transient `InstanceLockedError`) instead of permanently disabling
+  the API with the "locked by another process" banner; resubscribes abort the
+  superseded watch task; startup recovery skips a corrupt orchestration row
+  instead of killing the whole store; duplicate labels are rejected on every
+  pane-creation path.
+- CLI/server contract: `layout apply --ui chat|terminal` and `--force`
+  (overwrite) exist as first-class flags, the bogus `--ui auto` choice was
+  removed, `tab close|move|reorder` verbs are wired, and `team.run` strips
+  placement keys from per-role launch parameters.
+- Terminal: per-row fingerprint render caches (snapshot + shaping) remove
+  full-grid reshape per frame; the engine reaps never-attached sessions after
+  a 10-minute TTL (configurable in tests); failed opens drain queued boot
+  keystrokes; mouse-mode wheel reports are clamped; tab numbering stays
+  unique after closes.
+- Shell hooks: a failed notify delivery now retries on subsequent drains
+  (5 attempts, attempt count in the on-disk name) before quarantining, and
+  invalid names no longer consume the drain budget; the Python interpreter
+  for generated wrappers is resolved from PATH candidates before the handoff
+  journal is written, so a missing interpreter surfaces a retryable
+  precondition instead of RecoveryRequired; the bogus Claude `SubagentStart`
+  hook was removed; GetSessionView now carries the canonical identity
+  (provider, native session id, worktree, model, effort).
+- CUA safety: agent-seat cancellation synthesizes the matching MouseUp before
+  exit events; window closure cancels agent held state for that surface;
+  keyboard rebind flushes stale held keys; click counters reset on mismatched
+  release and capability loss; the input marker publishes a JSON payload with
+  a machine-readable reason (`physical_seat_present`, `no_qualified_target`)
+  that legacy readers still parse.
+- Chat UI: an ActivePlanHud strip (label, done/total, current step, compact
+  progress pill) docks above the composer and hides without a plan; the
+  transcript gained a hover/drag overlay scrollbar; the reference-typography
+  pass (15px prose, 13px code, reference heading scale, monochrome markers,
+  keyword-hue links, composer radius) is pinned by updated tests.
+- Workspace: a chat pane's committed session is no longer stripped when its
+  fresh fork drops a selection the engine has not confirmed yet (`chat.new`
+  panes keep their session; real selections still land; close still clears).
+- dev.sh: terminate stale `zeron-dev` windows by pid (this machine's hyprctl
+  dispatch shim rejects `closewindow address:...`, which left the previous
+  UI holding the instance lock and wedged every relaunch).
+
+Verification evidence: `cargo clippy --workspace --all-targets --features dev
+-- -D warnings` clean; `cargo test --workspace --all-targets --features dev`
+1830 passed / 0 failed; installed-Pi continuity (`scripts/tests/run-
+pi-continuity.sh`, Pi 0.85.1) passed the full Chat→CLI→Chat round trip with
+exact history, preserved identity/cwd/model/effort, busy-close refusal and
+idempotent import; live CLI battery against the running dev instance covered
+discovery/identity, read verbs, consent denial without Allow, grant-minted
+`chat.new` on the mock provider, and the recipe save/apply(dry-run)/delete
+round trip; the input marker on the live window carries the JSON reason
+payload.
+
+Known scope limits, recorded honestly: background computer use against the
+GPUI window works only while the window is not physically focused (full
+physical/agent concurrency is a GPUI single-focus-context limitation tracked
+for the vendored fork, not a local hack); Claude/Codex handoff beyond
+resume-args generation remains gated (Pi is the verified provider); pane
+TabItem variants beyond Chat/Terminal (Browser/Diff/FilePreview) are not
+wired as pane modes — no product entry point exists yet.

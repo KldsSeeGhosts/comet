@@ -17,7 +17,7 @@ use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use zeron_harness::provider_history::{
     NativeHistory, NativeMessage, ResumeCommand, prepare_resume,
 };
-use zeron_proto::{Chat, ChatConfig, TerminalSession, ToolCall};
+use zeron_proto::{Chat, ChatConfig, HarnessId, ReasoningLevel, TerminalSession, ToolCall};
 use zeron_sync::DocsStore;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -34,6 +34,18 @@ pub struct SessionView {
     pub owner: SessionOwner,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_activity: Option<NativeActivity>,
+    /// Canonical provider identity: the live handoff's command/config, else
+    /// the persisted Chat record. Absent for plain terminals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<HarnessId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningLevel>,
     pub terminal: Option<TerminalSession>,
     pub error: Option<String>,
 }
@@ -233,15 +245,49 @@ impl SessionViews {
     pub fn get(&self, chat_id: &str) -> SessionView {
         let handoffs = lock(&self.inner.handoffs);
         let h = handoffs.get(chat_id);
+        // While a handoff owns the chat, its live command/config is canonical.
+        let (provider, native_session_id, worktree_path, model, reasoning) = match h {
+            Some(h) => (
+                Some(h.config.harness),
+                Some(h.command.session_id.clone()),
+                Some(h.command.cwd.clone()),
+                h.config.model.clone(),
+                h.config.reasoning,
+            ),
+            None => (None, None, None, None, None),
+        };
         SessionView {
             chat_id: chat_id.into(),
             owner: h.map_or(SessionOwner::Chat, |h| h.owner),
             native_activity: self.inner.hooks.get().and_then(|hooks| hooks.activity(chat_id)),
+            provider,
+            native_session_id,
+            worktree_path,
+            model,
+            reasoning,
             terminal: h.filter(|h| !h.recovered).and_then(|h| h.terminal.clone()),
             error: lock(&self.inner.persistence_error)
                 .clone()
                 .or_else(|| h.and_then(|h| h.error.clone())),
         }
+    }
+
+    /// Canonical identity merges the live handoff with the persisted Chat
+    /// record, so a plain view describes provider chats that Chat owns.
+    pub fn view(&self, chat_id: &str, chat: Option<&Chat>) -> SessionView {
+        let mut view = self.get(chat_id);
+        if view.provider.is_none()
+            && let Some(chat) = chat
+        {
+            if let Some(config) = &chat.config {
+                view.provider = Some(config.harness);
+                view.model = config.model.clone();
+                view.reasoning = config.reasoning;
+            }
+            view.native_session_id = chat.harness_session_id.clone().filter(|s| !s.is_empty());
+            view.worktree_path = chat.harness_session_cwd.clone();
+        }
+        view
     }
 
     fn recovery(&self, chat: &str, error: &EngineError) -> Result<(), EngineError> {
@@ -306,9 +352,11 @@ impl SessionViews {
             .config
             .clone()
             .ok_or_else(|| failed("Chat has no provider configuration"))?;
-        // Refuse unsupported lifecycle adapters before native-file probes,
-        // interrupting Chat, or persisting a handoff that cannot return safely.
+        // Refuse unsupported lifecycle adapters and a missing interpreter
+        // before native-file probes, interrupting Chat, or persisting a
+        // handoff that cannot return safely.
         hooks::managed_provider(config.harness)?;
+        let python = hooks::resolve_python()?;
         let fresh = chat.harness_session_id.is_none();
         let (native, cwd) = if fresh {
             if config.harness != zeron_proto::HarnessId::Pi
@@ -398,7 +446,7 @@ impl SessionViews {
                 let hooks = HookRuntime::start()?;
                 let _ = self.inner.hooks.set(hooks);
             }
-            match self.inner.hooks.get().unwrap().prepare(chat_id, &command, &h.baseline.identity) {
+            match self.inner.hooks.get().unwrap().prepare(chat_id, &command, &h.baseline.identity, &python) {
                 Ok(program) => program,
                 Err(error) => {
                     h.process = ProcessState::NotSpawned;
@@ -470,11 +518,12 @@ impl SessionViews {
         let chat = local_chat(workspace, chat_id)?;
         let handoff = lock(&self.inner.handoffs).get(chat_id).cloned();
         let Some(mut h) = handoff else {
+            let view = self.view(chat_id, Some(&chat));
             return Ok(HydrationOutcome {
                 chat_id: chat_id.into(),
                 imported_messages: 0,
                 native_session_id: chat.harness_session_id,
-                view: self.get(chat_id),
+                view,
             });
         };
         let already_dead = matches!(&h.process, ProcessState::Dead | ProcessState::NotSpawned)
@@ -1027,6 +1076,73 @@ mod tests {
         assert_eq!(h.baseline.messages, fixture_handoff().baseline.messages);
         assert!(h.command.env.is_empty());
         assert!(matches!(h.process, ProcessState::SpawnPending { .. }));
+    }
+
+    fn fixture_chat(config: Option<ChatConfig>) -> Chat {
+        Chat {
+            id: "chat".into(),
+            device_id: "device".into(),
+            title: None,
+            archived: false,
+            cwd: Some("/tmp".into()),
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
+    }
+
+    #[test]
+    fn session_view_reports_canonical_provider_identity() {
+        use zeron_proto::{HarnessId, ReasoningLevel};
+        let views = SessionViews::default();
+        let mut h = fixture_handoff();
+        h.config.model = Some("provider/model".into());
+        h.config.reasoning = Some(ReasoningLevel::Medium);
+        views.put("chat", h.clone()).unwrap();
+
+        // A live handoff is canonical, even against a stale Chat row.
+        let mut chat = fixture_chat(Some(h.config.clone()));
+        chat.harness_session_id = Some("stale-native".into());
+        let view = views.view("chat", Some(&chat));
+        assert_eq!(view.provider, Some(HarnessId::Pi));
+        assert_eq!(view.native_session_id.as_deref(), Some(h.command.session_id.as_str()));
+        assert_eq!(view.worktree_path.as_deref(), Some(h.command.cwd.as_str()));
+        assert_eq!(view.model.as_deref(), Some("provider/model"));
+        assert_eq!(view.reasoning, Some(ReasoningLevel::Medium));
+        let wire = serde_json::to_value(&view).unwrap();
+        assert_eq!(wire["provider"], "pi");
+        assert_eq!(wire["nativeSessionId"], h.command.session_id);
+        assert_eq!(wire["worktreePath"], h.command.cwd);
+
+        // Without a handoff the persisted Chat record carries the identity.
+        chat.harness_session_id = Some("native-uuid".into());
+        chat.harness_session_cwd = Some("/tmp/worktree".into());
+        let view = views.view("elsewhere", Some(&chat));
+        assert!(matches!(view.owner, SessionOwner::Chat));
+        assert_eq!(view.provider, Some(HarnessId::Pi));
+        assert_eq!(view.native_session_id.as_deref(), Some("native-uuid"));
+        assert_eq!(view.worktree_path.as_deref(), Some("/tmp/worktree"));
+        assert_eq!(view.model.as_deref(), Some("provider/model"));
+
+        // A plain terminal chat has no provider configuration to report.
+        let plain = views.view("plain", Some(&fixture_chat(None)));
+        assert!(plain.provider.is_none());
+        assert!(plain.native_session_id.is_none());
+        assert!(plain.worktree_path.is_none());
+        assert!(plain.model.is_none());
+        assert!(plain.reasoning.is_none());
+        assert!(serde_json::to_value(&plain).unwrap().get("provider").is_none());
+        let unknown = views.view("unknown", None);
+        assert!(unknown.provider.is_none() && unknown.native_session_id.is_none());
     }
 
     #[tokio::test]

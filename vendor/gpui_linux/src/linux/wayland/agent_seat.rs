@@ -57,7 +57,7 @@ impl Drop for DispatchGuard {
 /// A process-generation-bound compatibility declaration, not input authority.
 /// Only the dev app_id enables this path; the compositor still binds a live
 /// surface and owns the input grant and held-key cleanup.
-pub(super) struct AgentRegistration { path: PathBuf, identity: String }
+pub(super) struct AgentRegistration { path: PathBuf, pid: u32, identity: String }
 impl AgentRegistration {
     pub fn create() -> std::io::Result<Self> {
         let pid = std::process::id();
@@ -76,17 +76,26 @@ impl AgentRegistration {
         let start = stat.rsplit_once(')').and_then(|(_, tail)| tail.split_whitespace().nth(19))
             .ok_or_else(|| std::io::Error::other("missing process generation"))?;
         let exe = std::fs::metadata("/proc/self/exe")?;
-        let record = Self { path: root.join(pid.to_string()),
+        let record = Self { path: root.join(pid.to_string()), pid,
             identity: format!("noches-gpui-agent-seat-v1\n{pid}\n{start}\n{}\n{}\n", exe.dev(), exe.ino()) };
-        record.publish(true)?;
+        // Conservative until the first refresh publishes the real state: an
+        // external reader must never see a ready record we cannot honor.
+        record.publish("primary_client_busy", "startup")?;
         Ok(record)
     }
-    pub fn publish(&self, busy: bool) -> std::io::Result<()> {
+    /// Rewrites the marker atomically. The payload line is one JSON object
+    /// `{"state":..,"reason":..,"pid":..}`; the state tokens are unchanged
+    /// from the previous bare-string format, so older readers keep working
+    /// while newer ones also get the machine-readable reason. `state` and
+    /// `reason` are fixed tokens from this module, never caller text, so no
+    /// escaping is required.
+    pub fn publish(&self, state: &str, reason: &str) -> std::io::Result<()> {
         use std::io::Write;
         let temporary = self.path.with_extension("tmp");
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
         let result = (|| {
-            writeln!(file, "{}{}", self.identity, if busy { "primary_client_busy" } else { "ready" })?;
+            writeln!(file, "{}{{\"state\":\"{state}\",\"reason\":\"{reason}\",\"pid\":{}}}",
+                self.identity, self.pid)?;
             std::fs::rename(&temporary, &self.path)
         })();
         if result.is_err() { let _ = std::fs::remove_file(&temporary); }
@@ -98,13 +107,27 @@ impl Drop for AgentRegistration {
 }
 use std::os::unix::fs::DirBuilderExt;
 
+/// Marker tokens for the current state. The state strings are the two bare
+/// payloads external readers already know; the reason says why.
+fn agent_marker_tokens(busy: bool, qualified_targets: bool) -> (&'static str, &'static str) {
+    if busy {
+        ("primary_client_busy", "physical_seat_present")
+    } else if !qualified_targets {
+        ("ready", "no_qualified_target")
+    } else {
+        ("ready", "ready")
+    }
+}
+
 impl WaylandClientState {
     pub(super) fn agent_primary_busy(&self) -> bool {
         self.mouse_focused_window.is_some() || self.keyboard_focused_window.is_some()
     }
     pub(super) fn agent_publish(&self) {
         if let Some(registration) = &self.agent_registration {
-            if let Err(error) = registration.publish(self.agent_primary_busy()) {
+            let (state, reason) =
+                agent_marker_tokens(self.agent_primary_busy(), !self.agent_windows.is_empty());
+            if let Err(error) = registration.publish(state, reason) {
                 // A stale ready record must never survive a failed busy update.
                 let _ = std::fs::remove_file(&registration.path);
                 log::error!("cannot publish GPUI input compatibility: {error}");
@@ -123,6 +146,10 @@ impl WaylandClientState {
             } else if let Some(pointer) = agent.pointer.take() {
                 pointer.release(); agent.pointer_surface = None; agent.button = None;
                 agent.scroll = Point::default();
+                // A lost capability is a fresh seat: no click history may leak
+                // into a future press as a spurious multi-click.
+                agent.click = ClickState { last_mouse_button: None, last_click: Instant::now(),
+                    last_location: Point::default(), current_count: 0 };
             }
             if caps.contains(wl_seat::Capability::Keyboard) {
                 if agent.keyboard.is_none() { agent.keyboard = Some(seat.get_keyboard(qh, AgentDevice(id))); }
@@ -147,6 +174,22 @@ impl WaylandClientStatePtr {
     pub(super) fn agent_cancel_all(&self) {
         self.agent_cancel(None);
     }
+    /// Cancels every agent seat that still references a surface which is
+    /// going away. Runs the same cancellation as a compositor Leave so no
+    /// held state or stale surface reference outlives the window; must run
+    /// while the window is still resolvable for effect delivery.
+    pub(super) fn agent_cancel_surface(&self, surface: &ObjectId) {
+        let client = self.get_client();
+        let seats: Vec<u32> = {
+            let state = client.borrow();
+            state.agent_seats.iter()
+                .filter(|(_, agent)| agent.pointer_surface.as_ref() == Some(surface)
+                    || agent.keyboard_surface.as_ref() == Some(surface))
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in seats { self.agent_cancel(Some(id)); }
+    }
     pub(super) fn agent_cancel(&self, selected: Option<u32>) {
         let client = self.get_client();
         let mut state = client.borrow_mut();
@@ -156,6 +199,17 @@ impl WaylandClientStatePtr {
             if selected.is_some_and(|selected| selected != *id) { continue; }
             if let Some(surface) = agent.pointer_surface.take() {
                 if let Some(window) = windows.get(&surface) {
+                    // A plain-element drag armed by an agent MouseDown must end
+                    // with a matching MouseUp (current position and modifiers)
+                    // before the exit events clear GPUI's app-wide drag state.
+                    if let Some(button) = agent.button {
+                        let context = AgentDispatch { surface: surface.clone(),
+                            position: agent.position, modifiers: agent.modifiers,
+                            capslock: agent.capslock };
+                        effects.push((window.clone(), context, PlatformInput::MouseUp(MouseUpEvent {
+                            button, position: agent.position, modifiers: agent.modifiers,
+                            click_count: agent.click.current_count })));
+                    }
                     let context = AgentDispatch { surface, position: agent.position,
                         modifiers: Modifiers::default(), capslock: Capslock { on: false } };
                     // GPUI's FileDrop::Exited clears its app-wide drag without
@@ -245,7 +299,12 @@ impl Dispatch<wl_pointer::WlPointer, AgentDevice> for WaylandClientStatePtr {
                             modifiers: agent.modifiers, click_count: agent.click.current_count, first_mouse: false }))
                     }
                     wl_pointer::ButtonState::Released => {
-                        if agent.button.take() != Some(button) { return; }
+                        if agent.button.take() != Some(button) {
+                            // A release for a button we never tracked must not
+                            // arm the next press with a stale multi-click count.
+                            agent.click.current_count = 0;
+                            return;
+                        }
                         Some(PlatformInput::MouseUp(MouseUpEvent { button, position: agent.position,
                             modifiers: agent.modifiers, click_count: agent.click.current_count }))
                     }
@@ -296,10 +355,21 @@ impl Dispatch<wl_keyboard::WlKeyboard, AgentDevice> for WaylandClientStatePtr {
             _ => agent.keyboard_surface.clone(),
         };
         let target = surface.as_ref().and_then(|surface| state.agent_target(id, surface));
+        // Enter can replace a previous keyboard target without an intervening
+        // Leave; resolve that previous window now so stale held keys can flush
+        // to it after the mutable borrow below ends.
+        let previous = if matches!(&event, wl_keyboard::Event::Enter { .. }) {
+            agent.keyboard_surface.clone()
+        } else {
+            None
+        };
+        let previous_target =
+            previous.as_ref().and_then(|surface| state.windows.get(surface).cloned());
         if std::env::var_os("NOCHES_AGENT_INPUT_TRACE").is_some() {
             eprintln!("agent keyboard seat={id} event={:?} target={} busy={}", std::mem::discriminant(&event), target.is_some(), state.agent_primary_busy());
         }
         let agent = state.agent_seats.get_mut(&id).unwrap();
+        let mut stale_keyups: Option<(WaylandWindowStatePtr, AgentDispatch, Vec<KeyUpEvent>)> = None;
         let input = match event {
             wl_keyboard::Event::Keymap { format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1), fd, size, .. } => {
                 let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
@@ -308,6 +378,19 @@ impl Dispatch<wl_keyboard::WlKeyboard, AgentDevice> for WaylandClientStatePtr {
                 None
             }
             wl_keyboard::Event::Enter { surface, .. } => {
+                // A rebind must not inherit the previous surface's held keys:
+                // flush them to their own window while it is still alive,
+                // otherwise drop them.
+                let keyups: Vec<KeyUpEvent> = agent.held_keys.drain(..)
+                    .map(|(_, keystroke)| KeyUpEvent { keystroke }).collect();
+                if !keyups.is_empty()
+                    && let (Some(previous), Some(previous_target)) =
+                        (previous.clone(), previous_target.clone())
+                {
+                    let context = AgentDispatch { surface: previous, position: agent.position,
+                        modifiers: Modifiers::default(), capslock: Capslock { on: false } };
+                    stale_keyups = Some((previous_target, context, keyups));
+                }
                 agent.keyboard_surface = target.as_ref().map(|_| surface.id()); None
             }
             wl_keyboard::Event::Leave { .. } => {
@@ -345,6 +428,51 @@ impl Dispatch<wl_keyboard::WlKeyboard, AgentDevice> for WaylandClientStatePtr {
         let context = surface.map(|surface| AgentDispatch { surface, position: agent.position,
             modifiers: agent.modifiers, capslock: agent.capslock });
         drop(state);
+        if let Some((previous_target, context, keyups)) = stale_keyups {
+            for keystroke in keyups {
+                this.agent_deliver(previous_target.clone(), context.clone(),
+                    PlatformInput::KeyUp(keystroke));
+            }
+        }
         if let (Some(target), Some(context), Some(input)) = (target, context, input) { this.agent_deliver(target, context, input); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_tokens_map_state_to_its_reason() {
+        assert_eq!(agent_marker_tokens(true, true),
+            ("primary_client_busy", "physical_seat_present"));
+        assert_eq!(agent_marker_tokens(true, false),
+            ("primary_client_busy", "physical_seat_present"));
+        assert_eq!(agent_marker_tokens(false, false), ("ready", "no_qualified_target"));
+        assert_eq!(agent_marker_tokens(false, true), ("ready", "ready"));
+    }
+
+    #[test]
+    fn marker_payload_is_identity_header_plus_one_json_line() {
+        let path = std::env::temp_dir().join(format!(
+            "noches-agent-marker-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_file(&path);
+        let record = AgentRegistration { path: path.clone(), pid: 4242,
+            identity: "noches-gpui-agent-seat-v1\n4242\n77\n9\n11\n".into() };
+        record.publish("primary_client_busy", "physical_seat_present").unwrap();
+        let lines: Vec<String> =
+            std::fs::read_to_string(&path).unwrap().lines().map(String::from).collect();
+        assert_eq!(lines.first().map(String::as_str), Some("noches-gpui-agent-seat-v1"));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("{\"state\":\"primary_client_busy\",\"reason\":\"physical_seat_present\",\"pid\":4242}"),
+            "the payload must be a single-line JSON object after the identity header"
+        );
+        // A second publish replaces the record instead of appending to it.
+        record.publish("ready", "ready").unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.lines().count(), 6, "republish must not grow the record");
+        assert!(contents.lines().last().unwrap().contains("\"state\":\"ready\""));
+        let _ = std::fs::remove_file(&path);
     }
 }

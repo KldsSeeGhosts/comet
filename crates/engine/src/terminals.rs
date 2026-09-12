@@ -6,7 +6,9 @@
 //!   at [`TERMINAL_OUTPUT_BATCH_MS`]; data rides base64 (PTY bytes ≠ UTF-8).
 //! - Live shells survive subscriber detach — a detached session is the user's
 //!   running process, kept until its tab is explicitly closed or the engine exits.
-//!   Only EXITED sessions expire (30min TTL on their inert replay buffers), and
+//!   Only EXITED sessions expire (30min TTL on their inert replay buffers),
+//!   sessions never attached within [`UNATTACHED_TTL`] are reaped outright (a UI
+//!   that died between `open` and `subscribe` must not leak a live PTY), and
 //!   [`MAX_TERMINALS`] bounds leakage from renderers that lost their tab state.
 //! - Ownership: M5 is single-user local — every IPC/relay caller is the device
 //!   owner, so the per-user owner re-checks from zeron's Router land with real
@@ -31,6 +33,10 @@ const MAX_TERMINALS: usize = 32;
 const MAX_INPUT_BYTES: usize = 64 * 1024;
 const MAX_REPLAY_BYTES: usize = 1024 * 1024;
 const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
+/// A session nobody ever subscribed to is an orphaned `OpenTerminal` roundtrip
+/// (UI cancelled between engine-side creation and attach); it holds a live PTY,
+/// so the reaper kills it after 10 minutes instead of waiting for a restart.
+const UNATTACHED_TTL: Duration = Duration::from_secs(10 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 struct LiveTerminal {
@@ -41,7 +47,11 @@ struct LiveTerminal {
     replay: VecDeque<TerminalEvent>,
     replay_bytes: usize,
     seq: u64,
+    created_at: std::time::Instant,
     last_active_at: std::time::Instant,
+    /// Set by the first `subscribe` — the UI's attach. Orphan detection
+    /// ([`UNATTACHED_TTL`]) only ever applies while this is false.
+    attached: bool,
     exited: bool,
     managed: bool,
     identity: Option<ProcessIdentity>,
@@ -233,12 +243,22 @@ fn selected_shell() -> String {
 impl Terminals {
     /// Requires a tokio runtime (spawns the exited-session reaper).
     pub fn new() -> Self {
+        Self::with_reaper(UNATTACHED_TTL, REAPER_INTERVAL)
+    }
+
+    /// Reaper tuning for tests: a tiny unclaimed TTL and tick interval make
+    /// orphan reaping observable without waiting real minutes.
+    fn with_reaper(unattached_ttl: Duration, interval: Duration) -> Self {
         let terminals = Self {
             inner: Arc::new(TerminalsInner {
                 sessions: Mutex::new(HashMap::new()),
             }),
         };
-        tokio::spawn(reaper_task(Arc::downgrade(&terminals.inner)));
+        tokio::spawn(reaper_task(
+            Arc::downgrade(&terminals.inner),
+            unattached_ttl,
+            interval,
+        ));
         terminals
     }
 
@@ -355,7 +375,9 @@ impl Terminals {
             replay: VecDeque::new(),
             replay_bytes: 0,
             seq: 0,
+            created_at: std::time::Instant::now(),
             last_active_at: std::time::Instant::now(),
+            attached: false,
             exited: false,
             managed,
             identity,
@@ -404,6 +426,8 @@ impl Terminals {
 
     /// Replay (from `after_seq`, bounded 1MB window) then live tail. The stream
     /// ends after `Exit`; detaching (dropping the stream) leaves the PTY running.
+    /// The first subscribe is the session's attach: it lifts the unclaimed-TTL
+    /// reaping that applies to sessions nobody ever came back for.
     pub fn subscribe(
         &self,
         terminal_id: &str,
@@ -411,6 +435,7 @@ impl Terminals {
     ) -> Result<mpsc::UnboundedReceiver<TerminalEvent>, EngineError> {
         let session = self.session(terminal_id)?;
         let mut session = lock(&session);
+        session.attached = true;
         session.last_active_at = std::time::Instant::now();
         let (tx, rx) = mpsc::unbounded_channel();
         let after = after_seq.unwrap_or(0);
@@ -634,18 +659,35 @@ async fn pump_output(
 /// Live shells never expire on idleness — a detached session is the user's running
 /// process. Only EXITED sessions are swept after [`EXITED_TTL`]: they're inert
 /// replay buffers held so a returning viewer can show the tail + exit status.
-async fn reaper_task(inner: Weak<TerminalsInner>) {
-    let mut tick = tokio::time::interval(REAPER_INTERVAL);
+/// Sessions that were NEVER attached die after `unattached_ttl` regardless —
+/// their child is still running, so each victim goes through the same kill path
+/// as an explicit close rather than being merely dropped.
+async fn reaper_task(inner: Weak<TerminalsInner>, unattached_ttl: Duration, interval: Duration) {
+    let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await; // consume the immediate first tick
     loop {
         tick.tick().await;
         let Some(inner) = inner.upgrade() else { break };
-        let mut sessions = lock(&inner.sessions);
-        sessions.retain(|_, session| {
-            let session = lock(session);
-            session.managed || !(session.exited && session.last_active_at.elapsed() > EXITED_TTL)
-        });
+        let mut victims = Vec::new();
+        {
+            let mut sessions = lock(&inner.sessions);
+            sessions.retain(|_, session| {
+                let live = lock(session);
+                let expired_exited =
+                    !live.managed && live.exited && live.last_active_at.elapsed() > EXITED_TTL;
+                let expired_unclaimed =
+                    !live.attached && live.created_at.elapsed() > unattached_ttl;
+                if expired_exited || expired_unclaimed {
+                    victims.push(Arc::clone(session));
+                    return false;
+                }
+                true
+            });
+        }
+        for session in victims {
+            dispose(&session, true);
+        }
     }
 }
 
@@ -719,6 +761,47 @@ mod tests {
                 .open_argv(cwd, 80, 24, "/no/such/native-cli", &[], &[])
                 .is_err()
         );
+        assert!(!terminals.any_open());
+    }
+
+    /// A session the UI never attached (cancel between open and subscribe) is
+    /// a live PTY leak; the reaper kills it on the unclaimed TTL. An attached
+    /// session — even one whose subscriber has since detached — survives.
+    #[tokio::test]
+    async fn unclaimed_sessions_are_reaped_and_attached_ones_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminals =
+            Terminals::with_reaper(Duration::from_millis(120), Duration::from_millis(40));
+        let cwd = dir.path().to_str().unwrap();
+        let spawn = || {
+            terminals
+                .open_argv(
+                    cwd,
+                    80,
+                    24,
+                    "/bin/sh",
+                    &["-c".into(), "sleep 30".into()],
+                    &[],
+                )
+                .unwrap()
+        };
+        let unclaimed = spawn();
+        let claimed = spawn();
+        let stream = terminals.subscribe(&claimed.id, None).unwrap();
+        drop(stream); // detaching keeps the shell alive; attach is what matters
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !terminals.contains(&unclaimed.id),
+            "a never-attached session must be reaped"
+        );
+        assert!(
+            terminals.contains(&claimed.id),
+            "an attached session survives"
+        );
+
+        terminals.terminate_and_wait(&claimed.id).await.unwrap();
+        terminals.forget_terminated(&claimed.id).unwrap();
         assert!(!terminals.any_open());
     }
 }

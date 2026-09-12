@@ -94,14 +94,13 @@ Default CLI discovery uses only `~/.zeron-dev` under the dev feature and only `~
 
 All domain commands accept `--params '{...}'`. Explicit fields override keys in that object. Optional flags are omitted when absent so UI defaults remain authoritative. The CLI parses files and JSON but does not validate domain schemas.
 
-* `layout views|list` forwards the params object. `layout compose --from-file FILE --dry-run --refresh-guard` maps to `composition`, `dry_run`, and `refresh_guard`. `layout save|apply|delete|run [NAME] [--from-file FILE] [--dry-run]` uses `name`, `composition`, and `dry_run`.
-* `tab split|split-view [--to TARGET] [--direction left|right|up|down] [--ui chat|terminal|auto]` uses optional string fields `to`, `direction`, and `ui`. No direction or UI default is injected by the CLI.
+* `layout views|list` forwards the params object. `layout compose --from-file FILE --dry-run --refresh-guard` maps to `composition`, `dry_run`, and `refresh_guard`. `layout save|apply|delete|run [NAME] [--from-file FILE] [--dry-run]` uses `name`, `composition`, and `dry_run`. `layout apply` requires `--ui chat|terminal` (the server rejects `auto`); `layout save --force` forwards `overwrite: true` to replace an existing recipe.
+* `tab split|split-view [--to TARGET] [--direction left|right|up|down] [--ui chat|terminal]` uses optional string fields `to`, `direction`, and `ui`. No direction or UI default is injected by the CLI. `tab close --to TARGET`, `tab move --to TARGET --view VIEW`, and `tab reorder --to TARGET --view VIEW [--before TARGET]` forward `to`, `view`, and `before`.
 * `agent send --to TARGET [MESSAGE] [--from-file FILE] [--queue]` uses string `to`, optional string `message`, and `queue: true` when requested. MESSAGE and `--from-file` are mutually exclusive. Message files are UTF-8 text.
 * `agent wait --to TARGET [--idle] [--timeout SECONDS]` uses string `to`, `idle: true` when requested, and optional unsigned integer `timeout` in seconds. The UI owns waiting behavior and must respect the 30-second transport reply deadline.
 * `agent read|subscribe|stop|interrupt|should-stop --to TARGET` uses the exact string `to`. Only `subscribe` requests SSE.
 * `agents list`, `agents label --to TARGET LABEL`, and `agents group --to TARGET GROUP` use the named keys without resolving labels locally.
-* `team run [--from-file FILE]` uses `spec`. `team report|status|cancel ID` uses `id`. `team list` forwards params. `team watch` requests SSE. Every operation requires an explicit `scope` with `workspace` and `worktree`, supplied through `--params`; run may take scope from its spec.
-* `coordination-state get|watch KEY` uses `key`; watch requests SSE. `set KEY JSON [--if-version N]` uses `key`, parsed `value`, and optional numeric `if_version`. `delete KEY [--if-version N]` uses `key` and optional `if_version`. The UI implements compare-and-swap, including the meaning of version zero.
+* `team run [--from-file FILE]` uses `spec`. `team report|status|cancel ID` uses `id`. `team list` forwards params. `team watch` requests SSE. Every operation requires an explicit `scope` with `workspace` and `worktree`, supplied through `--params`; run may take scope from its spec.* `coordination-state get|watch KEY` uses `key`; watch requests SSE. `set KEY JSON [--if-version N]` uses `key`, parsed `value`, and optional numeric `if_version`. `delete KEY [--if-version N]` uses `key` and optional `if_version`. The UI implements compare-and-swap, including the meaning of version zero.
 * `worktree|workspace|section VERB [--params JSON] [--subscribe] [--confirm]` forwards generic extension methods. `--confirm` forwards `confirm: true`.
 
 Non-stream commands print the UI result as JSON. SSE prints newline-delimited JSON objects with `event`, `id`, and parsed `data`. Errors go to stderr with a nonzero exit code.
@@ -116,7 +115,9 @@ Existing session bindings survive inline compose plans. Named recipes replace
 the topology; active CLI ownership still prevents unsafe removal.
 
 `team report ID` also accepts `--label`, `--summary`, `--result-file`, and
-`--report-capability`. The result file is a reference, never read by the CLI.
+`--report-capability`, or `--capability-file PATH` to read (and trim) a
+capability written by the app at team launch; the two capability flags are
+mutually exclusive. The result file is a reference, never read by the CLI.
 Supply the exact scope in `--params`.
 
 ## Consent and destructive operations
@@ -130,12 +131,23 @@ permission.
 `chat.new` and `layout.run` return `sessions` entries containing a `sessionId` and
 random `sessionCapability`. `worktree.create` requires both fields plus the
 workspace's orchestration grant and a recorded human input submission in that
-same session. The UI captures a sealed proof at a real input callback; injected
-API prompts and synthetic CUA dispatch cannot mint it. It refuses inline
-`prompt` or `task` fields.
-Team launch privately adds a role-specific `reportCapability` to each role's
-prompt. `team.report` requires that capability and the exact team/scope/label.
-Caller-supplied session IDs do not authenticate reports.
+same session; that unlock expires 15 minutes after the submission. The UI
+captures a sealed proof at a real input callback; injected API prompts and
+synthetic CUA dispatch cannot mint it. It refuses inline `prompt` or `task`
+fields.
+
+`agent.send`, `agent.stop`, `agent.interrupt`, and `layout.stop` all require the
+target workspace's Allow grant; the workspace is derived from each target
+session exactly as it is for sends. Read and watch verbs stay ungated.
+
+Team launch never places a role's `reportCapability` in the prompt. The app
+writes it to `0600` file at `<orchestration store dir>/runs/<team id>/roles/<label>.capability`,
+the role prompt carries that absolute path, and the CLI reads it with
+`team report --capability-file`. `team run` also returns the capability per
+role in its `roles` array for programmatic callers. `team.report` requires the
+capability plus the exact team/scope/label. Caller-supplied session IDs do not
+authenticate reports. Capability files are removed when the team completes, is
+cancelled, or is marked interrupted at startup.
 
 `workspace.delete` and `worktree.delete` require `confirm: true` (the CLI's
 `--confirm`) to stage a request, then return `confirmationRequired: true`.

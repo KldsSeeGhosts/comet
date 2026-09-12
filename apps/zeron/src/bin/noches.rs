@@ -79,7 +79,7 @@ enum LayoutCommand {
     Stop(Params),
     Compose(Compose),
     Save(Artifact),
-    Apply(Artifact),
+    Apply(Apply),
     List(Params),
     Delete(Artifact),
     Run(LayoutRun),
@@ -105,8 +105,21 @@ struct Artifact {
     from_file: Option<PathBuf>,
     #[arg(long)]
     dry_run: bool,
+    /// Let layout save replace an existing recipe (server-side overwrite).
+    #[arg(long)]
+    force: bool,
     #[command(flatten)]
     extra: Params,
+}
+
+#[derive(Args, Debug)]
+struct Apply {
+    #[command(flatten)]
+    artifact: Artifact,
+    /// Renderer for the applied recipe's new cells. The server requires chat
+    /// or terminal; auto is not supported.
+    #[arg(long, value_enum)]
+    ui: Option<Ui>,
 }
 
 #[derive(Args, Debug)]
@@ -135,6 +148,30 @@ struct LayoutRun {
 enum TabCommand {
     Split(Split),
     SplitView(Split),
+    Close(Target),
+    Move(TabMove),
+    Reorder(TabReorder),
+}
+
+#[derive(Args, Debug)]
+struct TabMove {
+    #[command(flatten)]
+    target: Target,
+    /// Destination view address, for example view:2 or active-view.
+    #[arg(long)]
+    view: String,
+}
+
+#[derive(Args, Debug)]
+struct TabReorder {
+    #[command(flatten)]
+    target: Target,
+    /// Destination view address, for example view:2 or active-view.
+    #[arg(long)]
+    view: String,
+    /// Insert before this pane address's tab instead of appending.
+    #[arg(long)]
+    before: Option<String>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -149,7 +186,6 @@ enum Direction {
 enum Ui {
     Chat,
     Terminal,
-    Auto,
 }
 
 #[derive(Args, Debug)]
@@ -277,6 +313,9 @@ struct TeamReport {
     result_file: Option<String>,
     #[arg(long)]
     report_capability: Option<String>,
+    /// Read the capability from a 0600 file written by the app at team launch.
+    #[arg(long = "capability-file")]
+    capability_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -356,6 +395,39 @@ fn state_key(key: StateKey) -> Result<Map<String, Value>> {
     Ok(params)
 }
 
+fn split_params(split: Split) -> Result<Map<String, Value>> {
+    let mut p = split.extra.object()?;
+    insert_string(&mut p, "to", split.to);
+    if let Some(direction) = split.direction {
+        p.insert(
+            "direction".into(),
+            json!(direction.to_possible_value().expect("direction").get_name()),
+        );
+    }
+    if let Some(ui) = split.ui {
+        p.insert(
+            "ui".into(),
+            json!(ui.to_possible_value().expect("ui").get_name()),
+        );
+    }
+    Ok(p)
+}
+
+fn artifact_params(artifact: &Artifact) -> Result<Map<String, Value>> {
+    let mut p = artifact.extra.object()?;
+    insert_string(&mut p, "name", artifact.name.clone());
+    if let Some(path) = &artifact.from_file {
+        p.insert("composition".into(), file_json(path)?);
+    }
+    if artifact.dry_run {
+        p.insert("dry_run".into(), json!(true));
+    }
+    if artifact.force {
+        p.insert("overwrite".into(), json!(true));
+    }
+    Ok(p)
+}
+
 fn route(command: Command) -> Result<Call> {
     let mut subscribe = false;
     let (domain, verb, params) = match command {
@@ -427,44 +499,49 @@ fn route(command: Command) -> Result<Call> {
                     ("run", p)
                 }
                 command => {
-                    let (verb, a) = match command {
-                        LayoutCommand::Save(a) => ("save", a),
-                        LayoutCommand::Apply(a) => ("apply", a),
-                        LayoutCommand::Delete(a) => ("delete", a),
+                    let (verb, p) = match command {
+                        LayoutCommand::Save(a) => ("save", artifact_params(&a)?),
+                        LayoutCommand::Delete(a) => ("delete", artifact_params(&a)?),
+                        LayoutCommand::Apply(a) => {
+                            let mut p = artifact_params(&a.artifact)?;
+                            if let Some(ui) = a.ui {
+                                p.insert(
+                                    "ui".into(),
+                                    json!(ui.to_possible_value().expect("ui").get_name()),
+                                );
+                            }
+                            ensure!(
+                                p.get("ui").is_some_and(|ui| ui == "chat" || ui == "terminal"),
+                                "layout apply requires --ui chat or --ui terminal; auto is not supported"
+                            );
+                            ("apply", p)
+                        }
                         _ => unreachable!(),
                     };
-                    let mut p = a.extra.object()?;
-                    insert_string(&mut p, "name", a.name);
-                    if let Some(path) = a.from_file {
-                        p.insert("composition".into(), file_json(&path)?);
-                    }
-                    if a.dry_run {
-                        p.insert("dry_run".into(), json!(true));
-                    }
                     (verb, p)
                 }
             };
             ("layout", verb.to_owned(), params)
         }
         Command::Tab(command) => {
-            let (verb, split) = match command {
-                TabCommand::Split(s) => ("split", s),
-                TabCommand::SplitView(s) => ("split-view", s),
+            let (verb, p) = match command {
+                TabCommand::Split(s) => ("split", split_params(s)?),
+                TabCommand::SplitView(s) => ("split-view", split_params(s)?),
+                TabCommand::Close(t) => ("close", target(t)?),
+                TabCommand::Move(m) => {
+                    let mut p = m.target.extra.object()?;
+                    p.insert("to".into(), json!(m.target.to));
+                    p.insert("view".into(), json!(m.view));
+                    ("move", p)
+                }
+                TabCommand::Reorder(r) => {
+                    let mut p = r.target.extra.object()?;
+                    p.insert("to".into(), json!(r.target.to));
+                    p.insert("view".into(), json!(r.view));
+                    insert_string(&mut p, "before", r.before);
+                    ("reorder", p)
+                }
             };
-            let mut p = split.extra.object()?;
-            insert_string(&mut p, "to", split.to);
-            if let Some(direction) = split.direction {
-                p.insert(
-                    "direction".into(),
-                    json!(direction.to_possible_value().expect("direction").get_name()),
-                );
-            }
-            if let Some(ui) = split.ui {
-                p.insert(
-                    "ui".into(),
-                    json!(ui.to_possible_value().expect("ui").get_name()),
-                );
-            }
             ("tab", verb.to_owned(), p)
         }
         Command::Agent(command) => {
@@ -550,10 +627,28 @@ fn route(command: Command) -> Result<Call> {
                     ("watch", p.object()?)
                 }
                 TeamCommand::Report(r) => {
+                    ensure!(
+                        r.capability_file.is_none() || r.report_capability.is_none(),
+                        "--capability-file and --report-capability are mutually exclusive"
+                    );
+                    let capability = match r.capability_file {
+                        Some(path) => {
+                            let content = std::fs::read_to_string(&path)
+                                .with_context(|| format!("read {}", path.display()))?;
+                            let trimmed = content.trim();
+                            ensure!(
+                                !trimmed.is_empty(),
+                                "capability file {} is empty",
+                                path.display()
+                            );
+                            Some(trimmed.to_owned())
+                        }
+                        None => r.report_capability,
+                    };
                     let mut p = r.team.extra.object()?;
                     p.insert("id".into(), json!(r.team.id));
                     insert_string(&mut p, "label", r.label);
-                    insert_string(&mut p, "reportCapability", r.report_capability);
+                    insert_string(&mut p, "reportCapability", capability);
                     if r.summary.is_some() || r.result_file.is_some() {
                         let report = p
                             .entry("report")
@@ -875,5 +970,111 @@ mod tests {
         let call = route(cli.command).unwrap();
         assert_eq!(call.method, "worktree.list");
         assert_eq!(call.params, json!({}));
+    }
+
+    #[test]
+    fn ui_auto_is_gone_and_apply_requires_explicit_ui() {
+        assert!(
+            Cli::try_parse_from(["noches", "tab", "split", "--ui", "auto"]).is_err(),
+            "auto is not a server-supported value"
+        );
+        let cli = Cli::try_parse_from(["noches", "layout", "apply", "recipe"]).unwrap();
+        assert!(route(cli.command).is_err());
+        let cli = Cli::try_parse_from(["noches", "layout", "apply", "recipe", "--ui", "chat"])
+            .unwrap();
+        assert_eq!(
+            route(cli.command).unwrap().params,
+            json!({"name":"recipe", "ui":"chat"})
+        );
+        let cli =
+            Cli::try_parse_from(["noches", "layout", "save", "recipe", "--force"]).unwrap();
+        assert_eq!(
+            route(cli.command).unwrap().params,
+            json!({"name":"recipe", "overwrite":true})
+        );
+    }
+
+    #[test]
+    fn tab_close_move_and_reorder_route_with_view_addresses() {
+        let cli = Cli::try_parse_from(["noches", "tab", "close", "--to", "tab:2"]).unwrap();
+        let call = route(cli.command).unwrap();
+        assert_eq!(call.method, "tab.close");
+        assert_eq!(call.params, json!({"to":"tab:2"}));
+        let cli =
+            Cli::try_parse_from(["noches", "tab", "move", "--to", "tab:1", "--view", "view:2"])
+                .unwrap();
+        let call = route(cli.command).unwrap();
+        assert_eq!(call.method, "tab.move");
+        assert_eq!(call.params, json!({"to":"tab:1", "view":"view:2"}));
+        let cli = Cli::try_parse_from([
+            "noches",
+            "tab",
+            "reorder",
+            "--to",
+            "tab:1",
+            "--view",
+            "active-view",
+            "--before",
+            "pane:1",
+        ])
+        .unwrap();
+        let call = route(cli.command).unwrap();
+        assert_eq!(call.method, "tab.reorder");
+        assert_eq!(
+            call.params,
+            json!({"to":"tab:1", "view":"active-view", "before":"pane:1"})
+        );
+    }
+
+    #[test]
+    fn report_capability_file_is_read_trimmed_and_mutually_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviewer.capability");
+        std::fs::write(&path, "capability-secret\n").unwrap();
+        let cli = Cli::try_parse_from([
+            "noches",
+            "team",
+            "report",
+            "team",
+            "--label",
+            "reviewer",
+            "--capability-file",
+            path.to_str().unwrap(),
+            "--params",
+            r#"{"scope":{"workspace":"w","worktree":"/repo"}}"#,
+        ])
+        .unwrap();
+        let call = route(cli.command).unwrap();
+        assert_eq!(call.method, "team.report");
+        assert_eq!(
+            call.params["reportCapability"],
+            json!("capability-secret"),
+            "trailing newlines are trimmed"
+        );
+        let cli = Cli::try_parse_from([
+            "noches",
+            "team",
+            "report",
+            "team",
+            "--capability-file",
+            path.to_str().unwrap(),
+            "--report-capability",
+            "other",
+        ])
+        .unwrap();
+        assert!(
+            route(cli.command).is_err(),
+            "the two capability flags are mutually exclusive"
+        );
+        let cli = Cli::try_parse_from([
+            "noches",
+            "team",
+            "report",
+            "team",
+            "--capability-file",
+            dir.path().join("missing").to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(route(cli.command).is_err());
     }
 }

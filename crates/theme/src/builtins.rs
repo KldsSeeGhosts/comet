@@ -310,20 +310,24 @@ fn zeron_light() -> ThemeVariant {
 }
 
 /// Claude's desktop palette: warm-neutral "paper" surfaces and the Crail/coral
-/// brand accent. Surface tones are measured off the reference desktop app's
-/// dark UI; the accent stays the brand Crail from claude.ai's CSS tokens
+/// brand accent. Surface tones are pixel-sampled off the reference desktop
+/// app's dark Code-mode UI (chat pane, user bubble, raised buttons, sidebar);
+/// the accent stays the brand Crail from claude.ai's CSS tokens
 /// (`--accent-brand`), not a third-party approximation.
 ///
 /// Mapping (measured surface -> this app's role):
-///   content pane (#201f20)   -> background
-///   sidebar/chrome (#17181a) -> shell — the reference's sidebar sits a step
-///                               BELOW the content, so shell is darker
-///   selected rows / buttons  -> raised (#37393b)
-///   cards/floats             -> card (#2b2c2f, between background and raised)
-///   --text-100/-200/-400     -> text / muted / faint
+///   chat pane (#161617)      -> background
+///   sidebar / bottom sheet   -> shell (#121213) — the reference's chrome sits
+///                               a step BELOW the content
+///   raised buttons (#373838) -> raised (Create PR, diff pill)
+///   bubble / chip (#222223)  -> card — user bubble, inline-code chips, context pill
+///   input field (#212121)    -> input (opaque, like the reference)
+///   text-90 (#e6e5e3)        -> text (claude.ai renders prose at 90% ivory,
+///                               not the brighter text-100)
+///   gray-200 / gray-400      -> muted / faint (#c3c2b7 / #898781)
 ///   --accent-brand (#d97757) -> accent (light uses the deeper #c15f3c for AA)
 fn claude_dark() -> ThemeVariant {
-    variant(Seeds {
+    let mut variant = variant(Seeds {
         id: "claude-dark",
         family_id: "claude",
         name: "Claude Dark",
@@ -331,38 +335,54 @@ fn claude_dark() -> ThemeVariant {
         // The reference Electron shell composites opaque — no translucency —
         // so the variant recommends Opaque rather than frost.
         treatment: SurfaceTreatment::Opaque,
-        background: "#151515",
-        shell: "#111111",
-        raised: "#343434",
-        card: "#202020",
-        text: "#f0efec",
-        muted: "#8a8887",
-        faint: "#6f6f6f",
+        background: "#161617",
+        shell: "#121213",
+        raised: "#373838",
+        card: "#222223",
+        text: "#e6e5e3",
+        muted: "#c3c2b7",
+        faint: "#898781",
         accent: "#d97757",
-        danger: "#f28b82",
+        danger: "#e5484d",
         warning: "#e8c47c",
-        success: "#7ec699",
-        terminal_background: "#111111",
+        success: "#3ecf56",
+        terminal_background: "#121213",
         ansi: [
-            "#111111", "#f28b82", "#7ec699", "#e8c47c", "#7cace8", "#c49be8", "#7ce8d4", "#e8e4dc",
-            "#57534e", "#f5a396", "#a3d9b8", "#f0d5a0", "#a5c8f0", "#d4b8f0", "#a0ece0", "#faf9f5",
+            "#121213", "#e5484d", "#3ecf56", "#e8c47c", "#6db2f7", "#c49be8", "#7ce8d4", "#e6e5e3",
+            "#57534e", "#f5a396", "#96e263", "#f0d5a0", "#a5c8f0", "#d4b8f0", "#a0ece0", "#faf9f5",
         ],
+        // Measured off Code-mode code blocks: keyword/hyphen-flag blue
+        // (#6db2f7), string/path green (#96e263), warm-neutral comments.
         syntax: [
-            "#8a857a", "#f4845f", "#7ec699", "#f4a58a", "#e8c47c", "#7cace8", "#c49be8", "#e8e4dc",
-            "#b8b2a5", "#f4845f", "#7ce8d4", "#f28b82",
+            "#8a857a", "#6db2f7", "#96e263", "#e8c47c", "#e8c47c", "#e6e5e3", "#c3c2b7", "#e6e5e3",
+            "#c3c2b7", "#6db2f7", "#96e263", "#e5484d",
         ],
         source: source(
             "claude-dark",
             "native",
             "https://claude.ai",
-            "claude-desktop-v1",
+            "claude-desktop-v2",
             "Proprietary; palette adapted for interoperability",
         ),
-    })
+    });
+    // The reference input field is an opaque #212121 plate on the darker
+    // bottom sheet — not the translucent raised-wash the generic seed
+    // pipeline derives.
+    variant.colors.input = c("#212121");
+    // Code-mode inline code is salmon on the chip plate (#222223) — NOT the
+    // accent-orange tint other themes derive. Theme::from_variant reads these
+    // two keys; the chip geometry lives in crates/ui/src/markdown/render.rs.
+    variant
+        .syntax
+        .insert("codeText".into(), c("#e27a7b"));
+    variant
+        .syntax
+        .insert("codeWash".into(), c("#222223"));
+    variant
 }
 
 fn claude_light() -> ThemeVariant {
-    variant(Seeds {
+    let mut variant = variant(Seeds {
         id: "claude-light",
         family_id: "claude",
         name: "Claude Light",
@@ -386,17 +406,25 @@ fn claude_light() -> ThemeVariant {
             "#78756c", "#d3392e", "#2b9440", "#8f5700", "#2c84db", "#a155b9", "#14919b", "#141413",
         ],
         syntax: [
-            "#8a857a", "#c15f3c", "#1e7d32", "#b06000", "#7c5cc4", "#1a5fb4", "#8e44ad", "#141413",
+            "#8a857a", "#1a5fb4", "#1e7d32", "#b06000", "#7c5cc4", "#1a5fb4", "#8e44ad", "#141413",
             "#6f6c64", "#c15f3c", "#14919b", "#b3261e",
         ],
         source: source(
             "claude-light",
             "native",
             "https://claude.ai",
-            "claude-desktop-v1",
+            "claude-desktop-v2",
             "Proprietary; palette adapted for interoperability",
         ),
-    })
+    });
+    // Light-mode inline code: the deeper Crail on a 5% black chip plate.
+    variant
+        .syntax
+        .insert("codeText".into(), c("#c15f3c"));
+    variant
+        .syntax
+        .insert("codeWash".into(), c("#eeede7"));
+    variant
 }
 
 fn vscode_dark() -> ThemeVariant {

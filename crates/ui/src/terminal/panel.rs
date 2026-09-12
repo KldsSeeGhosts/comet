@@ -22,7 +22,8 @@ use futures::{FutureExt, channel::oneshot, future::Shared};
 use gpui::{
     App, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, IntoElement, KeyBinding,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
-    ScrollDelta, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
+    ScrollDelta, ShapedLine, SharedString, Subscription, Task, Window, actions, div, prelude::*,
+    px,
 };
 
 use zeron_proto::{TerminalEvent, TerminalSession};
@@ -33,7 +34,10 @@ use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
-use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
+use super::emulator::{
+    CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side, ROW_HASH_BASIS,
+    fold_hash, fold_hash_bytes,
+};
 use super::view::{
     COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
     cell_at, keydown_bytes, paste_bytes, terminal_panel_bg,
@@ -48,6 +52,12 @@ const SCROLLBAR_HIT_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
 const SCROLLBAR_HOVER_THUMB_WIDTH: f32 = 4.5;
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// Mouse reports per wheel event: applications receive each report as a real
+/// button event, and a fast flick can carry 100+ lines — repeating the report
+/// per line floods them. Three per event (alacritty's notch feel) keeps
+/// acceleration for normal use without the flood; the excess is dropped.
+const MAX_WHEEL_MOUSE_REPORTS: usize = 3;
 
 fn wheel_mouse_bytes(button: u8, col: usize, row: usize, sgr: bool, utf8: bool) -> Option<Vec<u8>> {
     if sgr {
@@ -181,6 +191,18 @@ pub fn shell_title(shell: &str) -> String {
     }
 }
 
+/// The `Terminal N` fallback label's number, if `title` is one.
+fn terminal_number(title: &str) -> Option<u64> {
+    title.strip_prefix("Terminal ")?.parse().ok()
+}
+
+/// Next unique tab number: one past the highest in use. Deriving from the
+/// count instead would duplicate names once a middle tab is closed (open 3,
+/// close "Terminal 1", the next tab would be "Terminal 3" again).
+pub fn next_terminal_number(used: impl Iterator<Item = u64>) -> u64 {
+    used.max().unwrap_or(0) + 1
+}
+
 fn decode_base64(data: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(data)
@@ -199,9 +221,49 @@ fn encode_base64(bytes: &[u8]) -> String {
 // Entity
 // ---------------------------------------------------------------------------
 
+/// Upper bound on the shaped-row cache. A full-screen redraw (htop et al.)
+/// mints a new fingerprint per row per frame; past this the cache resets
+/// rather than growing without bound — those rows are changing anyway.
+const SHAPE_CACHE_MAX_ROWS: usize = 512;
+
+/// Per-row shaped-segment cache: the expensive half of a repaint. Keyed by the
+/// row's content fingerprint (from the emulator's snapshot) and guarded by a
+/// theme fingerprint; a row whose content did not change reuses its
+/// [`ShapedLine`]s instead of re-shaping every frame.
+#[derive(Default)]
+struct ShapeCache {
+    theme_fp: u64,
+    rows: HashMap<u64, Vec<(usize, ShapedLine)>>,
+    /// Rows actually re-shaped — the cache-miss counter the tests read.
+    builds: u64,
+}
+
+/// Fingerprint of the theme inputs a row's SHAPING depends on beyond cell
+/// content: the mono family, the foreground, ANSI16, and the grayscale
+/// appearance mirror. (Background runs, selection and the cursor are quads
+/// placed by column — they repaint per frame and never enter the cache.)
+pub(super) fn theme_paint_fingerprint(theme: &Theme) -> u64 {
+    let mut hash = fold_hash_bytes(ROW_HASH_BASIS, theme.font_mono.as_bytes());
+    hash = fold_hash(hash, u64::from(theme.appearance as u8));
+    hash = fold_color(hash, theme.terminal.foreground);
+    for color in &theme.terminal.ansi {
+        hash = fold_color(hash, *color);
+    }
+    hash
+}
+
+fn fold_color(hash: u64, color: gpui::Hsla) -> u64 {
+    fold_hash(
+        fold_hash(hash, u64::from(color.h.to_bits()) | (u64::from(color.s.to_bits()) << 32)),
+        u64::from(color.l.to_bits()) | (u64::from(color.a.to_bits()) << 32),
+    )
+}
+
 /// A grid snapshot handed to the paint element.
 pub struct GridSnapshot {
     pub lines: Vec<Vec<CellSnapshot>>,
+    /// Content fingerprints parallel to `lines` — the shape cache keys.
+    pub fingerprints: Vec<u64>,
     pub cursor: Option<CursorSnapshot>,
 }
 
@@ -350,6 +412,15 @@ impl TerminalTab {
         self.coalescer.take();
         self.flush_task = None;
         self.resize_task = None;
+    }
+
+    /// Open failed: drain queued keystrokes — bytes typed while the boot was
+    /// failing must never reach a later tab — and mark the tab exited.
+    fn fail_open(&mut self, error: &str) {
+        self.stop_input();
+        self.emulator
+            .feed(format!("\x1b[31mfailed to open terminal: {error}\x1b[0m\r\n").as_bytes());
+        self.exited = Some(-1);
     }
 }
 
@@ -503,6 +574,8 @@ pub struct TerminalPanel {
     last_selected: Option<String>,
     /// Last reported grid placement; `None` until the first prepaint.
     geometry: Option<GridGeometry>,
+    /// Per-row shaped-segment cache, fed by the snapshot fingerprints.
+    shape_cache: ShapeCache,
     composition: TerminalComposition,
     /// Shaped preedit and its window-space origin, shared with IME hit testing.
     pub(super) composition_layout: Option<(gpui::Point<Pixels>, gpui::ShapedLine)>,
@@ -692,6 +765,7 @@ impl TerminalPanel {
             drag: None,
             last_selected: None,
             geometry: None,
+            shape_cache: ShapeCache::default(),
             composition: TerminalComposition::default(),
             composition_layout: None,
             selection_drag: None,
@@ -1068,7 +1142,9 @@ impl TerminalPanel {
         self.tab_seq += 1;
         let key = self.tab_seq;
         let entry = self.chats.entry(chat.clone()).or_default();
-        let tab_no = entry.tabs.len() + 1;
+        let tab_no = next_terminal_number(
+            entry.tabs.iter().filter_map(|tab| terminal_number(&tab.title)),
+        );
         entry.tabs.push(TerminalTab {
             key,
             title: format!("Terminal {tab_no}").into(),
@@ -1129,11 +1205,7 @@ impl TerminalPanel {
                     tracing::warn!(error = %err, "OpenTerminal failed");
                     let _ = this.update(cx, |panel, cx| {
                         if let Some(tab) = panel.tab_mut(&chat, key) {
-                            tab.emulator.feed(
-                                format!("\x1b[31mfailed to open terminal: {err}\x1b[0m\r\n")
-                                    .as_bytes(),
-                            );
-                            tab.exited = Some(-1);
+                            tab.fail_open(&err.to_string());
                             cx.notify();
                         }
                         if session_view && panel.session_status == SessionViewStatus::Opening {
@@ -1582,7 +1654,9 @@ impl TerminalPanel {
         // current frame, which already paints the resized grid.
     }
 
-    /// Snapshot for the paint element.
+    /// Snapshot for the paint element. Rows come through the emulator's
+    /// per-row cache with their content fingerprints; the fingerprints key the
+    /// shaped-segment cache consumed by the paint element.
     pub fn active_grid_snapshot(&mut self, cx: &App) -> Option<GridSnapshot> {
         let chat = self.selected_chat(cx)?;
         let tabs = self.chats.get_mut(&chat)?;
@@ -1591,10 +1665,44 @@ impl TerminalPanel {
         if let Some(cursor) = cursor {
             tab.input_cursor = cursor;
         }
+        let (fingerprints, lines) = tab.emulator.lines().into_iter().unzip();
         Some(GridSnapshot {
-            lines: tab.emulator.lines(),
+            lines,
+            fingerprints,
             cursor,
         })
+    }
+
+    /// Shaped segments for one grid row, via [`ShapeCache`]. `theme_fp` and
+    /// `row_fp` come from the current frame; a row whose content and theme
+    /// fingerprints both match reuses the previous shape.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn shaped_row(
+        &mut self,
+        theme_fp: u64,
+        row_fp: u64,
+        row: &[CellSnapshot],
+        theme: &Theme,
+        mono: &gpui::Font,
+        font_size: Pixels,
+        window: &Window,
+    ) -> Vec<(usize, ShapedLine)> {
+        if self.shape_cache.theme_fp != theme_fp {
+            self.shape_cache = ShapeCache {
+                theme_fp,
+                ..ShapeCache::default()
+            };
+        }
+        if let Some(segments) = self.shape_cache.rows.get(&row_fp) {
+            return segments.clone();
+        }
+        let segments = super::view::shape_row(row, theme, mono, font_size, window);
+        self.shape_cache.builds += 1;
+        if self.shape_cache.rows.len() >= SHAPE_CACHE_MAX_ROWS {
+            self.shape_cache.rows.clear();
+        }
+        self.shape_cache.rows.insert(row_fp, segments.clone());
+        segments
     }
 
     // ---- selection ----
@@ -1818,7 +1926,9 @@ impl TerminalPanel {
                     | if event.modifiers.alt { 8 } else { 0 }
                     | if event.modifiers.control { 16 } else { 0 };
                 if let Some(bytes) = wheel_mouse_bytes(button, hit.col, hit.row, sgr, utf8) {
-                    self.queue_input(&bytes.repeat(step.unsigned_abs() as usize), cx);
+                    let repeats =
+                        (step.unsigned_abs() as usize).min(MAX_WHEEL_MOUSE_REPORTS);
+                    self.queue_input(&bytes.repeat(repeats), cx);
                 }
             }
         } else if alternate_scroll {
@@ -2490,6 +2600,64 @@ mod tests {
         }).unwrap();
     }
 
+    /// Mouse-mode wheel reports are capped per event: a 40-line flick fires
+    /// three reports, not forty.
+    #[gpui::test]
+    fn wheel_reports_cap_at_three_per_event(cx: &mut gpui::TestAppContext) {
+        let handle = ime_window(cx);
+        handle.update(cx, |panel, _, _| {
+            panel.tab_mut("ime", 0).unwrap().emulator.feed(
+                b"\x1b[?1049h\x1b[?1000h\x1b[?1006h",
+            );
+        }).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
+        let position = handle.update(cx, |panel, _, _| {
+            let geometry = panel.geometry.unwrap();
+            geometry.origin + gpui::point(px(geometry.cell_w * 2.5), px(geometry.line_h * 3.5))
+        }).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.dispatch_event(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Lines(gpui::point(0.0, 40.0)),
+                ..Default::default()
+            }), cx);
+        }).unwrap();
+        handle.update(cx, |panel, _, _| {
+            let bytes = panel.tab_mut("ime", 0).unwrap().coalescer.take();
+            assert_eq!(bytes, b"\x1b[<64;3;4M".repeat(3));
+        }).unwrap();
+    }
+
+    /// The layout cache: an unchanged grid shapes every row exactly once, and
+    /// a one-row edit re-shapes only that row.
+    #[gpui::test]
+    fn unchanged_grids_reuse_shaped_rows(cx: &mut gpui::TestAppContext) {
+        let handle = ime_window(cx);
+        handle.update(cx, |panel, _, _| {
+            panel.tab_mut("ime", 0).unwrap().emulator.feed(b"stable output");
+        }).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
+        let builds_after_first = handle.update(cx, |panel, _, _| panel.shape_cache.builds).unwrap();
+        assert!(builds_after_first > 0);
+        cx.update_window(handle.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
+        handle.update(cx, |panel, _, _| {
+            assert_eq!(
+                panel.shape_cache.builds, builds_after_first,
+                "unchanged grid must not re-shape"
+            );
+        }).unwrap();
+        handle.update(cx, |panel, _, _| {
+            panel.tab_mut("ime", 0).unwrap().emulator.feed(b"!");
+        }).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
+        handle.update(cx, |panel, _, _| {
+            assert!(
+                panel.shape_cache.builds <= builds_after_first + 2,
+                "a one-row edit re-shapes at most that row plus the cursor row"
+            );
+        }).unwrap();
+    }
+
     #[test]
     fn wheel_mouse_protocol_coordinates() {
         assert_eq!(wheel_mouse_bytes(64, 0, 0, false, false).unwrap(), b"\x1b[M`!!");
@@ -2719,6 +2887,31 @@ mod tests {
         }
         assert!(SessionViewStatus::Opening.accepts_input());
         assert!(SessionViewStatus::Ready.accepts_input());
+    }
+
+    #[test]
+    fn failed_open_drains_pending_input() {
+        let mut tab = pending_tab();
+        tab.coalescer.push(b"typed while booting");
+        tab.fail_open("engine unreachable");
+        assert!(tab.coalescer.is_empty(), "failed boot drops queued bytes");
+        tab.terminal_id = Some("late-pty".into());
+        assert_eq!(tab.take_input(), None, "exited tabs never flush");
+        assert_eq!(tab.exited, Some(-1));
+    }
+
+    #[test]
+    fn tab_numbers_survive_middle_closes() {
+        assert_eq!(next_terminal_number(std::iter::empty()), 1);
+        assert_eq!(next_terminal_number([1u64, 3, 7].into_iter()), 8);
+        let titles = ["Terminal 1", "Terminal 3"];
+        assert_eq!(
+            next_terminal_number(titles.into_iter().filter_map(terminal_number)),
+            4,
+            "closing a middle tab must not hand its number out again"
+        );
+        assert_eq!(terminal_number("Terminal 12"), Some(12));
+        assert_eq!(terminal_number("zsh"), None);
     }
 
     #[gpui::test]

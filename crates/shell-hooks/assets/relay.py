@@ -18,7 +18,11 @@ ERRORS = ROOT / "errors"
 MAX_BYTES = 65536
 MAX_PENDING = 256
 MAX_ERRORS = 32
+# A transient delivery failure retries on later drains; after MAX_ATTEMPTS
+# failures the event is quarantined. The count lives in the on-disk name.
+MAX_ATTEMPTS = 5
 NAME = re.compile(r"[a-f0-9]{32}\.json\Z")
+RETRY = re.compile(r"[a-f0-9]{32}\.retry[1-%d]\Z" % (MAX_ATTEMPTS - 1))
 EVENT = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}\Z")
 
 
@@ -45,7 +49,9 @@ def context():
 
 
 def checked_name(name):
-    if not NAME.fullmatch(name):
+    # A `.retry<N>` suffix keeps a failed event out of fresh admission without
+    # hiding it from later drains, and cannot collide with a new UUID name.
+    if not (NAME.fullmatch(name) or RETRY.fullmatch(name)):
         raise ValueError("invalid queue name")
     return QUEUE / name
 
@@ -148,19 +154,21 @@ def enqueue(args):
 
 def batch():
     count = 0
-    # A failed event leaves the active queue, so it cannot starve later valid events.
+    # A failed event stays queued under its `.retry<N>` name until a later
+    # drain redelivers it. Poison names are quarantined without consuming the
+    # per-drain delivery budget.
     for path in sorted(QUEUE.iterdir(), key=lambda p: (p.lstat().st_mtime_ns, p.name)):
         if path.suffix == ".tmp":
             continue
         if stat.S_ISDIR(path.lstat().st_mode):
             # Do not let an unexpected directory consume every future drain budget.
             continue
+        if not (NAME.fullmatch(path.name) or RETRY.fullmatch(path.name)):
+            quarantine(path, "invalid queue filename")
+            continue
         if count == 10:
             break
         count += 1
-        if not NAME.fullmatch(path.name):
-            quarantine(path, "invalid queue filename")
-            continue
         print(path.name)
 
 
@@ -206,11 +214,24 @@ def main():
     elif command == "ack":
         checked_name(args[0]).unlink(missing_ok=True)
     elif command == "fail":
-        quarantine(checked_name(args[0]), "invalid event or delivery failed")
+        fail(args[0])
     elif command == "deliver":
         send(envelope(args[0]))
     else:
         raise ValueError("unknown relay operation")
+
+
+def fail(name):
+    path = checked_name(name)
+    match = RETRY.fullmatch(name)
+    # A fresh name just failed its first delivery; `.retry<N>` its (N+1)-th.
+    attempts = int(name.rsplit(".", 1)[1][len("retry"):]) + 1 if match else 1
+    if attempts >= MAX_ATTEMPTS:
+        quarantine(path, "delivery failed after %d attempts" % MAX_ATTEMPTS)
+        return
+    # The renamed event is invisible to admission and picked up by a later
+    # drain, so one transient failure never becomes a permanent quarantine.
+    path.rename(QUEUE / f"{name[:32]}.retry{attempts}")
 
 
 if __name__ == "__main__":

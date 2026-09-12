@@ -522,6 +522,10 @@ impl WaylandClientStatePtr {
 
     pub fn drop_window(&self, surface_id: &ObjectId) {
         let client = self.get_client();
+        // A window going away must not leave agent seats holding its surface:
+        // cancel as a Leave while the window can still receive the matching
+        // MouseUp/KeyUp/exit effects.
+        self.agent_cancel_surface(surface_id);
         let mut state = client.borrow_mut();
         state.agent_windows.remove(surface_id);
         let closed_window = state.windows.remove(surface_id).unwrap();

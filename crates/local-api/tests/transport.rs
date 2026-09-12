@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 use zeron_local_api::{
     Client, ControlPlane, Manifest, PROTOCOL_VERSION, Request, SocketIdentity, discover_instances,
+    is_instance_locked,
 };
 
 fn temp() -> TempDir {
@@ -346,9 +347,9 @@ async fn active_registration_and_replacement_cleanup_are_safe() {
     let error = ControlPlane::start(dir.path().into(), "test".into(), sender)
         .await
         .err()
-        .unwrap()
-        .to_string();
-    assert!(error.contains("locked"), "{error}");
+        .unwrap();
+    assert!(is_instance_locked(&error), "{error}");
+    assert!(error.to_string().contains("locked"), "{error}");
     let mut replacement = api.manifest().clone();
     fs::remove_file(api.socket_path()).unwrap();
     let _listener = std::os::unix::net::UnixListener::bind(api.socket_path()).unwrap();

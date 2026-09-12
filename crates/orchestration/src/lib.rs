@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -129,6 +129,9 @@ pub struct Subscription {
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<Mutex<Inner>>,
+    /// Directory containing the database file. Out-of-band role capability
+    /// files live under `<dir>/runs/<run id>/roles/`.
+    dir: PathBuf,
 }
 
 struct Inner {
@@ -166,6 +169,11 @@ fn validate_roles(roles: &[RoleSpec]) -> Result<()> {
     let mut labels = HashSet::new();
     for role in roles {
         field("label", &role.label, 128, false)?;
+        // Labels become capability file names under runs/<id>/roles/.
+        ensure!(
+            !role.label.contains(['/', '\\']) && role.label != "." && role.label != "..",
+            "role label must be a safe file name"
+        );
         field("provider", &role.provider, 128, false)?;
         field("prompt", &role.prompt, MAX_PROMPT_BYTES, false)?;
         ensure!(labels.insert(&role.label), "duplicate role label");
@@ -231,6 +239,7 @@ impl Store {
     /// Opens or creates a dedicated database. Opening does not recover runs.
     /// Unknown schema versions or foreign database schemas are rejected.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         let mut db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.execute_batch(
@@ -257,11 +266,13 @@ impl Store {
             );
         }
         tx.commit()?;
+        let dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 db,
                 subscribers: HashMap::new(),
             })),
+            dir,
         })
     }
 
@@ -269,6 +280,12 @@ impl Store {
         self.inner
             .lock()
             .map_err(|_| anyhow::anyhow!("orchestration store lock poisoned"))
+    }
+
+    /// Directory holding the database file; empty for unnamed paths such as
+    /// `:memory:`. Callers derive per-run capability file locations from it.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     pub fn team_create(&self, spec: TeamSpec) -> Result<Team> {
@@ -458,7 +475,19 @@ impl Store {
             })?;
             for row in rows {
                 let (scope, id, data) = row?;
-                let mut team = decode_team(&scope, &id, &data)?;
+                // One undecodable row must not abort recovery for every other
+                // team; a skipped row keeps its stored bytes untouched.
+                let mut team = match decode_team(&scope, &id, &data) {
+                    Ok(team) => team,
+                    Err(error) => {
+                        tracing::warn!(
+                            row_id = %id,
+                            error = %error,
+                            "skipping undecodable orchestration team row during recovery"
+                        );
+                        continue;
+                    }
+                };
                 if team.status == TeamStatus::Running {
                     team.status = TeamStatus::Interrupted;
                     changed.push(team);
