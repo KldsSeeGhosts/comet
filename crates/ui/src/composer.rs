@@ -138,7 +138,7 @@ pub const CARET_BLINK_MS: u64 = 500;
 /// through the first half-period (typing bursts never blink — each keystroke
 /// resets the phase), then alternating.
 pub fn caret_visible(ms_since_activity: u64) -> bool {
-    (ms_since_activity / CARET_BLINK_MS) % 2 == 0
+    (ms_since_activity / CARET_BLINK_MS).is_multiple_of(2)
 }
 
 /// Auto-grow: content height for a wrapped-line count.
@@ -1513,6 +1513,7 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
 /// Events the composer wrapper listens for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerInputEvent {
+    SubmissionOrigin(Option<crate::input_origin::HumanInput>),
     Submitted,
     ModifiedSubmitted,
     Edited,
@@ -1553,6 +1554,7 @@ pub struct ComposerInput {
     content: String,
     pub(crate) read_only: bool,
     placeholder: SharedString,
+    inactive_placeholder: Option<SharedString>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -1651,6 +1653,7 @@ impl ComposerInput {
             content: String::new(),
             read_only: false,
             placeholder: placeholder.into(),
+            inactive_placeholder: None,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -1916,6 +1919,18 @@ impl ComposerInput {
 
     pub fn measured_content_height(&self) -> f32 {
         self.content_height
+    }
+
+    pub(crate) fn set_pane_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        let hint = (!active).then(|| SharedString::from("Click to focus chat"));
+        if self.inactive_placeholder != hint {
+            self.inactive_placeholder = hint;
+            cx.notify();
+        }
+    }
+
+    fn display_placeholder(&self) -> SharedString {
+        self.inactive_placeholder.as_ref().unwrap_or(&self.placeholder).clone()
     }
 
     pub fn set_placeholder(
@@ -2543,7 +2558,10 @@ impl ComposerInput {
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
         match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
             EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
-            EnterOutcome::Submit => cx.emit(ComposerInputEvent::Submitted),
+            EnterOutcome::Submit => {
+                cx.emit(ComposerInputEvent::SubmissionOrigin(crate::input_origin::capture()));
+                cx.emit(ComposerInputEvent::Submitted);
+            },
             EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
         }
     }
@@ -2551,7 +2569,10 @@ impl ComposerInput {
     fn modified_submit(&mut self, _: &ModifiedSubmit, _: &mut Window, cx: &mut Context<Self>) {
         match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
             EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
-            EnterOutcome::Submit => cx.emit(ComposerInputEvent::ModifiedSubmitted),
+            EnterOutcome::Submit => {
+                cx.emit(ComposerInputEvent::SubmissionOrigin(crate::input_origin::capture()));
+                cx.emit(ComposerInputEvent::ModifiedSubmitted);
+            },
             EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
         }
     }
@@ -2903,7 +2924,7 @@ impl ComposerInput {
             chip_family: theme.font_mono.clone(),
             chip_color: theme.code_text,
             marked_range: self.marked_range.clone(),
-            placeholder: self.placeholder.clone(),
+            placeholder: self.display_placeholder(),
             mentions_enabled: self.mentions_enabled,
         };
         // Height-only animation, scrolling, selection and caret blinking do
@@ -2923,7 +2944,7 @@ impl ComposerInput {
         // frame (or longer when no subsequent layout is requested).
         self.refresh_projection();
         let (display, is_placeholder) = if self.content.is_empty() {
-            (self.placeholder.clone(), true)
+            (self.display_placeholder(), true)
         } else {
             (SharedString::from(self.projection.display.clone()), false)
         };
@@ -3073,17 +3094,17 @@ impl ComposerInput {
             return self.scroll_left != previous;
         }
         let previous = self.scroll_top;
-        if self.follow_cursor {
-            if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
-                self.scroll_top = input_scroll_offset_for_cursor(
-                    self.scroll_top,
-                    f32::from(cursor.y),
-                    f32::from(self.line_height),
-                    self.content_height,
-                    element_height,
-                    self.settled_viewport_height,
-                );
-            }
+        if self.follow_cursor
+            && let Some(cursor) = self.point_for_index(self.cursor_offset())
+        {
+            self.scroll_top = input_scroll_offset_for_cursor(
+                self.scroll_top,
+                f32::from(cursor.y),
+                f32::from(self.line_height),
+                self.content_height,
+                element_height,
+                self.settled_viewport_height,
+            );
         }
         self.scroll_top = self.scroll_top.clamp(
             0.0,
@@ -3657,7 +3678,7 @@ impl Render for ComposerInput {
             .id(("composer-input", cx.entity_id()))
             .role(self.accessibility_role)
             .aria_label(self.placeholder.clone())
-            .aria_placeholder(self.placeholder.clone())
+            .aria_placeholder(self.display_placeholder())
             .key_context(self.key_context)
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
@@ -3751,6 +3772,7 @@ impl Render for ComposerInput {
 /// Events the shell listens for.
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
+    HumanSubmitted { chat_id: String, proof: crate::input_origin::HumanInput },
     /// A prompt was sent optimistically — give the transcript its exact row
     /// identity so it can anchor the prompt at the top with the reply's
     /// reserved space below it.
@@ -3778,9 +3800,7 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
         .rev()
         .find_map(|(at, ch)| ch.is_whitespace().then_some(at + ch.len_utf8()))
         .unwrap_or(0);
-    let Some(relative_at) = text[token_start..cursor].rfind('@') else {
-        return None;
-    };
+    let relative_at = text[token_start..cursor].rfind('@')?;
     let at = token_start + relative_at;
     let valid_boundary = at == 0
         || text[..at]
@@ -3936,6 +3956,7 @@ pub struct Composer {
     popup_bar: crate::popover::MenuScrollbarState,
     pub(crate) current_key: String,
     sending: bool,
+    submission_origin: Option<crate::input_origin::HumanInput>,
     pub(crate) failure: Option<SharedString>,
     /// The chat key `failure` belongs to (`None` = global, e.g. "Engine not
     /// connected"). Chat-scoped failures survive navigation and render only
@@ -4067,6 +4088,7 @@ impl Composer {
         let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
+            ComposerInputEvent::SubmissionOrigin(proof) => this.submission_origin = *proof,
             ComposerInputEvent::Submitted => this.on_submit(cx),
             ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
             ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
@@ -4128,6 +4150,7 @@ impl Composer {
             popup_bar: crate::popover::MenuScrollbarState::default(),
             current_key,
             sending: false,
+            submission_origin: None,
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
@@ -5475,6 +5498,7 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        let submission_origin = crate::input_origin::capture().or(self.submission_origin.take());
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             self.failure_key = None; // global — meaningful on every chat
@@ -6056,6 +6080,9 @@ impl Composer {
                 composer
                     .state
                     .update(cx, |s, _| s.end_upload_progress());
+                if result.is_ok() && let Some(proof) = submission_origin {
+                    cx.emit(ComposerEvent::HumanSubmitted { chat_id: err_chat_id.clone(), proof });
+                }
                 if let Ok(Some(message_id)) = &result {
                     cx.emit(ComposerEvent::Queued {
                         chat_id: err_chat_id.clone(),
@@ -6160,6 +6187,7 @@ impl Composer {
     // ---- wizard glue ----
 
     fn wizard_select(&mut self, option_ix: usize, cx: &mut Context<Self>) {
+        self.submission_origin = crate::input_origin::capture().or(self.submission_origin);
         let Some(wizard) = self.wizard.as_mut() else {
             return;
         };
@@ -6194,6 +6222,7 @@ impl Composer {
     }
 
     fn wizard_advance(&mut self, cx: &mut Context<Self>) {
+        self.submission_origin = crate::input_origin::capture().or(self.submission_origin);
         let Some(wizard) = self.wizard.as_mut() else {
             return;
         };
@@ -6216,6 +6245,7 @@ impl Composer {
 
     /// Submit RespondInput and retire the panel.
     fn wizard_finish(&mut self, answers: Vec<UserInputAnswer>, cx: &mut Context<Self>) {
+        let submission_origin = crate::input_origin::capture().or(self.submission_origin.take());
         let Some(wizard) = self.wizard.take() else {
             return;
         };
@@ -6256,6 +6286,9 @@ impl Composer {
                 })
                 .ok();
                 return;
+            }
+            if let Some(proof) = submission_origin {
+                let _ = this.update(cx, |_, cx| cx.emit(ComposerEvent::HumanSubmitted { chat_id: chat_id.clone(), proof }));
             }
             // Safety net against a dead-looking session: the command queued,
             // but the host may still REJECT it (e.g. the run's resolver is
@@ -8215,9 +8248,9 @@ mod tests {
 
     #[test]
     fn cluster_inset_glides_between_the_source_endpoints() {
+        const { assert!(ACTION_UTILITY_GAP < ACTION_PRIMARY_GAP) };
         assert_eq!(ACTION_UTILITY_GAP, 2.0);
         assert_eq!(ACTION_PRIMARY_GAP, Theme::SPACE_SM);
-        assert!(ACTION_UTILITY_GAP < ACTION_PRIMARY_GAP);
         // The morph starts from the OLD mode's resting inset (no sideways
         // step at the commit) and eases to the committed mode's…
         assert_eq!(morph_cluster_inset(true, 0.0), 8.0); // expand: from compact pr-2

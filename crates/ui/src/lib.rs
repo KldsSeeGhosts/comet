@@ -28,6 +28,7 @@ pub mod files;
 pub mod frost;
 pub mod history;
 pub mod icons;
+pub mod input_origin;
 pub mod links;
 pub mod loaders;
 pub mod markdown;
@@ -38,6 +39,7 @@ pub mod popover;
 pub mod queue;
 pub mod rail;
 pub mod settings;
+pub mod session_pane;
 pub mod shell;
 pub mod sound;
 pub mod state;
@@ -49,6 +51,7 @@ pub mod theme_library;
 pub mod transcript;
 pub mod typography;
 mod workspace_links;
+pub mod workspace;
 
 use std::path::PathBuf;
 

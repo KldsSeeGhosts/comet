@@ -14,13 +14,15 @@
 //! `ResizeTerminal` (the emulator resizes immediately).
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::time::Duration;
 
 use base64::Engine as _;
+use futures::{FutureExt, channel::oneshot, future::Shared};
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta, SharedString,
-    Subscription, Task, Window, actions, div, prelude::*, px,
+    App, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, IntoElement, KeyBinding,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render,
+    ScrollDelta, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
 use zeron_proto::{TerminalEvent, TerminalSession};
@@ -34,7 +36,7 @@ use crate::theme::Theme;
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
 use super::view::{
     COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
-    cell_at, keystroke_bytes, paste_bytes, terminal_panel_bg,
+    cell_at, keydown_bytes, paste_bytes, terminal_panel_bg,
 };
 
 /// Fixed tab width — drag-reorder math stays analytic.
@@ -46,6 +48,28 @@ const SCROLLBAR_HIT_WIDTH: f32 = 10.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
 const SCROLLBAR_HOVER_THUMB_WIDTH: f32 = 4.5;
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+fn wheel_mouse_bytes(button: u8, col: usize, row: usize, sgr: bool, utf8: bool) -> Option<Vec<u8>> {
+    if sgr {
+        return Some(format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes());
+    }
+    // Legacy mouse coordinates cannot represent cells past 223. Dropping the
+    // event matches xterm; clamping would send it to an unrelated widget.
+    let max = if utf8 { 2015 } else { 223 };
+    if col >= max || row >= max {
+        return None;
+    }
+    let mut bytes = vec![0x1b, b'[', b'M', button + 32];
+    for coordinate in [col, row] {
+        if utf8 {
+            let mut encoded = [0; 4];
+            bytes.extend_from_slice(char::from_u32(coordinate as u32 + 33)?.encode_utf8(&mut encoded).as_bytes());
+        } else {
+            bytes.push(coordinate as u8 + 33);
+        }
+    }
+    Some(bytes)
+}
 
 actions!(terminal, [ToggleTerminal]);
 
@@ -299,13 +323,34 @@ struct TerminalTab {
     title: SharedString,
     terminal_id: Option<String>,
     emulator: Emulator,
+    /// The emulator hides cursor coordinates along with the cursor shape.
+    /// Keep the last visible position as an IME anchor while it is hidden.
+    input_cursor: CursorSnapshot,
     exited: Option<i32>,
     last_seq: u64,
     coalescer: InputCoalescer,
+    wheel_remainder: f32,
     flush_task: Option<Task<()>>,
     resize_task: Option<Task<()>>,
     /// Open + subscribe/reconnect lifecycle; dropping it cancels the stream.
     _run: Option<Task<()>>,
+}
+
+impl TerminalTab {
+    fn take_input(&mut self) -> Option<(String, Vec<u8>)> {
+        if self.exited.is_some() || self.coalescer.is_empty() {
+            return None;
+        }
+        // Leave the bytes queued until the open RPC supplies the PTY id.
+        let id = self.terminal_id.clone()?;
+        Some((id, self.coalescer.take()))
+    }
+
+    fn stop_input(&mut self) {
+        self.coalescer.take();
+        self.flush_task = None;
+        self.resize_task = None;
+    }
 }
 
 #[derive(Default)]
@@ -353,6 +398,84 @@ impl Render for TabGhost {
     }
 }
 
+/// Subscribe to these transitions before requesting a session handoff.
+/// `Closing` followed by `Idle` confirms that history hydration succeeded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SessionViewStatus {
+    #[default]
+    Idle,
+    Opening,
+    Ready,
+    Closing,
+    Failed(String),
+}
+
+impl SessionViewStatus {
+    fn accepts_input(&self) -> bool {
+        matches!(self, Self::Opening | Self::Ready)
+    }
+}
+
+/// Only uncommitted platform text lives here. PTY output is not editable text.
+#[derive(Default)]
+struct TerminalComposition {
+    text: String,
+    selection: Range<usize>,
+}
+
+impl TerminalComposition {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.selection = 0..0;
+    }
+
+    fn replace(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        selection: Option<Range<usize>>,
+    ) {
+        let range = range
+            .map(|range| utf16_to_bytes(&self.text, range))
+            .unwrap_or(0..self.text.len());
+        self.text.replace_range(range.clone(), text);
+        let selected = selection
+            .map(|range| utf16_to_bytes(text, range))
+            .unwrap_or(text.len()..text.len());
+        self.selection = range.start + selected.start..range.start + selected.end;
+    }
+}
+
+/// Clamp platform offsets to scalar boundaries, including split surrogate pairs.
+fn utf16_to_bytes(text: &str, range: Range<usize>) -> Range<usize> {
+    let offset = |target: usize, round_up: bool| {
+        let mut utf16 = 0;
+        for (byte, ch) in text.char_indices() {
+            if target <= utf16 {
+                return byte;
+            }
+            utf16 += ch.len_utf16();
+            if target < utf16 {
+                return byte + if round_up { ch.len_utf8() } else { 0 };
+            }
+        }
+        text.len()
+    };
+    let start = offset(range.start, false);
+    let end = if range.is_empty() {
+        start
+    } else {
+        offset(range.end.max(range.start), true)
+    };
+    start..end
+}
+
+fn bytes_to_utf16(text: &str, range: Range<usize>) -> Range<usize> {
+    text[..range.start].encode_utf16().count()..text[..range.end].encode_utf16().count()
+}
+
+type SessionHandoff = Shared<Task<Result<(), String>>>;
+
 pub struct TerminalPanel {
     state: Entity<AppState>,
     focus_handle: FocusHandle,
@@ -364,6 +487,13 @@ pub struct TerminalPanel {
     /// explicitly (no ensure-on-open/chat-switch), and closing the last tab
     /// must not dispatch the bottom drawer's [`ToggleTerminal`].
     embedded: bool,
+    session_view: bool,
+    session_chat: Option<String>,
+    session_status: SessionViewStatus,
+    session_open: Option<SessionHandoff>,
+    session_close: Option<SessionHandoff>,
+    native_activity: Option<String>,
+    native_watch: Option<Task<()>>,
     /// The right pane is in its width tween. Keep painting the retained grid
     /// through the changing clip, but do not feed transient widths into the
     /// emulator: alternate-screen rows truncate rather than reflow.
@@ -373,6 +503,9 @@ pub struct TerminalPanel {
     last_selected: Option<String>,
     /// Last reported grid placement; `None` until the first prepaint.
     geometry: Option<GridGeometry>,
+    composition: TerminalComposition,
+    /// Shaped preedit and its window-space origin, shared with IME hit testing.
+    pub(super) composition_layout: Option<(gpui::Point<Pixels>, gpui::ShapedLine)>,
     /// Left-button gesture in flight, if any.
     selection_drag: Option<SelectionDrag>,
     /// One-shot timer rescheduled only while a live selection remains in an
@@ -387,6 +520,157 @@ pub struct TerminalPanel {
     _observe: Subscription,
 }
 
+impl EntityInputHandler for TerminalPanel {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if !self.accepts_ime_input(cx) {
+            return None;
+        }
+        let range = utf16_to_bytes(&self.composition.text, range);
+        *actual_range = Some(bytes_to_utf16(&self.composition.text, range.clone()));
+        Some(self.composition.text[range].to_owned())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        self.accepts_ime_input(cx).then(|| gpui::UTF16Selection {
+            range: bytes_to_utf16(&self.composition.text, self.composition.selection.clone()),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked_text(cx)
+            .map(|text| 0..text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_composition();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.accepts_ime_input(cx) {
+            self.cancel_composition();
+            return;
+        }
+        // Empty replacement cancels preedit. Never delete already-sent PTY text.
+        if !text.is_empty() {
+            self.composition.replace(range, text, None);
+            let committed = std::mem::take(&mut self.composition.text);
+            self.queue_input(committed.as_bytes(), cx);
+        }
+        self.cancel_composition();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        selection: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.accepts_ime_input(cx) || text.is_empty() {
+            self.cancel_composition();
+        } else {
+            self.composition.replace(range, text, selection);
+            self.composition_layout = None;
+            self.with_active_emulator(cx, |emulator| emulator.scroll_to_bottom());
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range: Range<usize>,
+        _: gpui::Bounds<Pixels>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<Pixels>> {
+        if !self.accepts_ime_input(cx) {
+            return None;
+        }
+        let cursor = self.input_cursor_bounds(cx)?;
+        if let Some((origin, line)) = &self.composition_layout {
+            let range = utf16_to_bytes(&self.composition.text, range);
+            let start = line.x_for_index(range.start);
+            let end = line.x_for_index(range.end);
+            return Some(gpui::Bounds::new(
+                gpui::point(origin.x + start, origin.y),
+                gpui::size((end - start).max(px(1.0)), cursor.size.height),
+            ));
+        }
+        Some(cursor)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: gpui::Point<Pixels>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        if !self.accepts_ime_input(cx) {
+            return None;
+        }
+        if let Some((origin, line)) = &self.composition_layout {
+            let byte = line.closest_index_for_x(point.x - origin.x);
+            return Some(self.composition.text[..byte].encode_utf16().count());
+        }
+        Some(0)
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range: Range<usize>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.accepts_ime_input(cx) {
+            self.composition.selection = utf16_to_bytes(&self.composition.text, range);
+            cx.notify();
+        }
+    }
+
+    fn text_length_utf16(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
+        self.accepts_ime_input(cx)
+            .then(|| self.composition.text.encode_utf16().count())
+    }
+
+    fn accepts_text_input(&self, _: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.accepts_ime_input(cx)
+    }
+}
+
+pub(crate) struct HumanTerminalInput {
+    pub chat_id: String,
+    pub proof: crate::input_origin::HumanInput,
+}
+impl EventEmitter<HumanTerminalInput> for TerminalPanel {}
+impl EventEmitter<SessionViewStatus> for TerminalPanel {}
+
+impl gpui::Focusable for TerminalPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl TerminalPanel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -396,11 +680,20 @@ impl TerminalPanel {
             chats: HashMap::new(),
             open: false,
             embedded: false,
+            session_view: false,
+            session_chat: None,
+            session_status: SessionViewStatus::Idle,
+            session_open: None,
+            session_close: None,
+            native_activity: None,
+            native_watch: None,
             resize_suspended: false,
             tab_seq: 0,
             drag: None,
             last_selected: None,
             geometry: None,
+            composition: TerminalComposition::default(),
+            composition_layout: None,
             selection_drag: None,
             selection_scroll_task: None,
             scrollbar_drag: None,
@@ -417,6 +710,190 @@ impl TerminalPanel {
         panel
     }
 
+    /// One provider CLI, bound to the selected chat without opening a process.
+    /// Dropping or hiding the view parks the daemon PTY; only an explicit close
+    /// releases the CLI and returns the session to the structured renderer.
+    pub fn new_session_view(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let mut panel = Self::new_embedded(state, cx);
+        panel.session_view = true;
+        panel.session_chat = panel.state.read(cx).selected_chat.clone();
+        panel
+    }
+
+    pub fn session_view_status(&self) -> &SessionViewStatus {
+        &self.session_status
+    }
+
+    pub fn handoff_unavailable(&self) -> Option<&'static str> {
+        match self.native_activity.as_deref() {
+            Some("idle") => None,
+            Some("busy" | "permission") => Some("Session is busy"),
+            _ => Some("Native session state is not verified"),
+        }
+    }
+
+    fn watch_native_activity(&mut self, cx: &mut Context<Self>) {
+        if self.native_watch.is_some() { return; }
+        let Some(chat) = self.session_chat.clone() else { return; };
+        let Some(engine) = self.engine(cx) else { return; };
+        let target = self.chat_target(&chat, cx);
+        self.native_watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let result = engine.client().call(methods::GET_SESSION_VIEW,
+                    with_target(serde_json::json!({"chatId": chat}), &target)).await;
+                let activity = result.ok().and_then(|view|
+                    view["nativeActivity"].as_str().map(str::to_owned));
+                if this.update(cx, |panel, cx| {
+                    if panel.native_activity != activity {
+                        panel.native_activity = activity;
+                        cx.notify();
+                    }
+                }).is_err() { break; }
+                cx.background_executor().timer(Duration::from_millis(400)).await;
+            }
+        }));
+    }
+
+    fn set_session_status(&mut self, status: SessionViewStatus, cx: &mut Context<Self>) {
+        if self.session_status != status {
+            if !status.accepts_input() {
+                self.cancel_composition();
+            }
+            self.session_status = status.clone();
+            if status == SessionViewStatus::Ready { self.watch_native_activity(cx); }
+            if status == SessionViewStatus::Idle {
+                self.native_watch = None;
+                self.native_activity = None;
+            }
+            cx.emit(status);
+            cx.notify();
+        }
+    }
+
+    fn accepts_input(&self) -> bool {
+        !self.session_view || self.session_status.accepts_input()
+    }
+
+    /// Open or reattach through the idempotent provider-session RPC. Repeated
+    /// calls share the pending operation instead of creating additional PTYs.
+    /// The panel retains the task even if the caller drops its returned task.
+    pub fn open_session_view(&mut self, cx: &mut Context<Self>) -> Task<Result<(), String>> {
+        if !self.session_view {
+            return Task::ready(Err("Not a session terminal view".into()));
+        }
+        if self.session_status == SessionViewStatus::Closing {
+            return Task::ready(Err("Session terminal is closing".into()));
+        }
+        if matches!(
+            self.session_status,
+            SessionViewStatus::Opening | SessionViewStatus::Ready
+        ) && let Some(open) = self.session_open.clone()
+        {
+            return cx.spawn(async move |_, _| open.await);
+        }
+        let Some(chat) = self.selected_chat(cx) else {
+            let error = "Select a chat to open its session terminal".to_string();
+            self.set_session_status(SessionViewStatus::Failed(error.clone()), cx);
+            return Task::ready(Err(error));
+        };
+        if self.engine(cx).is_none() {
+            let error = "Engine is not connected".to_string();
+            self.set_session_status(SessionViewStatus::Failed(error.clone()), cx);
+            return Task::ready(Err(error));
+        }
+        self.session_chat = Some(chat.clone());
+        self.open = true;
+        self.session_close = None;
+        // A retry reattaches through OpenSessionTerminal, never CloseTerminal.
+        self.chats.remove(&chat);
+        self.set_session_status(SessionViewStatus::Opening, cx);
+        let (ready, receiver) = oneshot::channel();
+        self.open_tab_with_ready(chat, Some(ready), cx);
+        let open = cx
+            .spawn(async move |_, _| {
+                receiver
+                    .await
+                    .unwrap_or_else(|_| Err("Session terminal view detached".into()))
+            })
+            .shared();
+        self.session_open = Some(open.clone());
+        cx.spawn(async move |_, _| open.await)
+    }
+
+    /// Stop writes immediately, then release the CLI and hydrate history on
+    /// the daemon. Await success, or the `Idle` event, before switching views.
+    /// A failed close leaves the view attached and can be retried.
+    pub fn close_session_view(&mut self, cx: &mut Context<Self>) -> Task<Result<(), String>> {
+        if !self.session_view {
+            return Task::ready(Err("Not a session terminal view".into()));
+        }
+        if self.session_status == SessionViewStatus::Closing
+            && let Some(close) = self.session_close.clone()
+        {
+            return cx.spawn(async move |_, _| close.await);
+        }
+        let Some(chat) = self.session_chat.clone() else {
+            self.set_session_status(SessionViewStatus::Idle, cx);
+            return Task::ready(Ok(()));
+        };
+        let Some(engine) = self.engine(cx) else {
+            let error = "Engine is not connected".to_string();
+            self.set_session_status(SessionViewStatus::Failed(error.clone()), cx);
+            return Task::ready(Err(error));
+        };
+        if self.chats.get(&chat).is_some_and(|tabs| tabs.tabs.iter().any(|tab| !tab.coalescer.is_empty())) {
+            return Task::ready(Err("Wait for buffered terminal input before switching views".into()));
+        }
+        let target = self.chat_target(&chat, cx);
+        let opening = self.session_open.clone();
+        self.set_session_status(SessionViewStatus::Closing, cx);
+        if let Some(tabs) = self.chats.get_mut(&chat) {
+            for tab in &mut tabs.tabs {
+                tab.stop_input();
+            }
+        }
+        let close = cx
+            .spawn(async move |this, cx| {
+                // Do not race close against an open that has not reached the daemon.
+                if let Some(opening) = opening {
+                    let _ = opening.await;
+                }
+                let result = engine
+                    .client()
+                    .call(
+                        "CloseSessionTerminal",
+                        with_target(serde_json::json!({ "chatId": chat }), &target),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                // A refused busy handoff leaves the daemon's CLI alive. Restore
+                // input only when the daemon confirms it still owns the session.
+                let still_cli = if result.is_err() {
+                    engine.client().call(methods::GET_SESSION_VIEW,
+                        with_target(serde_json::json!({"chatId": chat}), &target)).await
+                        .is_ok_and(|view| view["owner"] == "cli")
+                } else { false };
+                let _ = this.update(cx, |panel, cx| match &result {
+                    Ok(()) => {
+                        panel.chats.remove(&chat);
+                        panel.session_chat = None;
+                        panel.session_open = None;
+                        panel.open = false;
+                        panel.set_session_status(SessionViewStatus::Idle, cx);
+                    }
+                    Err(error) => {
+                        if still_cli { panel.set_session_status(SessionViewStatus::Ready, cx); }
+                        else { panel.set_session_status(SessionViewStatus::Failed(error.clone()), cx); }
+                    }
+                });
+                result
+            })
+            .shared();
+        self.session_close = Some(close.clone());
+        cx.spawn(async move |_, _| close.await)
+    }
+
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
     }
@@ -430,6 +907,9 @@ impl TerminalPanel {
     /// keeps every session alive (detach ≠ close).
     pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.open = open;
+        if !open {
+            self.cancel_composition();
+        }
         if open && !self.embedded {
             self.ensure_tab(cx);
         }
@@ -468,6 +948,9 @@ impl TerminalPanel {
 
     /// Open a fresh tab for the selected chat and return its key.
     pub fn open_tab_for_selected(&mut self, cx: &mut Context<Self>) -> Option<u64> {
+        if self.session_view {
+            return None;
+        }
         let chat = self.selected_chat(cx)?;
         self.open_tab(chat, cx);
         Some(self.tab_seq)
@@ -502,6 +985,7 @@ impl TerminalPanel {
         if switched {
             self.last_selected = selected;
             self.drag = None;
+            self.cancel_composition();
         }
         if self.open && !self.embedded {
             // Returning to a chat with tabs restores them; a fresh chat (or an
@@ -533,6 +1017,9 @@ impl TerminalPanel {
     }
 
     fn selected_chat(&self, cx: &App) -> Option<String> {
+        if self.session_view && self.session_chat.is_some() {
+            return self.session_chat.clone();
+        }
         self.state.read(cx).selected_chat.clone()
     }
 
@@ -554,7 +1041,7 @@ impl TerminalPanel {
     }
 
     fn active_tab(&self, cx: &App) -> Option<&TerminalTab> {
-        let chat = self.state.read(cx).selected_chat.clone()?;
+        let chat = self.selected_chat(cx)?;
         let tabs = self.chats.get(&chat)?;
         tabs.tabs.get(tabs.active)
     }
@@ -562,9 +1049,22 @@ impl TerminalPanel {
     // ---- open / stream lifecycle ----
 
     fn open_tab(&mut self, chat: String, cx: &mut Context<Self>) {
+        if self.session_view {
+            return;
+        }
+        self.open_tab_with_ready(chat, None, cx);
+    }
+
+    fn open_tab_with_ready(
+        &mut self,
+        chat: String,
+        ready: Option<oneshot::Sender<Result<(), String>>>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(engine) = self.engine(cx) else {
             return;
         };
+        self.cancel_composition();
         self.tab_seq += 1;
         let key = self.tab_seq;
         let entry = self.chats.entry(chat.clone()).or_default();
@@ -574,9 +1074,11 @@ impl TerminalPanel {
             title: format!("Terminal {tab_no}").into(),
             terminal_id: None,
             emulator: Emulator::new(80, 24),
+            input_cursor: CursorSnapshot { row: 0, col: 0 },
             exited: None,
             last_seq: 0,
             coalescer: InputCoalescer::default(),
+            wheel_remainder: 0.0,
             flush_task: None,
             resize_task: None,
             _run: None,
@@ -584,7 +1086,7 @@ impl TerminalPanel {
         entry.active = entry.tabs.len() - 1;
 
         let target = self.chat_target(&chat, cx);
-        let run = Self::spawn_session(chat.clone(), key, engine, target, cx);
+        let run = Self::spawn_session(chat.clone(), key, engine, target, ready, cx);
         if let Some(tab) = self.tab_mut(&chat, key) {
             tab._run = Some(run);
         }
@@ -597,8 +1099,10 @@ impl TerminalPanel {
         key: u64,
         engine: EngineHandle,
         target: Option<String>,
+        ready: Option<oneshot::Sender<Result<(), String>>>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
+        let session_view = ready.is_some();
         cx.spawn(async move |this, cx| {
             let (cols, rows) = this
                 .update(cx, |panel, _| {
@@ -612,7 +1116,7 @@ impl TerminalPanel {
             let opened = engine
                 .client()
                 .call_as::<TerminalSession>(
-                    methods::OPEN_TERMINAL,
+                    if session_view { "OpenSessionTerminal" } else { methods::OPEN_TERMINAL },
                     with_target(
                         serde_json::json!({ "chatId": chat, "cols": cols, "rows": rows }),
                         &target,
@@ -632,7 +1136,13 @@ impl TerminalPanel {
                             tab.exited = Some(-1);
                             cx.notify();
                         }
+                        if session_view && panel.session_status == SessionViewStatus::Opening {
+                            panel.set_session_status(SessionViewStatus::Failed(err.to_string()), cx);
+                        }
                     });
+                    if let Some(ready) = ready {
+                        let _ = ready.send(Err(err.to_string()));
+                    }
                     return;
                 }
             };
@@ -641,6 +1151,10 @@ impl TerminalPanel {
                 .update(cx, |panel, cx| {
                     if let Some(tab) = panel.tab_mut(&chat, key) {
                         tab.terminal_id = Some(terminal_id.clone());
+                        if session_view && panel.session_status == SessionViewStatus::Opening {
+                            panel.set_session_status(SessionViewStatus::Ready, cx);
+                        }
+                        panel.flush_input(chat.clone(), key, cx);
                         cx.notify();
                         true
                     } else {
@@ -649,6 +1163,10 @@ impl TerminalPanel {
                 })
                 .unwrap_or(false);
             if !attached {
+                if session_view {
+                    // Parking or dropping a view must not release the provider CLI.
+                    return;
+                }
                 // Tab was closed before the open completed — release the PTY.
                 let _ = engine
                     .client()
@@ -661,6 +1179,19 @@ impl TerminalPanel {
                     )
                     .await;
                 return;
+            }
+            // The viewport can resize while OpenSessionTerminal is pending.
+            // Its debounce may fire before there is a PTY id. Send the latest
+            // dimensions again on attachment instead of leaving the CLI at 80x24.
+            if let Ok(Some((current_cols, current_rows))) = this.update(cx, |panel, _| {
+                panel.tab_mut(&chat, key).map(|tab| (tab.emulator.cols(), tab.emulator.rows()))
+            }) && (current_cols, current_rows) != (cols as usize, rows as usize) {
+                let _ = engine.client().call(methods::RESIZE_TERMINAL,
+                    with_target(serde_json::json!({"terminalId": terminal_id,
+                        "cols": current_cols, "rows": current_rows}), &target)).await;
+            }
+            if let Some(ready) = ready {
+                let _ = ready.send(Ok(()));
             }
 
             let mut attempt: u32 = 0;
@@ -739,6 +1270,8 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> StreamDisposition {
         let target = self.chat_target(chat, cx);
+        let session_view = self.session_view;
+        let accepts_input = self.accepts_input();
         let Some(tab) = self.tab_mut(chat, key) else {
             return StreamDisposition::Stop;
         };
@@ -746,13 +1279,28 @@ impl TerminalPanel {
             TerminalEvent::Data { seq, data } => {
                 tab.last_seq = seq;
                 let responses = tab.emulator.feed(&decode_base64(&data));
-                if !responses.is_empty()
+                if accepts_input
+                    && !responses.is_empty()
                     && let Some(id) = tab.terminal_id.clone()
                 {
                     // Query responses (DSR etc.) go straight back, no coalescing.
                     let engine = engine.clone();
                     let data = encode_base64(&responses);
-                    cx.spawn(async move |_, _| {
+                    let chat = chat.to_string();
+                    cx.spawn(async move |this, cx| {
+                        if session_view
+                            && !this
+                                .update(cx, |panel, _| {
+                                    panel.accepts_input()
+                                        && panel.tab_mut(&chat, key).is_some_and(|tab| {
+                                            tab.exited.is_none()
+                                                && tab.terminal_id.as_ref() == Some(&id)
+                                        })
+                                })
+                                .unwrap_or(false)
+                        {
+                            return;
+                        }
                         let _ = engine
                             .client()
                             .call(
@@ -773,6 +1321,14 @@ impl TerminalPanel {
                 tab.last_seq = seq;
                 tab.exited = Some(exit_code);
                 tab.emulator.feed(&exit_message(exit_code));
+                if session_view {
+                    tab.stop_input();
+                    if self.session_status != SessionViewStatus::Closing {
+                        self.set_session_status(SessionViewStatus::Failed(format!(
+                            "Session terminal exited with code {exit_code}. Close it to restore history."
+                        )), cx);
+                    }
+                }
                 cx.notify();
                 StreamDisposition::Stop
             }
@@ -781,8 +1337,42 @@ impl TerminalPanel {
 
     // ---- input ----
 
+    pub(super) fn cancel_composition(&mut self) {
+        self.composition.clear();
+        self.composition_layout = None;
+    }
+
+    fn accepts_ime_input(&self, cx: &App) -> bool {
+        self.open
+            && self.accepts_input()
+            && self.active_tab(cx).is_some_and(|tab| tab.exited.is_none())
+    }
+
+    pub(super) fn marked_text(&self, cx: &App) -> Option<&str> {
+        (self.accepts_ime_input(cx) && !self.composition.text.is_empty())
+            .then_some(self.composition.text.as_str())
+    }
+
+    pub(super) fn input_cursor_bounds(&self, cx: &App) -> Option<gpui::Bounds<Pixels>> {
+        let geometry = self.geometry?;
+        let tab = self.active_tab(cx)?;
+        let cursor = tab.emulator.cursor().unwrap_or(tab.input_cursor);
+        let col = cursor.col.min(geometry.cols.saturating_sub(1) as usize);
+        let row = cursor.row.min(geometry.rows.saturating_sub(1) as usize);
+        Some(gpui::Bounds::new(
+            gpui::point(
+                geometry.origin.x + px(geometry.cell_w * col as f32),
+                geometry.origin.y + px(geometry.line_h * row as f32),
+            ),
+            gpui::size(px(geometry.cell_w), px(geometry.line_h)),
+        ))
+    }
+
     /// Queue keyboard bytes on the active tab (12 ms coalescing window).
     fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if !self.accepts_input() {
+            return;
+        }
         let Some(chat) = self.selected_chat(cx) else {
             return;
         };
@@ -802,7 +1392,10 @@ impl TerminalPanel {
         }
         let key = tab.key;
         if tab.coalescer.push(bytes) {
-            tab.flush_task = Some(Self::schedule_flush(chat, key, cx));
+            tab.flush_task = Some(Self::schedule_flush(chat.clone(), key, cx));
+        }
+        if self.session_view && bytes.contains(&b'\r') && let Some(proof) = crate::input_origin::capture() {
+            cx.emit(HumanTerminalInput { chat_id: chat, proof });
         }
     }
 
@@ -816,6 +1409,10 @@ impl TerminalPanel {
     }
 
     fn flush_input(&mut self, chat: String, key: u64, cx: &mut Context<Self>) {
+        if !self.accepts_input() {
+            return;
+        }
+        let session_view = self.session_view;
         let Some(engine) = self.engine(cx) else {
             return;
         };
@@ -823,18 +1420,25 @@ impl TerminalPanel {
         let Some(tab) = self.tab_mut(&chat, key) else {
             return;
         };
-        if tab.coalescer.is_empty() {
-            return;
-        }
-        let Some(id) = tab.terminal_id.clone() else {
-            // OpenTerminal still in flight — keep the buffer, retry shortly.
-            if tab.exited.is_none() {
-                tab.flush_task = Some(Self::schedule_flush(chat, key, cx));
-            }
+        let Some((id, bytes)) = tab.take_input() else {
+            // The open completion flushes these bytes without polling timers.
             return;
         };
-        let data = encode_base64(&tab.coalescer.take());
-        cx.spawn(async move |_, _| {
+        let data = encode_base64(&bytes);
+        cx.spawn(async move |this, cx| {
+            // Close may have started after this write was queued.
+            if session_view
+                && !this
+                    .update(cx, |panel, _| {
+                        panel.accepts_input()
+                            && panel.tab_mut(&chat, key).is_some_and(|tab| {
+                                tab.exited.is_none() && tab.terminal_id.as_ref() == Some(&id)
+                            })
+                    })
+                    .unwrap_or(false)
+            {
+                return;
+            }
             let _ = engine
                 .client()
                 .call(
@@ -864,6 +1468,10 @@ impl TerminalPanel {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         let mods = &ks.modifiers;
+        // AltGr can carry Control+Alt while still producing platform text.
+        if event.prefer_character_input {
+            return;
+        }
         // Paste: Cmd+V (macOS) / Ctrl+Shift+V.
         if ks.key == "v" && (mods.platform || (mods.control && mods.shift)) {
             self.paste_clipboard(cx);
@@ -880,11 +1488,27 @@ impl TerminalPanel {
             cx.stop_propagation();
             return;
         }
+        // Main-screen history belongs to the emulator. Fullscreen applications
+        // keep their own PageUp/PageDown bindings and receive them unchanged.
+        if mods.shift && !mods.control && !mods.alt && !mods.platform
+            && self.active_tab(cx).is_some_and(|tab| !tab.emulator.alternate_screen())
+            && matches!(ks.key.as_str(), "pageup" | "pagedown")
+        {
+            let rows = self.active_tab(cx).map_or(1, |tab| tab.emulator.rows()) as i32;
+            self.scroll_active(if ks.key == "pageup" { rows } else { -rows }, cx);
+            cx.stop_propagation();
+            return;
+        }
         let app_cursor = self
             .active_tab(cx)
             .map(|tab| tab.emulator.app_cursor_mode())
             .unwrap_or(false);
-        if let Some(bytes) = keystroke_bytes(&ks.key, ks.key_char.as_deref(), mods, app_cursor) {
+        // Printable text, including dead keys, is committed by the platform handler.
+        // During preedit the IME owns navigation, backspace and confirmation too.
+        if !self.composition.text.is_empty() && !mods.control && !mods.alt && !mods.platform {
+            return;
+        }
+        if let Some(bytes) = keydown_bytes(&ks.key, ks.key_char.as_deref(), mods, app_cursor) {
             self.queue_input(&bytes, cx);
             cx.stop_propagation();
         }
@@ -899,7 +1523,7 @@ impl TerminalPanel {
         // mapping needs the placement even on frames where nothing resized,
         // which is almost all of them.
         self.geometry = Some(geometry);
-        if self.resize_suspended {
+        if self.resize_suspended || !self.accepts_input() {
             return;
         }
         let (cols, rows) = (geometry.cols, geometry.rows);
@@ -929,6 +1553,9 @@ impl TerminalPanel {
                 // Re-read the *current* size — later prepaints may have
                 // resized again inside the debounce window.
                 let Ok(current) = this.update(cx, |panel, _| {
+                    if !panel.accepts_input() {
+                        return None;
+                    }
                     panel
                         .tab_mut(&chat, key)
                         .map(|t| (t.terminal_id.clone(), t.emulator.cols(), t.emulator.rows()))
@@ -956,11 +1583,17 @@ impl TerminalPanel {
     }
 
     /// Snapshot for the paint element.
-    pub fn active_grid_snapshot(&self, cx: &App) -> Option<GridSnapshot> {
-        let tab = self.active_tab(cx)?;
+    pub fn active_grid_snapshot(&mut self, cx: &App) -> Option<GridSnapshot> {
+        let chat = self.selected_chat(cx)?;
+        let tabs = self.chats.get_mut(&chat)?;
+        let tab = tabs.tabs.get_mut(tabs.active)?;
+        let cursor = tab.emulator.cursor();
+        if let Some(cursor) = cursor {
+            tab.input_cursor = cursor;
+        }
         Some(GridSnapshot {
             lines: tab.emulator.lines(),
-            cursor: tab.emulator.cursor(),
+            cursor,
         })
     }
 
@@ -1152,6 +1785,56 @@ impl TerminalPanel {
         }
     }
 
+    fn on_scroll_wheel(&mut self, event: &gpui::ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let line_h = self.geometry.map_or(super::view::TERM_LINE_HEIGHT, |g| g.line_h);
+        let lines = match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Pixels(delta) => f32::from(delta.y) / line_h,
+        };
+        if !lines.is_finite() || lines == 0.0 { return; }
+        let Some(chat) = self.selected_chat(cx) else { return; };
+        let Some(tabs) = self.chats.get_mut(&chat) else { return; };
+        let Some(tab) = tabs.tabs.get_mut(tabs.active) else { return; };
+        // Keep sub-line trackpad deltas rather than rounding every event to zero.
+        if lines.signum() != tab.wheel_remainder.signum() { tab.wheel_remainder = 0.0; }
+        tab.wheel_remainder += lines;
+        let step = tab.wheel_remainder.trunc().clamp(-120.0, 120.0) as i32;
+        tab.wheel_remainder -= step as f32;
+        if step == 0 {
+            cx.stop_propagation();
+            return;
+        }
+        let reports = tab.emulator.mouse_reporting() && !event.modifiers.shift;
+        let sgr = tab.emulator.sgr_mouse();
+        let utf8 = tab.emulator.utf8_mouse();
+        let alternate_scroll = tab.emulator.alternate_scroll() && !event.modifiers.shift;
+        let app_cursor = tab.emulator.app_cursor_mode();
+        if reports {
+            if let Some(g) = self.geometry {
+                let hit = cell_at(f32::from(event.position.x - g.origin.x),
+                    f32::from(event.position.y - g.origin.y), g.cell_w, g.line_h,
+                    g.cols as usize, g.rows as usize);
+                let button = if step > 0 { 64 } else { 65 }
+                    | if event.modifiers.alt { 8 } else { 0 }
+                    | if event.modifiers.control { 16 } else { 0 };
+                if let Some(bytes) = wheel_mouse_bytes(button, hit.col, hit.row, sgr, utf8) {
+                    self.queue_input(&bytes.repeat(step.unsigned_abs() as usize), cx);
+                }
+            }
+        } else if alternate_scroll {
+            let bytes: &[u8] = match (step > 0, app_cursor) {
+                (true, false) => b"\x1b[A",
+                (false, false) => b"\x1b[B",
+                (true, true) => b"\x1bOA",
+                (false, true) => b"\x1bOB",
+            };
+            self.queue_input(&bytes.repeat(step.unsigned_abs() as usize), cx);
+        } else {
+            self.scroll_active(step, cx);
+        }
+        cx.stop_propagation();
+    }
+
     fn schedule_selection_scroll(&mut self, cx: &mut Context<Self>) {
         if self.selection_scroll_task.is_some() {
             return;
@@ -1309,11 +1992,16 @@ impl TerminalPanel {
             && tabs.active != ix
         {
             tabs.active = ix;
+            self.cancel_composition();
             cx.notify();
         }
     }
 
     fn close_tab(&mut self, chat: &str, key: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_view {
+            self.close_session_view(cx).detach();
+            return;
+        }
         let engine = self.engine(cx);
         let target = self.chat_target(chat, cx);
         let Some(tabs) = self.chats.get_mut(chat) else {
@@ -1325,6 +2013,7 @@ impl TerminalPanel {
         let tab = tabs.tabs.remove(ix);
         tabs.active = active_after_close(tabs.active, ix, tabs.tabs.len());
         let now_empty = tabs.tabs.is_empty();
+        self.cancel_composition();
         self.drag = None;
         // Closing the LAST terminal closes the drawer too — an empty dock is
         // dead space (user request). Same path as the collapse chevron.
@@ -1690,16 +2379,7 @@ impl Render for TerminalPanel {
                     // the user let go of.
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                    .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
-                        let lines = match event.delta {
-                            ScrollDelta::Lines(delta) => delta.y,
-                            ScrollDelta::Pixels(delta) => {
-                                f32::from(delta.y) / super::view::TERM_LINE_HEIGHT
-                            }
-                        };
-                        let step = lines.round() as i32;
-                        this.scroll_active(step, cx);
-                    }))
+                    .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                     .child(TerminalElement::new(cx.entity(), focused))
                     .children(scrollbar),
             )
@@ -1710,6 +2390,429 @@ impl Render for TerminalPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_tab() -> TerminalTab {
+        TerminalTab {
+            key: 1,
+            title: "Session".into(),
+            terminal_id: None,
+            emulator: Emulator::new(80, 24),
+            input_cursor: CursorSnapshot { row: 0, col: 0 },
+            exited: None,
+            last_seq: 0,
+            coalescer: InputCoalescer::default(),
+            wheel_remainder: 0.0,
+            flush_task: None,
+            resize_task: None,
+            _run: None,
+        }
+    }
+
+    fn ime_window(cx: &mut gpui::TestAppContext) -> gpui::WindowHandle<TerminalPanel> {
+        cx.update(|cx| cx.set_global(Theme::default()));
+        cx.add_window(|window, cx| {
+            let state = cx.new(|_| AppState::new());
+            let mut panel = TerminalPanel::new_session_view(state, cx);
+            panel.open = true;
+            panel.session_chat = Some("ime".into());
+            panel.session_status = SessionViewStatus::Opening;
+            panel.chats.insert(
+                "ime".into(),
+                ChatTabs {
+                    tabs: vec![TerminalTab {
+                        key: 0,
+                        ..pending_tab()
+                    }],
+                    active: 0,
+                },
+            );
+            window.focus(&panel.focus_handle, cx);
+            panel
+        })
+    }
+
+    #[gpui::test]
+    fn wheel_reaches_pi_through_the_rendered_terminal(cx: &mut gpui::TestAppContext) {
+        let handle = ime_window(cx);
+        handle.update(cx, |panel, _, _| {
+            // Pi's real fullscreen startup sequence enables SGR mouse events.
+            panel.tab_mut("ime", 0).unwrap().emulator.feed(
+                b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h",
+            );
+        }).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
+        let position = handle.update(cx, |panel, _, _| {
+            let geometry = panel.geometry.unwrap();
+            geometry.origin + gpui::point(px(geometry.cell_w * 2.5), px(geometry.line_h * 3.5))
+        }).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.dispatch_event(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Lines(gpui::point(0.0, 2.0)),
+                ..Default::default()
+            }), cx);
+        }).unwrap();
+        handle.update(cx, |panel, _, _| {
+            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), b"\x1b[<64;3;4M\x1b[<64;3;4M");
+        }).unwrap();
+    }
+
+    #[gpui::test]
+    fn wheel_trackpad_history_and_alternate_screen_modes(cx: &mut gpui::TestAppContext) {
+        let handle = ime_window(cx);
+        handle.update(cx, |panel, window, cx| {
+            panel.geometry = Some(test_geometry());
+            let tab = panel.tab_mut("ime", 0).unwrap();
+            tab.emulator.resize(20, 4);
+            tab.emulator.feed(b"0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n");
+            let mut event = gpui::ScrollWheelEvent {
+                position: test_geometry().origin,
+                delta: ScrollDelta::Pixels(gpui::point(px(0.0), px(test_geometry().line_h / 4.0))),
+                ..Default::default()
+            };
+            for _ in 0..4 { panel.on_scroll_wheel(&event, window, cx); }
+            let tab = panel.tab_mut("ime", 0).unwrap();
+            assert_eq!(tab.emulator.display_offset(), 1);
+            assert!(tab.coalescer.is_empty());
+            tab.emulator.feed(b"\x1b[?1049h\x1b[?1h");
+            event.delta = ScrollDelta::Lines(gpui::point(0.0, -2.0));
+            panel.on_scroll_wheel(&event, window, cx);
+            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), b"\x1bOB\x1bOB");
+            panel.tab_mut("ime", 0).unwrap().emulator.feed(b"\x1b[?1007l");
+            panel.on_scroll_wheel(&event, window, cx);
+            assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
+            panel.tab_mut("ime", 0).unwrap().emulator.feed(b"\x1b[?1000h\x1b[?1006h");
+            panel.on_scroll_wheel(&event, window, cx);
+            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), b"\x1b[<65;1;1M\x1b[<65;1;1M");
+            event.modifiers.shift = true;
+            panel.on_scroll_wheel(&event, window, cx);
+            assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
+        }).unwrap();
+    }
+
+    #[test]
+    fn wheel_mouse_protocol_coordinates() {
+        assert_eq!(wheel_mouse_bytes(64, 0, 0, false, false).unwrap(), b"\x1b[M`!!");
+        assert!(wheel_mouse_bytes(64, 223, 0, false, false).is_none());
+        assert_eq!(wheel_mouse_bytes(65, 499, 10, true, false).unwrap(), b"\x1b[<65;500;11M");
+        assert_eq!(wheel_mouse_bytes(64, 223, 0, false, true).unwrap(), "\x1b[M`Ā!".as_bytes());
+    }
+
+    #[gpui::test]
+    fn history_page_keys_leave_native_cli_navigation_available(cx: &mut gpui::TestAppContext) {
+        let handle = ime_window(cx);
+        handle.update(cx, |panel, _, _| {
+            let tab = panel.tab_mut("ime", 0).unwrap();
+            // Enough output to exceed the test window's measured viewport.
+            tab.emulator.feed(&b"history\r\n".repeat(200));
+        }).unwrap();
+        cx.simulate_keystrokes(handle.into(), "shift-pageup");
+        handle.update(cx, |panel, _, _| {
+            let tab = panel.tab_mut("ime", 0).unwrap();
+            assert!(tab.emulator.display_offset() > 0);
+            assert!(tab.coalescer.is_empty());
+        }).unwrap();
+        cx.simulate_keystrokes(handle.into(), "pageup pagedown");
+        handle.update(cx, |panel, _, _| {
+            let tab = panel.tab_mut("ime", 0).unwrap();
+            assert_eq!(tab.coalescer.take(), b"\x1b[5~\x1b[6~");
+            assert_eq!(tab.emulator.display_offset(), 0);
+            tab.emulator.feed(b"\x1b[?1049h");
+        }).unwrap();
+        cx.simulate_keystrokes(handle.into(), "pageup pagedown ctrl-c");
+        handle.update(cx, |panel, _, _| {
+            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), b"\x1b[5~\x1b[6~\x03");
+        }).unwrap();
+    }
+
+    #[gpui::test]
+    fn ime_commits_unicode_once_through_painted_input_handler(cx: &mut gpui::TestAppContext) {
+        let window = ime_window(cx);
+        cx.simulate_keystrokes(window.into(), "é 界 😀 space shift-a ctrl-c alt-b");
+        window
+            .update(cx, |panel, _, cx| {
+                let tab = panel.tab_mut("ime", 0).unwrap();
+                assert_eq!(tab.coalescer.take(), "é界😀 A\u{3}\u{1b}b".as_bytes());
+                panel.set_session_status(SessionViewStatus::Ready, cx);
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "é");
+        window
+            .update(cx, |panel, _, _| {
+                assert_eq!(
+                    panel.tab_mut("ime", 0).unwrap().coalescer.take(),
+                    "é".as_bytes()
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn ime_dead_keys_altgr_and_clipboard_keep_separate_routes(cx: &mut gpui::TestAppContext) {
+        let window = ime_window(cx);
+        window.update(cx, |panel, window, cx| {
+            panel.replace_and_mark_text_in_range(None, "´", None, window, cx);
+            panel.on_key_down(&KeyDownEvent {
+                keystroke: gpui::Keystroke { key: "dead_acute".into(), key_char: None, modifiers: Default::default() },
+                is_held: false,
+                prefer_character_input: false,
+            }, window, cx);
+            assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
+            panel.replace_text_in_range(None, "é", window, cx);
+            panel.on_key_down(&KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    key: "q".into(), key_char: Some("@".into()),
+                    modifiers: gpui::Modifiers { control: true, alt: true, ..Default::default() },
+                },
+                is_held: false,
+                prefer_character_input: true,
+            }, window, cx);
+            panel.replace_text_in_range(None, "@", window, cx);
+            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), "é@".as_bytes());
+            panel.tab_mut("ime", 0).unwrap().emulator.feed(b"\x1b[?2004h");
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("貼付".into()));
+        }).unwrap();
+        cx.simulate_keystrokes(window.into(), "ctrl-shift-v");
+        window.update(cx, |panel, _, _| {
+            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), "\x1b[200~貼付\x1b[201~".as_bytes());
+        }).unwrap();
+    }
+
+    #[gpui::test]
+    fn ime_preedit_ranges_commit_and_cancellation(cx: &mut gpui::TestAppContext) {
+        let window = ime_window(cx);
+        window
+            .update(cx, |panel, window, cx| {
+                panel.replace_and_mark_text_in_range(None, "a😀é", Some(1..3), window, cx);
+                assert_eq!(panel.marked_text_range(window, cx), Some(0..4));
+                assert_eq!(
+                    panel.selected_text_range(false, window, cx).unwrap().range,
+                    1..3
+                );
+                let mut actual = None;
+                assert_eq!(
+                    panel.text_for_range(2..3, &mut actual, window, cx),
+                    Some("😀".into())
+                );
+                assert_eq!(actual, Some(1..3));
+                assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
+                panel.replace_and_mark_text_in_range(Some(1..3), "界", Some(0..1), window, cx);
+                assert_eq!(panel.composition.text, "a界é");
+                assert_eq!(
+                    panel.selected_text_range(false, window, cx).unwrap().range,
+                    1..2
+                );
+                panel.replace_text_in_range(None, "確定😀", window, cx);
+                assert_eq!(
+                    panel.tab_mut("ime", 0).unwrap().coalescer.take(),
+                    "確定😀".as_bytes()
+                );
+                assert_eq!(panel.marked_text_range(window, cx), None);
+                assert_eq!(
+                    panel.selected_text_range(false, window, cx).unwrap().range,
+                    0..0
+                );
+                panel.replace_and_mark_text_in_range(None, "cancel", None, window, cx);
+                panel.unmark_text(window, cx);
+                panel.replace_and_mark_text_in_range(None, "cancel", None, window, cx);
+                panel.replace_text_in_range(None, "", window, cx);
+                panel.replace_and_mark_text_in_range(None, "cancel", None, window, cx);
+                panel.replace_and_mark_text_in_range(None, "", None, window, cx);
+                assert!(panel.composition.text.is_empty());
+                assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn ime_closing_and_failed_sessions_reject_all_input(cx: &mut gpui::TestAppContext) {
+        let window = ime_window(cx);
+        window
+            .update(cx, |panel, window, cx| {
+                panel.replace_and_mark_text_in_range(None, "preedit", None, window, cx);
+                for status in [
+                    SessionViewStatus::Closing,
+                    SessionViewStatus::Failed("failed".into()),
+                ] {
+                    panel.set_session_status(status, cx);
+                    assert!(!panel.accepts_text_input(window, cx));
+                    assert_eq!(panel.marked_text_range(window, cx), None);
+                    panel.replace_and_mark_text_in_range(None, "blocked", None, window, cx);
+                    panel.replace_text_in_range(None, "blocked", window, cx);
+                    panel.queue_input(b"blocked", cx);
+                    assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
+                    assert!(panel.composition.text.is_empty());
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn ime_candidate_bounds_follow_terminal_cursor_and_preedit(cx: &mut gpui::TestAppContext) {
+        let window = ime_window(cx);
+        window
+            .update(cx, |panel, window, cx| {
+                panel.geometry = Some(test_geometry());
+                panel.tab_mut("ime", 0).unwrap().emulator.feed(b"abc\r\nxy");
+                let bounds = panel
+                    .bounds_for_range(0..0, test_geometry().bounds, window, cx)
+                    .unwrap();
+                assert_eq!(bounds.origin, gpui::point(px(34.0), px(48.0)));
+                panel.active_grid_snapshot(cx);
+                panel.tab_mut("ime", 0).unwrap().emulator.feed(b"\x1b[?25l");
+                assert_eq!(panel.input_cursor_bounds(cx), Some(bounds));
+                panel.replace_and_mark_text_in_range(None, "😀é", Some(2..2), window, cx);
+            })
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+        })
+        .unwrap();
+        window
+            .update(cx, |panel, window, cx| {
+                let (origin, line) = panel.composition_layout.as_ref().unwrap();
+                let expected = gpui::point(origin.x + line.x_for_index("😀".len()), origin.y);
+                let bounds = panel
+                    .bounds_for_range(2..2, test_geometry().bounds, window, cx)
+                    .unwrap();
+                assert_eq!(bounds.origin, expected);
+                assert_eq!(
+                    panel.character_index_for_point(expected, window, cx),
+                    Some(2)
+                );
+                assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn input_waits_for_open_and_flushes_once() {
+        let mut tab = pending_tab();
+        assert!(tab.coalescer.push(b"hello"));
+        assert_eq!(tab.take_input(), None);
+        assert!(!tab.coalescer.push(b"\r"));
+        assert_eq!(tab.take_input(), None);
+        tab.terminal_id = Some("provider-pty".into());
+        assert_eq!(
+            tab.take_input(),
+            Some(("provider-pty".into(), b"hello\r".to_vec()))
+        );
+        assert_eq!(tab.take_input(), None);
+    }
+
+    #[test]
+    fn stopping_or_exiting_never_flushes_pending_input() {
+        let mut tab = pending_tab();
+        tab.coalescer.push(b"queued before close");
+        tab.stop_input();
+        tab.terminal_id = Some("provider-pty".into());
+        assert_eq!(tab.take_input(), None);
+        tab.coalescer.push(b"queued before exit");
+        tab.exited = Some(0);
+        assert_eq!(tab.take_input(), None);
+        for status in [
+            SessionViewStatus::Idle,
+            SessionViewStatus::Closing,
+            SessionViewStatus::Failed("failed".into()),
+        ] {
+            assert!(!status.accepts_input());
+        }
+        assert!(SessionViewStatus::Opening.accepts_input());
+        assert!(SessionViewStatus::Ready.accepts_input());
+    }
+
+    #[gpui::test]
+    fn session_mode_does_not_create_shell_tabs_or_follow_chat_switches(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.selected_chat = Some("first".into());
+            state
+        });
+        let panel = cx.new(|cx| TerminalPanel::new_session_view(state.clone(), cx));
+        panel.update(cx, |panel, cx| {
+            assert!(panel.embedded && panel.session_view);
+            assert_eq!(panel.session_view_status(), &SessionViewStatus::Idle);
+            assert_eq!(panel.session_chat.as_deref(), Some("first"));
+            panel.set_open(true, cx);
+            assert_eq!(panel.open_tab_for_selected(cx), None);
+            panel.open_tab("first".into(), cx);
+            assert!(panel.chats.is_empty());
+            panel.set_open(false, cx);
+            assert_eq!(panel.session_chat.as_deref(), Some("first"));
+        });
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("second".into());
+            cx.notify();
+        });
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.selected_chat(cx).as_deref(), Some("first"));
+            assert!(panel.chats.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn session_open_shares_pending_result_and_reports_errors(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let panel = cx.new(|cx| TerminalPanel::new_session_view(state, cx));
+        let failed = panel.update(cx, |panel, cx| panel.open_session_view(cx));
+        assert!(failed.await.is_err());
+        panel.update(cx, |panel, _| {
+            assert!(matches!(
+                panel.session_view_status(),
+                SessionViewStatus::Failed(_)
+            ));
+        });
+        let (sender, receiver) = oneshot::channel();
+        let first = panel.update(cx, |panel, cx| {
+            panel.session_status = SessionViewStatus::Opening;
+            panel.session_open = Some(cx.spawn(async move |_, _| receiver.await.unwrap()).shared());
+            panel.open_session_view(cx)
+        });
+        let second = panel.update(cx, |panel, cx| panel.open_session_view(cx));
+        sender.send(Ok(())).unwrap();
+        assert_eq!(first.await, Ok(()));
+        assert_eq!(second.await, Ok(()));
+        panel.update(cx, |panel, _| assert!(panel.chats.is_empty()));
+    }
+
+    #[gpui::test]
+    fn session_status_emits_only_transitions(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let panel = cx.new(|cx| TerminalPanel::new_session_view(state, cx));
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&panel, move |_, event: &SessionViewStatus, _| {
+                observed.borrow_mut().push(event.clone());
+            })
+        });
+        panel.update(cx, |panel, cx| {
+            for status in [
+                SessionViewStatus::Opening,
+                SessionViewStatus::Ready,
+                SessionViewStatus::Ready,
+                SessionViewStatus::Closing,
+                SessionViewStatus::Failed("hydrate failed".into()),
+                SessionViewStatus::Closing,
+                SessionViewStatus::Idle,
+            ] {
+                panel.set_session_status(status, cx);
+            }
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                SessionViewStatus::Opening,
+                SessionViewStatus::Ready,
+                SessionViewStatus::Closing,
+                SessionViewStatus::Failed("hydrate failed".into()),
+                SessionViewStatus::Closing,
+                SessionViewStatus::Idle
+            ]
+        );
+    }
 
     #[test]
     fn height_clamps_between_160_and_55vh() {

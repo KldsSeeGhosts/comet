@@ -130,8 +130,10 @@ pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
 /// Put this machine's device group first without disturbing the recency-based
 /// order of any remote groups. A targeted promotion is more truthful than a
 /// full name sort: local context leads, then the user's chosen chat sort wins.
+type DeviceGroups<T> = Vec<(Option<(String, String)>, Vec<T>)>;
+
 fn promote_local_device_group<T>(
-    groups: &mut Vec<(Option<(String, String)>, Vec<T>)>,
+    groups: &mut DeviceGroups<T>,
     local_device_id: Option<&str>,
 ) {
     let Some(local_device_id) = local_device_id else {
@@ -1070,7 +1072,7 @@ impl Shell {
         if self.settings.sidebar_organization != SidebarOrganization::ByDevice {
             return chats.into_iter().map(|chat| chat.id).collect();
         }
-        let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
+        let mut groups: DeviceGroups<zeron_proto::Chat> = Vec::new();
         for chat in chats {
             let key = Some((chat.device_id.clone(), String::new()));
             if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
@@ -1160,7 +1162,7 @@ impl Shell {
             }
         }
 
-        let mut groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = Vec::new();
+        let mut groups: DeviceGroups<ActiveChatRow> = Vec::new();
         for row in rows {
             if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &row.group) {
                 existing.push(row);
@@ -1724,12 +1726,11 @@ impl Shell {
         };
         if rows.is_empty() {
             let text = flow.search.read(cx).text().to_string();
-            if text.starts_with('/') || text.starts_with('~') {
-                if let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref())
+            if (text.starts_with('/') || text.starts_with('~'))
+                && let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref())
                 {
                     self.add_space_descend(target, false, cx);
                 }
-            }
             return;
         }
         let Some(listing) = flow.browser.ready() else {
@@ -2555,9 +2556,8 @@ impl Shell {
         //    Locations (home + the picked device's mounted drives), an info
         //    line naming the browsed device. Rows are the tab recipe (h-28
         //    rounded-8 washes), vertical.
-        let location_rows: Vec<(LocationRow, SharedString, &'static str, Option<String>)> = device
-            .is_some()
-            .then(|| {
+        let location_rows: Vec<(LocationRow, SharedString, &'static str, Option<String>)> = if device
+            .is_some() { {
                 std::iter::once((
                     LocationRow::Home,
                     SharedString::from("Home"),
@@ -2573,8 +2573,7 @@ impl Shell {
                     )
                 }))
                 .collect()
-            })
-            .unwrap_or_default();
+            } } else { Default::default() };
         let rail = div()
             .id("add-space-rail")
             .w(px(196.0))

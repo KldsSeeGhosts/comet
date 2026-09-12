@@ -3442,8 +3442,7 @@ impl Transcript {
             }
             self.own_turn_last_tick = None;
         } else if anchored
-            && err <= OWN_SEND_GLIDE_SNAP_PX
-            && err >= -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
+            && (-(OWN_SEND_SCROLL_SLACK_PX + 2.0)..=OWN_SEND_GLIDE_SNAP_PX).contains(&err)
         {
             // At the hold — or resting inside the slack under it (a restick
             // that fired at the true bottom): land WITHOUT pulling the view
@@ -4324,6 +4323,8 @@ impl Transcript {
     /// collapsing the bubble to min-content width (one character per line).
     /// A plain height clip preserves the original bubble width calculation and
     /// never feeds measured layout back into the virtualized list.
+    // Keep the render callback signature local to this UI component.
+    #[allow(clippy::too_many_arguments)]
     fn render_user_body(
         &mut self,
         row_id: &SharedString,
@@ -4460,6 +4461,8 @@ impl Transcript {
 
     /// A plain text link aligned with the message's left edge, following the
     /// continuation ellipsis when collapsed. No pill, border, or button wash.
+    // Keep the render callback signature local to this UI component.
+    #[allow(clippy::too_many_arguments)]
     fn render_user_expander(
         &mut self,
         row_id: &SharedString,
@@ -4728,7 +4731,7 @@ impl Transcript {
             if !live {
                 return None;
             }
-            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
+            let elapsed = (now.timestamp_millis() - last.created_at).max(0) / 1000;
             (false, false, elapsed, flavour_seed(doc_id))
         } else {
             let chat_id = self.chat_id.clone()?;
@@ -5218,7 +5221,7 @@ impl Transcript {
             .map(|(_, ix)| *ix);
         let row_key = row_id.clone();
         let entity = cx.weak_entity();
-        let handler: Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)> =
+        let handler: render::CopyHandler =
             Rc::new(move |ix, code, _window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
                 let row_key = row_key.clone();
@@ -7671,7 +7674,7 @@ mod tests {
             tools[0].detail.as_deref(),
             Some(ToolDetail::Thought { lines, .. }) if !lines.is_empty()
         ));
-        let summary = tool_group_summary(&tools);
+        let summary = tool_group_summary(tools);
         assert!(summary.starts_with("Thought 2 times"), "{summary}");
         assert!(summary.contains("2 commands"), "{summary}");
 
@@ -7687,7 +7690,7 @@ mod tests {
         let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
             panic!("expected a tool group");
         };
-        assert_eq!(tool_group_summary(&tools), "Thought process");
+        assert_eq!(tool_group_summary(tools), "Thought process");
 
         // Empty reasoning renders nothing.
         let entry = assistant(

@@ -145,6 +145,7 @@ version="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 
 if [[ "$variant" == "dev" ]]; then
     name="zeron-dev"
+    cli_name="noches-dev"
     data_dir="$HOME/.zeron-dev"
     app_root="$data_dir/app"
     ipc_port=27655
@@ -155,6 +156,7 @@ if [[ "$variant" == "dev" ]]; then
     feature_args=(--features dev)
 else
     name="zeron"
+    cli_name="noches"
     data_dir="$HOME/.zeron"
     app_root="$data_dir/app"
     ipc_port=27654
@@ -237,9 +239,11 @@ cargo build --locked "${profile_args[@]}" -p zeron "${feature_args[@]}"
 # --- install binary into versioned app dir, repoint current ---
 mkdir -p "$target_ver_dir"
 install_atomic "target/$target_profile/zeron" "$target_bin" 755
+install_atomic "target/$target_profile/noches" "$target_ver_dir/noches" 755
 repoint_current "$app_root" "$target_ver_dir"
 # PATH entry -> the variant's current build.
 ln -sf "$target_ver_dir/zeron" "$bin_dir/$name"
+ln -sf "$app_root/current/noches" "$bin_dir/$cli_name"
 
 # --- icons ---
 install_atomic "$icon_src_svg" "$icons_dir/scalable/apps/$name.svg" 644
@@ -259,6 +263,7 @@ systemctl --user daemon-reload >/dev/null 2>&1 || true
 
 echo "Installed $variant variant ($target_profile build):"
 echo "  binary:  $bin_dir/$name -> $target_bin"
+echo "  CLI:     $bin_dir/$cli_name -> $app_root/current/noches"
 echo "  desktop: $target_desktop (app_id $app_id)"
 echo "  icon:    $icons_dir/.../$name.{svg,png}"
 echo "  service: $target_unit"

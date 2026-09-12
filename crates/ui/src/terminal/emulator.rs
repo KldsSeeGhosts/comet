@@ -240,6 +240,28 @@ impl Emulator {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// Applications in mouse mode own wheel events, including Pi's alternate-screen UI.
+    pub fn mouse_reporting(&self) -> bool {
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    pub fn sgr_mouse(&self) -> bool {
+        self.term.mode().contains(TermMode::SGR_MOUSE)
+    }
+
+    pub fn utf8_mouse(&self) -> bool {
+        self.term.mode().contains(TermMode::UTF8_MOUSE)
+    }
+
+    pub fn alternate_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Fullscreen programs without mouse reporting receive wheel events as arrows.
+    pub fn alternate_scroll(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+    }
+
     /// Lines scrolled back into history (0 = pinned to the live bottom).
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()

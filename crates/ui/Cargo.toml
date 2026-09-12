@@ -28,6 +28,9 @@ required-features = ["browser-fixture"]
 [dependencies]
 url = "2"
 zeron-proto.workspace = true
+zeron-workspace.workspace = true
+zeron-local-api.workspace = true
+zeron-orchestration.workspace = true
 similar.workspace = true
 zeron-doc.workspace = true
 zeron-engine.workspace = true

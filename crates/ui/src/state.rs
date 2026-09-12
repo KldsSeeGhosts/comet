@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use gpui::{App, Context, Entity, Task};
+use gpui::{App, AppContext as _, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
@@ -1584,6 +1584,32 @@ impl AppState {
 
     pub fn engine(&self) -> Option<&EngineHandle> {
         self.engine.as_ref()
+    }
+
+    /// A pane owns its selection and transcript subscriptions, but shares the engine.
+    pub fn fork_pane(source: &Entity<Self>, cx: &mut App) -> Entity<Self> {
+        let source = source.read(cx);
+        let mut pane = Self::new();
+        pane.data_dir = source.data_dir.clone();
+        pane.auth = source.auth.clone();
+        pane.devices = source.devices.clone();
+        pane.spaces = source.spaces.clone();
+        pane.chats = source.chats.clone();
+        pane.sessions = source.sessions.clone();
+        pane.connectivity = source.connectivity.clone();
+        pane.selected_space = source.selected_space.clone();
+        pane.selected_device = source.selected_device.clone();
+        pane.no_project = source.no_project;
+        pane.chats_synced = source.chats_synced;
+        pane.spaces_synced = source.spaces_synced;
+        pane.auto_selected = true;
+        let engine = source.engine.clone();
+        cx.new(move |cx| {
+            if let Some(engine) = engine {
+                pane.attach_engine(engine, cx);
+            }
+            pane
+        })
     }
 
     /// Drop every account-scoped view and subscription after its runtime has
@@ -4012,8 +4038,7 @@ mod tests {
 
     #[test]
     fn explicit_capabilities_distinguish_same_version_builds() {
-        let mut state = AppState::default();
-        state.devices = vec![
+        let state = AppState { devices: vec![
             Device {
                 id: "personal".into(),
                 name: "personal".into(),
@@ -4032,7 +4057,7 @@ mod tests {
                 version: Some("0.2.31".into()),
                 capabilities: Vec::new(),
             },
-        ];
+        ], ..Default::default() };
 
         assert!(state.device_supports("personal", zeron_proto::capabilities::MESSAGE_QUEUE_V1));
         assert!(!state.device_supports("upstream", zeron_proto::capabilities::MESSAGE_QUEUE_V1));
@@ -4042,8 +4067,7 @@ mod tests {
     fn delivery_degradation_and_queued_sends_tell_the_truth() {
         use zeron_proto::{ChatConnectivity, ConnectivityState};
         let now = Utc::now();
-        let mut s = AppState::default();
-        s.local_device_id = Some("local".into());
+        let mut s = AppState { local_device_id: Some("local".into()), ..Default::default() };
         let mut remote = chat("c-remote", 0, None);
         remote.device_id = "remote".into();
         let mut local = chat("c-local", 0, None);

@@ -370,11 +370,7 @@ impl AccentRoles {
             if appearance.is_dark() { 0.28 } else { 0.18 },
         );
         let deep = primary.mix(
-            if appearance.is_dark() {
-                Color::BLACK
-            } else {
-                Color::BLACK
-            },
+            Color::BLACK,
             if appearance.is_dark() { 0.18 } else { 0.26 },
         );
         Self {

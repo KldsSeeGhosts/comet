@@ -34,6 +34,9 @@ pub enum SessionCommandStatus {
     Cancelled,
 }
 
+// RunRequest dwarfs the other variants, but boxing it would churn every
+// queued-command read; these are one entry per user action, not hot data.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum SessionCommandPayload {

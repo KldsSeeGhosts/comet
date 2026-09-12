@@ -301,6 +301,7 @@ pub fn apply_keymap(
     // close, ⌘M minimize, ⌘H hide on macOS) — these back the native menu
     // key equivalents and must survive keymap re-application.
     crate::app_menus::bind_keys(cx);
+    crate::workspace::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new(
             &valid_or_default(&keymap.save_file, "mod-s"),
@@ -592,6 +593,10 @@ impl NavHistory {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -1133,6 +1138,8 @@ pub struct Shell {
     sidebar_pane: Entity<SidebarPane>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    workspace: Option<Entity<crate::workspace::Workspace>>,
+    workspace_events: Option<Subscription>,
     /// External image or workspace-path drag hovering the conversation
     /// column; a drop stages an image or inserts a file-mention chip.
     file_drag_active: bool,
@@ -1406,6 +1413,7 @@ impl Shell {
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
             move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+                ComposerEvent::HumanSubmitted { .. } => {}
                 ComposerEvent::Sent {
                     chat_id,
                     message_id,
@@ -1524,6 +1532,8 @@ impl Shell {
             sidebar_pane,
             transcript,
             composer,
+            workspace: None,
+            workspace_events: None,
             file_drag_active: false,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
@@ -2884,6 +2894,13 @@ impl Shell {
     }
 
     fn prepare_exit(&mut self, action: PendingExit, cx: &mut Context<Self>) -> bool {
+        if let Some(workspace) = &self.workspace
+            && let Err(error) = workspace.update(cx, |workspace, _| workspace.flush())
+        {
+            self.sidebar_notice = Some(SidebarNotice::error(error));
+            cx.notify();
+            return false;
+        }
         let surfaces = self
             .files
             .values()
@@ -2913,12 +2930,9 @@ impl Shell {
     }
 
     fn reveal_unsaved_file(&mut self, cx: &mut Context<Self>) {
-        let browser = self.files.iter().filter_map(|(key, files)| {
-            files
+        let browser = self.files.iter().filter(|&(_key, files)| files
                 .read(cx)
-                .has_unsaved_changes()
-                .then(|| (key.clone(), RightSurface::Files))
-        });
+                .has_unsaved_changes()).map(|(key, _files)| (key.clone(), RightSurface::Files));
         let editors = self.file_surface_keys.iter().filter_map(|((key, _), id)| {
             self.file_surfaces
                 .get(id)
@@ -3409,7 +3423,7 @@ impl Shell {
                         |this: &mut Shell, _, event: &ShortcutsEvent, cx| {
                             match event {
                                 ShortcutsEvent::KeymapChanged(keymap) => {
-                                    this.settings.keymap = keymap.clone();
+                                    this.settings.keymap = keymap.as_ref().clone();
                                 }
                                 ShortcutsEvent::ComposerSendBehaviorChanged(behavior) => {
                                     this.settings.composer_send_behavior = *behavior;
@@ -3672,6 +3686,8 @@ impl Shell {
                         shell.org = None;
                         shell.route = Route::Chat;
                         shell.space_boot_applied = false;
+                        shell.workspace = None;
+                        shell.workspace_events = None;
                         state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
                         AppState::bootstrap(state.clone(), boot, cx);
                     }
@@ -3807,6 +3823,8 @@ impl Shell {
                         shell.org = None;
                         shell.route = Route::Chat;
                         shell.space_boot_applied = false;
+                        shell.workspace = None;
+                        shell.workspace_events = None;
                         state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
                         AppState::bootstrap(state.clone(), boot, cx);
                     }
@@ -6536,6 +6554,29 @@ impl Shell {
                 .into_any_element();
         }
 
+        if self.state.read(cx).engine().is_some() {
+            if self.workspace.is_none() {
+                let state = self.state.clone();
+                let path = crate::workspace::layout_path(self.state.read(cx), &self.data_dir);
+                let workspace = cx.new(|cx| crate::workspace::Workspace::new(state, path, cx));
+                self.workspace_events = Some(cx.subscribe(&workspace, |shell, _, event, cx| {
+                    let crate::workspace::WorkspaceEvent::ActivePane { chat, transcript, composer } = event;
+                    shell.transcript = transcript.clone();
+                    shell.composer = composer.clone();
+                    shell._transcript_events = cx.subscribe(transcript, Self::on_transcript_event);
+                    if shell.state.read(cx).selected_chat != *chat {
+                        shell.state.update(cx, |state, cx| state.select_chat(chat.clone(), cx));
+                    }
+                    cx.notify();
+                }));
+                self.workspace = Some(workspace);
+            }
+            return div().flex_1().min_w_0().min_h_0().h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .child(self.workspace.as_ref().unwrap().clone())
+                .into_any_element();
+        }
+
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
@@ -8809,18 +8850,22 @@ impl Render for Shell {
                 let main_content_width =
                     stable_panel_content_width(main_target_width, main_transition);
                 let main_width = (main_content_width - 10.0).max(0.0);
-                self.composer.update(cx, |composer, cx| {
-                    composer.set_available_width(main_width, cx)
-                });
+                if self.workspace.is_none() {
+                    self.composer.update(cx, |composer, cx| {
+                        composer.set_available_width(main_width, cx)
+                    });
+                }
                 // Clearance excludes the terminal dock: the transcript
                 // viewport ends at the dock's top (see the underlay in
                 // `render_main`), so only the chrome above it overlaps.
                 let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
                 let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
-                self.transcript.update(cx, |t, cx| {
-                    t.set_rail_enabled(rail::rail_visible(main_width), cx);
-                    t.set_bottom_clearance(stack_h, cx);
-                });
+                if self.workspace.is_none() {
+                    self.transcript.update(cx, |t, cx| {
+                        t.set_rail_enabled(rail::rail_visible(main_width), cx);
+                        t.set_bottom_clearance(stack_h, cx);
+                    });
+                }
 
                 let sidebar = self.render_sidebar(cx);
                 let sidebar_handle = self.resize_handle(
@@ -9641,8 +9686,8 @@ mod tests {
     #[test]
     fn sidebar_harness_geometry_reflects_row_hierarchy() {
         assert_eq!(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP, Theme::SPACE_SM);
-        assert!(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP < SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP);
-        assert!(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE < SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE);
+        const { assert!(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP < SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP); }
+        const { assert!(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE < SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE); }
     }
 
     #[test]

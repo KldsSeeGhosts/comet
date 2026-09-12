@@ -94,15 +94,18 @@ pub struct RenderOptions {
 /// Copy-button wiring for one row's code blocks: the handler writes the code
 /// to the clipboard and flips a transient per-row "Copied" state owned by the
 /// transcript entity; `copied_ix` is the block currently showing feedback.
+pub type CopyHandler = Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)>;
+type LinkHandler = Rc<dyn Fn(&str, &mut Window, &mut gpui::App) -> bool>;
+
 #[derive(Clone)]
 pub struct CopyUi {
-    pub handler: Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)>,
+    pub handler: CopyHandler,
     pub copied_ix: Option<usize>,
 }
 
 #[derive(Clone)]
 pub struct LinkUi {
-    pub handler: Rc<dyn Fn(&str, &mut Window, &mut gpui::App) -> bool>,
+    pub handler: LinkHandler,
 }
 
 type HoverHandler = Rc<dyn Fn(bool, &mut Window, &mut gpui::App)>;
@@ -118,7 +121,7 @@ pub struct CodeUi {
     pub fit_content: bool,
     pub scroll: gpui::ScrollHandle,
     pub scrollbar: Option<CodeScrollbarUi>,
-    pub toggle_fit: Rc<dyn Fn(&mut Window, &mut gpui::App)>,
+    pub toggle_fit: ReleaseHandler,
     pub viewport_hover: HoverHandler,
     pub drag_move: PointerHandler,
 }
@@ -621,8 +624,8 @@ fn render_table(
 }
 
 /// Flattened inline runs: one string + gpui `TextRun`s + clickable link ranges
-/// + inline-code ranges (their rounded washes are painted by a canvas UNDER
-/// the text — `TextRun::background_color` can only paint square boxes).
+/// and inline-code ranges. A canvas paints rounded backgrounds under the text;
+/// `TextRun::background_color` only paints square boxes.
 /// `text` is a `SharedString` so cached reuse across frames is an Arc clone.
 pub struct FlatText {
     pub text: SharedString,
@@ -1426,7 +1429,7 @@ fn render_code_block(
     };
 
     let scrollbar = (!fit_content)
-        .then(|| code_ui.as_ref())
+        .then_some(code_ui.as_ref())
         .flatten()
         .and_then(|ui| {
             let bar = ui.scrollbar.as_ref()?;
