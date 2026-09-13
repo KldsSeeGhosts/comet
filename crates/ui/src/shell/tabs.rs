@@ -170,7 +170,11 @@ impl Shell {
     /// Replaces the tab strip; inherits its titlebar duties (drag region,
     /// animated left inset, the toggle-changes button on git projects).
     #[allow(dead_code)]
-    pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_session_title_bar(
+        &mut self,
+        viewport_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         // The canvas titles as NOTHING (user request — a "New session"
         // header over the empty canvas was noise); the bar keeps its height,
@@ -339,7 +343,9 @@ impl Shell {
         };
 
         let actions = (!takeover && !on_canvas)
-            .then(|| self.render_project_actions_control(available_titlebar_width, cx))
+            .then(|| {
+                self.render_project_actions_control(available_titlebar_width, viewport_height, cx)
+            })
             .flatten();
         let inner = div()
             .size_full()

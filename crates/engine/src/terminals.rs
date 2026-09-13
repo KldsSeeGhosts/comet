@@ -38,6 +38,8 @@ const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 struct LiveTerminal {
+    // Keep the private action script alive until the shell exits or the tab closes.
+    initial_script: Option<tempfile::NamedTempFile>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
@@ -75,6 +77,7 @@ impl LiveTerminal {
         }
         self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
         if matches!(event, TerminalEvent::Exit { .. }) {
+            self.initial_script.take();
             self.exited = true;
             self.subscribers.clear();
         }
@@ -172,7 +175,7 @@ impl Terminals {
         rows: u16,
         environment: &HashMap<String, String>,
     ) -> Result<TerminalSession, EngineError> {
-        self.open_with_shell_and_environment(cwd, cols, rows, None, environment)
+        self.open_session(cwd, cols, rows, None, environment, None)
     }
 
     /// Explicit shell override (tests use `/bin/sh`).
@@ -195,6 +198,32 @@ impl Terminals {
         shell: Option<&str>,
         environment: &HashMap<String, String>,
     ) -> Result<TerminalSession, EngineError> {
+        self.open_session(cwd, cols, rows, shell, environment, None)
+    }
+
+    /// Run an exact command in a fresh interactive login shell. On Unix, only a
+    /// short bootstrap crosses the PTY's limited initial canonical line buffer.
+    pub fn open_with_command(
+        &self,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        environment: &HashMap<String, String>,
+        command: &str,
+    ) -> Result<TerminalSession, EngineError> {
+        self.open_session(cwd, cols, rows, None, environment, Some(command))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_session(
+        &self,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        shell: Option<&str>,
+        environment: &HashMap<String, String>,
+        command: Option<&str>,
+    ) -> Result<TerminalSession, EngineError> {
         if lock(&self.inner.sessions).len() >= MAX_TERMINALS {
             return Err(EngineError::Other(format!(
                 "Too many open terminals (maximum {MAX_TERMINALS})"
@@ -212,9 +241,18 @@ impl Terminals {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| shell.clone());
 
+        let mut initial_script = None;
+        let mut bootstrap = None;
         #[cfg(windows)]
-        let (master, mut child) = windows::open(&shell, cwd, clamp_size(cols, rows), environment)
-            .map_err(|e| EngineError::Other(format!("could not open Windows terminal: {e}")))?;
+        let (master, mut child) = {
+            if let Some(command) = command {
+                // ConPTY has no Unix canonical line buffer. Preserve the user's
+                // interactive-shell syntax and avoid PowerShell execution policy.
+                bootstrap = Some(format!("{command}\r"));
+            }
+            windows::open(&shell, cwd, clamp_size(cols, rows), environment)
+                .map_err(|e| EngineError::Other(format!("could not open Windows terminal: {e}")))?
+        };
         #[cfg(not(windows))]
         let (master, mut child) = {
             let pty = native_pty_system();
@@ -231,6 +269,21 @@ impl Terminals {
             cmd.env("TERM_PROGRAM", "Zeron");
             for (name, value) in environment {
                 cmd.env(name, value);
+            }
+            if let Some(command) = command {
+                let (suffix, source) = match shell_name.as_str() {
+                    "fish" => (".fish", "source \"$ZERON_ACTION_SCRIPT\"\r"),
+                    _ => (".sh", ". \"$ZERON_ACTION_SCRIPT\"\r"),
+                };
+                let mut script = tempfile::Builder::new()
+                    .prefix("zeron-action-")
+                    .suffix(suffix)
+                    .tempfile()?;
+                script.write_all(command.as_bytes())?;
+                script.flush()?;
+                cmd.env("ZERON_ACTION_SCRIPT", script.path());
+                initial_script = Some(script);
+                bootstrap = Some(source.to_string());
             }
             let child = pair
                 .slave
@@ -249,6 +302,7 @@ impl Terminals {
 
         let id = new_id();
         let session = Arc::new(Mutex::new(LiveTerminal {
+            initial_script,
             master: Some(master),
             writer: Some(writer),
             killer,
@@ -304,6 +358,13 @@ impl Terminals {
             tokio::spawn(async move { rx.await.map_err(std::io::Error::other)? })
         };
         tokio::spawn(pump_output(Arc::downgrade(&session), raw_rx, wait));
+
+        if let Some(bootstrap) = bootstrap
+            && let Err(err) = self.write_bytes(&id, bootstrap.as_bytes())
+        {
+            let _ = self.close(&id);
+            return Err(err);
+        }
 
         Ok(TerminalSession {
             id,
@@ -423,6 +484,7 @@ impl Terminals {
 fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) -> bool {
     let mut session = lock(session);
     session.subscribers.clear();
+    session.initial_script.take();
     if kill
         && !session.exited
         && let Err(err) = session.killer.kill()
