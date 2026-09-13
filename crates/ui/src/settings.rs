@@ -420,6 +420,10 @@ pub struct UiSettings {
     pub diff_split: bool,
     /// Changes pane: wrap long source lines instead of scrolling horizontally.
     pub diff_wrap: bool,
+    /// Automatically expand diff and edit tool cards in transcripts.
+    pub auto_expand_edits: bool,
+    /// Confirm before closing a tab or pane with a live, running native CLI session.
+    pub confirm_before_closing_running_tab: bool,
     /// Agent-sent Markdown fences: wrap long lines to the chat width instead
     /// of exposing their horizontal scroll plane.
     pub code_fences_fit_content: bool,
@@ -478,6 +482,8 @@ impl Default for UiSettings {
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
             diff_wrap: false,
+            auto_expand_edits: false,
+            confirm_before_closing_running_tab: true,
             code_fences_fit_content: false,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
@@ -1070,6 +1076,18 @@ mod tests {
     }
 
     #[test]
+    fn auto_expand_edits_and_confirm_close_camel_case_round_trip() {
+        let json = r#"{"autoExpandEdits":true,"confirmBeforeClosingRunningTab":false}"#;
+        let loaded: UiSettings = serde_json::from_str(json).unwrap();
+        assert!(loaded.auto_expand_edits);
+        assert!(!loaded.confirm_before_closing_running_tab);
+
+        let empty: UiSettings = serde_json::from_str("{}").unwrap();
+        assert!(!empty.auto_expand_edits);
+        assert!(empty.confirm_before_closing_running_tab);
+    }
+
+    #[test]
     fn obsolete_steering_preference_does_not_reset_other_settings() {
         let loaded: UiSettings = serde_json::from_str(
             r#"{"activeTurnSendBehavior":"steer","sidebarWidth":300,"soundEnabled":false}"#,
@@ -1142,6 +1160,8 @@ mod tests {
             },
             diff_split: true,
             diff_wrap: true,
+            auto_expand_edits: true,
+            confirm_before_closing_running_tab: false,
             code_fences_fit_content: true,
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,

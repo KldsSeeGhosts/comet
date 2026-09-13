@@ -1,0 +1,25 @@
+Custom command instructions
+
+- Use `sc commands list --json` to read effective custom commands and their
+  stable IDs in launch order: global, workspace, shared, then project. This
+  unscoped read uses the running app.
+- `sc commands list --scope shared` and
+  `sc commands get ID --scope shared` operate offline on the effective repo config.
+  In a linked worktree without its own config, reads inherit the main config; the
+  first mutation copies that complete config into the worktree and edits the
+  branch-owned copy without dropping scripts or unknown fields.
+- Use `sc commands get ID [--scope SCOPE] --json` for one command. If an ID is
+  duplicated across scopes, specify the scope explicitly.
+- Mutations require one explicit `--scope global|workspace|project|shared`.
+  Global, workspace, and project scopes are personal App Settings and require
+  the running app. Shared scope is repository-owned and operates offline on
+  the effective `.superconductor/config.json` for the current Git worktree.
+- Create with `sc commands create NAME --command TEXT --scope SCOPE`. Update
+  fields with `sc commands update ID --scope SCOPE ...`; delete with
+  `sc commands delete ID --scope SCOPE`.
+- Shared edits preserve unknown JSON fields and atomically replace the validated
+  config. A linked worktree without a config reads the main-repo config; creating
+  a worktree config shadows that whole file, including script configuration.
+- Provider `none` launches plain terminal commands. Omitting provider/model/
+  reasoning uses the normal routed defaults; clear an existing override with
+  its `--clear-*` option.

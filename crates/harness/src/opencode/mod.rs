@@ -51,7 +51,7 @@ use tokio::sync::mpsc;
 
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
+    SteeringMode, TodoItem, ToolCall, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
 
 use crate::{Harness, HarnessError, RunCommand, RunControls, shutdown_child};
@@ -2470,8 +2470,17 @@ fn map_questions(props: &Value) -> Vec<UserInputQuestion> {
                             .and_then(Value::as_array)
                             .map(|opts| {
                                 opts.iter()
-                                    .filter_map(|o| o.get("label").and_then(Value::as_str))
-                                    .map(str::to_owned)
+                                    .map(|o| UserInputOption {
+                                        label: o
+                                            .get("label")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .to_owned(),
+                                        description: o
+                                            .get("description")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned),
+                                    })
                                     .collect()
                             })
                             .unwrap_or_default(),

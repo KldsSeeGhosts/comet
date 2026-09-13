@@ -1,0 +1,71 @@
+Workspace instructions
+
+Control surface and authorization:
+- Use documented `sc workspace` commands for app-managed workspaces. Do not
+  edit the settings file or call local API internals directly.
+- Read-only discovery (`list`, `get`, and `watch`) needs no mutation approval.
+- Run `sc workspace create` only when the human explicitly asks to create a
+  workspace. Never infer authorization from setup, isolation, subagents,
+  delegation, parallel work, or missing capabilities.
+- Run `update`, `add`, `theme`, `move`, `select`, or `delete` only when the
+  human user's requested outcome requires that app-managed state change.
+- Workspace creation is not delegation and does not authorize launching an
+  agent, creating a Git worktree, or changing branches.
+
+Discovery and exact targeting:
+- Start with `sc workspace list --json`; use its exact workspace ids for
+  `get`, `update`, `add`, `theme`, `move`, `delete`, `select`, and
+  `sc worktree create`.
+- Use `sc workspace get WORKSPACE_ID --json` for type-specific configuration.
+  Do not infer type, project membership, repositories, or remote target from a
+  name or directory.
+- An api_chat row with stable_id: null has no live view (parked or lazily
+  restored). Its conversation still exists, and its agent stable_target_id
+  and label survive parking.
+- Inactive terminal rows can also have stable_id: null. Use the explicit
+  parked field in `sc chat list --worktree PATH --json` for chat loading state;
+  this listing does not restore chats or change selection.
+- `sc workspace watch --json` streams live hierarchy changes after an initial
+  snapshot. Reconnect and list again if the stream ends.
+
+Creation and mutation:
+- `sc workspace create NAME` creates an individual workspace. Add
+  `--type shared-context --repo PATH` for Shared Context or
+  `--type remote --ssh-target TARGET` for a remote workspace. Feature flags
+  for Shared Context and remote workspaces must already be enabled.
+- Add `--before WORKSPACE_ID` or `--after WORKSPACE_ID` to create directly at
+  that sidebar position. Without either option, creation appends the workspace.
+- Shared Context accepts repeated repository paths or one parent folder that
+  discovers at least two Git repositories. `--analysis-depth quick|thorough`
+  uses the app's normal setup policy. Creation returns after setup is scheduled,
+  not after AI setup or remote probing finishes.
+- Remote creation keeps managed-CLI install consent on by default; use
+  `--no-install-cli` only when the human requested that policy.
+- Creation preserves the current app selection and never foregrounds the app
+  by default. Use `--select` only when changing the visible in-app workspace is
+  part of the requested outcome; it still does not foreground the app.
+- `sc workspace add WORKSPACE_ID --project PATH` registers or attaches a local
+  project to an individual workspace. `--repository PATH` adds one or more Git
+  repositories (or a parent folder) to Shared Context. `--remote-project
+  /ABSOLUTE/PATH` resolves and adds a directory through a remote workspace's
+  configured SSH target.
+- Additions run in the background and never change workspace/worktree
+  selection, input focus, or app activation. Risky local paths return
+  `confirmation_required` instead of opening a dialog; non-Git paths return
+  `feature_disabled` unless the existing experimental feature is enabled.
+- `update` changes common name/icon metadata using `--emoji`, `--named-icon`,
+  `--image-icon`, or `--clear-icon`. `theme` sets or clears per-workspace light
+  and dark chrome, accent, highlight, and accent-style overrides. Neither
+  command changes selection, focus, or activation. Remote-target changes and
+  removals remain app-managed UI flows. `move` changes sidebar order.
+
+Deletion:
+- `sc workspace delete WORKSPACE_ID --confirm` always requires the explicit
+  confirmation flag and refuses to delete the last workspace.
+- Individual and remote deletion remove the app grouping, not registered
+  repositories. Shared Context deletion is destructive: it runs cleanup hooks
+  and removes managed branch-group worktrees and the managed workspace
+  directory. Confirm the exact id and requested scope before running it.
+
+Use `sc help workspace`; focused help is available for `create`, `get`,
+`update`, `add`, `theme`, `move`, and `delete`.

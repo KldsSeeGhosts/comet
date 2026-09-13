@@ -244,7 +244,12 @@ fn controls() -> (RunControls, mpsc::Sender<RunCommand>, CancellationToken) {
                 .iter()
                 .map(|q| UserInputAnswer {
                     question_id: q.id.clone(),
-                    labels: q.options.first().cloned().into_iter().collect(),
+                    labels: q
+                        .options
+                        .first()
+                        .map(|o| o.label.clone())
+                        .into_iter()
+                        .collect(),
                 })
                 .collect();
             let _ = tx.send(answers);

@@ -58,7 +58,7 @@ use crate::theme::Theme;
 use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workspace_links::resolve_workspace_file_link;
 
-mod spaces;
+pub(crate) mod spaces;
 mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
@@ -3546,6 +3546,13 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.close_chat_menu(cx);
+        if archived && self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
+            // Archiving the open session lands on the new-session canvas
+            // (bb: archive navigates to the compose route) — the row leaves
+            // the active list, so the view must not stay on it. Unarchiving
+            // never navigates: the row returns to the list on its own.
+            self.open_new_session_draft(cx);
+        }
         self.mutate(
             serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": archived }),
             cx,
@@ -4829,6 +4836,9 @@ impl Shell {
         status: zeron_proto::ChatIndicator,
         selected: bool,
         archived: bool,
+        // bb's open-in-split row state: a session shown by any workspace pane
+        // reads as "on stage" even when another pane holds the selection.
+        open_in_pane: bool,
         // This row's jump combo while the hint overlay is up. It takes the
         // corner outright — above hover and above the status word — so all
         // nine chips appear together instead of leaving a hole on whichever
@@ -5056,9 +5066,12 @@ impl Shell {
         // below its near-opaque selected fill, and blending toward it visibly
         // dimmed the active row under the pointer (user report).
         let hover_bg = if selected { selected_wash } else { hover };
-        let rest_text = if selected { text } else { text.opacity(0.8) };
+        // An open-in-split row keeps full title ink (bb tints rows whose
+        // thread lives in a pane) — the accent edge marker carries the rest.
+        let rest_text = if selected || open_in_pane { text } else { text.opacity(0.8) };
         div()
             .id(SharedString::from(format!("chat-{id}")))
+            .relative()
             .flex()
             .flex_row()
             .items_center()
@@ -5090,9 +5103,30 @@ impl Shell {
                 })
             })
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_chat(select_id.clone(), cx);
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                // Cmd/Ctrl-click is bb's open-in-split gesture; a plain click
+                // stays the selector.
+                if event.modifiers().platform || event.modifiers().control {
+                    this.open_chat_in_split(select_id.clone(), cx);
+                } else {
+                    this.open_chat(select_id.clone(), cx);
+                }
             }))
+            // The bb split drag: pull a session out of the sidebar and drop
+            // it on a pane edge (split), pane center (open), or tab rail.
+            .on_drag(
+                crate::workspace::SidebarSessionDrag {
+                    chat_id: id.clone(),
+                    title: title.to_string(),
+                },
+                |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| crate::workspace::PaneGhost {
+                        title: drag.title.clone(),
+                        tab: false,
+                    })
+                },
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -5104,6 +5138,20 @@ impl Shell {
                     cx.notify();
                 }),
             )
+            // bb's open-in-split edge: the accent bar names the pane-backed
+            // rows without touching the row's wash system.
+            .when(open_in_pane, |row| {
+                row.child(
+                    div()
+                        .absolute()
+                        .left(px(2.0))
+                        .top(px(7.0))
+                        .bottom(px(7.0))
+                        .w(px(2.0))
+                        .rounded_full()
+                        .bg(theme.accent.opacity(0.55)),
+                )
+            })
             // Companion avatar leads the row.
             .child(div().flex_none().child(avatar))
             // Line 1: "project @ device", status word / time-ago right.
@@ -5207,9 +5255,10 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
-    /// section (folder + device rows, add-space), the global Active sessions
-    /// list, the notice strip, and the UserMenu (§1.6).
+    /// Chat-mode sidebar: the space-filter row (project picker + view
+    /// options), the global Sessions list (drag a row into the workspace to
+    /// split it open; Cmd/Ctrl-click opens in split; Cmd+1..9 jumps), the
+    /// archived shelf, the notice strip, and the UserMenu.
     /// The global connection line. `None` while healthy (`Connected`) or on
     /// local profiles (`Disabled`) — and the engine's degrade grace means it
     /// only exists during REAL outages, never join/wake blips. No surface,
@@ -6202,6 +6251,7 @@ impl Shell {
             let chat_id = menu_state.chat_id;
             let position = menu_state.position;
             let chat_menu_closing = self.chat_menu.closing_since();
+            let split_id = chat_id.clone();
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
@@ -6214,6 +6264,16 @@ impl Shell {
                 .flex_col();
             let menu = match menu_state.page {
                 ChatMenuPage::Root => menu
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-split-{chat_id}"))
+                            .id("chat-menu-split")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_chat_menu(cx);
+                                this.open_chat_in_split(split_id.clone(), cx);
+                            }))
+                            .child(icon(icons::SPLIT_COLUMNS).size(px(16.0)).text_color(theme.text_muted))
+                            .child(SharedString::from("Open in split")),
+                    )
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
                             .id("chat-menu-rename")
@@ -8743,8 +8803,12 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             // New session works from anywhere — `open_new_session` routes back
-            // to chat itself, so Settings is not a dead spot.
-            .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
+            // to chat itself, so Settings is not a dead spot. The keyboard
+            // shortcut opens the blank draft canvas; the titlebar `+` opens
+            // the folder browser for a directory-first pick.
+            .on_action(cx.listener(|this, _: &NewSession, _, cx| {
+                this.open_new_session_draft(cx)
+            }))
             // Native Settings menu item and the platform convention (Cmd+, on
             // macOS, Ctrl+, elsewhere) always land on the default section.
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
@@ -9934,6 +9998,85 @@ mod exit_regressions {
     }
 
     #[gpui::test]
+    fn archiving_the_open_session_lands_on_the_canvas(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        let chat = |id: &str| zeron_proto::Chat {
+            id: id.into(),
+            device_id: "dev".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        };
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.apply_chats(vec![chat("open"), chat("other")]);
+                    state.select_chat(Some("open".into()), cx);
+                });
+                shell.set_chat_archived("open".into(), true, cx);
+                assert_eq!(
+                    shell.state.read(cx).selected_chat, None,
+                    "archiving the open session must land on the new-session canvas"
+                );
+                // Archiving a background row leaves the selection alone.
+                shell.state.update(cx, |state, cx| {
+                    state.select_chat(Some("other".into()), cx);
+                });
+                shell.set_chat_archived("open".into(), true, cx);
+                assert_eq!(
+                    shell.state.read(cx).selected_chat.as_deref(),
+                    Some("other")
+                );
+                // Unarchiving the open row (sidebar's archived shelf lets a
+                // selected archived chat restore itself) never navigates.
+                shell.state.update(cx, |state, _| {
+                    state.chats.iter_mut().find(|c| c.id == "other").unwrap().archived = true;
+                });
+                shell.set_chat_archived("other".into(), false, cx);
+                assert_eq!(
+                    shell.state.read(cx).selected_chat.as_deref(),
+                    Some("other"),
+                    "unarchiving must not drop the open session"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn projectless_new_session_restores_opt_out_and_clears_sidebar_filter(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         crate::settings::composer::ComposerDefaults {
@@ -9990,7 +10133,7 @@ mod exit_regressions {
                     state.no_project = false;
                 });
                 shell.settings.space_filter = None;
-                shell.open_new_session(cx);
+                shell.open_new_session_draft(cx);
                 assert!(shell.state.read(cx).no_project);
                 assert!(shell.state.read(cx).selected_space.is_none());
                 assert_eq!(

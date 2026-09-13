@@ -1110,14 +1110,18 @@ impl Driver {
                 command.env_remove(key);
             }
         }
-        // CUA_DRIVER_RS_ENABLE_WAYLAND alone selects the production Hyprland
-        // isolated-input lanes (cua-input-v3.sock) bound by the
-        // cua-hyprland-plugin. Setting CUA_DRIVER_EXPERIMENTAL_HYPRLAND_INPUT
-        // would switch the driver to the experimental test protocol and look
-        // for cua-input-test.sock instead, so it must stay unset.
+        // Select CUA's production Hyprland backend and the native input-v3
+        // route that this host explicitly enables in its compositor config.
+        // The driver still requires an exact target and the engine still
+        // permits background-only input; this only avoids silently restoring
+        // the driver's narrow package matrix after the engine sanitizes CUA_*.
+        // Setting CUA_DRIVER_EXPERIMENTAL_HYPRLAND_INPUT would instead select
+        // the test protocol and look for cua-input-test.sock, so it must stay
+        // unset.
         command
             .env("CUA_DRIVER_PERMISSION_MODE", "standard")
-            .env("CUA_DRIVER_RS_ENABLE_WAYLAND", "1");
+            .env("CUA_DRIVER_RS_ENABLE_WAYLAND", "1")
+            .env("CUA_HYPRLAND_OPEN_INPUT", "1");
         command
     }
 

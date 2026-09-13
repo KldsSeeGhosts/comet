@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use zeron_proto::{
     AgentEvent, CommandScope, ContextComponent, ContextComponentKind, DoneStatus, HarnessId, Model,
     ReasoningLevel, RunRequest, SessionOptions, SlashCommand, SteeringMode, TodoItem, ToolCall,
-    ToolDiff, UserInputAnswer, UserInputQuestion,
+    ToolDiff, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
 
 use crate::{
@@ -2162,33 +2162,61 @@ fn extension_question(request: &Value, method: &str) -> UserInputQuestion {
         .get("message")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|message| !message.is_empty());
-    let question_text = match (title, message) {
-        (Some(title), Some(message)) => format!("{title}\n\n{message}"),
-        (Some(title), None) => title.to_owned(),
-        (None, Some(message)) => message.to_owned(),
-        (None, None) => method.to_owned(),
-    };
-    let options = match method {
+        .filter(|message| !message.is_empty())
+        // Some extensions stamp the header into the message as a `[Header]`
+        // prefix — the chip already carries `header`, so the card would show
+        // it twice. Strip the echo.
+        .map(|m| strip_leading_tag(m));
+    // `title` rides `header` — the transcript chip / collapsed row already
+    // surfaces it (Claude: "Asking Tech Stack"), so it stays OUT of the
+    // card's question text.
+    let question_text = message.unwrap_or_else(|| {
+        title.map(str::to_owned).unwrap_or_else(|| method.to_owned())
+    });
+    let mut options: Vec<UserInputOption> = match method {
         "select" => request
             .get("options")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter_map(|option| {
-                option
-                    .as_str()
-                    .or_else(|| {
-                        option
-                            .get("label")
-                            .or_else(|| option.get("value"))
-                            .and_then(Value::as_str)
-                    })
-                    .map(str::to_owned)
+            .map(|option| match option {
+                Value::String(s) => s.clone().into(),
+                other => UserInputOption {
+                    label: other
+                        .get("label")
+                        .or_else(|| other.get("value"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    description: other
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
             })
             .collect(),
-        "confirm" => vec!["Yes".to_owned(), "No".to_owned()],
+        "confirm" => vec!["Yes".into(), "No".into()],
         _ => Vec::new(),
+    };
+    // Some extensions flatten the pick list into the prompt itself
+    // (`1. Label — description` lines plus an "enter the numbers…" footer)
+    // instead of populating `options`. Lift those lines into real option
+    // rows and keep the bare question as the card's text. When `options`
+    // DID arrive, the same lines are a duplicate echo of the rows — strip
+    // them so the card doesn't render the list twice.
+    let (clean, parsed) = lift_numbered_options(&question_text);
+    let question_text = if options.is_empty() {
+        options = parsed;
+        clean
+    } else if !parsed.is_empty()
+        && parsed
+            .iter()
+            .all(|p| options.iter().any(|o| o.label == p.label))
+    {
+        // The numbered lines echo the option rows verbatim — strip them.
+        clean
+    } else {
+        question_text
     };
     UserInputQuestion {
         id: uuid::Uuid::new_v4().to_string(),
@@ -2197,6 +2225,82 @@ fn extension_question(request: &Value, method: &str) -> UserInputQuestion {
         options,
         multi_select: false,
     }
+}
+
+/// Drop a leading `[tag]` an extension stamped on its prompt — the tag is
+/// already surfaced as the chip's `header`, so the card would render it
+/// twice.
+fn strip_leading_tag(text: &str) -> String {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('[') {
+        return text.to_owned();
+    }
+    let Some(end) = trimmed.find(']') else {
+        return text.to_owned();
+    };
+    let tag = &trimmed[1..end];
+    // Only a short, word-like tag is a header echo — a `[link](…)` opener or
+    // a long bracketed sentence is real content.
+    if tag.is_empty() || tag.len() > 48 || tag.contains(['\n', '[', ']', '(', ')']) {
+        return text.to_owned();
+    }
+    trimmed[end + 1..].trim_start().to_owned()
+}
+
+/// Pull `N. Label — description` (or `N. Label: description`) option lines
+/// out of a prompt that flattened its pick list into plain text, returning
+/// the cleaned question plus the parsed options. Only fires when the prompt
+/// carries at least two numbered lines — a single `1.` step is prose, not a
+/// choice list.
+fn lift_numbered_options(text: &str) -> (String, Vec<UserInputOption>) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut options: Vec<UserInputOption> = Vec::new();
+    let mut in_list = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let numbered = trimmed
+            .split_once(['.', ')', ':'])
+            .and_then(|(head, rest)| {
+                let n: u32 = head.trim().parse().ok()?;
+                (n == options.len() as u32 + 1 && !rest.trim().is_empty())
+                    .then(|| rest.trim().to_owned())
+            });
+        match numbered {
+            Some(body) => {
+                in_list = true;
+                // `Label — description`, `Label - description`, `Label: description`.
+                let (label, description) = body
+                    .split_once(" — ")
+                    .or_else(|| body.split_once(" - "))
+                    .or_else(|| body.split_once(": "))
+                    .map(|(l, d)| (l.trim().to_owned(), Some(d.trim().to_owned())))
+                    .unwrap_or((body, None));
+                options.push(UserInputOption {
+                    label,
+                    description,
+                });
+            }
+            None => {
+                // A trailing instruction line ("Enter the numbers of all that
+                // apply…") right after the list is formatting, not content.
+                if in_list
+                    && (trimmed.is_empty()
+                        || trimmed.to_ascii_lowercase().contains("enter the number")
+                        || trimmed.to_ascii_lowercase().contains("comma-separated")
+                        || trimmed.to_ascii_lowercase().contains("type a custom"))
+                {
+                    continue;
+                }
+                kept.push(line);
+                in_list = false;
+            }
+        }
+    }
+    if options.len() < 2 {
+        return (text.to_owned(), Vec::new());
+    }
+    let clean = kept.join("\n").trim().to_owned();
+    (clean, options)
 }
 
 /// Whether a fire-and-forget request is a `notify` the user should see —
@@ -2498,6 +2602,15 @@ fn optional_string(value: &Value, names: &[&str]) -> Option<String> {
 }
 
 pub(crate) fn map_tool_call(name: &str, args: &Value) -> ToolCall {
+    // Question-style tool calls (`ask_user_question` and friends) are driven
+    // by the wizard, not the transcript — strip their raw args (which carry
+    // the question + option previews) so the tool body never leaks them.
+    if is_question_tool_name(name, args) {
+        return ToolCall::Unknown {
+            name: name.to_owned(),
+            input: None,
+        };
+    }
     match name.to_ascii_lowercase().as_str() {
         "bash" | "exec" => ToolCall::Exec {
             command: string_field(args, &["command", "cmd"]),
@@ -2558,6 +2671,15 @@ pub(crate) fn map_tool_call(name: &str, args: &Value) -> ToolCall {
             input: (!args.is_null()).then(|| args.clone()),
         },
     }
+}
+
+/// True when a tool name is the question prompt — pi relays these through
+/// `extension_dialog`/`request_input`, so any `tool_execution_start` echo
+/// must not carry the question's raw args into the transcript.
+fn is_question_tool_name(name: &str, args: &Value) -> bool {
+    let n = name.to_ascii_lowercase();
+    matches!(n.as_str(), "askuserquestion" | "ask_user_question" | "user_question")
+        || args.get("questions").and_then(Value::as_array).is_some()
 }
 
 /// Decode a todo list out of whatever shape the value carries. Pi's todo
@@ -3250,6 +3372,31 @@ mod tests {
         let skills = discover_skill_names(cwd);
         assert!(skills.contains("review"));
         assert!(!skills.contains(".hidden"));
+    }
+
+    #[test]
+    fn numbered_options_lift_out_of_a_flattened_prompt() {
+        // A pi extension that can't send structured `options` flattens the
+        // pick list into `message`; the wizard should still show rows.
+        let request = serde_json::json!({
+            "title": "Dev areas",
+            "message": "[Dev areas] Which components of the Zeron stack would you like to inspect?\n\n1. IPC protocol (Recommended) — Inspect Unix domain socket IPC endpoints and communication contracts.\n2. Systemd services — Check the systemd user service unit files and lifecycle management.\n3. Desktop entries — Review desktop entry files, local bin wrappers, and icons.\n\nEnter the numbers of all that apply, comma-separated (e.g. \"1,3\"), or type a custom answer as plain text."
+        });
+        let q = extension_question(&request, "input");
+        // The header rides the chip; the `[Dev areas]` echo in the message
+        // is stripped from the card's question line.
+        assert_eq!(
+            q.question,
+            "Which components of the Zeron stack would you like to inspect?"
+        );
+        assert_eq!(q.header, "Dev areas");
+        assert_eq!(q.options.len(), 3);
+        assert_eq!(q.options[0].label, "IPC protocol (Recommended)");
+        assert_eq!(
+            q.options[0].description.as_deref(),
+            Some("Inspect Unix domain socket IPC endpoints and communication contracts.")
+        );
+        assert_eq!(q.options[2].label, "Desktop entries");
     }
 
     #[test]

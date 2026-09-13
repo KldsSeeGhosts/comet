@@ -1,0 +1,8 @@
+{
+  "name": "noches",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm -C apps/desktop dev",
+    "dev:desktop": "pnpm -C apps/desktop dev"
+  }
+}

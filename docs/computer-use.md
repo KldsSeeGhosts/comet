@@ -53,10 +53,11 @@ approval carries the narrow `--grant existing-profile`, which only admits
 attaching DevTools to an existing logged-in Chromium-family profile after
 the user approved computer use for the session; a pre-approval metadata
 daemon never carries the grant and is replaced by a granted one when
-approval arrives. Inherited `CUA_*` environment settings are removed
-before launching the child, then standard mode, that grant and Wayland
-support are set explicitly. Driver-level permission refusals remain errors;
-a Noches grant does not bypass them.
+approval arrives. Inherited `CUA_*` environment settings are removed before
+launching the child, then standard mode, that grant, Wayland support, and the
+host's reviewed Hyprland input-v3 route are set explicitly. The test-only
+Hyprland input protocol remains disabled. Driver-level permission refusals
+remain errors; a Noches grant does not bypass them.
 
 The socket directory is private, mode 0700, and the socket is mode 0600.
 Each run gets a distinct connection and identity. No computer-use endpoint

@@ -324,10 +324,35 @@ impl Shell {
         cx.notify();
     }
 
-    /// `+` in the titlebar: open the new-session canvas. A set sidebar filter
-    /// re-homes the canvas onto that project; under "All" the current pick
-    /// (the last selected project, restored from composer defaults) stands.
+    /// bb's Cmd/Ctrl-click and "Open in split": the session gets its own pane
+    /// beside the active one instead of retargeting it — or focuses the pane
+    /// already showing it.
+    pub(super) fn open_chat_in_split(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        if let Some(workspace) = self.workspace.clone() {
+            workspace.update(cx, |workspace, cx| workspace.open_session_in_split(&chat_id, cx));
+        } else {
+            self.state
+                .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+        }
+        cx.notify();
+    }
+
+    /// `+` in the titlebar: open the new-session canvas and the native folder
+    /// browser over it, so a session starts with a directory pick. Choosing a
+    /// folder mints (or reuses) its Space and lands the draft on it via
+    /// `land_in_space`; escaping leaves the blank draft up to type into.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        self.open_new_session_draft(cx);
+        self.open_add_space(cx);
+    }
+
+    /// The plain new-session canvas without the folder prompt — reached from
+    /// the sidebar's session rows and any flow that already knows its target.
+    /// A set sidebar filter re-homes the canvas onto that project; under
+    /// "All" the current pick (restored from composer defaults) stands. The
+    /// chat mints on first send.
+    pub(super) fn open_new_session_draft(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         let target = {
             let state = self.state.read(cx);

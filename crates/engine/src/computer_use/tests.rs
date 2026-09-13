@@ -1,6 +1,39 @@
 use super::*;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[test]
+fn managed_driver_explicitly_enables_the_reviewed_hyprland_input_route() {
+    let command = Driver::base_command(Path::new("/usr/bin/cua-driver"));
+    let environment: BTreeMap<String, Option<String>> = command
+        .as_std()
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        environment.get("CUA_DRIVER_PERMISSION_MODE"),
+        Some(&Some("standard".into()))
+    );
+    assert_eq!(
+        environment.get("CUA_DRIVER_RS_ENABLE_WAYLAND"),
+        Some(&Some("1".into()))
+    );
+    assert_eq!(
+        environment.get("CUA_HYPRLAND_OPEN_INPUT"),
+        Some(&Some("1".into()))
+    );
+    assert!(
+        !environment.contains_key("CUA_DRIVER_EXPERIMENTAL_HYPRLAND_INPUT"),
+        "the managed driver must not select CUA's test-only input protocol"
+    );
+}
 
 #[test]
 fn real_daemon_args_carry_serve_standard_mode_and_existing_profile_grant() {

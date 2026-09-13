@@ -266,3 +266,462 @@ fn tab_drag_inserts_after_target_and_preserves_nested_panes(cx: &mut TestAppCont
         assert_eq!(workspace.layout.views.len(), 1, "tab rail must not create an outer split");
     });
 }
+
+#[test]
+fn tab_indicator_priority_and_terminal_mapping() {
+    assert_eq!(
+        tab_indicator([
+            Some(ChatIndicator::Idle),
+            Some(ChatIndicator::Completed),
+            Some(ChatIndicator::Working),
+            Some(ChatIndicator::Errored),
+            Some(ChatIndicator::AwaitingInput),
+        ]),
+        Some(ChatIndicator::AwaitingInput)
+    );
+
+    assert_eq!(
+        tab_indicator([
+            Some(ChatIndicator::Idle),
+            Some(ChatIndicator::Completed),
+            Some(ChatIndicator::Errored),
+        ]),
+        Some(ChatIndicator::Errored)
+    );
+
+    assert_eq!(
+        tab_indicator([
+            Some(ChatIndicator::Idle),
+            Some(ChatIndicator::Completed),
+            Some(ChatIndicator::Working),
+        ]),
+        Some(ChatIndicator::Working)
+    );
+
+    assert_eq!(
+        tab_indicator([
+            Some(ChatIndicator::Idle),
+            Some(ChatIndicator::Completed),
+        ]),
+        Some(ChatIndicator::Completed)
+    );
+
+    assert_eq!(
+        tab_indicator([Some(ChatIndicator::Idle)]),
+        Some(ChatIndicator::Idle)
+    );
+
+    assert_eq!(tab_indicator([None, None]), None);
+    assert_eq!(tab_indicator(Vec::<Option<ChatIndicator>>::new()), None);
+
+    assert_eq!(
+        pane_indicator(Some(NativeActivity::Busy), Some(ChatIndicator::Idle)),
+        Some(ChatIndicator::Working)
+    );
+    assert_eq!(
+        pane_indicator(Some(NativeActivity::Permission), Some(ChatIndicator::Completed)),
+        Some(ChatIndicator::AwaitingInput)
+    );
+    assert_eq!(
+        pane_indicator(Some(NativeActivity::Idle), Some(ChatIndicator::Completed)),
+        Some(ChatIndicator::Idle)
+    );
+    assert_eq!(
+        pane_indicator(Some(NativeActivity::Ended), Some(ChatIndicator::Completed)),
+        Some(ChatIndicator::Completed)
+    );
+    assert_eq!(
+        pane_indicator(Some(NativeActivity::Unknown), Some(ChatIndicator::Completed)),
+        Some(ChatIndicator::Completed)
+    );
+    assert_eq!(
+        pane_indicator(None, Some(ChatIndicator::Working)),
+        Some(ChatIndicator::Working)
+    );
+    assert_eq!(pane_indicator(None, None), None);
+}
+
+#[test]
+fn tab_cycling_wraps_at_boundaries() {
+    let t1 = TabId(1);
+    let t2 = TabId(2);
+    let t3 = TabId(3);
+    let tabs = vec![t1, t2, t3];
+
+    assert_eq!(cycle_tab(&tabs, Some(t1), true), Some(t2));
+    assert_eq!(cycle_tab(&tabs, Some(t2), true), Some(t3));
+    assert_eq!(cycle_tab(&tabs, Some(t3), true), Some(t1));
+
+    assert_eq!(cycle_tab(&tabs, Some(t1), false), Some(t3));
+    assert_eq!(cycle_tab(&tabs, Some(t2), false), Some(t1));
+    assert_eq!(cycle_tab(&tabs, Some(t3), false), Some(t2));
+
+    assert_eq!(cycle_tab(&tabs, None, true), Some(t1));
+    assert_eq!(cycle_tab(&tabs, None, false), Some(t3));
+
+    assert_eq!(cycle_tab(&tabs, Some(TabId(99)), true), Some(t1));
+    assert_eq!(cycle_tab(&tabs, Some(TabId(99)), false), Some(t3));
+
+    assert_eq!(cycle_tab(&[], None, true), None);
+}
+
+#[test]
+fn close_confirmation_gates_on_running_cli_and_setting() {
+    let idle_cli = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: Some(SessionViewStatus::Ready),
+        terminal_activity: Some(NativeActivity::Idle),
+    };
+    let busy_cli = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: Some(SessionViewStatus::Ready),
+        terminal_activity: Some(NativeActivity::Busy),
+    };
+    let permission_cli = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: Some(SessionViewStatus::Ready),
+        terminal_activity: Some(NativeActivity::Permission),
+    };
+    let opening_cli = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: Some(SessionViewStatus::Opening),
+        terminal_activity: None,
+    };
+    let closing_cli = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: Some(SessionViewStatus::Closing),
+        terminal_activity: None,
+    };
+    let ready_unverified_cli = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: Some(SessionViewStatus::Ready),
+        terminal_activity: None,
+    };
+    let ready_unknown_cli = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: Some(SessionViewStatus::Ready),
+        terminal_activity: Some(NativeActivity::Unknown),
+    };
+    let starting = PaneCloseRunningState {
+        starting_cli: true,
+        terminal_status: None,
+        terminal_activity: None,
+    };
+    let plain_chat = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: None,
+        terminal_activity: None,
+    };
+    let ended_cli = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: Some(SessionViewStatus::Ready),
+        terminal_activity: Some(NativeActivity::Ended),
+    };
+    let idle_status_cli = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: Some(SessionViewStatus::Idle),
+        terminal_activity: None,
+    };
+    let failed_cli = PaneCloseRunningState {
+        starting_cli: false,
+        terminal_status: Some(SessionViewStatus::Failed("failed".into())),
+        terminal_activity: None,
+    };
+
+    // Setting false: never confirms even if busy or opening
+    assert!(!needs_close_confirmation(false, [busy_cli.clone()]));
+    assert!(!needs_close_confirmation(false, [opening_cli.clone()]));
+    assert!(!needs_close_confirmation(false, [closing_cli.clone()]));
+    assert!(!needs_close_confirmation(false, [starting.clone()]));
+
+    // Setting true:
+    // Busy CLI requires confirm
+    assert!(needs_close_confirmation(true, [busy_cli.clone()]));
+    // Permission CLI requires confirm
+    assert!(needs_close_confirmation(true, [permission_cli]));
+    // Opening / Closing CLI states require confirm
+    assert!(needs_close_confirmation(true, [opening_cli.clone()]));
+    assert!(needs_close_confirmation(true, [closing_cli]));
+    // Ready with no verified idle activity requires confirm
+    assert!(needs_close_confirmation(true, [ready_unverified_cli]));
+    assert!(needs_close_confirmation(true, [ready_unknown_cli]));
+    // In-flight starting_cli requires confirm
+    assert!(needs_close_confirmation(true, [starting.clone()]));
+
+    // Idle CLI does NOT require confirm
+    assert!(!needs_close_confirmation(true, [idle_cli.clone()]));
+    assert!(!needs_close_confirmation(true, [idle_status_cli]));
+    // Plain chat does NOT require confirm
+    assert!(!needs_close_confirmation(true, [plain_chat.clone()]));
+    // Ended CLI does NOT require confirm
+    assert!(!needs_close_confirmation(true, [ended_cli]));
+    // Failed CLI does NOT require confirm
+    assert!(!needs_close_confirmation(true, [failed_cli]));
+
+    // Multi-pane tab: if any pane is running, confirm is required
+    assert!(needs_close_confirmation(true, [idle_cli.clone(), busy_cli]));
+    assert!(needs_close_confirmation(true, [plain_chat.clone(), opening_cli]));
+    assert!(needs_close_confirmation(true, [plain_chat.clone(), starting]));
+    assert!(!needs_close_confirmation(true, [idle_cli, plain_chat]));
+}
+
+#[gpui::test]
+fn closing_pane_while_starting_cli_downgrades_to_silent_noop(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    setup(cx, directory.path());
+    let workspace = cx.new(|cx| {
+        let source = cx.new(|_| AppState::new());
+        Workspace::new(source, directory.path().join("layout.json"), cx)
+    });
+    workspace.update(cx, |workspace, cx| {
+        let id = workspace.layout.active_pane_id().unwrap();
+        workspace.ensure_pane(id, cx);
+        let dummy_task = gpui::Task::ready(());
+        workspace.starting_cli.insert(id, dummy_task);
+        assert!(workspace.pane_close_running_state(id, cx).starting_cli);
+        workspace.close(id, cx);
+        assert!(workspace.layout.pane(id).is_none());
+        assert!(workspace.error.is_none());
+    });
+}
+
+#[gpui::test]
+fn request_close_tab_with_running_cli_shows_confirm_banner(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    setup(cx, directory.path());
+    let workspace = cx.new(|cx| {
+        let source = cx.new(|_| AppState::new());
+        Workspace::new(source, directory.path().join("layout.json"), cx)
+    });
+    workspace.update(cx, |workspace, cx| {
+        let active = workspace.layout.active_pane_id().unwrap();
+        workspace.ensure_pane(active, cx);
+        workspace.starting_cli.insert(active, gpui::Task::ready(()));
+
+        let view_id = workspace.layout.active_view_id;
+        let tab_id = workspace.layout.views[&view_id].active_tab_id;
+
+        workspace.request_close_tab(view_id, tab_id, cx);
+        assert!(workspace.pending_close_confirm.is_some());
+        assert!(workspace.layout.pane(active).is_some());
+
+        workspace.pending_close_confirm = None;
+        assert!(workspace.layout.pane(active).is_some());
+
+        workspace.starting_cli.remove(&active);
+        workspace.request_close_tab(view_id, tab_id, cx);
+        assert!(workspace.pending_close_confirm.is_none());
+        assert!(workspace.layout.pane(active).is_none());
+    });
+}
+
+#[gpui::test]
+fn mixed_tab_close_preserves_layout_integrity_and_awaits_cli_ack(cx: &mut TestAppContext) {
+    use futures::FutureExt;
+    let directory = tempfile::tempdir().unwrap();
+    setup(cx, directory.path());
+    let workspace = cx.new(|cx| {
+        let source = cx.new(|_| AppState::new());
+        Workspace::new(source, directory.path().join("layout.json"), cx)
+    });
+    let (second, terminal) = workspace.update(cx, |workspace, cx| {
+        let first = workspace.layout.active_pane_id().unwrap();
+        workspace.ensure_pane(first, cx);
+
+        workspace.split(Direction::Right, false, cx);
+        let second = workspace.layout.active_pane_id().unwrap();
+        workspace.ensure_pane(second, cx);
+
+        let view_id = workspace.layout.active_view_id;
+        let tab_id = workspace.layout.views[&view_id].active_tab_id;
+        assert_eq!(workspace.layout.views[&view_id].tabs[&tab_id].panes.len(), 2);
+
+        workspace.layout.pane_mut(second).unwrap().mode = PaneMode::Terminal;
+        let terminal = workspace.prepare_terminal(second, cx).unwrap();
+        let (_sender, receiver) = futures::channel::oneshot::channel::<()>();
+        terminal.update(cx, |t, cx| {
+            t.set_session_status(SessionViewStatus::Opening, cx);
+            t.set_session_open(Some(cx.spawn(async move |_, _| {
+                let _ = receiver.await;
+                Ok(())
+            }).shared()));
+        });
+
+        let state = workspace.pane_close_running_state(second, cx);
+        assert!(state.is_running());
+        assert_eq!(state.terminal_status, Some(SessionViewStatus::Opening));
+
+        workspace.request_close_tab(view_id, tab_id, cx);
+        assert!(workspace.pending_close_confirm.is_some());
+        assert_eq!(workspace.layout.views[&view_id].tabs[&tab_id].panes.len(), 2);
+
+        let pending = workspace.pending_close_confirm.take().unwrap();
+        assert_eq!(pending.panes.len(), 2);
+        for pane in pending.panes {
+            workspace.close(pane, cx);
+        }
+
+        assert!(workspace.layout.pane(first).is_none());
+        assert!(!workspace.panes.contains_key(&first));
+        assert!(workspace.pending_close.contains(&second));
+        assert!(workspace.layout.pane(second).is_some());
+        assert!(workspace.panes.contains_key(&second));
+
+        assert!(workspace.layout.validate().is_ok());
+
+        workspace.request_close_tab(view_id, tab_id, cx);
+        assert!(workspace.pending_close_confirm.is_none());
+
+        drop(_sender);
+        (second, terminal)
+    });
+    terminal.update(cx, |t, cx| {
+        t.set_session_status(SessionViewStatus::Idle, cx);
+    });
+    cx.run_until_parked();
+    workspace.update(cx, |workspace, _| {
+        assert!(workspace.pending_close.is_empty());
+        assert!(workspace.layout.pane(second).is_none());
+        assert!(!workspace.panes.contains_key(&second));
+        assert!(workspace.layout.validate().is_ok());
+
+        let launcher = workspace.layout.active_pane_id().unwrap();
+        assert_eq!(workspace.layout.pane(launcher).unwrap(), &PaneState::default());
+    });
+}
+
+#[test]
+fn create_chat_payload_shape() {
+    let config = zeron_proto::ChatConfig {
+        harness: zeron_proto::HarnessId::Pi,
+        model: Some("model-1".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+    };
+
+    let p1 = create_chat_payload("c1", Some("s1"), Some("d1"), "/path", Some("feat"), Some(&config));
+    assert_eq!(p1["op"], "createChat");
+    assert_eq!(p1["chatId"], "c1");
+    assert_eq!(p1["spaceId"], "s1");
+    assert!(p1.get("deviceId").is_none());
+    assert_eq!(p1["cwd"], "/path");
+    assert_eq!(p1["branch"], "feat");
+    assert_eq!(p1["config"]["harness"], "pi");
+    assert_eq!(p1["config"]["model"], "model-1");
+
+    let p2 = create_chat_payload("c2", None, Some("d2"), "~", None, None);
+    assert_eq!(p2["op"], "createChat");
+    assert_eq!(p2["chatId"], "c2");
+    assert!(p2.get("spaceId").is_none());
+    assert_eq!(p2["deviceId"], "d2");
+    assert_eq!(p2["cwd"], "~");
+    assert!(p2.get("branch").is_none());
+    assert!(p2.get("config").is_none());
+}
+
+#[gpui::test]
+fn new_tab_opens_an_empty_draft_without_minting(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    setup(cx, directory.path());
+    let workspace = cx.new(|cx| {
+        let source = cx.new(|_| AppState::new());
+        Workspace::new(source, directory.path().join("layout.json"), cx)
+    });
+    workspace.update(cx, |workspace, cx| {
+        let initial_pane = workspace.layout.active_pane_id().unwrap();
+        workspace.ensure_pane(initial_pane, cx);
+
+        workspace.new_tab(cx);
+        let new_pane = workspace.layout.active_pane_id().unwrap();
+        assert_ne!(new_pane, initial_pane);
+
+        // The draft canvas never mints a chat row on its own — the session
+        // is created on first send (or the CLI view's explicit mint).
+        assert!(workspace.error.is_none());
+        assert_eq!(workspace.layout.pane(new_pane).unwrap().session_id, None);
+    });
+}
+
+fn drag(chat_id: &str) -> SidebarSessionDrag {
+    SidebarSessionDrag { chat_id: chat_id.into(), title: chat_id.into() }
+}
+
+#[gpui::test]
+fn sidebar_session_drops_split_open_and_focus(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    setup(cx, directory.path());
+    let workspace = cx.new(|cx| {
+        let source = cx.new(|_| AppState::new());
+        Workspace::new(source, directory.path().join("layout.json"), cx)
+    });
+    workspace.update(cx, |workspace, cx| {
+        let first = workspace.layout.active_pane_id().unwrap();
+        workspace.ensure_pane(first, cx);
+        workspace.layout.pane_mut(first).unwrap().session_id = Some("chat-a".into());
+
+        // Edge drop: a new pane splits in beside the target and takes focus.
+        workspace.drop_session(&drag("chat-b"), SessionDrop { pane: first, zone: Some(Direction::Right), open_in: None }, cx);
+        let split = workspace.layout.active_pane_id().unwrap();
+        assert_ne!(split, first);
+        assert_eq!(workspace.layout.pane(split).unwrap().session_id.as_deref(), Some("chat-b"));
+        assert!(workspace.open_session_ids().contains("chat-b"));
+
+        // Center drop: the session opens in the pane under the pointer.
+        workspace.drop_session(&drag("chat-c"), SessionDrop { pane: split, zone: None, open_in: None }, cx);
+        assert_eq!(workspace.layout.pane(split).unwrap().session_id.as_deref(), Some("chat-c"));
+        assert_eq!(workspace.layout.active_pane_id(), Some(split));
+
+        // Already open: the drop focuses its pane instead of duplicating it.
+        workspace.focus(first, cx);
+        workspace.drop_session(
+            &drag("chat-c"),
+            SessionDrop { pane: first, zone: Some(Direction::Down), open_in: workspace.find_pane_by_session("chat-c") },
+            cx,
+        );
+        assert_eq!(workspace.layout.active_pane_id(), Some(split));
+        let pane_count: usize = workspace.layout.views.values()
+            .flat_map(|view| view.tabs.values()).map(|tab| tab.panes.len()).sum();
+        assert_eq!(pane_count, 2, "focusing an open session must not add panes");
+
+        assert!(workspace.error.is_none(), "{:?}", workspace.error);
+        workspace.layout.validate().unwrap();
+    });
+}
+
+#[gpui::test]
+fn open_in_split_reuses_the_pane_already_showing_the_session(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    setup(cx, directory.path());
+    let workspace = cx.new(|cx| {
+        let source = cx.new(|_| AppState::new());
+        Workspace::new(source, directory.path().join("layout.json"), cx)
+    });
+    workspace.update(cx, |workspace, cx| {
+        let first = workspace.layout.active_pane_id().unwrap();
+        workspace.ensure_pane(first, cx);
+
+        workspace.open_session_in_split("chat-a", cx);
+        let split = workspace.layout.active_pane_id().unwrap();
+        assert_ne!(split, first);
+        assert_eq!(workspace.layout.pane(split).unwrap().session_id.as_deref(), Some("chat-a"));
+
+        // A second open-in-split for the same session focuses, never duplicates.
+        workspace.focus(first, cx);
+        workspace.open_session_in_split("chat-a", cx);
+        assert_eq!(workspace.layout.active_pane_id(), Some(split));
+        let pane_count: usize = workspace.layout.views.values()
+            .flat_map(|view| view.tabs.values()).map(|tab| tab.panes.len()).sum();
+        assert_eq!(pane_count, 2);
+
+        // The tab rail's open: a new tab in the pane's own view.
+        workspace.open_session_tab(workspace.layout.active_view_id, "chat-b", cx);
+        let view = workspace.layout.active_view_id;
+        assert_eq!(workspace.layout.views[&view].tabs.len(), 2);
+        let active = workspace.layout.active_pane_id().unwrap();
+        assert_eq!(workspace.layout.pane(active).unwrap().session_id.as_deref(), Some("chat-b"));
+
+        assert!(workspace.error.is_none(), "{:?}", workspace.error);
+        workspace.layout.validate().unwrap();
+    });
+}

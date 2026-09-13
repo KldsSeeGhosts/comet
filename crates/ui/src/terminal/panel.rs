@@ -481,6 +481,16 @@ pub enum SessionViewStatus {
     Failed(String),
 }
 
+/// Wire values for daemon-reported native CLI activity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeActivity {
+    Busy,
+    Idle,
+    Permission,
+    Ended,
+    Unknown,
+}
+
 impl SessionViewStatus {
     fn accepts_input(&self) -> bool {
         matches!(self, Self::Opening | Self::Ready)
@@ -798,10 +808,21 @@ impl TerminalPanel {
         &self.session_status
     }
 
-    pub fn handoff_unavailable(&self) -> Option<&'static str> {
+    pub fn native_activity(&self) -> Option<NativeActivity> {
         match self.native_activity.as_deref() {
-            Some("idle") => None,
-            Some("busy" | "permission") => Some("Session is busy"),
+            Some("busy") => Some(NativeActivity::Busy),
+            Some("idle") => Some(NativeActivity::Idle),
+            Some("permission") => Some(NativeActivity::Permission),
+            Some("ended") => Some(NativeActivity::Ended),
+            Some("unknown") => Some(NativeActivity::Unknown),
+            _ => None,
+        }
+    }
+
+    pub fn handoff_unavailable(&self) -> Option<&'static str> {
+        match self.native_activity() {
+            Some(NativeActivity::Idle) => None,
+            Some(NativeActivity::Busy | NativeActivity::Permission) => Some("Session is busy"),
             _ => Some("Native session state is not verified"),
         }
     }
@@ -828,7 +849,12 @@ impl TerminalPanel {
         }));
     }
 
-    fn set_session_status(&mut self, status: SessionViewStatus, cx: &mut Context<Self>) {
+    #[cfg(test)]
+    pub(crate) fn set_session_open(&mut self, task: Option<SessionHandoff>) {
+        self.session_open = task;
+    }
+
+    pub(crate) fn set_session_status(&mut self, status: SessionViewStatus, cx: &mut Context<Self>) {
         if self.session_status != status {
             if !status.accepts_input() {
                 self.cancel_composition();

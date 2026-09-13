@@ -690,6 +690,25 @@ async fn dispatch(
             recipe(this, cx, method, params).await
         }
         "chat.new" | "layout.run" => launch(this, cx, method, params).await,
+        // A second `zeron`/`zeron-dev` launch forwards here and exits: raise
+        // the already-running window instead of opening a duplicate. No
+        // workspace grant — activation reveals nothing it didn't already.
+        "window.activate" | "window.focus" | "instance.activate" => {
+            let mut activated = 0usize;
+            cx.update(|app| {
+                for handle in app.windows() {
+                    if handle
+                        .update(app, |_, window, _| {
+                            window.activate_window();
+                        })
+                        .is_ok()
+                    {
+                        activated += 1;
+                    }
+                }
+            });
+            Ok(json!({"activated": activated}))
+        }
         "chat.providers" => {
             let engine = engine(this, cx)?;
             Ok(engine

@@ -1698,13 +1698,19 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                     .unwrap_or_default()
                     .iter()
                     .map(|op| match op {
-                        Value::String(s) => s.clone(),
-                        other => other
-                            .get("label")
-                            .or_else(|| other.get("value"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .into(),
+                        Value::String(s) => s.clone().into(),
+                        other => zeron_proto::UserInputOption {
+                            label: other
+                                .get("label")
+                                .or_else(|| other.get("value"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .into(),
+                            description: other
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                        },
                     })
                     .collect(),
                 multi_select: ["multiSelect", "multi_select"]
