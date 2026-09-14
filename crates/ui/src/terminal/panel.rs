@@ -35,7 +35,7 @@ use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
 use super::emulator::{
-    CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side, ROW_HASH_BASIS,
+    CellSnapshot, CursorSnapshot, Emulator, GridPoint, ROW_HASH_BASIS, SelectionType, Side,
     fold_hash, fold_hash_bytes,
 };
 use super::view::{
@@ -73,7 +73,11 @@ fn wheel_mouse_bytes(button: u8, col: usize, row: usize, sgr: bool, utf8: bool) 
     for coordinate in [col, row] {
         if utf8 {
             let mut encoded = [0; 4];
-            bytes.extend_from_slice(char::from_u32(coordinate as u32 + 33)?.encode_utf8(&mut encoded).as_bytes());
+            bytes.extend_from_slice(
+                char::from_u32(coordinate as u32 + 33)?
+                    .encode_utf8(&mut encoded)
+                    .as_bytes(),
+            );
         } else {
             bytes.push(coordinate as u8 + 33);
         }
@@ -254,7 +258,10 @@ pub(super) fn theme_paint_fingerprint(theme: &Theme) -> u64 {
 
 fn fold_color(hash: u64, color: gpui::Hsla) -> u64 {
     fold_hash(
-        fold_hash(hash, u64::from(color.h.to_bits()) | (u64::from(color.s.to_bits()) << 32)),
+        fold_hash(
+            hash,
+            u64::from(color.h.to_bits()) | (u64::from(color.s.to_bits()) << 32),
+        ),
         u64::from(color.l.to_bits()) | (u64::from(color.a.to_bits()) << 32),
     )
 }
@@ -828,23 +835,42 @@ impl TerminalPanel {
     }
 
     fn watch_native_activity(&mut self, cx: &mut Context<Self>) {
-        if self.native_watch.is_some() { return; }
-        let Some(chat) = self.session_chat.clone() else { return; };
-        let Some(engine) = self.engine(cx) else { return; };
+        if self.native_watch.is_some() {
+            return;
+        }
+        let Some(chat) = self.session_chat.clone() else {
+            return;
+        };
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
         let target = self.chat_target(&chat, cx);
         self.native_watch = Some(cx.spawn(async move |this, cx| {
             loop {
-                let result = engine.client().call(methods::GET_SESSION_VIEW,
-                    with_target(serde_json::json!({"chatId": chat}), &target)).await;
-                let activity = result.ok().and_then(|view|
-                    view["nativeActivity"].as_str().map(str::to_owned));
-                if this.update(cx, |panel, cx| {
-                    if panel.native_activity != activity {
-                        panel.native_activity = activity;
-                        cx.notify();
-                    }
-                }).is_err() { break; }
-                cx.background_executor().timer(Duration::from_millis(400)).await;
+                let result = engine
+                    .client()
+                    .call(
+                        methods::GET_SESSION_VIEW,
+                        with_target(serde_json::json!({"chatId": chat}), &target),
+                    )
+                    .await;
+                let activity = result
+                    .ok()
+                    .and_then(|view| view["nativeActivity"].as_str().map(str::to_owned));
+                if this
+                    .update(cx, |panel, cx| {
+                        if panel.native_activity != activity {
+                            panel.native_activity = activity;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
             }
         }));
     }
@@ -860,7 +886,9 @@ impl TerminalPanel {
                 self.cancel_composition();
             }
             self.session_status = status.clone();
-            if status == SessionViewStatus::Ready { self.watch_native_activity(cx); }
+            if status == SessionViewStatus::Ready {
+                self.watch_native_activity(cx);
+            }
             if status == SessionViewStatus::Idle {
                 self.native_watch = None;
                 self.native_activity = None;
@@ -941,8 +969,14 @@ impl TerminalPanel {
             self.set_session_status(SessionViewStatus::Failed(error.clone()), cx);
             return Task::ready(Err(error));
         };
-        if self.chats.get(&chat).is_some_and(|tabs| tabs.tabs.iter().any(|tab| !tab.coalescer.is_empty())) {
-            return Task::ready(Err("Wait for buffered terminal input before switching views".into()));
+        if self
+            .chats
+            .get(&chat)
+            .is_some_and(|tabs| tabs.tabs.iter().any(|tab| !tab.coalescer.is_empty()))
+        {
+            return Task::ready(Err(
+                "Wait for buffered terminal input before switching views".into(),
+            ));
         }
         let target = self.chat_target(&chat, cx);
         let opening = self.session_open.clone();
@@ -970,10 +1004,17 @@ impl TerminalPanel {
                 // A refused busy handoff leaves the daemon's CLI alive. Restore
                 // input only when the daemon confirms it still owns the session.
                 let still_cli = if result.is_err() {
-                    engine.client().call(methods::GET_SESSION_VIEW,
-                        with_target(serde_json::json!({"chatId": chat}), &target)).await
+                    engine
+                        .client()
+                        .call(
+                            methods::GET_SESSION_VIEW,
+                            with_target(serde_json::json!({"chatId": chat}), &target),
+                        )
+                        .await
                         .is_ok_and(|view| view["owner"] == "cli")
-                } else { false };
+                } else {
+                    false
+                };
                 let _ = this.update(cx, |panel, cx| match &result {
                     Ok(()) => {
                         panel.chats.remove(&chat);
@@ -983,8 +1024,11 @@ impl TerminalPanel {
                         panel.set_session_status(SessionViewStatus::Idle, cx);
                     }
                     Err(error) => {
-                        if still_cli { panel.set_session_status(SessionViewStatus::Ready, cx); }
-                        else { panel.set_session_status(SessionViewStatus::Failed(error.clone()), cx); }
+                        if still_cli {
+                            panel.set_session_status(SessionViewStatus::Ready, cx);
+                        } else {
+                            panel.set_session_status(SessionViewStatus::Failed(error.clone()), cx);
+                        }
                     }
                 });
                 result
@@ -1169,7 +1213,10 @@ impl TerminalPanel {
         let key = self.tab_seq;
         let entry = self.chats.entry(chat.clone()).or_default();
         let tab_no = next_terminal_number(
-            entry.tabs.iter().filter_map(|tab| terminal_number(&tab.title)),
+            entry
+                .tabs
+                .iter()
+                .filter_map(|tab| terminal_number(&tab.title)),
         );
         entry.tabs.push(TerminalTab {
             key,
@@ -1492,8 +1539,14 @@ impl TerminalPanel {
         if tab.coalescer.push(bytes) {
             tab.flush_task = Some(Self::schedule_flush(chat.clone(), key, cx));
         }
-        if self.session_view && bytes.contains(&b'\r') && let Some(proof) = crate::input_origin::capture() {
-            cx.emit(HumanTerminalInput { chat_id: chat, proof });
+        if self.session_view
+            && bytes.contains(&b'\r')
+            && let Some(proof) = crate::input_origin::capture()
+        {
+            cx.emit(HumanTerminalInput {
+                chat_id: chat,
+                proof,
+            });
         }
     }
 
@@ -1588,8 +1641,13 @@ impl TerminalPanel {
         }
         // Main-screen history belongs to the emulator. Fullscreen applications
         // keep their own PageUp/PageDown bindings and receive them unchanged.
-        if mods.shift && !mods.control && !mods.alt && !mods.platform
-            && self.active_tab(cx).is_some_and(|tab| !tab.emulator.alternate_screen())
+        if mods.shift
+            && !mods.control
+            && !mods.alt
+            && !mods.platform
+            && self
+                .active_tab(cx)
+                .is_some_and(|tab| !tab.emulator.alternate_screen())
             && matches!(ks.key.as_str(), "pageup" | "pagedown")
         {
             let rows = self.active_tab(cx).map_or(1, |tab| tab.emulator.rows()) as i32;
@@ -1919,18 +1977,35 @@ impl TerminalPanel {
         }
     }
 
-    fn on_scroll_wheel(&mut self, event: &gpui::ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let line_h = self.geometry.map_or(super::view::TERM_LINE_HEIGHT, |g| g.line_h);
+    fn on_scroll_wheel(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let line_h = self
+            .geometry
+            .map_or(super::view::TERM_LINE_HEIGHT, |g| g.line_h);
         let lines = match event.delta {
             ScrollDelta::Lines(delta) => delta.y,
             ScrollDelta::Pixels(delta) => f32::from(delta.y) / line_h,
         };
-        if !lines.is_finite() || lines == 0.0 { return; }
-        let Some(chat) = self.selected_chat(cx) else { return; };
-        let Some(tabs) = self.chats.get_mut(&chat) else { return; };
-        let Some(tab) = tabs.tabs.get_mut(tabs.active) else { return; };
+        if !lines.is_finite() || lines == 0.0 {
+            return;
+        }
+        let Some(chat) = self.selected_chat(cx) else {
+            return;
+        };
+        let Some(tabs) = self.chats.get_mut(&chat) else {
+            return;
+        };
+        let Some(tab) = tabs.tabs.get_mut(tabs.active) else {
+            return;
+        };
         // Keep sub-line trackpad deltas rather than rounding every event to zero.
-        if lines.signum() != tab.wheel_remainder.signum() { tab.wheel_remainder = 0.0; }
+        if lines.signum() != tab.wheel_remainder.signum() {
+            tab.wheel_remainder = 0.0;
+        }
         tab.wheel_remainder += lines;
         let step = tab.wheel_remainder.trunc().clamp(-120.0, 120.0) as i32;
         tab.wheel_remainder -= step as f32;
@@ -1945,15 +2020,19 @@ impl TerminalPanel {
         let app_cursor = tab.emulator.app_cursor_mode();
         if reports {
             if let Some(g) = self.geometry {
-                let hit = cell_at(f32::from(event.position.x - g.origin.x),
-                    f32::from(event.position.y - g.origin.y), g.cell_w, g.line_h,
-                    g.cols as usize, g.rows as usize);
+                let hit = cell_at(
+                    f32::from(event.position.x - g.origin.x),
+                    f32::from(event.position.y - g.origin.y),
+                    g.cell_w,
+                    g.line_h,
+                    g.cols as usize,
+                    g.rows as usize,
+                );
                 let button = if step > 0 { 64 } else { 65 }
                     | if event.modifiers.alt { 8 } else { 0 }
                     | if event.modifiers.control { 16 } else { 0 };
                 if let Some(bytes) = wheel_mouse_bytes(button, hit.col, hit.row, sgr, utf8) {
-                    let repeats =
-                        (step.unsigned_abs() as usize).min(MAX_WHEEL_MOUSE_REPORTS);
+                    let repeats = (step.unsigned_abs() as usize).min(MAX_WHEEL_MOUSE_REPORTS);
                     self.queue_input(&bytes.repeat(repeats), cx);
                 }
             }
@@ -2570,60 +2649,99 @@ mod tests {
     #[gpui::test]
     fn wheel_reaches_pi_through_the_rendered_terminal(cx: &mut gpui::TestAppContext) {
         let handle = ime_window(cx);
-        handle.update(cx, |panel, _, _| {
-            // Pi's real fullscreen startup sequence enables SGR mouse events.
-            panel.tab_mut("ime", 0).unwrap().emulator.feed(
-                b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h",
-            );
-        }).unwrap();
-        cx.update_window(handle.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
-        let position = handle.update(cx, |panel, _, _| {
-            let geometry = panel.geometry.unwrap();
-            geometry.origin + gpui::point(px(geometry.cell_w * 2.5), px(geometry.line_h * 3.5))
-        }).unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                // Pi's real fullscreen startup sequence enables SGR mouse events.
+                panel
+                    .tab_mut("ime", 0)
+                    .unwrap()
+                    .emulator
+                    .feed(b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h");
+            })
+            .unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
-            window.dispatch_event(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
-                position,
-                delta: ScrollDelta::Lines(gpui::point(0.0, 2.0)),
-                ..Default::default()
-            }), cx);
-        }).unwrap();
-        handle.update(cx, |panel, _, _| {
-            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), b"\x1b[<64;3;4M\x1b[<64;3;4M");
-        }).unwrap();
+            let _ = window.draw(cx);
+        })
+        .unwrap();
+        let position = handle
+            .update(cx, |panel, _, _| {
+                let geometry = panel.geometry.unwrap();
+                geometry.origin + gpui::point(px(geometry.cell_w * 2.5), px(geometry.line_h * 3.5))
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(gpui::point(0.0, 2.0)),
+                    ..Default::default()
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                assert_eq!(
+                    panel.tab_mut("ime", 0).unwrap().coalescer.take(),
+                    b"\x1b[<64;3;4M\x1b[<64;3;4M"
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]
     fn wheel_trackpad_history_and_alternate_screen_modes(cx: &mut gpui::TestAppContext) {
         let handle = ime_window(cx);
-        handle.update(cx, |panel, window, cx| {
-            panel.geometry = Some(test_geometry());
-            let tab = panel.tab_mut("ime", 0).unwrap();
-            tab.emulator.resize(20, 4);
-            tab.emulator.feed(b"0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n");
-            let mut event = gpui::ScrollWheelEvent {
-                position: test_geometry().origin,
-                delta: ScrollDelta::Pixels(gpui::point(px(0.0), px(test_geometry().line_h / 4.0))),
-                ..Default::default()
-            };
-            for _ in 0..4 { panel.on_scroll_wheel(&event, window, cx); }
-            let tab = panel.tab_mut("ime", 0).unwrap();
-            assert_eq!(tab.emulator.display_offset(), 1);
-            assert!(tab.coalescer.is_empty());
-            tab.emulator.feed(b"\x1b[?1049h\x1b[?1h");
-            event.delta = ScrollDelta::Lines(gpui::point(0.0, -2.0));
-            panel.on_scroll_wheel(&event, window, cx);
-            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), b"\x1bOB\x1bOB");
-            panel.tab_mut("ime", 0).unwrap().emulator.feed(b"\x1b[?1007l");
-            panel.on_scroll_wheel(&event, window, cx);
-            assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
-            panel.tab_mut("ime", 0).unwrap().emulator.feed(b"\x1b[?1000h\x1b[?1006h");
-            panel.on_scroll_wheel(&event, window, cx);
-            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), b"\x1b[<65;1;1M\x1b[<65;1;1M");
-            event.modifiers.shift = true;
-            panel.on_scroll_wheel(&event, window, cx);
-            assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
-        }).unwrap();
+        handle
+            .update(cx, |panel, window, cx| {
+                panel.geometry = Some(test_geometry());
+                let tab = panel.tab_mut("ime", 0).unwrap();
+                tab.emulator.resize(20, 4);
+                tab.emulator.feed(b"0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n");
+                let mut event = gpui::ScrollWheelEvent {
+                    position: test_geometry().origin,
+                    delta: ScrollDelta::Pixels(gpui::point(
+                        px(0.0),
+                        px(test_geometry().line_h / 4.0),
+                    )),
+                    ..Default::default()
+                };
+                for _ in 0..4 {
+                    panel.on_scroll_wheel(&event, window, cx);
+                }
+                let tab = panel.tab_mut("ime", 0).unwrap();
+                assert_eq!(tab.emulator.display_offset(), 1);
+                assert!(tab.coalescer.is_empty());
+                tab.emulator.feed(b"\x1b[?1049h\x1b[?1h");
+                event.delta = ScrollDelta::Lines(gpui::point(0.0, -2.0));
+                panel.on_scroll_wheel(&event, window, cx);
+                assert_eq!(
+                    panel.tab_mut("ime", 0).unwrap().coalescer.take(),
+                    b"\x1bOB\x1bOB"
+                );
+                panel
+                    .tab_mut("ime", 0)
+                    .unwrap()
+                    .emulator
+                    .feed(b"\x1b[?1007l");
+                panel.on_scroll_wheel(&event, window, cx);
+                assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
+                panel
+                    .tab_mut("ime", 0)
+                    .unwrap()
+                    .emulator
+                    .feed(b"\x1b[?1000h\x1b[?1006h");
+                panel.on_scroll_wheel(&event, window, cx);
+                assert_eq!(
+                    panel.tab_mut("ime", 0).unwrap().coalescer.take(),
+                    b"\x1b[<65;1;1M\x1b[<65;1;1M"
+                );
+                event.modifiers.shift = true;
+                panel.on_scroll_wheel(&event, window, cx);
+                assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
+            })
+            .unwrap();
     }
 
     /// Mouse-mode wheel reports are capped per event: a 40-line flick fires
@@ -2631,27 +2749,42 @@ mod tests {
     #[gpui::test]
     fn wheel_reports_cap_at_three_per_event(cx: &mut gpui::TestAppContext) {
         let handle = ime_window(cx);
-        handle.update(cx, |panel, _, _| {
-            panel.tab_mut("ime", 0).unwrap().emulator.feed(
-                b"\x1b[?1049h\x1b[?1000h\x1b[?1006h",
-            );
-        }).unwrap();
-        cx.update_window(handle.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
-        let position = handle.update(cx, |panel, _, _| {
-            let geometry = panel.geometry.unwrap();
-            geometry.origin + gpui::point(px(geometry.cell_w * 2.5), px(geometry.line_h * 3.5))
-        }).unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                panel
+                    .tab_mut("ime", 0)
+                    .unwrap()
+                    .emulator
+                    .feed(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+            })
+            .unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
-            window.dispatch_event(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
-                position,
-                delta: ScrollDelta::Lines(gpui::point(0.0, 40.0)),
-                ..Default::default()
-            }), cx);
-        }).unwrap();
-        handle.update(cx, |panel, _, _| {
-            let bytes = panel.tab_mut("ime", 0).unwrap().coalescer.take();
-            assert_eq!(bytes, b"\x1b[<64;3;4M".repeat(3));
-        }).unwrap();
+            let _ = window.draw(cx);
+        })
+        .unwrap();
+        let position = handle
+            .update(cx, |panel, _, _| {
+                let geometry = panel.geometry.unwrap();
+                geometry.origin + gpui::point(px(geometry.cell_w * 2.5), px(geometry.line_h * 3.5))
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Lines(gpui::point(0.0, 40.0)),
+                    ..Default::default()
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                let bytes = panel.tab_mut("ime", 0).unwrap().coalescer.take();
+                assert_eq!(bytes, b"\x1b[<64;3;4M".repeat(3));
+            })
+            .unwrap();
     }
 
     /// The layout cache: an unchanged grid shapes every row exactly once, and
@@ -2659,64 +2792,107 @@ mod tests {
     #[gpui::test]
     fn unchanged_grids_reuse_shaped_rows(cx: &mut gpui::TestAppContext) {
         let handle = ime_window(cx);
-        handle.update(cx, |panel, _, _| {
-            panel.tab_mut("ime", 0).unwrap().emulator.feed(b"stable output");
-        }).unwrap();
-        cx.update_window(handle.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
-        let builds_after_first = handle.update(cx, |panel, _, _| panel.shape_cache.builds).unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                panel
+                    .tab_mut("ime", 0)
+                    .unwrap()
+                    .emulator
+                    .feed(b"stable output");
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+        })
+        .unwrap();
+        let builds_after_first = handle
+            .update(cx, |panel, _, _| panel.shape_cache.builds)
+            .unwrap();
         assert!(builds_after_first > 0);
-        cx.update_window(handle.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
-        handle.update(cx, |panel, _, _| {
-            assert_eq!(
-                panel.shape_cache.builds, builds_after_first,
-                "unchanged grid must not re-shape"
-            );
-        }).unwrap();
-        handle.update(cx, |panel, _, _| {
-            panel.tab_mut("ime", 0).unwrap().emulator.feed(b"!");
-        }).unwrap();
-        cx.update_window(handle.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
-        handle.update(cx, |panel, _, _| {
-            assert!(
-                panel.shape_cache.builds <= builds_after_first + 2,
-                "a one-row edit re-shapes at most that row plus the cursor row"
-            );
-        }).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+        })
+        .unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                assert_eq!(
+                    panel.shape_cache.builds, builds_after_first,
+                    "unchanged grid must not re-shape"
+                );
+            })
+            .unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                panel.tab_mut("ime", 0).unwrap().emulator.feed(b"!");
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let _ = window.draw(cx);
+        })
+        .unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                assert!(
+                    panel.shape_cache.builds <= builds_after_first + 2,
+                    "a one-row edit re-shapes at most that row plus the cursor row"
+                );
+            })
+            .unwrap();
     }
 
     #[test]
     fn wheel_mouse_protocol_coordinates() {
-        assert_eq!(wheel_mouse_bytes(64, 0, 0, false, false).unwrap(), b"\x1b[M`!!");
+        assert_eq!(
+            wheel_mouse_bytes(64, 0, 0, false, false).unwrap(),
+            b"\x1b[M`!!"
+        );
         assert!(wheel_mouse_bytes(64, 223, 0, false, false).is_none());
-        assert_eq!(wheel_mouse_bytes(65, 499, 10, true, false).unwrap(), b"\x1b[<65;500;11M");
-        assert_eq!(wheel_mouse_bytes(64, 223, 0, false, true).unwrap(), "\x1b[M`Ā!".as_bytes());
+        assert_eq!(
+            wheel_mouse_bytes(65, 499, 10, true, false).unwrap(),
+            b"\x1b[<65;500;11M"
+        );
+        assert_eq!(
+            wheel_mouse_bytes(64, 223, 0, false, true).unwrap(),
+            "\x1b[M`Ā!".as_bytes()
+        );
     }
 
     #[gpui::test]
     fn history_page_keys_leave_native_cli_navigation_available(cx: &mut gpui::TestAppContext) {
         let handle = ime_window(cx);
-        handle.update(cx, |panel, _, _| {
-            let tab = panel.tab_mut("ime", 0).unwrap();
-            // Enough output to exceed the test window's measured viewport.
-            tab.emulator.feed(&b"history\r\n".repeat(200));
-        }).unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                let tab = panel.tab_mut("ime", 0).unwrap();
+                // Enough output to exceed the test window's measured viewport.
+                tab.emulator.feed(&b"history\r\n".repeat(200));
+            })
+            .unwrap();
         cx.simulate_keystrokes(handle.into(), "shift-pageup");
-        handle.update(cx, |panel, _, _| {
-            let tab = panel.tab_mut("ime", 0).unwrap();
-            assert!(tab.emulator.display_offset() > 0);
-            assert!(tab.coalescer.is_empty());
-        }).unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                let tab = panel.tab_mut("ime", 0).unwrap();
+                assert!(tab.emulator.display_offset() > 0);
+                assert!(tab.coalescer.is_empty());
+            })
+            .unwrap();
         cx.simulate_keystrokes(handle.into(), "pageup pagedown");
-        handle.update(cx, |panel, _, _| {
-            let tab = panel.tab_mut("ime", 0).unwrap();
-            assert_eq!(tab.coalescer.take(), b"\x1b[5~\x1b[6~");
-            assert_eq!(tab.emulator.display_offset(), 0);
-            tab.emulator.feed(b"\x1b[?1049h");
-        }).unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                let tab = panel.tab_mut("ime", 0).unwrap();
+                assert_eq!(tab.coalescer.take(), b"\x1b[5~\x1b[6~");
+                assert_eq!(tab.emulator.display_offset(), 0);
+                tab.emulator.feed(b"\x1b[?1049h");
+            })
+            .unwrap();
         cx.simulate_keystrokes(handle.into(), "pageup pagedown ctrl-c");
-        handle.update(cx, |panel, _, _| {
-            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), b"\x1b[5~\x1b[6~\x03");
-        }).unwrap();
+        handle
+            .update(cx, |panel, _, _| {
+                assert_eq!(
+                    panel.tab_mut("ime", 0).unwrap().coalescer.take(),
+                    b"\x1b[5~\x1b[6~\x03"
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -2744,32 +2920,63 @@ mod tests {
     #[gpui::test]
     fn ime_dead_keys_altgr_and_clipboard_keep_separate_routes(cx: &mut gpui::TestAppContext) {
         let window = ime_window(cx);
-        window.update(cx, |panel, window, cx| {
-            panel.replace_and_mark_text_in_range(None, "´", None, window, cx);
-            panel.on_key_down(&KeyDownEvent {
-                keystroke: gpui::Keystroke { key: "dead_acute".into(), key_char: None, modifiers: Default::default() },
-                is_held: false,
-                prefer_character_input: false,
-            }, window, cx);
-            assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
-            panel.replace_text_in_range(None, "é", window, cx);
-            panel.on_key_down(&KeyDownEvent {
-                keystroke: gpui::Keystroke {
-                    key: "q".into(), key_char: Some("@".into()),
-                    modifiers: gpui::Modifiers { control: true, alt: true, ..Default::default() },
-                },
-                is_held: false,
-                prefer_character_input: true,
-            }, window, cx);
-            panel.replace_text_in_range(None, "@", window, cx);
-            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), "é@".as_bytes());
-            panel.tab_mut("ime", 0).unwrap().emulator.feed(b"\x1b[?2004h");
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string("貼付".into()));
-        }).unwrap();
+        window
+            .update(cx, |panel, window, cx| {
+                panel.replace_and_mark_text_in_range(None, "´", None, window, cx);
+                panel.on_key_down(
+                    &KeyDownEvent {
+                        keystroke: gpui::Keystroke {
+                            key: "dead_acute".into(),
+                            key_char: None,
+                            modifiers: Default::default(),
+                        },
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(panel.tab_mut("ime", 0).unwrap().coalescer.is_empty());
+                panel.replace_text_in_range(None, "é", window, cx);
+                panel.on_key_down(
+                    &KeyDownEvent {
+                        keystroke: gpui::Keystroke {
+                            key: "q".into(),
+                            key_char: Some("@".into()),
+                            modifiers: gpui::Modifiers {
+                                control: true,
+                                alt: true,
+                                ..Default::default()
+                            },
+                        },
+                        is_held: false,
+                        prefer_character_input: true,
+                    },
+                    window,
+                    cx,
+                );
+                panel.replace_text_in_range(None, "@", window, cx);
+                assert_eq!(
+                    panel.tab_mut("ime", 0).unwrap().coalescer.take(),
+                    "é@".as_bytes()
+                );
+                panel
+                    .tab_mut("ime", 0)
+                    .unwrap()
+                    .emulator
+                    .feed(b"\x1b[?2004h");
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("貼付".into()));
+            })
+            .unwrap();
         cx.simulate_keystrokes(window.into(), "ctrl-shift-v");
-        window.update(cx, |panel, _, _| {
-            assert_eq!(panel.tab_mut("ime", 0).unwrap().coalescer.take(), "\x1b[200~貼付\x1b[201~".as_bytes());
-        }).unwrap();
+        window
+            .update(cx, |panel, _, _| {
+                assert_eq!(
+                    panel.tab_mut("ime", 0).unwrap().coalescer.take(),
+                    "\x1b[200~貼付\x1b[201~".as_bytes()
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]
