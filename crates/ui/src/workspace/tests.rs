@@ -9,7 +9,13 @@ fn setup(cx: &mut TestAppContext, directory: &std::path::Path) {
         gpui_tokio::init(cx);
         cx.set_global(Theme::default());
         crate::settings::init(crate::settings::UiSettings::default(), directory, cx);
-        crate::history::init(Default::default(), Default::default(), Default::default(), Default::default(), cx);
+        crate::history::init(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            cx,
+        );
         crate::composer::init(cx, Default::default());
     });
 }
@@ -26,25 +32,54 @@ fn panes_keep_independent_drafts_and_selection(cx: &mut TestAppContext) {
         });
         Workspace::new(source, directory.path().join("layout.json"), cx)
     });
-    window.update(cx, |workspace, _, cx| {
-        let first = workspace.layout.active_pane_id().unwrap();
-        workspace.ensure_pane(first, cx);
-        let first_chat = workspace.panes[&first].chat.clone();
-        first_chat.read(cx).composer.clone().update(cx, |composer, cx| composer.load_text("first draft".into(), cx));
-        workspace.split(Direction::Right, false, cx);
-        let second = workspace.layout.active_pane_id().unwrap();
-        workspace.ensure_pane(second, cx);
-        let second_chat = workspace.panes[&second].chat.clone();
-        second_chat.read(cx).composer.clone().update(cx, |composer, cx| composer.load_text("second draft".into(), cx));
-        assert_ne!(first_chat.read(cx).state.entity_id(), second_chat.read(cx).state.entity_id());
-        assert_eq!(first_chat.read(cx).composer.read(cx).input.read(cx).text(), "first draft");
-        assert_eq!(second_chat.read(cx).composer.read(cx).input.read(cx).text(), "second draft");
-        workspace.focus(first, cx);
-        assert_eq!(workspace.layout.active_pane_id(), Some(first));
-        assert_eq!(second_chat.read(cx).composer.read(cx).input.read(cx).text(), "second draft");
-        workspace.flush().unwrap();
-        assert_eq!(WorkspaceLayout::load(directory.path().join("layout.json")).unwrap(), workspace.layout);
-    }).unwrap();
+    window
+        .update(cx, |workspace, _, cx| {
+            let first = workspace.layout.active_pane_id().unwrap();
+            workspace.ensure_pane(first, cx);
+            let first_chat = workspace.panes[&first].chat.clone();
+            first_chat
+                .read(cx)
+                .composer
+                .clone()
+                .update(cx, |composer, cx| {
+                    composer.load_text("first draft".into(), cx)
+                });
+            workspace.split(Direction::Right, false, cx);
+            let second = workspace.layout.active_pane_id().unwrap();
+            workspace.ensure_pane(second, cx);
+            let second_chat = workspace.panes[&second].chat.clone();
+            second_chat
+                .read(cx)
+                .composer
+                .clone()
+                .update(cx, |composer, cx| {
+                    composer.load_text("second draft".into(), cx)
+                });
+            assert_ne!(
+                first_chat.read(cx).state.entity_id(),
+                second_chat.read(cx).state.entity_id()
+            );
+            assert_eq!(
+                first_chat.read(cx).composer.read(cx).input.read(cx).text(),
+                "first draft"
+            );
+            assert_eq!(
+                second_chat.read(cx).composer.read(cx).input.read(cx).text(),
+                "second draft"
+            );
+            workspace.focus(first, cx);
+            assert_eq!(workspace.layout.active_pane_id(), Some(first));
+            assert_eq!(
+                second_chat.read(cx).composer.read(cx).input.read(cx).text(),
+                "second draft"
+            );
+            workspace.flush().unwrap();
+            assert_eq!(
+                WorkspaceLayout::load(directory.path().join("layout.json")).unwrap(),
+                workspace.layout
+            );
+        })
+        .unwrap();
 }
 
 #[gpui::test]
@@ -55,25 +90,33 @@ fn moving_and_closing_panes_preserves_sibling_entities(cx: &mut TestAppContext) 
         let source = cx.new(|_| AppState::new());
         Workspace::new(source, directory.path().join("layout.json"), cx)
     });
-    window.update(cx, |workspace, _, cx| {
-        let first = workspace.layout.active_pane_id().unwrap();
-        workspace.ensure_pane(first, cx);
-        let identity = workspace.panes[&first].chat.entity_id();
-        workspace.split(Direction::Right, true, cx);
-        let second = workspace.layout.active_pane_id().unwrap();
-        workspace.ensure_pane(second, cx);
-        workspace.apply(|layout| layout.move_pane(second, first, Direction::Down), cx);
-        assert_eq!(workspace.layout.views.len(), 1);
-        assert_eq!(workspace.panes[&first].chat.entity_id(), identity);
-        workspace.close(second, cx);
-        assert_eq!(workspace.layout.active_pane_id(), Some(first));
-        assert_eq!(workspace.panes[&first].chat.entity_id(), identity);
-        workspace.close(first, cx);
-        assert!(workspace.error.is_none());
-        assert!(workspace.layout.pane(first).is_none());
-        let launcher = workspace.layout.active_pane_id().unwrap();
-        assert_eq!(workspace.layout.pane(launcher).unwrap(), &PaneState::default());
-    }).unwrap();
+    window
+        .update(cx, |workspace, _, cx| {
+            let first = workspace.layout.active_pane_id().unwrap();
+            workspace.ensure_pane(first, cx);
+            let identity = workspace.panes[&first].chat.entity_id();
+            workspace.split(Direction::Right, true, cx);
+            let second = workspace.layout.active_pane_id().unwrap();
+            workspace.ensure_pane(second, cx);
+            workspace.apply(
+                |layout| layout.move_pane(second, first, Direction::Down),
+                cx,
+            );
+            assert_eq!(workspace.layout.views.len(), 1);
+            assert_eq!(workspace.panes[&first].chat.entity_id(), identity);
+            workspace.close(second, cx);
+            assert_eq!(workspace.layout.active_pane_id(), Some(first));
+            assert_eq!(workspace.panes[&first].chat.entity_id(), identity);
+            workspace.close(first, cx);
+            assert!(workspace.error.is_none());
+            assert!(workspace.layout.pane(first).is_none());
+            let launcher = workspace.layout.active_pane_id().unwrap();
+            assert_eq!(
+                workspace.layout.pane(launcher).unwrap(),
+                &PaneState::default()
+            );
+        })
+        .unwrap();
 }
 
 #[gpui::test]
@@ -84,21 +127,23 @@ fn maximize_toggles_active_pane_and_clears_on_close(cx: &mut TestAppContext) {
         let source = cx.new(|_| AppState::new());
         Workspace::new(source, directory.path().join("layout.json"), cx)
     });
-    window.update(cx, |workspace, _, cx| {
-        let first = workspace.layout.active_pane_id().unwrap();
-        workspace.ensure_pane(first, cx);
-        workspace.split(Direction::Right, false, cx);
-        let second = workspace.layout.active_pane_id().unwrap();
-        assert!(workspace.is_split_view());
-        workspace.toggle_maximize_active_pane(cx);
-        assert_eq!(workspace.maximized_pane_id(), Some(second));
-        workspace.toggle_maximize_active_pane(cx);
-        assert_eq!(workspace.maximized_pane_id(), None);
-        workspace.toggle_maximize_pane(first, cx);
-        assert_eq!(workspace.maximized_pane_id(), Some(first));
-        workspace.close(first, cx);
-        assert_eq!(workspace.maximized_pane_id(), None);
-    }).unwrap();
+    window
+        .update(cx, |workspace, _, cx| {
+            let first = workspace.layout.active_pane_id().unwrap();
+            workspace.ensure_pane(first, cx);
+            workspace.split(Direction::Right, false, cx);
+            let second = workspace.layout.active_pane_id().unwrap();
+            assert!(workspace.is_split_view());
+            workspace.toggle_maximize_active_pane(cx);
+            assert_eq!(workspace.maximized_pane_id(), Some(second));
+            workspace.toggle_maximize_active_pane(cx);
+            assert_eq!(workspace.maximized_pane_id(), None);
+            workspace.toggle_maximize_pane(first, cx);
+            assert_eq!(workspace.maximized_pane_id(), Some(first));
+            workspace.close(first, cx);
+            assert_eq!(workspace.maximized_pane_id(), None);
+        })
+        .unwrap();
 }
 
 #[test]
@@ -108,12 +153,20 @@ fn layout_files_are_account_scoped() {
     let local = layout_path(&state, directory);
     state.workspace_scope = Some(zeron_proto::WorkspaceScope::Synced);
     state.auth = Some(zeron_proto::AuthState::SignedIn {
-        user: zeron_proto::UserProfile { id: "user-a".into(), email: String::new(), name: None },
+        user: zeron_proto::UserProfile {
+            id: "user-a".into(),
+            email: String::new(),
+            name: None,
+        },
         org_id: Some("org-a".into()),
     });
     let first = layout_path(&state, directory);
     state.auth = Some(zeron_proto::AuthState::SignedIn {
-        user: zeron_proto::UserProfile { id: "user-b".into(), email: String::new(), name: None },
+        user: zeron_proto::UserProfile {
+            id: "user-b".into(),
+            email: String::new(),
+            name: None,
+        },
         org_id: Some("org-a".into()),
     });
     let second = layout_path(&state, directory);
@@ -146,7 +199,14 @@ fn closing_parked_cli_requires_daemon_acknowledgement(cx: &mut TestAppContext) {
     cx.run_until_parked();
     workspace.update(cx, |workspace, _| {
         assert!(workspace.pending_close.is_empty());
-        assert_eq!(workspace.layout.pane(workspace.layout.active_pane_id().unwrap()).unwrap().mode, PaneMode::Terminal);
+        assert_eq!(
+            workspace
+                .layout
+                .pane(workspace.layout.active_pane_id().unwrap())
+                .unwrap()
+                .mode,
+            PaneMode::Terminal
+        );
         assert_eq!(workspace.error.as_deref(), Some("Engine is not connected"));
     });
 }
@@ -164,12 +224,39 @@ fn failed_open_cannot_be_rebound_by_sidebar_selection(cx: &mut TestAppContext) {
         workspace.layout.pane_mut(original).unwrap().session_id = Some("pi-original".into());
         workspace.ensure_pane(original, cx);
         workspace.open_terminal(original, cx);
-        assert!(matches!(workspace.panes[&original].terminal.as_ref().unwrap().read(cx).session_view_status(), SessionViewStatus::Failed(_)));
-        assert_eq!(workspace.layout.pane(original).unwrap().mode, PaneMode::Chat);
+        assert!(matches!(
+            workspace.panes[&original]
+                .terminal
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .session_view_status(),
+            SessionViewStatus::Failed(_)
+        ));
+        assert_eq!(
+            workspace.layout.pane(original).unwrap().mode,
+            PaneMode::Chat
+        );
         workspace.select_session(Some("different-chat".into()), cx);
-        assert_eq!(workspace.layout.pane(original).unwrap().session_id.as_deref(), Some("pi-original"));
+        assert_eq!(
+            workspace
+                .layout
+                .pane(original)
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("pi-original")
+        );
         assert_ne!(workspace.layout.active_pane_id(), Some(original));
-        assert_eq!(workspace.layout.pane(workspace.layout.active_pane_id().unwrap()).unwrap().session_id.as_deref(), Some("different-chat"));
+        assert_eq!(
+            workspace
+                .layout
+                .pane(workspace.layout.active_pane_id().unwrap())
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("different-chat")
+        );
     });
 }
 
@@ -186,32 +273,72 @@ fn pane_header_center_drop_swaps_panes_in_same_tab(cx: &mut TestAppContext) {
     });
     cx.simulate_resize(size(px(1000.0), px(700.0)));
     cx.run_until_parked();
-    let origin = cx.debug_bounds("pane-drag-3").expect("first pane drag header").center();
+    let origin = cx
+        .debug_bounds("pane-drag-3")
+        .expect("first pane drag header")
+        .center();
     let destination = cx.debug_bounds("pane-4").expect("second pane").center();
     workspace.update(cx, |workspace, cx| {
-        workspace.panes[&PaneId(3)].chat.read(cx).composer.clone()
-            .update(cx, |composer, cx| composer.load_text("preserve draft".into(), cx));
+        workspace.panes[&PaneId(3)]
+            .chat
+            .read(cx)
+            .composer
+            .clone()
+            .update(cx, |composer, cx| {
+                composer.load_text("preserve draft".into(), cx)
+            });
     });
     cx.simulate_mouse_down(origin, MouseButton::Left, Modifiers::none());
-    cx.simulate_mouse_move(origin + point(px(15.0), px(0.0)), MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        origin + point(px(15.0), px(0.0)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
     cx.simulate_mouse_move(destination, MouseButton::Left, Modifiers::none());
     cx.simulate_mouse_up(destination, MouseButton::Left, Modifiers::none());
     workspace.update(cx, |workspace, cx| {
         assert!(workspace.error.is_none(), "{:?}", workspace.error);
         // Same-tab center drop swaps: still one tab, two panes.
         assert_eq!(workspace.layout.views[&ViewId(1)].tabs.len(), 1);
-        assert_eq!(workspace.layout.views[&ViewId(1)].tabs[&TabId(2)].panes.len(), 2);
+        assert_eq!(
+            workspace.layout.views[&ViewId(1)].tabs[&TabId(2)]
+                .panes
+                .len(),
+            2
+        );
         // The draft follows its pane (swap exchanges leaves, not state).
-        assert_eq!(workspace.panes[&PaneId(3)].chat.read(cx).composer.read(cx).input.read(cx).text(), "preserve draft");
+        assert_eq!(
+            workspace.panes[&PaneId(3)]
+                .chat
+                .read(cx)
+                .composer
+                .read(cx)
+                .input
+                .read(cx)
+                .text(),
+            "preserve draft"
+        );
     });
 }
 
 #[test]
 fn outside_ring_does_not_consume_inner_pane_targets() {
-    let bounds = Bounds::new(gpui::point(px(100.0), px(50.0)), gpui::size(px(800.0), px(600.0)));
-    assert_eq!(outside_ring(gpui::point(px(105.0), px(300.0)), bounds), Some(Direction::Left));
-    assert_eq!(outside_ring(gpui::point(px(190.0), px(300.0)), bounds), None);
-    assert_eq!(outside_ring(gpui::point(px(500.0), px(645.0)), bounds), Some(Direction::Down));
+    let bounds = Bounds::new(
+        gpui::point(px(100.0), px(50.0)),
+        gpui::size(px(800.0), px(600.0)),
+    );
+    assert_eq!(
+        outside_ring(gpui::point(px(105.0), px(300.0)), bounds),
+        Some(Direction::Left)
+    );
+    assert_eq!(
+        outside_ring(gpui::point(px(190.0), px(300.0)), bounds),
+        None
+    );
+    assert_eq!(
+        outside_ring(gpui::point(px(500.0), px(645.0)), bounds),
+        Some(Direction::Down)
+    );
     assert_eq!(outside_ring(gpui::point(px(90.0), px(300.0)), bounds), None);
 }
 
@@ -231,32 +358,59 @@ fn divider_resizes_resets_and_outer_drop_moves_a_full_view(cx: &mut TestAppConte
     let start = cx.debug_bounds(divider).unwrap().center();
     let end = point(px(700.0), start.y);
     cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
-    cx.simulate_mouse_move(start + point(px(20.0), px(0.0)), MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        start + point(px(20.0), px(0.0)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
     cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
     cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
     workspace.update(cx, |workspace, _| {
-        let SplitNode::Split { ratio, .. } = &workspace.layout.views[&ViewId(1)].tabs[&TabId(2)].root else { panic!("split missing") };
+        let SplitNode::Split { ratio, .. } =
+            &workspace.layout.views[&ViewId(1)].tabs[&TabId(2)].root
+        else {
+            panic!("split missing")
+        };
         assert!((0.68..0.72).contains(ratio), "ratio {ratio}");
     });
     let reset = cx.debug_bounds(divider).unwrap().center();
-    cx.simulate_event(MouseDownEvent { position: reset, button: MouseButton::Left,
-        modifiers: Modifiers::none(), click_count: 2, first_mouse: false });
+    cx.simulate_event(MouseDownEvent {
+        position: reset,
+        button: MouseButton::Left,
+        modifiers: Modifiers::none(),
+        click_count: 2,
+        first_mouse: false,
+    });
     cx.simulate_mouse_up(reset, MouseButton::Left, Modifiers::none());
     workspace.update(cx, |workspace, _| {
-        let SplitNode::Split { ratio, .. } = &workspace.layout.views[&ViewId(1)].tabs[&TabId(2)].root else { panic!("split missing") };
+        let SplitNode::Split { ratio, .. } =
+            &workspace.layout.views[&ViewId(1)].tabs[&TabId(2)].root
+        else {
+            panic!("split missing")
+        };
         assert_eq!(*ratio, 0.5);
     });
     let header = cx.debug_bounds("pane-drag-3").unwrap().center();
     let outer_edge = point(px(995.0), px(350.0));
     cx.simulate_mouse_down(header, MouseButton::Left, Modifiers::none());
-    cx.simulate_mouse_move(header + point(px(20.0), px(0.0)), MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        header + point(px(20.0), px(0.0)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
     cx.simulate_mouse_move(outer_edge, MouseButton::Left, Modifiers::none());
     cx.simulate_mouse_up(outer_edge, MouseButton::Left, Modifiers::none());
     workspace.update(cx, |workspace, _| {
         assert!(workspace.error.is_none(), "{:?}", workspace.error);
         assert_eq!(workspace.layout.views.len(), 2);
-        assert_ne!(workspace.layout.pane_location(PaneId(3)).unwrap().0, ViewId(1));
-        assert_eq!(workspace.layout.pane_location(PaneId(4)).unwrap().0, ViewId(1));
+        assert_ne!(
+            workspace.layout.pane_location(PaneId(3)).unwrap().0,
+            ViewId(1)
+        );
+        assert_eq!(
+            workspace.layout.pane_location(PaneId(4)).unwrap().0,
+            ViewId(1)
+        );
         workspace.layout.validate().unwrap();
     });
 }
@@ -282,18 +436,31 @@ fn tab_drag_inserts_after_target_and_preserves_nested_panes(cx: &mut TestAppCont
     });
     let origin = cx.debug_bounds("workspace-tab-2").unwrap().center();
     let target = cx.debug_bounds("workspace-tab-5").unwrap();
-    let destination = point(target.origin.x + target.size.width * 0.65, target.center().y);
+    let destination = point(
+        target.origin.x + target.size.width * 0.65,
+        target.center().y,
+    );
     cx.simulate_mouse_down(origin, MouseButton::Left, Modifiers::none());
-    cx.simulate_mouse_move(origin + point(px(15.0), px(0.0)), MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(
+        origin + point(px(15.0), px(0.0)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
     cx.simulate_mouse_move(destination, MouseButton::Left, Modifiers::none());
-    workspace.update(cx, |workspace, _| assert_eq!(workspace.tab_preview, Some((ViewId(1), None))));
+    workspace.update(cx, |workspace, _| {
+        assert_eq!(workspace.tab_preview, Some((ViewId(1), None)))
+    });
     cx.simulate_mouse_up(destination, MouseButton::Left, Modifiers::none());
     workspace.update(cx, |workspace, _| {
         assert!(workspace.error.is_none(), "{:?}", workspace.error);
         let view = &workspace.layout.views[&ViewId(1)];
         assert_eq!(view.ordered_tabs(), vec![second, first]);
         assert_eq!(view.tabs[&first].root, nested);
-        assert_eq!(workspace.layout.views.len(), 1, "tab rail must not create an outer split");
+        assert_eq!(
+            workspace.layout.views.len(),
+            1,
+            "tab rail must not create an outer split"
+        );
     });
 }
 
@@ -329,10 +496,7 @@ fn tab_indicator_priority_and_terminal_mapping() {
     );
 
     assert_eq!(
-        tab_indicator([
-            Some(ChatIndicator::Idle),
-            Some(ChatIndicator::Completed),
-        ]),
+        tab_indicator([Some(ChatIndicator::Idle), Some(ChatIndicator::Completed),]),
         Some(ChatIndicator::Completed)
     );
 
@@ -349,7 +513,10 @@ fn tab_indicator_priority_and_terminal_mapping() {
         Some(ChatIndicator::Working)
     );
     assert_eq!(
-        pane_indicator(Some(NativeActivity::Permission), Some(ChatIndicator::Completed)),
+        pane_indicator(
+            Some(NativeActivity::Permission),
+            Some(ChatIndicator::Completed)
+        ),
         Some(ChatIndicator::AwaitingInput)
     );
     assert_eq!(
@@ -361,7 +528,10 @@ fn tab_indicator_priority_and_terminal_mapping() {
         Some(ChatIndicator::Completed)
     );
     assert_eq!(
-        pane_indicator(Some(NativeActivity::Unknown), Some(ChatIndicator::Completed)),
+        pane_indicator(
+            Some(NativeActivity::Unknown),
+            Some(ChatIndicator::Completed)
+        ),
         Some(ChatIndicator::Completed)
     );
     assert_eq!(
@@ -490,8 +660,14 @@ fn close_confirmation_gates_on_running_cli_and_setting() {
 
     // Multi-pane tab: if any pane is running, confirm is required
     assert!(needs_close_confirmation(true, [idle_cli.clone(), busy_cli]));
-    assert!(needs_close_confirmation(true, [plain_chat.clone(), opening_cli]));
-    assert!(needs_close_confirmation(true, [plain_chat.clone(), starting]));
+    assert!(needs_close_confirmation(
+        true,
+        [plain_chat.clone(), opening_cli]
+    ));
+    assert!(needs_close_confirmation(
+        true,
+        [plain_chat.clone(), starting]
+    ));
     assert!(!needs_close_confirmation(true, [idle_cli, plain_chat]));
 }
 
@@ -564,17 +740,23 @@ fn mixed_tab_close_preserves_layout_integrity_and_awaits_cli_ack(cx: &mut TestAp
 
         let view_id = workspace.layout.active_view_id;
         let tab_id = workspace.layout.views[&view_id].active_tab_id;
-        assert_eq!(workspace.layout.views[&view_id].tabs[&tab_id].panes.len(), 2);
+        assert_eq!(
+            workspace.layout.views[&view_id].tabs[&tab_id].panes.len(),
+            2
+        );
 
         workspace.layout.pane_mut(second).unwrap().mode = PaneMode::Terminal;
         let terminal = workspace.prepare_terminal(second, cx).unwrap();
         let (_sender, receiver) = futures::channel::oneshot::channel::<()>();
         terminal.update(cx, |t, cx| {
             t.set_session_status(SessionViewStatus::Opening, cx);
-            t.set_session_open(Some(cx.spawn(async move |_, _| {
-                let _ = receiver.await;
-                Ok(())
-            }).shared()));
+            t.set_session_open(Some(
+                cx.spawn(async move |_, _| {
+                    let _ = receiver.await;
+                    Ok(())
+                })
+                .shared(),
+            ));
         });
 
         let state = workspace.pane_close_running_state(second, cx);
@@ -583,7 +765,10 @@ fn mixed_tab_close_preserves_layout_integrity_and_awaits_cli_ack(cx: &mut TestAp
 
         workspace.request_close_tab(view_id, tab_id, cx);
         assert!(workspace.pending_close_confirm.is_some());
-        assert_eq!(workspace.layout.views[&view_id].tabs[&tab_id].panes.len(), 2);
+        assert_eq!(
+            workspace.layout.views[&view_id].tabs[&tab_id].panes.len(),
+            2
+        );
 
         let pending = workspace.pending_close_confirm.take().unwrap();
         assert_eq!(pending.panes.len(), 2);
@@ -616,7 +801,10 @@ fn mixed_tab_close_preserves_layout_integrity_and_awaits_cli_ack(cx: &mut TestAp
         assert!(workspace.layout.validate().is_ok());
 
         let launcher = workspace.layout.active_pane_id().unwrap();
-        assert_eq!(workspace.layout.pane(launcher).unwrap(), &PaneState::default());
+        assert_eq!(
+            workspace.layout.pane(launcher).unwrap(),
+            &PaneState::default()
+        );
     });
 }
 
@@ -630,7 +818,14 @@ fn create_chat_payload_shape() {
         sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
     };
 
-    let p1 = create_chat_payload("c1", Some("s1"), Some("d1"), "/path", Some("feat"), Some(&config));
+    let p1 = create_chat_payload(
+        "c1",
+        Some("s1"),
+        Some("d1"),
+        "/path",
+        Some("feat"),
+        Some(&config),
+    );
     assert_eq!(p1["op"], "createChat");
     assert_eq!(p1["chatId"], "c1");
     assert_eq!(p1["spaceId"], "s1");
@@ -674,7 +869,10 @@ fn new_tab_opens_an_empty_draft_without_minting(cx: &mut TestAppContext) {
 }
 
 fn drag(chat_id: &str) -> SidebarSessionDrag {
-    SidebarSessionDrag { chat_id: chat_id.into(), title: chat_id.into() }
+    SidebarSessionDrag {
+        chat_id: chat_id.into(),
+        title: chat_id.into(),
+    }
 }
 
 #[gpui::test]
@@ -691,27 +889,58 @@ fn sidebar_session_drops_split_open_and_focus(cx: &mut TestAppContext) {
         workspace.layout.pane_mut(first).unwrap().session_id = Some("chat-a".into());
 
         // Edge drop: a new pane splits in beside the target and takes focus.
-        workspace.drop_session(&drag("chat-b"), SessionDrop { pane: first, zone: Some(Direction::Right), open_in: None }, cx);
+        workspace.drop_session(
+            &drag("chat-b"),
+            SessionDrop {
+                pane: first,
+                zone: Some(Direction::Right),
+                open_in: None,
+            },
+            cx,
+        );
         let split = workspace.layout.active_pane_id().unwrap();
         assert_ne!(split, first);
-        assert_eq!(workspace.layout.pane(split).unwrap().session_id.as_deref(), Some("chat-b"));
+        assert_eq!(
+            workspace.layout.pane(split).unwrap().session_id.as_deref(),
+            Some("chat-b")
+        );
         assert!(workspace.open_session_ids().contains("chat-b"));
 
         // Center drop: the session opens in the pane under the pointer.
-        workspace.drop_session(&drag("chat-c"), SessionDrop { pane: split, zone: None, open_in: None }, cx);
-        assert_eq!(workspace.layout.pane(split).unwrap().session_id.as_deref(), Some("chat-c"));
+        workspace.drop_session(
+            &drag("chat-c"),
+            SessionDrop {
+                pane: split,
+                zone: None,
+                open_in: None,
+            },
+            cx,
+        );
+        assert_eq!(
+            workspace.layout.pane(split).unwrap().session_id.as_deref(),
+            Some("chat-c")
+        );
         assert_eq!(workspace.layout.active_pane_id(), Some(split));
 
         // Already open: the drop focuses its pane instead of duplicating it.
         workspace.focus(first, cx);
         workspace.drop_session(
             &drag("chat-c"),
-            SessionDrop { pane: first, zone: Some(Direction::Down), open_in: workspace.find_pane_by_session("chat-c") },
+            SessionDrop {
+                pane: first,
+                zone: Some(Direction::Down),
+                open_in: workspace.find_pane_by_session("chat-c"),
+            },
             cx,
         );
         assert_eq!(workspace.layout.active_pane_id(), Some(split));
-        let pane_count: usize = workspace.layout.views.values()
-            .flat_map(|view| view.tabs.values()).map(|tab| tab.panes.len()).sum();
+        let pane_count: usize = workspace
+            .layout
+            .views
+            .values()
+            .flat_map(|view| view.tabs.values())
+            .map(|tab| tab.panes.len())
+            .sum();
         assert_eq!(pane_count, 2, "focusing an open session must not add panes");
 
         assert!(workspace.error.is_none(), "{:?}", workspace.error);
@@ -734,14 +963,22 @@ fn open_in_split_reuses_the_pane_already_showing_the_session(cx: &mut TestAppCon
         workspace.open_session_in_split("chat-a", cx);
         let split = workspace.layout.active_pane_id().unwrap();
         assert_ne!(split, first);
-        assert_eq!(workspace.layout.pane(split).unwrap().session_id.as_deref(), Some("chat-a"));
+        assert_eq!(
+            workspace.layout.pane(split).unwrap().session_id.as_deref(),
+            Some("chat-a")
+        );
 
         // A second open-in-split for the same session focuses, never duplicates.
         workspace.focus(first, cx);
         workspace.open_session_in_split("chat-a", cx);
         assert_eq!(workspace.layout.active_pane_id(), Some(split));
-        let pane_count: usize = workspace.layout.views.values()
-            .flat_map(|view| view.tabs.values()).map(|tab| tab.panes.len()).sum();
+        let pane_count: usize = workspace
+            .layout
+            .views
+            .values()
+            .flat_map(|view| view.tabs.values())
+            .map(|tab| tab.panes.len())
+            .sum();
         assert_eq!(pane_count, 2);
 
         // The tab rail's open: a new tab in the pane's own view.
@@ -749,7 +986,10 @@ fn open_in_split_reuses_the_pane_already_showing_the_session(cx: &mut TestAppCon
         let view = workspace.layout.active_view_id;
         assert_eq!(workspace.layout.views[&view].tabs.len(), 2);
         let active = workspace.layout.active_pane_id().unwrap();
-        assert_eq!(workspace.layout.pane(active).unwrap().session_id.as_deref(), Some("chat-b"));
+        assert_eq!(
+            workspace.layout.pane(active).unwrap().session_id.as_deref(),
+            Some("chat-b")
+        );
 
         assert!(workspace.error.is_none(), "{:?}", workspace.error);
         workspace.layout.validate().unwrap();

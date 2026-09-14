@@ -1136,9 +1136,9 @@ async fn agent(
                 .clone();
             if gated {
                 this.control_scope(
-                    chat.space_id
-                        .as_deref()
-                        .context("denied: this verb requires a session that belongs to a workspace")?,
+                    chat.space_id.as_deref().context(
+                        "denied: this verb requires a session that belongs to a workspace",
+                    )?,
                     cx,
                     false,
                 )?;
@@ -1302,9 +1302,9 @@ async fn agent(
                     .find(|row| row.id == chat)
                     .context("session disappeared")?;
                 this.control_scope(
-                    row.space_id
-                        .as_deref()
-                        .context("denied: this verb requires a session that belongs to a workspace")?,
+                    row.space_id.as_deref().context(
+                        "denied: this verb requires a session that belongs to a workspace",
+                    )?,
                     cx,
                     false,
                 )?;
@@ -1443,10 +1443,7 @@ fn no_symlinks(path: &Path) -> Result<()> {
 fn write_role_capability(dir: &Path, run: &str, label: &str, capability: &str) -> Result<PathBuf> {
     let roles = run_roles_dir(dir, run)?;
     ensure!(
-        !label.is_empty()
-            && !label.contains(['/', '\\'])
-            && label != "."
-            && label != "..",
+        !label.is_empty() && !label.contains(['/', '\\']) && label != "." && label != "..",
         "role label is not a safe capability file name"
     );
     let roles = roles.join("roles");
@@ -2209,7 +2206,9 @@ async fn orchestration(
                 json!(failures)
             );
         }
-        return Ok(json!({"id": team.id, "results":results, "roles":admitted_roles, "completed":false}));
+        return Ok(
+            json!({"id": team.id, "results":results, "roles":admitted_roles, "completed":false}),
+        );
     }
     if matches!(method, "coordination-state.watch" | "team.watch") {
         let watch_store = store.clone();
@@ -2316,8 +2315,8 @@ async fn orchestration(
                             .as_deref()
                             .context("unauthenticated report")?,
                         serde_json::from_value(
-                            params.get("report").context("report required")?.clone()
-                        )?
+                            params.get("report").context("report required")?.clone(),
+                        )?,
                     )?;
                     if team.status == zeron_orchestration::TeamStatus::Completed {
                         remove_run_capabilities(store.dir(), &team.id);
@@ -3124,9 +3123,7 @@ mod tests {
             consent.prune_human_input();
             assert!(!consent.human_input.contains_key("session"));
         }
-        consent
-            .human_input
-            .insert("session".into(), Instant::now());
+        consent.human_input.insert("session".into(), Instant::now());
         consent.revoke("workspace");
         assert!(!consent.human_input.contains_key("session"));
     }
@@ -3175,12 +3172,13 @@ mod tests {
             write_role_capability(dir.path(), "run-1", "reviewer", "capability-secret").unwrap();
         assert_eq!(
             path,
-            dir.path().join("runs").join("run-1").join("roles").join("reviewer.capability")
+            dir.path()
+                .join("runs")
+                .join("run-1")
+                .join("roles")
+                .join("reviewer.capability")
         );
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "capability-secret"
-        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "capability-secret");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

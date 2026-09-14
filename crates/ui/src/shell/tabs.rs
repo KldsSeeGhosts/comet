@@ -330,7 +330,9 @@ impl Shell {
     pub(super) fn open_chat_in_split(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         if let Some(workspace) = self.workspace.clone() {
-            workspace.update(cx, |workspace, cx| workspace.open_session_in_split(&chat_id, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_session_in_split(&chat_id, cx)
+            });
         } else {
             self.state
                 .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
@@ -390,9 +392,13 @@ impl Shell {
         // "project @ device" tag right of the title (the composer footer no
         // longer carries it). In split view the session name is suppressed —
         // each pane header already names its own session.
-        let split_view = self.workspace.as_ref()
+        let split_view = self
+            .workspace
+            .as_ref()
             .is_some_and(|w| w.read(cx).is_split_view());
-        let maximized = self.workspace.as_ref()
+        let maximized = self
+            .workspace
+            .as_ref()
             .and_then(|w| w.read(cx).maximized_pane_id())
             .is_some();
         let (title, target, harness, on_canvas): (
@@ -543,21 +549,26 @@ impl Shell {
             // bb session chrome: maximize + close sit beside the changes
             // toggle whenever a session is selected (single-pane; split panes
             // carry their own header controls).
-            let mut trailing_el = controls
-                .child(header_icon_button(
-                    "toggle-changes",
-                    icons::SIDEBAR_MINIMALISTIC,
-                    &theme,
-                    cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
-                ));
+            let mut trailing_el = controls.child(header_icon_button(
+                "toggle-changes",
+                icons::SIDEBAR_MINIMALISTIC,
+                &theme,
+                cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+            ));
             if has_session && !split_view {
                 trailing_el = trailing_el.child(header_icon_button(
                     "maximize-session",
-                    if maximized { icons::COLLAPSE_ARROWS } else { icons::EXPAND_ARROWS },
+                    if maximized {
+                        icons::COLLAPSE_ARROWS
+                    } else {
+                        icons::EXPAND_ARROWS
+                    },
                     &theme,
                     cx.listener(|this, _, _, cx| {
                         if let Some(workspace) = this.workspace.clone() {
-                            workspace.update(cx, |workspace, cx| workspace.toggle_maximize_active_pane(cx));
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.toggle_maximize_active_pane(cx)
+                            });
                         }
                     }),
                 ));
@@ -615,7 +626,9 @@ impl Shell {
                             // element_active is a soft wash in both appearances —
                             // surface_overlay is white in light mode and vanishes
                             // on the page bg (user report: pill "not landing").
-                            el.px(px(8.0)).py(px(3.0)).rounded(px(6.0))
+                            el.px(px(8.0))
+                                .py(px(3.0))
+                                .rounded(px(6.0))
                                 .bg(theme.element_active)
                         })
                         .when_some(

@@ -27,10 +27,10 @@ pub fn create_chat_payload(
     if let Some(branch) = branch {
         obj["branch"] = serde_json::Value::String(branch.to_string());
     }
-    if let Some(config) = config {
-        if let Ok(config_val) = serde_json::to_value(config) {
-            obj["config"] = config_val;
-        }
+    if let Some(config) = config
+        && let Ok(config_val) = serde_json::to_value(config)
+    {
+        obj["config"] = config_val;
     }
     obj
 }
@@ -40,7 +40,9 @@ impl Workspace {
         let runtime = self.panes.get(&id)?;
         let chat = runtime.chat.read(cx);
         let state = chat.state.read(cx);
-        if state.engine().is_none() { return Some("Engine is not connected"); }
+        if state.engine().is_none() {
+            return Some("Engine is not connected");
+        }
         if state.effective_device_id() != state.local_device_id {
             return Some("Open CLI on the session's host device");
         }
@@ -58,16 +60,23 @@ impl Workspace {
         self.mint_session_for_pane(id, true, cx);
     }
 
-    pub(super) fn mint_session_for_pane(&mut self, id: PaneId, open_terminal: bool, cx: &mut Context<Self>) {
-        if self.starting_cli.contains_key(&id) { return; }
-        if open_terminal {
-            if let Some(reason) = self.empty_cli_unavailable(id, cx) {
-                self.error = Some(reason.into());
-                cx.notify();
-                return;
-            }
+    pub(super) fn mint_session_for_pane(
+        &mut self,
+        id: PaneId,
+        open_terminal: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.starting_cli.contains_key(&id) {
+            return;
         }
-        let Some(runtime) = self.panes.get(&id) else { return; };
+        if open_terminal && let Some(reason) = self.empty_cli_unavailable(id, cx) {
+            self.error = Some(reason.into());
+            cx.notify();
+            return;
+        }
+        let Some(runtime) = self.panes.get(&id) else {
+            return;
+        };
         let chat = runtime.chat.read(cx);
         let state = chat.state.read(cx);
         let Some(engine) = state.engine().cloned() else {
@@ -79,10 +88,18 @@ impl Workspace {
             cx.notify();
             return;
         };
-        let config = chat.composer.read(cx).pickers().read(cx).resolved(cx).chat_config();
+        let config = chat
+            .composer
+            .read(cx)
+            .pickers()
+            .read(cx)
+            .resolved(cx)
+            .chat_config();
         let plan = chat.composer.read(cx).pickers().read(cx).checkout_plan();
         let space = state.selected_space_row().cloned();
-        let device = state.effective_device_id().or(state.local_device_id.clone());
+        let device = state
+            .effective_device_id()
+            .or(state.local_device_id.clone());
         let chat_id = uuid::Uuid::new_v4().to_string();
         let create = gpui_tokio::Tokio::spawn(cx, async move {
             tokio::time::timeout(Duration::from_secs(120), async move {
@@ -121,46 +138,66 @@ impl Workspace {
                 bail!("Chat watch closed before the new session became available")
             }).await.map_err(|_| anyhow::anyhow!("Creating the session timed out"))?
         });
-        self.starting_cli.insert(id, cx.spawn(async move |this, cx| {
-            let result: Result<Chat> = create.await.map_err(anyhow::Error::from).and_then(|result| result);
-            let _ = this.update(cx, |this, cx| {
-                this.starting_cli.remove(&id);
-                match result {
-                    Ok(chat) => {
-                        let pane_valid = this.layout.pane(id).is_some_and(|pane| pane.session_id.is_none());
-                        let runtime_exists = this.panes.contains_key(&id);
-                        if pane_valid && runtime_exists {
-                            let runtime = this.panes.get(&id).unwrap();
-                            let pane_state = runtime.chat.read(cx).state.clone();
-                            this.source.update(cx, |state, cx| {
-                                if !state.chats.iter().any(|c| c.id == chat.id) { state.chats.push(chat.clone()); }
-                                cx.notify();
-                            });
-                            pane_state.update(cx, |state, cx| {
-                                if !state.chats.iter().any(|c| c.id == chat.id) { state.chats.push(chat.clone()); }
-                                state.select_chat(Some(chat.id.clone()), cx);
-                            });
-                            runtime.chat.update(cx, |p, cx| p.select(Some(chat.id.clone()), cx));
-                            this.apply(|layout| layout.compose(layout.revision, |draft| {
-                                draft.pane_mut(id).unwrap().session_id = Some(chat.id);
-                                Ok(())
-                            }), cx);
-                            if open_terminal {
-                                this.open_terminal(id, cx);
+        self.starting_cli.insert(
+            id,
+            cx.spawn(async move |this, cx| {
+                let result: Result<Chat> = create
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result);
+                let _ = this.update(cx, |this, cx| {
+                    this.starting_cli.remove(&id);
+                    match result {
+                        Ok(chat) => {
+                            let pane_valid = this
+                                .layout
+                                .pane(id)
+                                .is_some_and(|pane| pane.session_id.is_none());
+                            let runtime_exists = this.panes.contains_key(&id);
+                            if pane_valid && runtime_exists {
+                                let runtime = this.panes.get(&id).unwrap();
+                                let pane_state = runtime.chat.read(cx).state.clone();
+                                this.source.update(cx, |state, cx| {
+                                    if !state.chats.iter().any(|c| c.id == chat.id) {
+                                        state.chats.push(chat.clone());
+                                    }
+                                    cx.notify();
+                                });
+                                pane_state.update(cx, |state, cx| {
+                                    if !state.chats.iter().any(|c| c.id == chat.id) {
+                                        state.chats.push(chat.clone());
+                                    }
+                                    state.select_chat(Some(chat.id.clone()), cx);
+                                });
+                                runtime
+                                    .chat
+                                    .update(cx, |p, cx| p.select(Some(chat.id.clone()), cx));
+                                this.apply(
+                                    |layout| {
+                                        layout.compose(layout.revision, |draft| {
+                                            draft.pane_mut(id).unwrap().session_id = Some(chat.id);
+                                            Ok(())
+                                        })
+                                    },
+                                    cx,
+                                );
+                                if open_terminal {
+                                    this.open_terminal(id, cx);
+                                }
                             }
                         }
+                        Err(error) => {
+                            this.error = Some(if open_terminal {
+                                format!("Could not open CLI: {error:#}")
+                            } else {
+                                format!("Could not create session: {error:#}")
+                            });
+                        }
                     }
-                    Err(error) => {
-                        this.error = Some(if open_terminal {
-                            format!("Could not open CLI: {error:#}")
-                        } else {
-                            format!("Could not create session: {error:#}")
-                        });
-                    }
-                }
-                cx.notify();
-            });
-        }));
+                    cx.notify();
+                });
+            }),
+        );
         cx.notify();
     }
 }

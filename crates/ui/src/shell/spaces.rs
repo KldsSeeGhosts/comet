@@ -158,10 +158,7 @@ pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
 /// full name sort: local context leads, then the user's chosen chat sort wins.
 type DeviceGroups<T> = Vec<(Option<(String, String)>, Vec<T>)>;
 
-fn promote_local_device_group<T>(
-    groups: &mut DeviceGroups<T>,
-    local_device_id: Option<&str>,
-) {
+fn promote_local_device_group<T>(groups: &mut DeviceGroups<T>, local_device_id: Option<&str>) {
     let Some(local_device_id) = local_device_id else {
         return;
     };
@@ -1763,9 +1760,9 @@ impl Shell {
             let text = flow.search.read(cx).text().to_string();
             if (text.starts_with('/') || text.starts_with('~'))
                 && let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref())
-                {
-                    self.add_space_descend(target, false, cx);
-                }
+            {
+                self.add_space_descend(target, false, cx);
+            }
             return;
         }
         let Some(listing) = flow.browser.ready() else {
@@ -2591,24 +2588,28 @@ impl Shell {
         //    Locations (home + the picked device's mounted drives), an info
         //    line naming the browsed device. Rows are the tab recipe (h-28
         //    rounded-8 washes), vertical.
-        let location_rows: Vec<(LocationRow, SharedString, &'static str, Option<String>)> = if device
-            .is_some() { {
-                std::iter::once((
-                    LocationRow::Home,
-                    SharedString::from("Home"),
-                    icons::HOME,
-                    None,
-                ))
-                .chain(drives.iter().enumerate().map(|(ix, drive)| {
-                    (
-                        LocationRow::Drive(ix),
-                        SharedString::from(drive.name.clone()),
-                        icons::HARD_DRIVE,
-                        Some(drive.path.clone()),
-                    )
-                }))
-                .collect()
-            } } else { Default::default() };
+        let location_rows: Vec<(LocationRow, SharedString, &'static str, Option<String>)> =
+            if device.is_some() {
+                {
+                    std::iter::once((
+                        LocationRow::Home,
+                        SharedString::from("Home"),
+                        icons::HOME,
+                        None,
+                    ))
+                    .chain(drives.iter().enumerate().map(|(ix, drive)| {
+                        (
+                            LocationRow::Drive(ix),
+                            SharedString::from(drive.name.clone()),
+                            icons::HARD_DRIVE,
+                            Some(drive.path.clone()),
+                        )
+                    }))
+                    .collect()
+                }
+            } else {
+                Default::default()
+            };
         let rail = div()
             .id("add-space-rail")
             .w(px(196.0))
@@ -3110,8 +3111,22 @@ mod tests {
     fn equal_sidebar_timestamps_sort_by_stable_chat_id() {
         let alpha = chat("alpha");
         let beta = chat("beta");
-        assert!(compare_sidebar_rows(SidebarSort::Created, &(ChatIndicator::Idle, alpha.clone()), &(ChatIndicator::Idle, beta.clone())).is_lt());
-        assert!(compare_sidebar_rows(SidebarSort::LastUpdated, &(ChatIndicator::Idle, alpha), &(ChatIndicator::Idle, beta)).is_lt());
+        assert!(
+            compare_sidebar_rows(
+                SidebarSort::Created,
+                &(ChatIndicator::Idle, alpha.clone()),
+                &(ChatIndicator::Idle, beta.clone())
+            )
+            .is_lt()
+        );
+        assert!(
+            compare_sidebar_rows(
+                SidebarSort::LastUpdated,
+                &(ChatIndicator::Idle, alpha),
+                &(ChatIndicator::Idle, beta)
+            )
+            .is_lt()
+        );
     }
 
     #[test]
@@ -3134,7 +3149,10 @@ mod tests {
         ];
         rows.sort_by(|left, right| compare_sidebar_rows(SidebarSort::LastUpdated, left, right));
         let order: Vec<&str> = rows.iter().map(|(_, chat)| chat.id.as_str()).collect();
-        assert_eq!(order, vec!["input", "failed", "working", "newer-idle", "older-idle"]);
+        assert_eq!(
+            order,
+            vec!["input", "failed", "working", "newer-idle", "older-idle"]
+        );
 
         // Done reads as settled: it stays in the user's sort, below busy work.
         let mut rows = vec![

@@ -62,7 +62,10 @@ fn swap_panes_exchanges_leaves_in_same_tab() -> Result<()> {
     // The tree structure is preserved: still a horizontal split.
     assert!(matches!(
         &layout.views[&view].tabs[&tab].root,
-        SplitNode::Split { horizontal: true, .. }
+        SplitNode::Split {
+            horizontal: true,
+            ..
+        }
     ));
     // Self-swap is rejected.
     assert!(layout.swap_panes(first, first).is_err());

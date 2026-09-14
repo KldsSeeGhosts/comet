@@ -27,13 +27,20 @@ impl<T: Copy + Eq> VisualNode<T> {
     fn settled(node: &SplitNode<T>, path: Vec<Branch>) -> Self {
         match node {
             SplitNode::Leaf { content } => Self::Leaf(*content),
-            SplitNode::Split { horizontal, ratio, first, second } => {
+            SplitNode::Split {
+                horizontal,
+                ratio,
+                first,
+                second,
+            } => {
                 let mut left = path.clone();
                 left.push(Branch::First);
                 let mut right = path.clone();
                 right.push(Branch::Second);
                 Self::Split {
-                    horizontal: *horizontal, from: *ratio as f32, ratio: *ratio as f32,
+                    horizontal: *horizontal,
+                    from: *ratio as f32,
+                    ratio: *ratio as f32,
                     path: Some(path),
                     first: Box::new(Self::settled(first, left)),
                     second: Box::new(Self::settled(second, right)),
@@ -45,15 +52,28 @@ impl<T: Copy + Eq> VisualNode<T> {
     fn same_shape(&self, node: &SplitNode<T>) -> bool {
         match (self, node) {
             (Self::Leaf(a), SplitNode::Leaf { content: b }) => a == b,
-            (Self::Split { horizontal: a, first: af, second: as_, .. },
-             SplitNode::Split { horizontal: b, first: bf, second: bs, .. }) =>
-                a == b && af.same_shape(bf) && as_.same_shape(bs),
+            (
+                Self::Split {
+                    horizontal: a,
+                    first: af,
+                    second: as_,
+                    ..
+                },
+                SplitNode::Split {
+                    horizontal: b,
+                    first: bf,
+                    second: bs,
+                    ..
+                },
+            ) => a == b && af.same_shape(bf) && as_.same_shape(bs),
             _ => false,
         }
     }
 
     fn find(&self, node: &SplitNode<T>) -> Option<&Self> {
-        if self.same_shape(node) { return Some(self); }
+        if self.same_shape(node) {
+            return Some(self);
+        }
         match self {
             Self::Split { first, second, .. } => first.find(node).or_else(|| second.find(node)),
             _ => None,
@@ -62,19 +82,35 @@ impl<T: Copy + Eq> VisualNode<T> {
 
     fn moving(&self) -> bool {
         match self {
-            Self::Split { from, ratio, first, second, .. } =>
-                (from - ratio).abs() > f32::EPSILON || first.moving() || second.moving(),
+            Self::Split {
+                from,
+                ratio,
+                first,
+                second,
+                ..
+            } => (from - ratio).abs() > f32::EPSILON || first.moving() || second.moving(),
             _ => false,
         }
     }
 
     fn sample(&self, progress: f32) -> Self {
         match self {
-            Self::Split { horizontal, from, ratio, path, first, second } => {
+            Self::Split {
+                horizontal,
+                from,
+                ratio,
+                path,
+                first,
+                second,
+            } => {
                 let value = lerp(*from, *ratio, progress);
                 Self::Split {
-                    horizontal: *horizontal, from: value, ratio: value, path: path.clone(),
-                    first: Box::new(first.sample(progress)), second: Box::new(second.sample(progress)),
+                    horizontal: *horizontal,
+                    from: value,
+                    ratio: value,
+                    path: path.clone(),
+                    first: Box::new(first.sample(progress)),
+                    second: Box::new(second.sample(progress)),
                 }
             }
             node => node.clone(),
@@ -84,27 +120,61 @@ impl<T: Copy + Eq> VisualNode<T> {
 
 // Match by leaf identities rather than tree paths: a path may name a different
 // split after a move. Empty exit branches never mount removed or moved entities.
-fn transition<T: Copy + Eq>(old: &VisualNode<T>, new: &SplitNode<T>, path: Vec<Branch>) -> VisualNode<T> {
-    if let VisualNode::Split { horizontal, ratio, first, second, .. } = old
+fn transition<T: Copy + Eq>(
+    old: &VisualNode<T>,
+    new: &SplitNode<T>,
+    path: Vec<Branch>,
+) -> VisualNode<T> {
+    if let VisualNode::Split {
+        horizontal,
+        ratio,
+        first,
+        second,
+        ..
+    } = old
         && !old.same_shape(new)
     {
-        let survivor = if first.same_shape(new) { Some((first, true)) }
-            else if second.same_shape(new) { Some((second, false)) } else { None };
+        let survivor = if first.same_shape(new) {
+            Some((first, true))
+        } else if second.same_shape(new) {
+            Some((second, false))
+        } else {
+            None
+        };
         if let Some((survivor, before)) = survivor {
             let child = Box::new(transition(survivor, new, path));
             let empty = Box::new(VisualNode::Empty);
-            let (first, second) = if before { (child, empty) } else { (empty, child) };
+            let (first, second) = if before {
+                (child, empty)
+            } else {
+                (empty, child)
+            };
             return VisualNode::Split {
-                horizontal: *horizontal, from: *ratio, ratio: if before { 1.0 } else { 0.0 },
-                path: None, first, second,
+                horizontal: *horizontal,
+                from: *ratio,
+                ratio: if before { 1.0 } else { 0.0 },
+                path: None,
+                first,
+                second,
             };
         }
     }
     match new {
         SplitNode::Leaf { content } => VisualNode::Leaf(*content),
-        SplitNode::Split { horizontal, ratio, first, second } => {
+        SplitNode::Split {
+            horizontal,
+            ratio,
+            first,
+            second,
+        } => {
             let matching = old.find(new);
-            let (from, left, right) = if let Some(VisualNode::Split { ratio, first, second, .. }) = matching {
+            let (from, left, right) = if let Some(VisualNode::Split {
+                ratio,
+                first,
+                second,
+                ..
+            }) = matching
+            {
                 (*ratio, first.as_ref(), second.as_ref())
             } else if old.same_shape(first) {
                 (1.0, old, &VisualNode::Empty)
@@ -113,10 +183,15 @@ fn transition<T: Copy + Eq>(old: &VisualNode<T>, new: &SplitNode<T>, path: Vec<B
             } else {
                 (*ratio as f32, old, old)
             };
-            let mut left_path = path.clone(); left_path.push(Branch::First);
-            let mut right_path = path.clone(); right_path.push(Branch::Second);
+            let mut left_path = path.clone();
+            left_path.push(Branch::First);
+            let mut right_path = path.clone();
+            right_path.push(Branch::Second);
             VisualNode::Split {
-                horizontal: *horizontal, from, ratio: *ratio as f32, path: Some(path),
+                horizontal: *horizontal,
+                from,
+                ratio: *ratio as f32,
+                path: Some(path),
                 first: Box::new(transition(left, first, left_path)),
                 second: Box::new(transition(right, second, right_path)),
             }
@@ -132,7 +207,11 @@ pub(super) struct TreeMotion<T> {
 
 impl<T: Copy + Eq> TreeMotion<T> {
     pub fn new(target: &SplitNode<T>, now: Instant) -> Self {
-        Self { target: target.clone(), origin: VisualNode::settled(target, vec![]), started: now }
+        Self {
+            target: target.clone(),
+            origin: VisualNode::settled(target, vec![]),
+            started: now,
+        }
     }
 
     pub fn update(&mut self, target: &SplitNode<T>, now: Instant, snap: bool) {
@@ -153,7 +232,9 @@ impl<T: Copy + Eq> TreeMotion<T> {
     }
 
     pub fn sample(&self, now: Instant) -> VisualNode<T> {
-        if !self.active(now) { return VisualNode::settled(&self.target, vec![]); }
+        if !self.active(now) {
+            return VisualNode::settled(&self.target, vec![]);
+        }
         let progress = now.saturating_duration_since(self.started).as_secs_f32()
             / SPLIT_MOTION.total().mul_f32(speed_scale()).as_secs_f32();
         self.origin.sample(SPLIT_MOTION.progress(progress))
@@ -166,12 +247,18 @@ mod tests {
     use std::time::Duration;
 
     fn split(first: u8, second: u8, ratio: f64) -> SplitNode<u8> {
-        SplitNode::Split { horizontal: true, ratio,
-            first: Box::new(SplitNode::leaf(first)), second: Box::new(SplitNode::leaf(second)) }
+        SplitNode::Split {
+            horizontal: true,
+            ratio,
+            first: Box::new(SplitNode::leaf(first)),
+            second: Box::new(SplitNode::leaf(second)),
+        }
     }
 
     fn ratio(node: VisualNode<u8>) -> f32 {
-        let VisualNode::Split { ratio, .. } = node else { panic!("expected split") };
+        let VisualNode::Split { ratio, .. } = node else {
+            panic!("expected split")
+        };
         ratio
     }
 
@@ -195,11 +282,22 @@ mod tests {
         let now = Instant::now();
         let mut motion = TreeMotion::new(&split(1, 2, 0.3), now);
         motion.update(&SplitNode::leaf(2), now, false);
-        let VisualNode::Split { path, first, second, .. } = motion.sample(now) else { panic!() };
+        let VisualNode::Split {
+            path,
+            first,
+            second,
+            ..
+        } = motion.sample(now)
+        else {
+            panic!()
+        };
         assert!(path.is_none());
         assert!(matches!(*first, VisualNode::Empty));
         assert!(matches!(*second, VisualNode::Leaf(2)));
-        assert!(matches!(motion.sample(now + Duration::from_millis(200)), VisualNode::Leaf(2)));
+        assert!(matches!(
+            motion.sample(now + Duration::from_millis(200)),
+            VisualNode::Leaf(2)
+        ));
     }
 
     #[test]
