@@ -4,6 +4,9 @@ use gpui::{AppContext, TestAppContext};
 fn setup(cx: &mut TestAppContext, directory: &std::path::Path) {
     cx.update(|cx| {
         gpui_base::init(cx);
+        // Production initializes the tokio bridge at boot (lib.rs); the
+        // picker's model-price fetch spawned from Pickers::new needs it.
+        gpui_tokio::init(cx);
         cx.set_global(Theme::default());
         crate::settings::init(crate::settings::UiSettings::default(), directory, cx);
         crate::history::init(Default::default(), Default::default(), Default::default(), Default::default(), cx);
@@ -70,6 +73,31 @@ fn moving_and_closing_panes_preserves_sibling_entities(cx: &mut TestAppContext) 
         assert!(workspace.layout.pane(first).is_none());
         let launcher = workspace.layout.active_pane_id().unwrap();
         assert_eq!(workspace.layout.pane(launcher).unwrap(), &PaneState::default());
+    }).unwrap();
+}
+
+#[gpui::test]
+fn maximize_toggles_active_pane_and_clears_on_close(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    setup(cx, directory.path());
+    let window = cx.add_window(|_, cx| {
+        let source = cx.new(|_| AppState::new());
+        Workspace::new(source, directory.path().join("layout.json"), cx)
+    });
+    window.update(cx, |workspace, _, cx| {
+        let first = workspace.layout.active_pane_id().unwrap();
+        workspace.ensure_pane(first, cx);
+        workspace.split(Direction::Right, false, cx);
+        let second = workspace.layout.active_pane_id().unwrap();
+        assert!(workspace.is_split_view());
+        workspace.toggle_maximize_active_pane(cx);
+        assert_eq!(workspace.maximized_pane_id(), Some(second));
+        workspace.toggle_maximize_active_pane(cx);
+        assert_eq!(workspace.maximized_pane_id(), None);
+        workspace.toggle_maximize_pane(first, cx);
+        assert_eq!(workspace.maximized_pane_id(), Some(first));
+        workspace.close(first, cx);
+        assert_eq!(workspace.maximized_pane_id(), None);
     }).unwrap();
 }
 
@@ -146,7 +174,7 @@ fn failed_open_cannot_be_rebound_by_sidebar_selection(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn pane_header_center_drop_creates_tab_without_losing_draft(cx: &mut TestAppContext) {
+fn pane_header_center_drop_swaps_panes_in_same_tab(cx: &mut TestAppContext) {
     use gpui::{Modifiers, point, size};
     let directory = tempfile::tempdir().unwrap();
     setup(cx, directory.path());
@@ -170,8 +198,10 @@ fn pane_header_center_drop_creates_tab_without_losing_draft(cx: &mut TestAppCont
     cx.simulate_mouse_up(destination, MouseButton::Left, Modifiers::none());
     workspace.update(cx, |workspace, cx| {
         assert!(workspace.error.is_none(), "{:?}", workspace.error);
-        assert_eq!(workspace.layout.views[&ViewId(1)].tabs.len(), 2);
-        assert_eq!(workspace.layout.active_pane_id(), Some(PaneId(3)));
+        // Same-tab center drop swaps: still one tab, two panes.
+        assert_eq!(workspace.layout.views[&ViewId(1)].tabs.len(), 1);
+        assert_eq!(workspace.layout.views[&ViewId(1)].tabs[&TabId(2)].panes.len(), 2);
+        // The draft follows its pane (swap exchanges leaves, not state).
         assert_eq!(workspace.panes[&PaneId(3)].chat.read(cx).composer.read(cx).input.read(cx).text(), "preserve draft");
     });
 }

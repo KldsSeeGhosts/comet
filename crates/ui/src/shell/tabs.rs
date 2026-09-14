@@ -388,7 +388,13 @@ impl Shell {
         // header over the empty canvas was noise); the bar keeps its height,
         // drag region, and buttons. A session appends its target as a muted
         // "project @ device" tag right of the title (the composer footer no
-        // longer carries it).
+        // longer carries it). In split view the session name is suppressed —
+        // each pane header already names its own session.
+        let split_view = self.workspace.as_ref()
+            .is_some_and(|w| w.read(cx).is_split_view());
+        let maximized = self.workspace.as_ref()
+            .and_then(|w| w.read(cx).maximized_pane_id())
+            .is_some();
         let (title, target, harness, on_canvas): (
             SharedString,
             Option<SharedString>,
@@ -397,6 +403,7 @@ impl Shell {
         ) = {
             let state = self.state.read(cx);
             match state.selected_chat_row() {
+                Some(_) if split_view => (SharedString::from(""), None, None, false),
                 Some(chat) => {
                     let folder = chat
                         .space_id
@@ -419,6 +426,7 @@ impl Shell {
                 None => (SharedString::from(""), None, None, true),
             }
         };
+        let has_session = !title.is_empty();
 
         // The new-session `+` renders in the WINDOW-CONTROL CLUSTER whenever a
         // session is selected (`render_titlebar_cluster`) — this row budgets
@@ -531,16 +539,40 @@ impl Shell {
             }
             // The floating todo progress card owns the in-chat todo UI;
             // no titlebar trigger (ZCode pattern — it mounts itself).
-            Some(
-                controls
-                    .child(header_icon_button(
-                        "toggle-changes",
-                        icons::SIDEBAR_MINIMALISTIC,
-                        &theme,
-                        cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
-                    ))
-                    .into_any_element(),
-            )
+            //
+            // bb session chrome: maximize + close sit beside the changes
+            // toggle whenever a session is selected (single-pane; split panes
+            // carry their own header controls).
+            let mut trailing_el = controls
+                .child(header_icon_button(
+                    "toggle-changes",
+                    icons::SIDEBAR_MINIMALISTIC,
+                    &theme,
+                    cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+                ));
+            if has_session && !split_view {
+                trailing_el = trailing_el.child(header_icon_button(
+                    "maximize-session",
+                    if maximized { icons::COLLAPSE_ARROWS } else { icons::EXPAND_ARROWS },
+                    &theme,
+                    cx.listener(|this, _, _, cx| {
+                        if let Some(workspace) = this.workspace.clone() {
+                            workspace.update(cx, |workspace, cx| workspace.toggle_maximize_active_pane(cx));
+                        }
+                    }),
+                ));
+                trailing_el = trailing_el.child(header_icon_button(
+                    "close-session",
+                    icons::CLOSE,
+                    &theme,
+                    cx.listener(|this, _, _, cx| {
+                        if let Some(workspace) = this.workspace.clone() {
+                            workspace.update(cx, |workspace, cx| workspace.close_active_pane(cx));
+                        }
+                    }),
+                ));
+            }
+            Some(trailing_el.into_any_element())
         };
 
         let inner = div()
@@ -555,6 +587,10 @@ impl Shell {
             // title would sit UNDER it (both flex_none, the row overflows and
             // paint order stacks them), so it hides for the duration.
             .when(!takeover, |el| {
+                // bb's focused-session pill: harness + title ride a soft
+                // raised plate so the selected session reads as selected
+                // without a heavier border (ThreadDetailHeader's
+                // CONTEXT_SELECTION_SURFACE_CLASS).
                 el.child(
                     div()
                         .min_w_0()
@@ -562,6 +598,10 @@ impl Shell {
                         .flex_row()
                         .items_center()
                         .gap(px(6.0))
+                        .when(has_session, |el| {
+                            el.px(px(8.0)).py(px(3.0)).rounded(px(6.0))
+                                .bg(theme.surface_overlay.opacity(0.65))
+                        })
                         .when_some(
                             harness.map(crate::pickers::harness_brand_icon),
                             |el, (path, tint)| {
