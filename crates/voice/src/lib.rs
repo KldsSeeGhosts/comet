@@ -19,8 +19,10 @@ mod events;
 mod tools;
 
 pub use audio::{
-    AudioCapture, AudioEngine, AudioError, AudioPlayback, AudioStats, CaptureFrame, DeviceConfig,
-    DeviceReport, VOICE_CHUNK_FRAMES, VOICE_SAMPLE_RATE, base64_to_pcm16, pcm16_to_base64,
+    AudioCapture, AudioDevicePreferences, AudioEngine, AudioEngineConfig, AudioError,
+    AudioErrorKind, AudioPlayback, AudioStats, CaptureFrame, DeviceConfig, DeviceMatch,
+    DeviceReport, InputDeviceInfo, InputDiagnostics, InputResolution, MicProbe, PlaybackTuning,
+    VOICE_CHUNK_FRAMES, VOICE_SAMPLE_RATE, base64_to_pcm16, pcm16_to_base64, resolve_input,
 };
 pub use client::{VoiceConfig, VoiceSession};
 pub use error::VoiceError;

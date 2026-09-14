@@ -1,24 +1,33 @@
-//! Local audio I/O: default-device capture and playback for the Realtime session.
+//! Local audio I/O: device-resolved capture and default-device playback for
+//! the Realtime session.
 //!
 //! Two independent halves, each built on CPAL's native default host (ALSA on
 //! Linux, CoreAudio on macOS) and a small worker thread:
 //!
 //! - [`AudioCapture`] gates the microphone behind a push-to-talk flag and
 //!   emits bounded 20 ms chunks of 24 kHz mono PCM16 through a bounded channel.
-//!   While the gate is closed no sample leaves the callback.
+//!   While the gate is closed no sample leaves the callback. Which microphone
+//!   opens is decided by [`AudioDevicePreferences`]: an exact device-id match
+//!   first, then the remembered label, then the system default.
 //! - [`AudioPlayback`] accepts 24 kHz mono PCM16 chunks - the decoded
 //!   `response.output_audio.delta` payloads - resamples them to the default
-//!   output device, and lets the caller drop everything queued with
-//!   [`AudioPlayback::clear`].
+//!   output device, applies output gain and a soft limiter, and lets the
+//!   caller drop everything queued with [`AudioPlayback::clear`]. Output is
+//!   always the system default device; [`DeviceReport`] exposes what was
+//!   negotiated, read-only.
 //!
-//! There is no echo cancellation, gain control, or device picker: this is a
-//! headphones-first, push-to-talk half-duplex layer. Both callbacks are
-//! nonblocking and allocation-free on the sample path; samples cross the
-//! callback/worker boundary through bounded SPSC rings and are dropped, with a
-//! counter, when the pipeline falls behind. Resampling runs on the worker
-//! threads, never in a callback. The device's native `f32`, `i32`, `i16`, or
-//! `u16` format is converted; any other format fails with
-//! [`AudioError::UnsupportedFormat`].
+//! [`MicProbe`] reuses the capture half alone for surfaces that need a
+//! microphone level test or picker without a session: it resolves the same
+//! saved preference, opens input only, and drains its own channel while the
+//! testing gate is open.
+//!
+//! There is no echo cancellation: this is a headphones-first, push-to-talk
+//! half-duplex layer. Both callbacks are nonblocking and allocation-free on
+//! the sample path; samples cross the callback/worker boundary through bounded
+//! SPSC rings and are dropped, with a counter, when the pipeline falls behind.
+//! Resampling runs on the worker threads, never in a callback. The device's
+//! native `f32`, `i32`, `i16`, or `u16` format is converted; any other format
+//! fails with [`AudioError::UnsupportedFormat`].
 //!
 //! # Push-to-talk sequence
 //!
@@ -55,16 +64,24 @@
 mod capture;
 mod codec;
 mod convert;
+mod devices;
 mod engine;
 mod error;
 mod playback;
+mod probe;
 mod resample;
 
 pub use capture::{AudioCapture, CaptureFrame};
 pub use codec::{base64_to_pcm16, pcm16_to_base64};
-pub use engine::{AudioEngine, AudioStats, DeviceConfig, DeviceReport};
-pub use error::AudioError;
-pub use playback::AudioPlayback;
+pub use devices::{
+    AudioDevicePreferences, DeviceMatch, InputDeviceInfo, InputResolution, resolve_input,
+};
+pub use engine::{
+    AudioEngine, AudioEngineConfig, AudioStats, DeviceConfig, DeviceReport, InputDiagnostics,
+};
+pub use error::{AudioError, AudioErrorKind};
+pub use playback::{AudioPlayback, PlaybackTuning};
+pub use probe::MicProbe;
 
 /// Sample rate of the Realtime PCM16 protocol, in Hz.
 pub const VOICE_SAMPLE_RATE: u32 = 24_000;

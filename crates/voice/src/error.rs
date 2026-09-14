@@ -18,6 +18,10 @@ pub enum VoiceError {
     Disconnected,
     #[error("voice session task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
+    /// A connect attempt did not finish inside its deadline. Carries no
+    /// endpoint or credential detail; the caller reports context.
+    #[error("the connection timed out")]
+    Timeout,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for VoiceError {

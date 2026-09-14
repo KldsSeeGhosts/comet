@@ -1948,7 +1948,10 @@ impl ComposerInput {
     }
 
     fn display_placeholder(&self) -> SharedString {
-        self.inactive_placeholder.as_ref().unwrap_or(&self.placeholder).clone()
+        self.inactive_placeholder
+            .as_ref()
+            .unwrap_or(&self.placeholder)
+            .clone()
     }
 
     pub fn set_placeholder(
@@ -2577,9 +2580,11 @@ impl ComposerInput {
         match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
             EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
             EnterOutcome::Submit => {
-                cx.emit(ComposerInputEvent::SubmissionOrigin(crate::input_origin::capture()));
+                cx.emit(ComposerInputEvent::SubmissionOrigin(
+                    crate::input_origin::capture(),
+                ));
                 cx.emit(ComposerInputEvent::Submitted);
-            },
+            }
             EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
         }
     }
@@ -2588,9 +2593,11 @@ impl ComposerInput {
         match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
             EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
             EnterOutcome::Submit => {
-                cx.emit(ComposerInputEvent::SubmissionOrigin(crate::input_origin::capture()));
+                cx.emit(ComposerInputEvent::SubmissionOrigin(
+                    crate::input_origin::capture(),
+                ));
                 cx.emit(ComposerInputEvent::ModifiedSubmitted);
-            },
+            }
             EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
         }
     }
@@ -3790,7 +3797,10 @@ impl Render for ComposerInput {
 /// Events the shell listens for.
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
-    HumanSubmitted { chat_id: String, proof: crate::input_origin::HumanInput },
+    HumanSubmitted {
+        chat_id: String,
+        proof: crate::input_origin::HumanInput,
+    },
     /// A prompt was sent optimistically — give the transcript its exact row
     /// identity so it can anchor the prompt at the top with the reply's
     /// reserved space below it.
@@ -3799,8 +3809,13 @@ pub enum ComposerEvent {
     /// yet: the transcript remembers the stable id and promotes it to an
     /// own-turn anchor only when the host materializes the matching bubble.
     Queued { chat_id: String, message_id: String },
-    /// The mic/waveform button beside send. The workspace owns the live session.
+    /// The mic/waveform button beside send. The workspace owns the single
+    /// push-to-talk session; the composer only forwards presses.
     VoiceToggled,
+    /// Alt-click on the live mic button: flip the capture gate without
+    /// stopping the session. The global mute shortcut reaches the workspace
+    /// through the same path's other end (`ChatViewEvent::VoiceMuted`).
+    VoiceMuted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4069,7 +4084,8 @@ pub struct Composer {
     /// Set on every session/route change: flips committed before this instant
     /// SNAP instead of morphing (see [`ROUTE_SNAP_MS`]).
     route_snap_until: Option<Instant>,
-    /// Shared workspace live-voice status shown by the mic button.
+    /// The workspace's shared push-to-talk status, mirrored onto the mic
+    /// button next to send.
     voice: crate::voice::VoiceStatus,
     _observe: Subscription,
     _pickers_observe: Subscription,
@@ -4277,7 +4293,8 @@ impl Composer {
         self.sending
     }
 
-    /// Mirrors the workspace's live-voice status onto this composer.
+    /// Pushes the workspace's shared voice status onto this composer's mic
+    /// button. Called by the pane for every session update.
     pub fn set_voice_status(&mut self, status: crate::voice::VoiceStatus, cx: &mut Context<Self>) {
         if self.voice != status {
             self.voice = status;
@@ -6392,7 +6409,12 @@ impl Composer {
                 return;
             }
             if let Some(proof) = submission_origin {
-                let _ = this.update(cx, |_, cx| cx.emit(ComposerEvent::HumanSubmitted { chat_id: chat_id.clone(), proof }));
+                let _ = this.update(cx, |_, cx| {
+                    cx.emit(ComposerEvent::HumanSubmitted {
+                        chat_id: chat_id.clone(),
+                        proof,
+                    })
+                });
             }
             // Safety net against a dead-looking session: the command queued,
             // but the host may still REJECT it (e.g. the run's resolver is
@@ -6671,9 +6693,7 @@ impl Composer {
                 div()
                     .text_size(crate::typography::ui_rems(14.0))
                     .text_color(theme.text)
-                    .when_some(self.wizard_input.clone(), |el, input| {
-                        el.child(input)
-                    }),
+                    .when_some(self.wizard_input.clone(), |el, input| el.child(input)),
             );
 
         let collapsed = wizard.collapsed;
@@ -6750,9 +6770,7 @@ impl Composer {
                                 crate::theme::ink(0.06),
                             ))
                             .on_hover(motion::hover_listener("wizard-collapse"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.wizard_toggle_collapse(cx)
-                            }))
+                            .on_click(cx.listener(|this, _, _, cx| this.wizard_toggle_collapse(cx)))
                             .child(
                                 crate::icons::icon(crate::icons::ALT_ARROW_RIGHT)
                                     .size(px(14.0))
@@ -6760,11 +6778,9 @@ impl Composer {
                                         if collapsed {
                                             icon
                                         } else {
-                                            icon.with_transformation(
-                                                gpui::Transformation::rotate(
-                                                    gpui::percentage(0.25),
-                                                ),
-                                            )
+                                            icon.with_transformation(gpui::Transformation::rotate(
+                                                gpui::percentage(0.25),
+                                            ))
                                         }
                                     }),
                             ),
@@ -6789,13 +6805,8 @@ impl Composer {
                                 crate::theme::ink(0.06),
                             ))
                             .on_hover(motion::hover_listener("wizard-dismiss"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.wizard_dismiss(cx)
-                            }))
-                            .child(
-                                crate::icons::icon(crate::icons::CLOSE)
-                                    .size(px(14.0)),
-                            ),
+                            .on_click(cx.listener(|this, _, _, cx| this.wizard_dismiss(cx)))
+                            .child(crate::icons::icon(crate::icons::CLOSE).size(px(14.0))),
                     ),
             );
 
@@ -6929,11 +6940,15 @@ impl Composer {
     /// the same event. Click in idle or after an error starts the session and
     /// opens the microphone for good - server VAD ends each utterance and
     /// submits it, so the user never clicks to send; click while the session
-    /// runs stops it.
+    /// runs stops it. Alt-click on a live session mutes the microphone gate
+    /// instead of stopping; the same action will land on the global shortcut
+    /// through `ChatViewEvent::VoiceMuted`.
     fn render_voice_button(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let phase = self.voice.phase;
+        let muted = self.voice.muted;
         let label: SharedString = match phase {
-            crate::voice::VoicePhase::Idle => "Start live voice".into(),
+            crate::voice::VoicePhase::Idle => "Start Handsfree voice".into(),
+            crate::voice::VoicePhase::Listening if muted => "Microphone muted".into(),
             crate::voice::VoicePhase::Connecting
             | crate::voice::VoicePhase::Listening
             | crate::voice::VoicePhase::Thinking
@@ -6944,22 +6959,25 @@ impl Composer {
                 .clone()
                 .unwrap_or_else(|| "Voice failed".into()),
         };
-        // While the gate is open the live meter level replaces the glyph with
-        // three rising bars; the pulse lease keeps this frame repainting at
-        // the shared 30Hz loader tick, and it parks when the gate closes.
-        let level = if phase == crate::voice::VoicePhase::Listening {
+        // While the gate is open and unmuted the live meter level replaces
+        // the glyph with three rising bars; the pulse lease keeps this frame
+        // repainting at the shared 30Hz loader tick, and it parks when the
+        // gate closes.
+        let level = if phase == crate::voice::VoicePhase::Listening && !muted {
             motion::pulse_lease(cx.entity_id(), cx);
             self.voice.level()
         } else {
             0.0
         };
         let (icon_path, icon_color): (&'static str, gpui::Hsla) = match phase {
-            crate::voice::VoicePhase::Idle => (crate::icons::MICROPHONE, theme.text_muted),
-            crate::voice::VoicePhase::Connecting => (crate::icons::MICROPHONE, theme.text_faint),
-            crate::voice::VoicePhase::Listening => (crate::icons::WAVEFORM, theme.accent),
-            crate::voice::VoicePhase::Thinking | crate::voice::VoicePhase::Speaking => {
-                (crate::icons::VOLUME_LOUD, theme.accent)
+            crate::voice::VoicePhase::Idle => (crate::icons::WAVEFORM, theme.text_muted),
+            crate::voice::VoicePhase::Connecting => (crate::icons::WAVEFORM, theme.text_faint),
+            crate::voice::VoicePhase::Listening if muted => {
+                (crate::icons::WAVEFORM, theme.text_muted)
             }
+            crate::voice::VoicePhase::Listening => (crate::icons::WAVEFORM, theme.accent),
+            crate::voice::VoicePhase::Thinking => (crate::icons::WAVEFORM, theme.text_muted),
+            crate::voice::VoicePhase::Speaking => (crate::icons::WAVEFORM, theme.accent),
             crate::voice::VoicePhase::Error => (crate::icons::DANGER_TRIANGLE, theme.danger),
         };
         let mut button = div()
@@ -6984,7 +7002,13 @@ impl Composer {
             .role(gpui::Role::Button)
             .aria_label(label.clone())
             .tooltip(move |_, cx| cx.new(|_| VoiceTooltip(label.clone())).into())
-            .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::VoiceToggled)));
+            .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                if event.modifiers().alt {
+                    cx.emit(ComposerEvent::VoiceMuted);
+                } else {
+                    cx.emit(ComposerEvent::VoiceToggled);
+                }
+            }));
         button = if phase == crate::voice::VoicePhase::Connecting {
             button.child(crate::loaders::mini_mono_spinner(
                 "composer-voice",
@@ -7319,9 +7343,10 @@ impl Render for Composer {
         let container = if wizard_active {
             container.child(motion::fade_quick(
                 "composer-wizard",
-                div().mx(px(QUEUE_SIDE_INSET)).mb(px(4.0)).child(
-                    self.render_wizard(window, cx),
-                ),
+                div()
+                    .mx(px(QUEUE_SIDE_INSET))
+                    .mb(px(4.0))
+                    .child(self.render_wizard(window, cx)),
             ))
         } else {
             container

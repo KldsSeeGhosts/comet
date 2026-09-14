@@ -40,6 +40,7 @@ use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
+use crate::settings::handsfree::{HandsfreeEvent, HandsfreePage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
@@ -74,7 +75,9 @@ actions!(
         OpenSettings,
         NextSession,
         PrevSession,
-        ArchiveSession
+        ArchiveSession,
+        ToggleVoice,
+        MuteVoice
     ]
 );
 
@@ -349,6 +352,16 @@ pub fn apply_keymap(
             ArchiveSession,
             None,
         ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.toggle_voice, "mod-shift-h"),
+            ToggleVoice,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.mute_voice, "mod-shift-u"),
+            MuteVoice,
+            None,
+        ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
@@ -375,6 +388,8 @@ pub fn apply_keymap(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Devices,
+    /// Handsfree voice session configuration (model, mic, VAD, DSP).
+    Voice,
     /// Which harnesses the composer offers (enable/disable toggles).
     Harnesses,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
@@ -387,8 +402,9 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 8] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Devices,
+        SettingsSection::Voice,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
@@ -403,6 +419,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
+            SettingsSection::Voice => "Handsfree",
             SettingsSection::Harnesses => "Agents",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
@@ -419,6 +436,37 @@ impl SettingsSection {
 pub enum Route {
     Chat,
     Settings(SettingsSection),
+}
+
+/// The `ZERON_OPEN_ROUTE` parse result: a route, or the new-chat pin that
+/// additionally suppresses the boot auto-select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenRoute {
+    Route(Route),
+    NewChat,
+}
+
+/// Parses `ZERON_OPEN_ROUTE` (`settings[/<section>]`, `new`) into a boot
+/// route. Pure so every section spelling is testable.
+fn open_route(value: Option<&str>) -> OpenRoute {
+    match value {
+        Some("settings") | Some("settings/devices") => {
+            OpenRoute::Route(Route::Settings(SettingsSection::Devices))
+        }
+        Some("settings/voice") => OpenRoute::Route(Route::Settings(SettingsSection::Voice)),
+        Some("settings/agents") => OpenRoute::Route(Route::Settings(SettingsSection::Agents)),
+        Some("settings/harnesses") => OpenRoute::Route(Route::Settings(SettingsSection::Harnesses)),
+        Some("settings/appearance") => {
+            OpenRoute::Route(Route::Settings(SettingsSection::Appearance))
+        }
+        Some("settings/notifications") => {
+            OpenRoute::Route(Route::Settings(SettingsSection::Notifications))
+        }
+        Some("settings/shortcuts") => OpenRoute::Route(Route::Settings(SettingsSection::Shortcuts)),
+        Some("settings/archived") => OpenRoute::Route(Route::Settings(SettingsSection::Archived)),
+        Some("new") => OpenRoute::NewChat,
+        _ => OpenRoute::Route(Route::Chat),
+    }
 }
 
 /// Maximum width the right pane may occupy while retaining the conversation
@@ -1221,6 +1269,7 @@ pub struct Shell {
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
+    handsfree_page: Option<Entity<HandsfreePage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
@@ -1228,6 +1277,7 @@ pub struct Shell {
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
+    handsfree_sub: Option<Subscription>,
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
     rename_dialog: Option<RenameChatDialog>,
@@ -1415,7 +1465,9 @@ impl Shell {
             move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 // The workspace owns the voice session; its pane composers
                 // are the only live mic buttons when the workspace is mounted.
-                ComposerEvent::HumanSubmitted { .. } | ComposerEvent::VoiceToggled => {}
+                ComposerEvent::HumanSubmitted { .. }
+                | ComposerEvent::VoiceToggled
+                | ComposerEvent::VoiceMuted => {}
                 ComposerEvent::Sent {
                     chat_id,
                     message_id,
@@ -1480,22 +1532,13 @@ impl Shell {
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
         // synthetic input can't reach them on headless compositors.
-        let route = match std::env::var("ZERON_OPEN_ROUTE").ok().as_deref() {
-            Some("settings") | Some("settings/devices") => {
-                Route::Settings(SettingsSection::Devices)
-            }
-            Some("settings/agents") => Route::Settings(SettingsSection::Agents),
-            Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
-            Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
-            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
-            Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
-            Some("settings/archived") => Route::Settings(SettingsSection::Archived),
+        let route = match open_route(std::env::var("ZERON_OPEN_ROUTE").ok().as_deref()) {
             // `new` pins the new-chat canvas (suppresses boot auto-select).
-            Some("new") => {
+            OpenRoute::NewChat => {
                 state.update(cx, |s, _| s.auto_selected = true);
                 Route::Chat
             }
-            _ => Route::Chat,
+            OpenRoute::Route(route) => route,
         };
         // More capture knobs of the same kind: `ZERON_OPEN_DIALOG=rename|delete`
         // opens that dialog for the first chat once chats land; `=model` pops
@@ -1577,6 +1620,7 @@ impl Shell {
             archived_page: None,
             appearance_page: None,
             files_settings_page: None,
+            handsfree_page: None,
             notifications_page: None,
             shortcuts_page: None,
             accounts_page: None,
@@ -1584,6 +1628,7 @@ impl Shell {
             shortcuts_sub: None,
             notifications_sub: None,
             files_settings_sub: None,
+            handsfree_sub: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
@@ -2932,9 +2977,11 @@ impl Shell {
     }
 
     fn reveal_unsaved_file(&mut self, cx: &mut Context<Self>) {
-        let browser = self.files.iter().filter(|&(_key, files)| files
-                .read(cx)
-                .has_unsaved_changes()).map(|(key, _files)| (key.clone(), RightSurface::Files));
+        let browser = self
+            .files
+            .iter()
+            .filter(|&(_key, files)| files.read(cx).has_unsaved_changes())
+            .map(|(key, _files)| (key.clone(), RightSurface::Files));
         let editors = self.file_surface_keys.iter().filter_map(|((key, _), id)| {
             self.file_surfaces
                 .get(id)
@@ -3288,6 +3335,29 @@ impl Shell {
                     self.devices_page = Some(cx.new(|cx| DevicesPage::new(state, cx)));
                 }
                 match &self.devices_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Voice => {
+                if self.handsfree_page.is_none() {
+                    let workspace = self.workspace.clone();
+                    let voice = self.settings.voice.clone();
+                    let page = cx.new(|cx| HandsfreePage::new(workspace, voice, cx));
+                    // The page edits a working copy; every change lands in
+                    // `settings.voice` and persists through the usual save.
+                    self.handsfree_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &HandsfreeEvent, cx| {
+                            let HandsfreeEvent::Changed(voice) = event;
+                            this.settings.voice = (**voice).clone();
+                            this.schedule_save(cx);
+                            cx.notify();
+                        },
+                    ));
+                    self.handsfree_page = Some(page);
+                }
+                match &self.handsfree_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -4721,6 +4791,7 @@ impl Shell {
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
+            SettingsSection::Voice => icons::WAVEFORM,
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
@@ -5070,7 +5141,11 @@ impl Shell {
         let hover_bg = if selected { selected_wash } else { hover };
         // An open-in-split row keeps full title ink (bb tints rows whose
         // thread lives in a pane) — the accent edge marker carries the rest.
-        let rest_text = if selected || open_in_pane { text } else { text.opacity(0.8) };
+        let rest_text = if selected || open_in_pane {
+            text
+        } else {
+            text.opacity(0.8)
+        };
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .relative()
@@ -6273,7 +6348,11 @@ impl Shell {
                                 this.close_chat_menu(cx);
                                 this.open_chat_in_split(split_id.clone(), cx);
                             }))
-                            .child(icon(icons::SPLIT_COLUMNS).size(px(16.0)).text_color(theme.text_muted))
+                            .child(
+                                icon(icons::SPLIT_COLUMNS)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
                             .child(SharedString::from("Open in split")),
                     )
                     .child(
@@ -6623,12 +6702,19 @@ impl Shell {
                 let workspace = cx.new(|cx| crate::workspace::Workspace::new(state, path, cx));
                 self.workspace_events = Some(cx.subscribe(&workspace, |shell, _, event, cx| {
                     match event {
-                        crate::workspace::WorkspaceEvent::ActivePane { chat, transcript, composer } => {
+                        crate::workspace::WorkspaceEvent::ActivePane {
+                            chat,
+                            transcript,
+                            composer,
+                        } => {
                             shell.transcript = transcript.clone();
                             shell.composer = composer.clone();
-                            shell._transcript_events = cx.subscribe(transcript, Self::on_transcript_event);
+                            shell._transcript_events =
+                                cx.subscribe(transcript, Self::on_transcript_event);
                             if shell.state.read(cx).selected_chat != *chat {
-                                shell.state.update(cx, |state, cx| state.select_chat(chat.clone(), cx));
+                                shell
+                                    .state
+                                    .update(cx, |state, cx| state.select_chat(chat.clone(), cx));
                             }
                         }
                         crate::workspace::WorkspaceEvent::ToggleRightPane => {
@@ -6647,8 +6733,16 @@ impl Shell {
                 .workspace
                 .as_ref()
                 .is_some_and(|w| w.read(cx).is_split_view());
-            return div().flex_1().min_w_0().min_h_0().h_full()
-                .pt(if split { px(0.0) } else { px(Theme::TITLEBAR_HEIGHT) })
+            return div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .h_full()
+                .pt(if split {
+                    px(0.0)
+                } else {
+                    px(Theme::TITLEBAR_HEIGHT)
+                })
                 .child(self.workspace.as_ref().unwrap().clone())
                 .into_any_element();
         }
@@ -8822,9 +8916,7 @@ impl Render for Shell {
             // to chat itself, so Settings is not a dead spot. The keyboard
             // shortcut opens the blank draft canvas; the titlebar `+` opens
             // the folder browser for a directory-first pick.
-            .on_action(cx.listener(|this, _: &NewSession, _, cx| {
-                this.open_new_session_draft(cx)
-            }))
+            .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session_draft(cx)))
             // Native Settings menu item and the platform convention (Cmd+, on
             // macOS, Ctrl+, elsewhere) always land on the default section.
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
@@ -8863,6 +8955,24 @@ impl Render for Shell {
                 let handled = pickers.update(cx, |pickers, cx| pickers.jump_model_slot(jump.0, cx));
                 if !handled && !this.overlay_owns_keyboard(cx) {
                     this.jump_to_session(jump.0, cx)
+                }
+            }))
+            // Global across routes (the workspace owns the live voice
+            // session, not the chat route), but dead without a workspace and
+            // refused while an overlay owns the keyboard, like the
+            // session-nav shortcuts.
+            .on_action(cx.listener(|this, _: &ToggleVoice, _, cx| {
+                if let Some(workspace) = &this.workspace
+                    && !this.overlay_owns_keyboard(cx)
+                {
+                    workspace.update(cx, |workspace, cx| workspace.voice_toggle(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MuteVoice, _, cx| {
+                if let Some(workspace) = &this.workspace
+                    && !this.overlay_owns_keyboard(cx)
+                {
+                    workspace.update(cx, |workspace, cx| workspace.voice_mute_toggle(cx));
                 }
             }))
             .on_modifiers_changed(
@@ -9766,8 +9876,12 @@ mod tests {
     #[test]
     fn sidebar_harness_geometry_reflects_row_hierarchy() {
         assert_eq!(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP, Theme::SPACE_SM);
-        const { assert!(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP < SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP); }
-        const { assert!(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE < SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE); }
+        const {
+            assert!(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP < SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP);
+        }
+        const {
+            assert!(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE < SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE);
+        }
     }
 
     #[test]
@@ -9913,6 +10027,36 @@ mod tests {
         assert_eq!(nav.len(), 1);
         assert_eq!(*nav.current(), chat("boot"));
         assert!(!nav.can_back());
+    }
+
+    #[test]
+    fn open_route_parses_every_settings_section() {
+        assert_eq!(
+            open_route(Some("settings")),
+            OpenRoute::Route(Route::Settings(SettingsSection::Devices))
+        );
+        assert_eq!(
+            open_route(Some("settings/voice")),
+            OpenRoute::Route(Route::Settings(SettingsSection::Voice))
+        );
+        assert_eq!(
+            open_route(Some("settings/shortcuts")),
+            OpenRoute::Route(Route::Settings(SettingsSection::Shortcuts))
+        );
+        assert_eq!(open_route(Some("new")), OpenRoute::NewChat);
+        assert_eq!(open_route(None), OpenRoute::Route(Route::Chat));
+        assert_eq!(
+            open_route(Some("settings/unknown")),
+            OpenRoute::Route(Route::Chat)
+        );
+    }
+
+    #[test]
+    fn handsfree_sits_after_devices_with_the_waveform_icon() {
+        assert_eq!(SettingsSection::ALL[0], SettingsSection::Devices);
+        assert_eq!(SettingsSection::ALL[1], SettingsSection::Voice);
+        assert_eq!(SettingsSection::Voice.label(), "Handsfree");
+        assert_eq!(SettingsSection::ALL.len(), 9);
     }
 
     #[test]
@@ -10065,7 +10209,8 @@ mod exit_regressions {
                 });
                 shell.set_chat_archived("open".into(), true, cx);
                 assert_eq!(
-                    shell.state.read(cx).selected_chat, None,
+                    shell.state.read(cx).selected_chat,
+                    None,
                     "archiving the open session must land on the new-session canvas"
                 );
                 // Archiving a background row leaves the selection alone.
@@ -10073,14 +10218,16 @@ mod exit_regressions {
                     state.select_chat(Some("other".into()), cx);
                 });
                 shell.set_chat_archived("open".into(), true, cx);
-                assert_eq!(
-                    shell.state.read(cx).selected_chat.as_deref(),
-                    Some("other")
-                );
+                assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("other"));
                 // Unarchiving the open row (sidebar's archived shelf lets a
                 // selected archived chat restore itself) never navigates.
                 shell.state.update(cx, |state, _| {
-                    state.chats.iter_mut().find(|c| c.id == "other").unwrap().archived = true;
+                    state
+                        .chats
+                        .iter_mut()
+                        .find(|c| c.id == "other")
+                        .unwrap()
+                        .archived = true;
                 });
                 shell.set_chat_archived("other".into(), false, cx);
                 assert_eq!(
