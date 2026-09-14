@@ -17,6 +17,7 @@ members = [
     "crates/orchestration",
     "crates/shell-hooks",
     "crates/syntax",
+    "crates/voice",
     "apps/zeron",
 ]
 
@@ -42,6 +43,7 @@ zeron-orchestration = { path = "crates/orchestration" }
 zeron-shell-hooks = { path = "crates/shell-hooks" }
 zeron-syntax = { path = "crates/syntax" }
 zeron-theme = { path = "crates/theme" }
+zeron-voice = { path = "crates/voice" }
 
 # CRDT
 loro = "1.13"
@@ -86,6 +88,14 @@ gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "8c3af053
 # diffs
 similar = "2"
 
+# audio: default-device capture/playback for the local voice layer. cpal uses
+# the native default host (ALSA on Linux, CoreAudio on macOS); no PipeWire
+# routing, no C++ AEC, no hotplug handling.
+cpal = "0.18"
+rubato = "5"
+# Lock-free SPSC ring between the CPAL callbacks and the resample workers.
+ringbuf = "0.5"
+
 # async / net
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
@@ -98,6 +108,7 @@ async-trait = "0.1"
 # serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 json5 = "0.4"
 plist = "1"
 uuid = { version = "1", features = ["v4", "serde"] }

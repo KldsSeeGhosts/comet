@@ -6620,19 +6620,33 @@ impl Shell {
                 let path = crate::workspace::layout_path(self.state.read(cx), &self.data_dir);
                 let workspace = cx.new(|cx| crate::workspace::Workspace::new(state, path, cx));
                 self.workspace_events = Some(cx.subscribe(&workspace, |shell, _, event, cx| {
-                    let crate::workspace::WorkspaceEvent::ActivePane { chat, transcript, composer } = event;
-                    shell.transcript = transcript.clone();
-                    shell.composer = composer.clone();
-                    shell._transcript_events = cx.subscribe(transcript, Self::on_transcript_event);
-                    if shell.state.read(cx).selected_chat != *chat {
-                        shell.state.update(cx, |state, cx| state.select_chat(chat.clone(), cx));
+                    match event {
+                        crate::workspace::WorkspaceEvent::ActivePane { chat, transcript, composer } => {
+                            shell.transcript = transcript.clone();
+                            shell.composer = composer.clone();
+                            shell._transcript_events = cx.subscribe(transcript, Self::on_transcript_event);
+                            if shell.state.read(cx).selected_chat != *chat {
+                                shell.state.update(cx, |state, cx| state.select_chat(chat.clone(), cx));
+                            }
+                        }
+                        crate::workspace::WorkspaceEvent::ToggleRightPane => {
+                            shell.toggle_right_pane(cx);
+                        }
                     }
                     cx.notify();
                 }));
                 self.workspace = Some(workspace);
             }
+            // Split view: pane headers own the title row, so content starts at
+            // the window edge — reserving TITLEBAR_HEIGHT left a dead band
+            // under an empty titlebar (user report). Single-session keeps the
+            // bar; the title lives there.
+            let split = self
+                .workspace
+                .as_ref()
+                .is_some_and(|w| w.read(cx).is_split_view());
             return div().flex_1().min_w_0().min_h_0().h_full()
-                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .pt(if split { px(0.0) } else { px(Theme::TITLEBAR_HEIGHT) })
                 .child(self.workspace.as_ref().unwrap().clone())
                 .into_any_element();
         }

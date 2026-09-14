@@ -22,7 +22,9 @@ use zeron_proto::ChatIndicator;
 
 mod animation;
 mod launch;
-mod control;
+// Crate-visible so the voice tool bridge in `crate::voice` can reach
+// `control::dispatch`. Still invisible outside `zeron-ui`.
+pub(crate) mod control;
 use animation::{TreeMotion, VisualNode};
 pub use launch::create_chat_payload;
 #[cfg(test)]
@@ -83,6 +85,9 @@ pub enum WorkspaceEvent {
         transcript: Entity<Transcript>,
         composer: Entity<Composer>,
     },
+    /// Split-view pane headers host the changes-panel toggle; the shell
+    /// titlebar is empty in that layout and cannot own the control.
+    ToggleRightPane,
 }
 
 /// A pane changes renderer without changing its conversation identity.
@@ -1134,7 +1139,9 @@ impl Workspace {
             .debug_selector(|| format!("pane-drag-{}", id.0))
             .min_w_0().flex_none().max_w(px(280.0)).px(px(8.0)).py(px(3.0))
             .rounded(px(6.0))
-            .when(active, |e| e.bg(theme.surface_overlay.opacity(0.72)))
+            // element_active is a soft wash in both appearances — surface_overlay
+            // is white in light mode and vanishes on the page bg.
+            .when(active, |e| e.bg(theme.element_active))
             .cursor_grab().text_size(px(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(if active { theme.text } else { theme.text_muted })
@@ -1168,6 +1175,18 @@ impl Workspace {
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.focus(id, cx)))
             .child(title_pill)
             .child(div().flex_1().min_w_0())
+            // Changes-panel toggle lives on the active pane header in split
+            // view — the shell titlebar has no trailing strip there.
+            .when(active, |e| e.child(pane_action(
+                SharedString::from(format!("pane-changes-{}", id.0)),
+                crate::icons::SIDEBAR_MINIMALISTIC,
+                "Toggle changes panel",
+                &theme,
+                cx.listener(|_, _, _, cx| {
+                    cx.emit(WorkspaceEvent::ToggleRightPane);
+                    cx.notify();
+                }),
+            )))
             .child(pane_action(
                 SharedString::from(format!("pane-maximize-{}", id.0)),
                 if is_maximized { crate::icons::COLLAPSE_ARROWS } else { crate::icons::EXPAND_ARROWS },

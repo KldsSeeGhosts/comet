@@ -671,7 +671,10 @@ impl Workspace {
     }
 }
 
-async fn dispatch(
+/// Runs one control method. Both the HTTP bridge and the in-process voice
+/// tool sink call this, so consent checks, CLI-pane refusal, and workspace
+/// routing stay identical across transports.
+pub(crate) async fn dispatch(
     this: &WeakEntity<Workspace>,
     cx: &mut AsyncApp,
     method: &str,

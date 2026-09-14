@@ -575,6 +575,19 @@ impl Shell {
             Some(trailing_el.into_any_element())
         };
 
+        // Split view: pane headers own the title row AND the session actions
+        // (pill, maximize, close, changes toggle). A full-height titlebar
+        // either paints an empty band above them or floats a detached strip —
+        // both wrong. Height 0 so the overlay does not cover the pane headers;
+        // window drag still works via the left control cluster.
+        if split_view {
+            return div()
+                .id("chat-titlebar")
+                .h(px(0.0))
+                .flex_none()
+                .into_any_element();
+        }
+
         let inner = div()
             .size_full()
             .flex()
@@ -599,8 +612,11 @@ impl Shell {
                         .items_center()
                         .gap(px(6.0))
                         .when(has_session, |el| {
+                            // element_active is a soft wash in both appearances —
+                            // surface_overlay is white in light mode and vanishes
+                            // on the page bg (user report: pill "not landing").
                             el.px(px(8.0)).py(px(3.0)).rounded(px(6.0))
-                                .bg(theme.surface_overlay.opacity(0.65))
+                                .bg(theme.element_active)
                         })
                         .when_some(
                             harness.map(crate::pickers::harness_brand_icon),
