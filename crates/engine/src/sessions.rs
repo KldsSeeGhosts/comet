@@ -2630,99 +2630,101 @@ mod tests {
             }
         }
         for delay_eof in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let (tx, rx) = mpsc::channel(4);
-        let registry = Arc::new(HarnessRegistry::new());
-        registry.register(Arc::new(HeldStream(Mutex::new(Some(rx)))));
-        let core = crate::EngineCore::assemble_with_identity(
-            dir.path(),
-            registry,
-            HarnessId::Mock,
-            None,
-            "org",
-            "user",
-        )
-        .unwrap();
-        core.workspace
-            .create_chat(
-                "chat",
+            let dir = tempfile::tempdir().unwrap();
+            let (tx, rx) = mpsc::channel(4);
+            let registry = Arc::new(HarnessRegistry::new());
+            registry.register(Arc::new(HeldStream(Mutex::new(Some(rx)))));
+            let core = crate::EngineCore::assemble_with_identity(
+                dir.path(),
+                registry,
+                HarnessId::Mock,
                 None,
-                Some(&core.device_id),
-                None,
-                Some("/tmp".into()),
+                "org",
+                "user",
             )
             .unwrap();
-        core.workspace
-            .rename_chat("chat", "Teardown fixture")
-            .unwrap();
-        let run = core
-            .sessions
-            .dispatch("chat", HarnessId::Mock, request(), None)
+            core.workspace
+                .create_chat(
+                    "chat",
+                    None,
+                    Some(&core.device_id),
+                    None,
+                    Some("/tmp".into()),
+                )
+                .unwrap();
+            core.workspace
+                .rename_chat("chat", "Teardown fixture")
+                .unwrap();
+            let run = core
+                .sessions
+                .dispatch("chat", HarnessId::Mock, request(), None)
+                .await
+                .unwrap();
+            let error = core
+                .sessions
+                .session_views()
+                .open(
+                    core.sessions.clone(),
+                    core.workspace.clone(),
+                    core.terminals.clone(),
+                    "chat".into(),
+                    80,
+                    24,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("busy"), "{error}");
+            assert!(core.sessions.is_live("chat", &run));
+            tx.send(Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            }))
             .await
             .unwrap();
-        let error = core
-            .sessions
-            .session_views()
-            .open(
-                core.sessions.clone(),
-                core.workspace.clone(),
-                core.terminals.clone(),
-                "chat".into(),
-                80,
-                24,
-            )
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while core.sessions.turn_in_flight("chat") {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("busy"), "{error}");
-        assert!(core.sessions.is_live("chat", &run));
-        tx.send(Ok(AgentEvent::Done {
-            status: DoneStatus::Completed,
-            result: None,
-            error: None,
-            session_id: None,
-        }))
-        .await
-        .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while core.sessions.turn_in_flight("chat") {
-                tokio::task::yield_now().await;
+            .unwrap();
+            if !delay_eof {
+                drop(tx);
+                core.sessions
+                    .interrupt_with_timeout("chat", std::time::Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                assert!(!core.sessions.is_live("chat", &run));
+                core.doc_host.shutdown_workers().await;
+                continue;
             }
-        })
-        .await
-        .unwrap();
-        if !delay_eof {
+            let result = core
+                .sessions
+                .interrupt_with_timeout("chat", std::time::Duration::from_millis(3300))
+                .await;
+            assert!(result.is_err());
+            // The engine's 3-second synthetic Done has settled the journal, but the
+            // backend still owns its stream and must prevent a replacement writer.
+            assert!(
+                core.sessions
+                    .inner
+                    .journal
+                    .stale_sessions()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(core.sessions.is_live("chat", &run));
             drop(tx);
-            core.sessions.interrupt_with_timeout("chat", std::time::Duration::from_secs(1))
-                .await.unwrap();
+            assert!(
+                core.sessions
+                    .interrupt_with_timeout("chat", std::time::Duration::from_secs(1))
+                    .await
+                    .unwrap()
+            );
             assert!(!core.sessions.is_live("chat", &run));
             core.doc_host.shutdown_workers().await;
-            continue;
-        }
-        let result = core
-            .sessions
-            .interrupt_with_timeout("chat", std::time::Duration::from_millis(3300))
-            .await;
-        assert!(result.is_err());
-        // The engine's 3-second synthetic Done has settled the journal, but the
-        // backend still owns its stream and must prevent a replacement writer.
-        assert!(
-            core.sessions
-                .inner
-                .journal
-                .stale_sessions()
-                .unwrap()
-                .is_empty()
-        );
-        assert!(core.sessions.is_live("chat", &run));
-        drop(tx);
-        assert!(
-            core.sessions
-                .interrupt_with_timeout("chat", std::time::Duration::from_secs(1))
-                .await
-                .unwrap()
-        );
-        assert!(!core.sessions.is_live("chat", &run));
-        core.doc_host.shutdown_workers().await;
         }
     }
 

@@ -2150,8 +2150,7 @@ async fn run_session(session: Session) {
     // Tool-call ids of question prompts (`AskUserQuestion`): the permission
     // request owns them; their `tool_call_update` completions carry no name,
     // so the ids are remembered here and suppressed for the session's life.
-    let mut question_tool_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut question_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // ---- main loop --------------------------------------------------------
     // Prompt-completion settlement state (the prompt-complete extension):

@@ -128,11 +128,7 @@ pub struct InstanceLockedError {
 
 impl std::fmt::Display for InstanceLockedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "instance {} is locked by another process",
-            self.name
-        )
+        write!(f, "instance {} is locked by another process", self.name)
     }
 }
 

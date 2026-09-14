@@ -1037,9 +1037,7 @@ async fn handle_call(
         driver.call(action, args).await
     };
     match result {
-        Ok(result) => {
-            attach_seat_marker_evidence(normalize_driver_outcome(result), marker_pid)
-        }
+        Ok(result) => attach_seat_marker_evidence(normalize_driver_outcome(result), marker_pid),
         Err(err) => {
             turn.cancel();
             state.clean_runtime(&mut runtime, false).await;
@@ -1503,13 +1501,9 @@ fn parse_agent_seat_marker(contents: &str) -> Option<Value> {
 fn agent_seat_marker(pid: u64) -> Option<Value> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe {
-            libc::geteuid()
-        })));
-    let contents = std::fs::read_to_string(
-        runtime.join("noches-gpui-input").join(pid.to_string()),
-    )
-    .ok()?;
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })));
+    let contents =
+        std::fs::read_to_string(runtime.join("noches-gpui-input").join(pid.to_string())).ok()?;
     parse_agent_seat_marker(&contents)
 }
 
@@ -1520,8 +1514,9 @@ fn agent_seat_marker(pid: u64) -> Option<Value> {
 fn attach_seat_marker_evidence(mut result: Value, pid: Option<u64>) -> Value {
     if classify_driver_outcome(&result) == DriverOutcome::Refused
         && let Some(marker) = pid.and_then(agent_seat_marker)
-        && let Some(structured) =
-            result.get_mut("structuredContent").and_then(Value::as_object_mut)
+        && let Some(structured) = result
+            .get_mut("structuredContent")
+            .and_then(Value::as_object_mut)
     {
         structured.insert("agentSeatMarker".into(), marker);
     }

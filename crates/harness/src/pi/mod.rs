@@ -2166,12 +2166,14 @@ fn extension_question(request: &Value, method: &str) -> UserInputQuestion {
         // Some extensions stamp the header into the message as a `[Header]`
         // prefix — the chip already carries `header`, so the card would show
         // it twice. Strip the echo.
-        .map(|m| strip_leading_tag(m));
+        .map(strip_leading_tag);
     // `title` rides `header` — the transcript chip / collapsed row already
     // surfaces it (Claude: "Asking Tech Stack"), so it stays OUT of the
     // card's question text.
     let question_text = message.unwrap_or_else(|| {
-        title.map(str::to_owned).unwrap_or_else(|| method.to_owned())
+        title
+            .map(str::to_owned)
+            .unwrap_or_else(|| method.to_owned())
     });
     let mut options: Vec<UserInputOption> = match method {
         "select" => request
@@ -2275,10 +2277,7 @@ fn lift_numbered_options(text: &str) -> (String, Vec<UserInputOption>) {
                     .or_else(|| body.split_once(": "))
                     .map(|(l, d)| (l.trim().to_owned(), Some(d.trim().to_owned())))
                     .unwrap_or((body, None));
-                options.push(UserInputOption {
-                    label,
-                    description,
-                });
+                options.push(UserInputOption { label, description });
             }
             None => {
                 // A trailing instruction line ("Enter the numbers of all that
@@ -2678,8 +2677,10 @@ pub(crate) fn map_tool_call(name: &str, args: &Value) -> ToolCall {
 /// must not carry the question's raw args into the transcript.
 fn is_question_tool_name(name: &str, args: &Value) -> bool {
     let n = name.to_ascii_lowercase();
-    matches!(n.as_str(), "askuserquestion" | "ask_user_question" | "user_question")
-        || args.get("questions").and_then(Value::as_array).is_some()
+    matches!(
+        n.as_str(),
+        "askuserquestion" | "ask_user_question" | "user_question"
+    ) || args.get("questions").and_then(Value::as_array).is_some()
 }
 
 /// Decode a todo list out of whatever shape the value carries. Pi's todo

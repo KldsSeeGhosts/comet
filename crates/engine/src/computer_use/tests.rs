@@ -525,10 +525,9 @@ fn agent_seat_marker_parses_json_and_legacy_payloads() {
 
     // Backward compatibility: a bare legacy state token still parses, with
     // no invented reason or pid.
-    let legacy = parse_agent_seat_marker(
-        "noches-gpui-agent-seat-v1\n1\n2\n3\n4\nprimary_client_busy\n",
-    )
-    .unwrap();
+    let legacy =
+        parse_agent_seat_marker("noches-gpui-agent-seat-v1\n1\n2\n3\n4\nprimary_client_busy\n")
+            .unwrap();
     assert_eq!(legacy["state"], "primary_client_busy");
     assert!(legacy.get("reason").is_none());
     assert!(legacy.get("pid").is_none());
@@ -539,7 +538,10 @@ fn agent_seat_marker_parses_json_and_legacy_payloads() {
     assert_eq!(parse_agent_seat_marker(""), None);
     assert_eq!(parse_agent_seat_marker("\n \n"), None);
     assert_eq!(parse_agent_seat_marker("qualified_somewhere_else\n"), None);
-    assert_eq!(parse_agent_seat_marker("{\"state\":\"ready\" truncated\n"), None);
+    assert_eq!(
+        parse_agent_seat_marker("{\"state\":\"ready\" truncated\n"),
+        None
+    );
     // JSON without a usable state token is rejected.
     assert_eq!(parse_agent_seat_marker("{\"pid\":1}\n"), None);
 }
