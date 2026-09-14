@@ -53,6 +53,7 @@ actions!(
         NewTab,
         ClosePane,
         ToggleSessionView,
+        MaximizePane,
         ActivateNextTab,
         ActivatePrevTab,
         CloseActiveTab,
@@ -69,6 +70,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-alt-shift-down"), SplitViewDown, Some("NochesWorkspace")),
         KeyBinding::new(&format!("{modifier}-alt-t"), NewTab, Some("NochesWorkspace")),
         KeyBinding::new(&format!("{modifier}-alt-w"), ClosePane, Some("NochesWorkspace")),
+        KeyBinding::new(&format!("{modifier}-alt-m"), MaximizePane, Some("NochesWorkspace")),
         KeyBinding::new(&format!("{modifier}-alt-]"), ActivateNextTab, Some("NochesWorkspace")),
         KeyBinding::new(&format!("{modifier}-alt-["), ActivatePrevTab, Some("NochesWorkspace")),
         KeyBinding::new(&format!("{modifier}-alt-shift-w"), CloseActiveTab, Some("NochesWorkspace")),
@@ -297,6 +299,9 @@ pub struct Workspace {
     events: Option<zeron_local_api::EventHub>,
     pending_close_confirm: Option<PendingCloseConfirm>,
     context_menu: crate::popover::Popup<(ContextMenuTarget, gpui::Point<Pixels>)>,
+    /// bb's pane maximize: when set, only this pane paints full-bleed in its
+    /// tab (siblings stay in the tree for restore). Session-local, not persisted.
+    maximized_pane: Option<PaneId>,
     view_motion: TreeMotion<ViewId>,
     tab_motion: BTreeMap<(ViewId, TabId), TreeMotion<PaneId>>,
     snap_motion: bool,
@@ -340,6 +345,7 @@ impl Workspace {
             control: None, control_task: None, control_watches: BTreeMap::new(), events: None,
             pending_close_confirm: None,
             context_menu: Default::default(),
+            maximized_pane: None,
         }
     }
 
@@ -384,6 +390,11 @@ impl Workspace {
     }
 
     fn select_session(&mut self, chat: Option<String>, cx: &mut Context<Self>) {
+        // A session switch leaves any maximized pane: the new selection owns
+        // the full canvas, not the previous pane's temporary full-bleed.
+        if self.maximized_pane.is_some() {
+            self.maximized_pane = None;
+        }
         if let Some(existing) = chat.as_deref().and_then(|chat_id| self.find_pane_by_session(chat_id)) {
             self.focus(existing, cx);
             return;
@@ -426,6 +437,45 @@ impl Workspace {
             .flat_map(|tab| tab.panes.values())
             .filter_map(|pane| pane.session_id.clone())
             .collect()
+    }
+
+    /// Whether the active tab has more than one pane (split view). The shell
+    /// titlebar uses this to suppress its session name — pane headers already
+    /// identify each session, so a third title layer is noise.
+    pub fn is_split_view(&self) -> bool {
+        self.layout.active_pane_id()
+            .and_then(|id| self.layout.pane_location(id))
+            .is_some_and(|(view, tab)| self.layout.views[&view].tabs[&tab].panes.len() > 1)
+    }
+
+    /// bb's pane maximize: the active pane fills its tab; siblings stay in the
+    /// tree so a second toggle restores the previous split ratios.
+    pub fn toggle_maximize_pane(&mut self, id: PaneId, cx: &mut Context<Self>) {
+        if self.layout.pane(id).is_none() {
+            return;
+        }
+        self.maximized_pane = if self.maximized_pane == Some(id) { None } else { Some(id) };
+        if self.maximized_pane.is_some() {
+            self.focus(id, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_maximize_active_pane(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.layout.active_pane_id() {
+            self.toggle_maximize_pane(id, cx);
+        }
+    }
+
+    pub fn maximized_pane_id(&self) -> Option<PaneId> {
+        self.maximized_pane.filter(|id| self.layout.pane(*id).is_some())
+    }
+
+    pub fn close_active_pane(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.layout.active_pane_id() {
+            self.request_close_pane(id, cx);
+        }
     }
 
     /// bb's sidebar drop semantics: a session that is already open focuses
@@ -516,6 +566,9 @@ impl Workspace {
 
     fn close(&mut self, id: PaneId, cx: &mut Context<Self>) {
         self.focus_pending = true;
+        if self.maximized_pane == Some(id) {
+            self.maximized_pane = None;
+        }
         let mut draft = self.layout.clone();
         if let Err(error) = draft.close_to_launcher(id) {
             self.error = Some(error.to_string());
@@ -1011,34 +1064,6 @@ impl Workspace {
             .unwrap_or_else(|| "New session".into())
     }
 
-    fn render_pane_tools(&self, id: PaneId, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        let terminal = self.panes.get(&id).is_some_and(|p| matches!(p.item, TabItem::Terminal(_)))
-            || self.layout.pane(id).is_some_and(|p| p.mode == PaneMode::Terminal);
-        let recovering = self.panes.get(&id).and_then(|p| p.terminal.as_ref())
-            .is_some_and(|terminal| matches!(terminal.read(cx).session_view_status(), SessionViewStatus::Failed(_)));
-        let reason = if recovering { None } else { self.toggle_unavailable(id, cx) };
-        let mut modes = div().flex().items_center().gap(px(2.0)).flex_none();
-        for (is_cli, label, icon) in [(false, "Chat", crate::icons::CHAT_ROUND_LINE), (true, "CLI", crate::icons::TERMINAL)] {
-            let selected = terminal == is_cli;
-            let enabled = selected || reason.is_none();
-            let tooltip: SharedString = reason.filter(|_| !selected).unwrap_or(if is_cli { "Open CLI view" } else { "Open Chat view" }).into();
-            modes = modes.child(div().id(SharedString::from(format!("pane-mode-{}-{label}", id.0)))
-                .role(gpui::Role::Button).aria_label(format!("{label} view"))
-                .h(px(26.0)).px(px(7.0)).rounded(px(5.0)).flex().items_center().gap(px(5.0))
-                .text_size(px(11.0)).text_color(if selected { theme.text } else { theme.text_muted })
-                .when(selected, |e| e.bg(theme.surface_raised))
-                .when(!enabled, |e| e.opacity(0.45))
-                .tooltip(move |_, cx| cx.new(|_| ControlTooltip(tooltip.clone())).into())
-                .when(enabled && !selected, |e| e.cursor_pointer().hover(|s| s.bg(theme.surface_raised))
-                    .on_click(cx.listener(move |this, _, _, cx| { cx.stop_propagation(); this.toggle(id, cx); })))
-                .child(crate::icons::icon(icon).size(px(12.0))).child(label));
-        }
-        modes.child(self.button(format!("pane-menu-{}", id.0), "Pane actions", move |this, window, cx| {
-            this.context_menu.open((ContextMenuTarget::Pane(id), window.mouse_position())); cx.notify();
-        }, cx)).into_any_element()
-    }
-
     fn button(&self, id: String, label: &'static str, action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx);
         let caption = match label {
@@ -1077,8 +1102,13 @@ impl Workspace {
         let theme = Theme::of(cx).clone();
         let active = self.layout.active_pane_id() == Some(id);
         let (view, tab) = self.layout.pane_location(id).unwrap();
+        let is_maximized = self.maximized_pane == Some(id);
+        // bb: pane headers always show when split, when left-tabbed, and while
+        // maximized (the restore control lives here). Single unmaximized panes
+        // keep the shell titlebar as their only title layer.
         let show_header = self.layout.views[&view].tabs[&tab].panes.len() > 1
-            || self.layout.views[&view].tab_placement == TabPlacement::Left;
+            || self.layout.views[&view].tab_placement == TabPlacement::Left
+            || is_maximized;
         let title = self.title(id, cx);
         self.panes[&id].chat.update(cx, |chat, cx| chat.set_active(active, cx));
         if let Some(terminal) = &self.panes[&id].terminal {
@@ -1098,25 +1128,60 @@ impl Workspace {
                 _ => None,
             }
         }).or_else(|| self.starting_cli.contains_key(&id).then(|| "Preparing session…".to_owned()));
+        // bb's focused-session pill: the title rides a soft raised plate so the
+        // active pane reads as selected without a heavy border (ThreadDetailHeader).
+        let title_pill = div().id(SharedString::from(format!("pane-drag-{}", id.0)))
+            .debug_selector(|| format!("pane-drag-{}", id.0))
+            .min_w_0().flex_none().max_w(px(280.0)).px(px(8.0)).py(px(3.0))
+            .rounded(px(6.0))
+            .when(active, |e| e.bg(theme.surface_overlay.opacity(0.72)))
+            .cursor_grab().text_size(px(12.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(if active { theme.text } else { theme.text_muted })
+            .on_drag(LayoutDrag { target: DragTarget::Pane(id), title: title.clone() }, |drag, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| PaneGhost { title: drag.title.clone(), tab: false })
+            })
+            .child(div().truncate().child(title));
+        fn pane_action(
+            id: SharedString,
+            icon_path: &'static str,
+            label: &'static str,
+            theme: &Theme,
+            on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+        ) -> gpui::Stateful<gpui::Div> {
+            div().id(id).size(px(24.0)).flex_none().flex().items_center().justify_center()
+                .rounded(px(5.0)).cursor_pointer().role(gpui::Role::Button).aria_label(label)
+                .occlude()
+                .hover(|s| s.bg(theme.surface_raised.opacity(0.9)))
+                .on_click(move |event, window, cx| { cx.stop_propagation(); on_click(event, window, cx); })
+                .child(crate::icons::icon(icon_path).size(px(13.0)).text_color(theme.text_muted.opacity(0.9)))
+        }
         let header = div().id(SharedString::from(format!("pane-header-{}", id.0)))
-            .h(px(36.0)).flex_none().flex().items_center().px(px(10.0)).gap(px(8.0))
-            .border_b_1().border_color(if active { theme.border_strong } else { theme.border })
+            .h(px(32.0)).flex_none().flex().items_center().gap(px(6.0)).px(px(8.0))
+            .border_b_1().border_color(if active { theme.border_strong.opacity(0.7) } else { theme.border })
             .bg(theme.bg)
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                 this.context_menu.open((ContextMenuTarget::Pane(id), event.position));
                 cx.stop_propagation(); cx.notify();
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.focus(id, cx)))
-            .child(div().id(SharedString::from(format!("pane-drag-{}", id.0)))
-                .debug_selector(|| format!("pane-drag-{}", id.0))
-                .flex_1().min_w_0().truncate().cursor_grab().text_size(px(12.0))
-                .text_color(if active { theme.text } else { theme.text_muted })
-                .on_drag(LayoutDrag { target: DragTarget::Pane(id), title: title.clone() }, |drag, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.new(|_| PaneGhost { title: drag.title.clone(), tab: false })
-                })
-                .child(title))
-            .child(self.render_pane_tools(id, cx));
+            .child(title_pill)
+            .child(div().flex_1().min_w_0())
+            .child(pane_action(
+                SharedString::from(format!("pane-maximize-{}", id.0)),
+                if is_maximized { crate::icons::COLLAPSE_ARROWS } else { crate::icons::EXPAND_ARROWS },
+                if is_maximized { "Restore split" } else { "Maximize pane" },
+                &theme,
+                cx.listener(move |this, _, _, cx| this.toggle_maximize_pane(id, cx)),
+            ))
+            .child(pane_action(
+                SharedString::from(format!("pane-close-{}", id.0)),
+                crate::icons::CLOSE,
+                "Close pane",
+                &theme,
+                cx.listener(move |this, _, _, cx| this.request_close_pane(id, cx)),
+            ));
         div().id(SharedString::from(format!("pane-{}", id.0))).size_full().min_w_0().min_h_0()
             .debug_selector(|| format!("pane-{}", id.0))
             .relative().flex().flex_col().overflow_hidden()
@@ -1130,6 +1195,7 @@ impl Workspace {
                     DragTarget::Pane(source) => source != id,
                     DragTarget::Tab(source) => this.layout.pane_location(id).is_some_and(|(_, tab)| tab != source),
                 };
+                // Edge drops split; center drops swap (same tab) or tabify.
                 let preview = (valid && event.bounds.contains(&event.event.position)).then_some((id, direction));
                 if (preview.is_some() || this.drop_preview.is_some_and(|(target, _)| target == id))
                     && this.drop_preview != preview { this.drop_preview = preview; cx.notify(); }
@@ -1141,8 +1207,16 @@ impl Workspace {
                     this.apply(|layout| match (drag.target, direction) {
                         (DragTarget::Pane(source), Some(direction)) => layout.move_pane(source, target, direction),
                         (DragTarget::Pane(source), None) => {
-                            let (view, _) = layout.pane_location(target).ok_or(zeron_workspace::LayoutError::NotFound("target pane"))?;
-                            layout.pane_to_tab(source, view).map(|_| ())
+                            // Center drop: same-tab panes swap; cross-view
+                            // drops still tabify.
+                            let same_tab = layout.pane_location(source).zip(layout.pane_location(target))
+                                .is_some_and(|((sv, st), (tv, tt))| sv == tv && st == tt);
+                            if same_tab {
+                                layout.swap_panes(source, target)
+                            } else {
+                                let (view, _) = layout.pane_location(target).ok_or(zeron_workspace::LayoutError::NotFound("target pane"))?;
+                                layout.pane_to_tab(source, view).map(|_| ())
+                            }
                         }
                         (DragTarget::Tab(source), Some(direction)) => layout.merge_tab(source, target, direction),
                         (DragTarget::Tab(source), None) => {
@@ -1267,89 +1341,131 @@ impl Workspace {
                 cx.stop_propagation();
             }));
         let ordered = view.ordered_tabs();
-        for tab_id in ordered.iter().copied() {
-            let tab = &view.tabs[&tab_id];
-            let pane_id = tab.active_pane_id;
-            let title = self.title(pane_id, cx);
-            let selected = view.active_tab_id == tab_id;
-            let measured = cx.weak_entity();
-            let insert_before = self.tab_preview == Some((id, Some(tab_id))) && cx.has_active_drag();
-            let (icon_path, icon_tint) = if tab.panes.len() > 1 {
-                (crate::icons::WIDGET, None)
-            } else if let Some(harness) = self.tab_harness(id, tab_id, cx) {
-                crate::pickers::harness_brand_icon(harness)
-            } else {
-                (crate::icons::CHAT_ROUND_LINE, None)
-            };
-            let run_indicator = self.tab_run_indicator(id, tab_id, cx);
-            rail = rail.child(div().id(SharedString::from(format!("view-{}-tab-{}", id.0, tab_id.0)))
-                .debug_selector(|| format!("workspace-tab-{}", tab_id.0))
-                .group("workspace-tab").relative().flex().items_center().gap(px(7.0)).flex_none()
-                .min_w(px(72.0)).max_w(px(220.0)).h(px(34.0)).px(px(9.0))
-                .text_size(px(12.0)).cursor_pointer().text_color(if selected { theme.text } else { theme.text_muted })
-                .border_b_2().border_color(if selected { theme.accent } else { gpui::transparent_black() })
-                .when(selected, |e| e.font_weight(gpui::FontWeight::MEDIUM))
-                .hover(|s| s.bg(theme.surface.opacity(0.5)))
-                .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    this.context_menu.open((ContextMenuTarget::Tab(id, tab_id), event.position)); cx.stop_propagation(); cx.notify();
-                }))
-                .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.request_close_tab(id, tab_id, cx);
-                }))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.focus_pending = true; this.apply(|layout| layout.focus_tab(id, tab_id), cx);
-                }))
-                .on_drag(LayoutDrag { target: DragTarget::Tab(tab_id), title: title.clone() }, |drag, _, _, cx| {
-                    cx.stop_propagation(); cx.new(|_| PaneGhost { title: drag.title.clone(), tab: true })
-                })
-                .child(gpui::canvas(move |bounds, _, cx| {
-                    let _ = measured.update(cx, |this, _| { this.tab_bounds.insert(tab_id, bounds); });
-                }, |_, _, _, _| {}).absolute().inset_0())
-                .child(crate::icons::icon(icon_path)
-                    .size(px(13.0)).flex_none().text_color(icon_tint.unwrap_or(theme.text_muted)))
-                .child(div().min_w_0().truncate().child(title))
-                .when_some(run_indicator, |e, indicator| {
-                    let dot_color = crate::shell::spaces::status_dot_color(indicator, &theme);
-                    e.child(div().size(px(6.0)).flex_none().rounded_full().bg(dot_color))
-                })
-                .child(div().id(SharedString::from(format!("tab-close-{}", tab_id.0)))
-                    .role(gpui::Role::Button).aria_label("Close tab").size(px(20.0)).flex_none()
-                    .flex().items_center().justify_center().rounded(px(4.0)).invisible().group_hover("workspace-tab", |s| s.visible())
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.surface_raised))
-                    .group("tab-close-btn")
-                    .on_click(cx.listener(move |this, _, _, cx| {
+        // Split view (multiple panes in the active tab): each pane header
+        // already names its session — hide the tab rail entirely so the
+        // shell titlebar and pane headers are the only title layers.
+        let split_view = view.tabs[&view.active_tab_id].panes.len() > 1;
+        // A lone tab duplicates the shell titlebar's session name — collapse
+        // the strip to a tools-only row (Chat/CLI + ⋯) so the title lives in
+        // exactly one place. Multiple tabs keep the full rail with titles.
+        let single_tab = !split_view && ordered.len() == 1;
+        // Rail height: tools-only strip is shorter than the full tab rail.
+        let rail_h = if single_tab { 32.0 } else { 40.0 };
+        if !single_tab && !split_view {
+            for tab_id in ordered.iter().copied() {
+                let tab = &view.tabs[&tab_id];
+                let pane_id = tab.active_pane_id;
+                let title = self.title(pane_id, cx);
+                let selected = view.active_tab_id == tab_id;
+                let measured = cx.weak_entity();
+                let insert_before = self.tab_preview == Some((id, Some(tab_id))) && cx.has_active_drag();
+                let (icon_path, icon_tint) = if tab.panes.len() > 1 {
+                    (crate::icons::WIDGET, None)
+                } else if let Some(harness) = self.tab_harness(id, tab_id, cx) {
+                    crate::pickers::harness_brand_icon(harness)
+                } else {
+                    (crate::icons::CHAT_ROUND_LINE, None)
+                };
+                let run_indicator = self.tab_run_indicator(id, tab_id, cx);
+                rail = rail.child(div().id(SharedString::from(format!("view-{}-tab-{}", id.0, tab_id.0)))
+                    .debug_selector(|| format!("workspace-tab-{}", tab_id.0))
+                    .group("workspace-tab").relative().flex().items_center().gap(px(7.0)).flex_none()
+                    .min_w(px(72.0)).max_w(px(220.0)).h(px(34.0)).px(px(9.0))
+                    .text_size(px(12.0)).cursor_pointer().text_color(if selected { theme.text } else { theme.text_muted })
+                    .border_b_2().border_color(if selected { theme.accent } else { gpui::transparent_black() })
+                    .when(selected, |e| e.font_weight(gpui::FontWeight::MEDIUM))
+                    .hover(|s| s.bg(theme.surface.opacity(0.5)))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        this.context_menu.open((ContextMenuTarget::Tab(id, tab_id), event.position)); cx.stop_propagation(); cx.notify();
+                    }))
+                    .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.request_close_tab(id, tab_id, cx);
                     }))
-                    .child(crate::icons::icon(crate::icons::CLOSE)
-                        .size(px(12.0))
-                        .text_color(theme.text_muted.opacity(0.8))
-                        .group_hover("tab-close-btn", |s| s.text_color(theme.text))))
-                .when(insert_before, |e| e.child(div().absolute().bg(theme.accent)
-                    .when(top, |e| e.left_0().top(px(5.0)).bottom(px(5.0)).w(px(2.0)))
-                    .when(!top, |e| e.top_0().left(px(5.0)).right(px(5.0)).h(px(2.0))))));
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.focus_pending = true; this.apply(|layout| layout.focus_tab(id, tab_id), cx);
+                    }))
+                    .on_drag(LayoutDrag { target: DragTarget::Tab(tab_id), title: title.clone() }, |drag, _, _, cx| {
+                        cx.stop_propagation(); cx.new(|_| PaneGhost { title: drag.title.clone(), tab: true })
+                    })
+                    .child(gpui::canvas(move |bounds, _, cx| {
+                        let _ = measured.update(cx, |this, _| { this.tab_bounds.insert(tab_id, bounds); });
+                    }, |_, _, _, _| {}).absolute().inset_0())
+                    .child(crate::icons::icon(icon_path)
+                        .size(px(13.0)).flex_none().text_color(icon_tint.unwrap_or(theme.text_muted)))
+                    .child(div().min_w_0().truncate().child(title))
+                    .when_some(run_indicator, |e, indicator| {
+                        let dot_color = crate::shell::spaces::status_dot_color(indicator, &theme);
+                        e.child(div().size(px(6.0)).flex_none().rounded_full().bg(dot_color))
+                    })
+                    .child(div().id(SharedString::from(format!("tab-close-{}", tab_id.0)))
+                        .role(gpui::Role::Button).aria_label("Close tab").size(px(20.0)).flex_none()
+                        .flex().items_center().justify_center().rounded(px(4.0)).invisible().group_hover("workspace-tab", |s| s.visible())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.surface_raised))
+                        .group("tab-close-btn")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.request_close_tab(id, tab_id, cx);
+                        }))
+                        .child(crate::icons::icon(crate::icons::CLOSE)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted.opacity(0.8))
+                            .group_hover("tab-close-btn", |s| s.text_color(theme.text))))
+                    .when(insert_before, |e| e.child(div().absolute().bg(theme.accent)
+                        .when(top, |e| e.left_0().top(px(5.0)).bottom(px(5.0)).w(px(2.0)))
+                        .when(!top, |e| e.top_0().left(px(5.0)).right(px(5.0)).h(px(2.0))))));
+            }
+            rail = rail.child(div().relative().flex_none()
+                .child(self.button(format!("view-new-tab-{}", id.0), "+", move |this, _, cx| {
+                    this.layout.focus_view(id).ok(); this.new_tab(cx);
+                }, cx))
+                .when(self.tab_preview == Some((id, None)) && cx.has_active_drag(), |e| e.child(
+                    div().absolute().bg(theme.accent)
+                        .when(top, |e| e.left_0().top_0().bottom_0().w(px(2.0)))
+                        .when(!top, |e| e.top_0().left_0().right_0().h(px(2.0)))))
+                .when(self.session_rail_preview == Some(id) && cx.has_active_drag(), |e| e.child(
+                    // A session dragged over the tab rail opens as a new tab.
+                    div().absolute().bg(theme.accent)
+                        .when(top, |e| e.left_0().top_0().bottom_0().w(px(2.0)))
+                        .when(!top, |e| e.top_0().left_0().right_0().h(px(2.0))))));
         }
-        rail = rail.child(div().relative().flex_none()
-            .child(self.button(format!("view-new-tab-{}", id.0), "+", move |this, _, cx| {
-                this.layout.focus_view(id).ok(); this.new_tab(cx);
-            }, cx))
-            .when(self.tab_preview == Some((id, None)) && cx.has_active_drag(), |e| e.child(
-                div().absolute().bg(theme.accent)
-                    .when(top, |e| e.left_0().top_0().bottom_0().w(px(2.0)))
-                    .when(!top, |e| e.top_0().left_0().right_0().h(px(2.0)))))
-            .when(self.session_rail_preview == Some(id) && cx.has_active_drag(), |e| e.child(
-                // A session dragged over the tab rail opens as a new tab.
-                div().absolute().bg(theme.accent)
-                    .when(top, |e| e.left_0().top_0().bottom_0().w(px(2.0)))
-                    .when(!top, |e| e.top_0().left_0().right_0().h(px(2.0))))));
-        let tabs = div().flex().flex_none().min_w_0().min_h_0().gap(px(8.0)).px(px(6.0))
-            .border_color(theme.border).bg(theme.bg)
-            .when(top, |e| e.flex_row().items_center().h(px(40.0)).border_b_1())
-            .when(!top, |e| e.flex_col().w(px(view.rail_width as f32)).py(px(5.0)))
-            .child(rail)
-            .when(top && view.tabs[&view.active_tab_id].panes.len() == 1, |e| e.child(self.render_pane_tools(active_pane, cx)));
+        let tabs = if split_view {
+            // Split view: no tab rail — each pane header names its session.
+            div().flex().flex_none().min_w_0().min_h_0().bg(theme.bg)
+        } else if single_tab {
+            // Single tab: no title (shell titlebar has it), no Chat/CLI —
+            // right-click the pane header for the context menu. Just the
+            // new-tab affordance, right-aligned.
+            let tools_id = id;
+            div().flex().flex_none().min_w_0().min_h_0().gap(px(8.0)).px(px(6.0))
+                .border_color(theme.border).bg(theme.bg)
+                .when(top, |e| e.flex_row().items_center().justify_end().h(px(rail_h)))
+                .when(!top, |e| e.flex_col().w(px(view.rail_width as f32)).py(px(5.0)))
+                .child(self.button(format!("view-new-tab-{}", tools_id.0), "+", move |this, _, cx| {
+                    this.layout.focus_view(tools_id).ok(); this.new_tab(cx);
+                }, cx))
+        } else {
+            div().flex().flex_none().min_w_0().min_h_0().gap(px(8.0)).px(px(6.0))
+                .border_color(theme.border).bg(theme.bg)
+                .when(top, |e| e.flex_row().items_center().h(px(rail_h)).border_b_1())
+                .when(!top, |e| e.flex_col().w(px(view.rail_width as f32)).py(px(5.0)))
+                .child(rail)
+        };
+        // bb maximized pane: full-bleed overlay of the focused pane while the
+        // tree stays mounted underneath so ratios restore on unmaximize.
+        let maximized_here = self.maximized_pane
+            .filter(|pane| view.tabs[&view.active_tab_id].panes.contains_key(pane));
+        if let Some(pane) = maximized_here {
+            let content = self.render_pane(pane, cx);
+            return div().id(SharedString::from(format!("split-view-{}", id.0)))
+                .relative().size_full().min_w_0().min_h_0().flex().overflow_hidden()
+                .when(view.tab_placement == TabPlacement::Top, |e| e.flex_col())
+                .when(view.tab_placement == TabPlacement::Left, |e| e.flex_row())
+                .child(tabs)
+                .child(div().flex_1().min_w_0().min_h_0().child(content))
+                .into_any_element();
+        }
         let now = Instant::now();
         let target = &view.tabs[&view.active_tab_id].root;
         let motion = self.tab_motion.entry((id, view.active_tab_id))
@@ -1364,7 +1480,7 @@ impl Workspace {
             .when(view.tab_placement == TabPlacement::Left, |e| e.flex_row())
             .on_drag_move::<LayoutDrag>(cx.listener(move |this, event: &gpui::DragMoveEvent<LayoutDrag>, _, cx| {
                 let offset = event.event.position - event.bounds.origin;
-                let in_rail = if top { offset.y < px(40.0) } else { offset.x < px(view.rail_width as f32) };
+                let in_rail = if top { offset.y < px(rail_h) } else { offset.x < px(view.rail_width as f32) };
                 let preview = if in_rail { None } else { outside_ring(event.event.position, event.bounds).map(|direction| (id, direction)) };
                 if (preview.is_some() || this.outer_preview.is_some_and(|(target, _)| target == id))
                     && this.outer_preview != preview { this.outer_preview = preview; cx.notify(); }
@@ -1375,7 +1491,7 @@ impl Workspace {
             .on_drag_move::<SidebarSessionDrag>(cx.listener(move |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, cx| {
                 if !event.bounds.contains(&event.event.position) { return; }
                 let offset = event.event.position - event.bounds.origin;
-                let in_rail = if top { offset.y < px(40.0) } else { offset.x < px(rail_width) };
+                let in_rail = if top { offset.y < px(rail_h) } else { offset.x < px(rail_width) };
                 if in_rail {
                     let changed = this.session_rail_preview != Some(id)
                         || this.session_outer_preview.is_some() || this.session_drop.is_some();
@@ -1556,6 +1672,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &SplitViewDown, _, cx| this.split(Direction::Down, true, cx)))
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
             .on_action(cx.listener(|this, _: &ClosePane, _, cx| { if let Some(id) = this.layout.active_pane_id() { this.request_close_pane(id, cx); } }))
+            .on_action(cx.listener(|this, _: &MaximizePane, _, cx| this.toggle_maximize_active_pane(cx)))
             .on_action(cx.listener(|this, _: &ToggleSessionView, _, cx| { if let Some(id) = this.layout.active_pane_id() { this.toggle(id, cx); } }))
             .on_action(cx.listener(|this, _: &ActivateNextTab, _, cx| {
                 let view_id = this.layout.active_view_id;

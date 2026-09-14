@@ -806,11 +806,12 @@ impl Theme {
     /// Main-panel header height (zeron `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
     /// The unified window titlebar (traffic lights + cluster + tabs). Content
-    /// rides [`Self::TITLEBAR_TOP_PAD`] lower than center so the air above
-    /// matches the perceived gap to the inset card below (border + card body).
-    pub const TITLEBAR_HEIGHT: f32 = 38.0;
+    /// sits on the bar's vertical center — bb keeps the session title tight to
+    /// the window edge, so the extra optical drop that once matched the old
+    /// inset card is gone.
+    pub const TITLEBAR_HEIGHT: f32 = 34.0;
     /// Downward shift of titlebar content within the bar.
-    pub const TITLEBAR_TOP_PAD: f32 = 2.0;
+    pub const TITLEBAR_TOP_PAD: f32 = 0.0;
     /// Reserved status strip under the content outlet (zeron `h-6`) — the
     /// WorkingIndicator row; reserving it keeps the composer from shifting.
     pub const STATUS_STRIP_HEIGHT: f32 = 24.0;
