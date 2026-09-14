@@ -13,11 +13,7 @@ pub fn builtin_registry() -> &'static ThemeRegistry {
     REGISTRY.get_or_init(|| ThemeRegistry {
         families: vec![
             family("zeron", "Noches", vec![zeron_light(), zeron_dark()]),
-            family(
-                "claude",
-                "Claude",
-                vec![claude_light(), claude_dark()],
-            ),
+            family("claude", "Claude", vec![claude_light(), claude_dark()]),
             family(
                 "vscode-default",
                 "VS Code Default",
@@ -372,12 +368,8 @@ fn claude_dark() -> ThemeVariant {
     // Code-mode inline code is salmon on the chip plate (#222223) — NOT the
     // accent-orange tint other themes derive. Theme::from_variant reads these
     // two keys; the chip geometry lives in crates/ui/src/markdown/render.rs.
-    variant
-        .syntax
-        .insert("codeText".into(), c("#e27a7b"));
-    variant
-        .syntax
-        .insert("codeWash".into(), c("#222223"));
+    variant.syntax.insert("codeText".into(), c("#e27a7b"));
+    variant.syntax.insert("codeWash".into(), c("#222223"));
     variant
 }
 
@@ -418,12 +410,8 @@ fn claude_light() -> ThemeVariant {
         ),
     });
     // Light-mode inline code: the deeper Crail on a 5% black chip plate.
-    variant
-        .syntax
-        .insert("codeText".into(), c("#c15f3c"));
-    variant
-        .syntax
-        .insert("codeWash".into(), c("#eeede7"));
+    variant.syntax.insert("codeText".into(), c("#c15f3c"));
+    variant.syntax.insert("codeWash".into(), c("#eeede7"));
     variant
 }
 

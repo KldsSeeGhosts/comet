@@ -1364,9 +1364,10 @@ impl AppearancePage {
                                             let variant_id = variant_id.clone();
                                             move |this, _, _, cx| {
                                                 if let Some(dialog) = this.import_dialog.as_mut()
-                                                    && !dialog.selected.remove(&variant_id) {
-                                                        dialog.selected.insert(variant_id.clone());
-                                                    }
+                                                    && !dialog.selected.remove(&variant_id)
+                                                {
+                                                    dialog.selected.insert(variant_id.clone());
+                                                }
                                                 cx.notify();
                                             }
                                         })),

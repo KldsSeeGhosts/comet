@@ -192,12 +192,7 @@ fn lookup(table: &HashMap<String, ModelPricing>, key: &str) -> Option<ModelPrici
 /// Fetch both sources and merge (CPA wins per key); persist the merged table.
 /// `(None, None)` — "keep the previous table and stamp" — when BOTH sources
 /// failed (or produced nothing): a transient outage must not wipe a cache.
-async fn refresh(
-    dir: &Path,
-) -> (
-    Option<HashMap<String, ModelPricing>>,
-    Option<SystemTime>,
-) {
+async fn refresh(dir: &Path) -> (Option<HashMap<String, ModelPricing>>, Option<SystemTime>) {
     let config = PriceSourceConfig::resolve(dir);
     let Some(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -252,10 +247,7 @@ async fn refresh(
     (Some(merged), Some(now))
 }
 
-async fn get_text(
-    _client: &reqwest::Client,
-    request: reqwest::RequestBuilder,
-) -> Option<String> {
+async fn get_text(_client: &reqwest::Client, request: reqwest::RequestBuilder) -> Option<String> {
     let response = request.send().await.ok()?;
     let response = response.error_for_status().ok()?;
     response.text().await.ok()
@@ -355,7 +347,15 @@ pub fn price_key(id: &str) -> String {
 /// thinking marker are peeled — `muse-spark-1.3-contributor` keeps its tail.
 pub fn strip_effort_suffixes(id: &str) -> String {
     const SUFFIXES: [&str; 10] = [
-        "thinking", "ultrathink", "ultracode", "minimal", "xhigh", "medium", "high", "low", "max",
+        "thinking",
+        "ultrathink",
+        "ultracode",
+        "minimal",
+        "xhigh",
+        "medium",
+        "high",
+        "low",
+        "max",
         "ultra",
     ];
     let mut current = id.to_string();

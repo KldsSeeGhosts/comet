@@ -348,8 +348,10 @@ fn is_edit_or_diff_chip(tool: &ToolItem, detail: Option<&ToolDetail>) -> bool {
     matches!(
         tool.call,
         ToolCall::EditFile { .. } | ToolCall::WriteFile { .. } | ToolCall::ApplyPatch { .. }
-    ) || matches!(detail, Some(ToolDetail::Diff { .. } | ToolDetail::Stats { .. }))
-        || tool.diff_ref.is_some()
+    ) || matches!(
+        detail,
+        Some(ToolDetail::Diff { .. } | ToolDetail::Stats { .. })
+    ) || tool.diff_ref.is_some()
         || match &tool.call {
             ToolCall::Unknown { name, .. } => {
                 name.contains("edit") || name.contains("patch") || name.contains("write")
@@ -1430,8 +1432,7 @@ pub fn rows_for_entry(
                         .into();
                         rows.push(Row {
                             id: format!("{}#{}", entry.id, part_id).into(),
-                            version: fnv1a(header.as_bytes())
-                                ^ fnv1a(question.as_bytes()) << 1
+                            version: fnv1a(header.as_bytes()) ^ fnv1a(question.as_bytes()) << 1
                                 | *resolved as u64,
                             turn_start: false,
                             kind: RowKind::InputChip {
@@ -3049,7 +3050,9 @@ impl Transcript {
         // thumb mid-drag (`max_offset_for_scrollbar` reports the same frozen
         // value the offset mapping uses).
         self.list.scrollbar_drag_started();
-        let scroll_top = self.scrollbar.press(metrics, track_top, f32::from(event.position.y));
+        let scroll_top = self
+            .scrollbar
+            .press(metrics, track_top, f32::from(event.position.y));
         self.apply_scrollbar_offset(scroll_top);
         self.refresh_after_viewport_input(cx);
         // A press on the rail is not a text-selection gesture.
@@ -3104,13 +3107,10 @@ impl Transcript {
                 .render_rail("transcript-scrollbar", theme, &metrics)
                 .on_hover(cx.listener(Self::on_scrollbar_rail_hover))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_scrollbar_press))
-                .on_drag(
-                    scrollbar::ScrollbarDrag,
-                    |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.new(|_| scrollbar::ScrollbarDragGhost)
-                    },
-                )
+                .on_drag(scrollbar::ScrollbarDrag, |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| scrollbar::ScrollbarDragGhost)
+                })
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_scrollbar_release))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_scrollbar_release))
                 .into_any_element(),
@@ -5391,28 +5391,27 @@ impl Transcript {
             .map(|(_, ix)| *ix);
         let row_key = row_id.clone();
         let entity = cx.weak_entity();
-        let handler: render::CopyHandler =
-            Rc::new(move |ix, code, _window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
-                let row_key = row_key.clone();
-                entity
-                    .update(cx, |this, cx| {
-                        this.copied_code = Some((row_key, ix));
-                        this.copied_clear = Some(cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(1200))
-                                .await;
-                            this.update(cx, |this, cx| {
-                                this.copied_code = None;
-                                this.copied_clear = None;
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
-                        cx.notify();
-                    })
-                    .ok();
-            });
+        let handler: render::CopyHandler = Rc::new(move |ix, code, _window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+            let row_key = row_key.clone();
+            entity
+                .update(cx, |this, cx| {
+                    this.copied_code = Some((row_key, ix));
+                    this.copied_clear = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1200))
+                            .await;
+                        this.update(cx, |this, cx| {
+                            this.copied_code = None;
+                            this.copied_clear = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    }));
+                    cx.notify();
+                })
+                .ok();
+        });
         render::CopyUi { handler, copied_ix }
     }
 
@@ -6289,9 +6288,7 @@ impl Transcript {
             .text_color(theme.text_muted.opacity(0.7))
             .map(|icon| {
                 if open {
-                    icon.with_transformation(gpui::Transformation::rotate(
-                        gpui::percentage(0.25),
-                    ))
+                    icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.25)))
                 } else {
                     icon
                 }

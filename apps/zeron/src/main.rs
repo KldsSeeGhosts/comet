@@ -247,10 +247,9 @@ fn activate_running_window(data_dir: &std::path::Path) -> bool {
     runtime.block_on(async move {
         // Bound the whole probe: a wedged socket must not stall app launch.
         let probe = async {
-            let client =
-                zeron_local_api::Client::discover(data_dir, None, Some(zeron_ui::APP_ID))
-                    .await
-                    .ok()?;
+            let client = zeron_local_api::Client::discover(data_dir, None, Some(zeron_ui::APP_ID))
+                .await
+                .ok()?;
             client
                 .request("window.activate", serde_json::json!({}))
                 .await

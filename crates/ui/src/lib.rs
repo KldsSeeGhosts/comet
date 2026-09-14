@@ -39,8 +39,8 @@ pub mod popover;
 pub mod pricing;
 pub mod queue;
 pub mod rail;
-pub mod settings;
 pub mod session_pane;
+pub mod settings;
 pub mod shell;
 pub mod sound;
 pub mod state;
@@ -52,8 +52,8 @@ pub mod theme_library;
 pub mod transcript;
 pub mod typography;
 pub mod voice;
-mod workspace_links;
 pub mod workspace;
+mod workspace_links;
 
 use std::path::PathBuf;
 

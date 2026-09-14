@@ -50,26 +50,26 @@ impl BrowserSurface {
                 cx.stop_propagation();
                 return;
             }
-            if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt
-                && let Some(native) = &self.native {
-                    match event.keystroke.key.as_str() {
-                        "c" | "x" => {
-                            native.command(serde_json::json!({"cmd":if event.keystroke.key=="c" {"copy"} else {"cut"}}));
-                            cx.stop_propagation();
-                            return;
-                        }
-                        "v" => {
-                            if let Some(text) =
-                                cx.read_from_clipboard().and_then(|item| item.text())
-                            {
-                                native.command(serde_json::json!({"cmd":"text","text":text}));
-                            }
-                            cx.stop_propagation();
-                            return;
-                        }
-                        _ => {}
+            if event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.alt
+                && let Some(native) = &self.native
+            {
+                match event.keystroke.key.as_str() {
+                    "c" | "x" => {
+                        native.command(serde_json::json!({"cmd":if event.keystroke.key=="c" {"copy"} else {"cut"}}));
+                        cx.stop_propagation();
+                        return;
                     }
+                    "v" => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            native.command(serde_json::json!({"cmd":"text","text":text}));
+                        }
+                        cx.stop_propagation();
+                        return;
+                    }
+                    _ => {}
                 }
+            }
             self.linux_key(&event.keystroke, true);
             cx.stop_propagation();
             return;

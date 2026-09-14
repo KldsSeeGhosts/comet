@@ -19,8 +19,8 @@
 use gpui::{Context, Div, Window, div, prelude::*, px};
 
 use crate::popover::{
-    MenuScrollbarMetrics, MENU_SCROLLBAR_HIT_WIDTH, MENU_SCROLLBAR_HOVER_THUMB_WIDTH,
-    MENU_SCROLLBAR_THUMB_WIDTH, MENU_SCROLLBAR_TRACK_INSET,
+    MENU_SCROLLBAR_HIT_WIDTH, MENU_SCROLLBAR_HOVER_THUMB_WIDTH, MENU_SCROLLBAR_THUMB_WIDTH,
+    MENU_SCROLLBAR_TRACK_INSET, MenuScrollbarMetrics,
 };
 use crate::theme::Theme;
 
@@ -148,12 +148,7 @@ impl TranscriptScrollbarState {
 
     /// Move an engaged drag to `pointer_y`, returning the new scroll-top.
     /// `None` when no drag is engaged.
-    pub fn drag(
-        &self,
-        m: MenuScrollbarMetrics,
-        track_top: f32,
-        pointer_y: f32,
-    ) -> Option<f32> {
+    pub fn drag(&self, m: MenuScrollbarMetrics, track_top: f32, pointer_y: f32) -> Option<f32> {
         let grab_offset = self.grab?;
         let pointer_in_track = pointer_y - track_top - MENU_SCROLLBAR_TRACK_INSET;
         Some(scroll_top_for_pointer(&m, grab_offset, pointer_in_track))
@@ -316,16 +311,23 @@ mod tests {
         let metrics = m(600.0, 1400.0, 0.0);
         let mut state = TranscriptScrollbarState::default();
         // Grab the resting thumb at its center.
-        state.press(metrics, 0.0, MENU_SCROLLBAR_TRACK_INSET + metrics.thumb_height / 2.0);
+        state.press(
+            metrics,
+            0.0,
+            MENU_SCROLLBAR_TRACK_INSET + metrics.thumb_height / 2.0,
+        );
         // Drag the thumb's center to the middle of the track: its TOP is
         // half the travel minus half the thumb, and that position maps
         // linearly onto the scroll range.
         let scroll_top = state
-            .drag(metrics, 0.0, MENU_SCROLLBAR_TRACK_INSET + metrics.travel() * 0.5)
+            .drag(
+                metrics,
+                0.0,
+                MENU_SCROLLBAR_TRACK_INSET + metrics.travel() * 0.5,
+            )
             .unwrap();
-        let expected =
-            (metrics.travel() * 0.5 - metrics.thumb_height / 2.0) / metrics.travel()
-                * metrics.max_scroll;
+        let expected = (metrics.travel() * 0.5 - metrics.thumb_height / 2.0) / metrics.travel()
+            * metrics.max_scroll;
         assert!((scroll_top - expected).abs() < 1e-4);
         // Past both ends it clamps.
         assert_eq!(state.drag(metrics, 0.0, -10_000.0).unwrap(), 0.0);

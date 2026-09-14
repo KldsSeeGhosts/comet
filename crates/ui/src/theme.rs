@@ -847,8 +847,7 @@ impl Theme {
     /// user pinned Opaque or because this platform/compositor cannot blur the
     /// window background (see [`compositor_window_blur_supported`]).
     pub fn glass(&self) -> Hsla {
-        if self.surface_treatment == SurfaceTreatment::Opaque
-            || !compositor_window_blur_supported()
+        if self.surface_treatment == SurfaceTreatment::Opaque || !compositor_window_blur_supported()
         {
             return self.surface;
         }

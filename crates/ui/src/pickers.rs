@@ -1587,7 +1587,7 @@ impl Pickers {
             .map(|f| (f.harness, f.model.clone()))
             .collect();
         let query = self.search.read(cx).text().trim().to_string();
-        let rows = scoped_model_rows(
+        scoped_model_rows(
             &query,
             self.model_rail,
             effective,
@@ -1600,8 +1600,7 @@ impl Pickers {
             },
             |harness, model| favorites.contains(&(harness, model)),
             &recents,
-        );
-        rows
+        )
     }
 
     /// Index of the Nth MODEL row (headers don't count) — the ⌘N jump map.
@@ -1622,9 +1621,9 @@ impl Pickers {
         loop {
             ix += delta;
             if ix < 0 {
-                return (delta < 0).then_some(0).filter(|_| {
-                    matches!(rows.first(), Some(ModelRow::Model(_)))
-                });
+                return (delta < 0)
+                    .then_some(0)
+                    .filter(|_| matches!(rows.first(), Some(ModelRow::Model(_))));
             }
             let ix = ix as usize;
             match rows.get(ix) {
@@ -1882,9 +1881,10 @@ impl Pickers {
             self.defaults.no_project = state.no_project;
         }
         if let Some(dir) = &self.data_dir
-            && let Err(err) = self.defaults.save(dir) {
-                tracing::warn!(error = %err, "composer-defaults save failed");
-            }
+            && let Err(err) = self.defaults.save(dir)
+        {
+            tracing::warn!(error = %err, "composer-defaults save failed");
+        }
     }
 
     /// Devices in picker order: this device first, then by name.
@@ -2192,7 +2192,9 @@ impl Pickers {
                     }
                 } else {
                     let count = match self.open_kind() {
-                        Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS),
+                        Some(PickerKind::Branch) => {
+                            self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS)
+                        }
                         Some(PickerKind::Checkout) => 2,
                         Some(PickerKind::Space) => self.filtered_space_rows(cx).len() + 1,
                         Some(PickerKind::Device) => self.filtered_device_rows(cx).len(),
@@ -3150,7 +3152,8 @@ impl Pickers {
                 ModelRail::All => "Search all models…",
                 _ => "Search models…",
             };
-            this.search.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+            this.search
+                .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
             cx.notify();
         };
         let all_view = self.model_rail == ModelRail::All;
@@ -3296,7 +3299,9 @@ impl Pickers {
                         entity.update(app, |this, cx| {
                             range
                                 .filter_map(|ix| {
-                                    row_data.get(ix).map(|row| this.render_list_row(ix, row, cx))
+                                    row_data
+                                        .get(ix)
+                                        .map(|row| this.render_list_row(ix, row, cx))
                                 })
                                 .collect::<Vec<AnyElement>>()
                         })
@@ -3414,12 +3419,7 @@ impl Pickers {
     /// One row of the virtualized list: a section heading or a model row.
     /// `ix` is the row's GLOBAL index (⌘N chips, hover-cursor, and activation
     /// all key on it).
-    fn render_list_row(
-        &mut self,
-        ix: usize,
-        row: &ModelRow,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_list_row(&mut self, ix: usize, row: &ModelRow, cx: &mut Context<Self>) -> AnyElement {
         match row {
             ModelRow::Header(label) => {
                 let theme = Theme::of(cx).clone();
@@ -4030,9 +4030,7 @@ fn scoped_model_rows_impl<'a>(
                     let model = models_for(*harness)?.iter().find(|m| m.id == *id)?;
                     Some((descriptor, model))
                 })
-                .filter(|(descriptor, model)| {
-                    listed.insert((descriptor.id, model.id.clone()))
-                })
+                .filter(|(descriptor, model)| listed.insert((descriptor.id, model.id.clone())))
                 .map(|(descriptor, model)| row(descriptor, model))
                 .collect();
             if !recent_rows.is_empty() {
@@ -4420,12 +4418,12 @@ impl Render for Pickers {
             | Some(PickerKind::Device) => None,
             Some(PickerKind::HarnessModel) => {
                 let content = self.render_harness_model_popover(cx);
-            Some((
-                PickerKind::HarnessModel,
-                // Compact single-harness pane (t3 ModelPickerContent
-                // shrunk to its tabbed layout), widened for the cost bars.
-                self.popover_frame_flush(352.0, content, cx),
-            ))
+                Some((
+                    PickerKind::HarnessModel,
+                    // Compact single-harness pane (t3 ModelPickerContent
+                    // shrunk to its tabbed layout), widened for the cost bars.
+                    self.popover_frame_flush(352.0, content, cx),
+                ))
             }
             None => None,
         };
@@ -4659,7 +4657,10 @@ mod tests {
             descriptor(HarnessId::ClaudeCode, "Claude Code"),
             descriptor(HarnessId::Codex, "Codex"),
         ];
-        let claude = vec![bare_model("fable-5", "Fable 5"), bare_model("haiku", "Haiku")];
+        let claude = vec![
+            bare_model("fable-5", "Fable 5"),
+            bare_model("haiku", "Haiku"),
+        ];
         let codex = vec![bare_model("gpt-fable", "Fable (Codex)")];
         let models_for = |harness: HarnessId| -> Option<&[Model]> {
             match harness {
