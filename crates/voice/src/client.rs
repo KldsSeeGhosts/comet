@@ -63,7 +63,9 @@ impl VoiceConfig {
         self
     }
 
-    fn endpoint(&self) -> String {
+    /// The WebSocket URL `connect` dials: `endpoint` verbatim when set, else
+    /// the default OpenAI Realtime endpoint with `?model=` appended.
+    pub fn endpoint_url(&self) -> String {
         match &self.endpoint {
             Some(endpoint) => endpoint.clone(),
             None => format!("{DEFAULT_ENDPOINT}?model={}", self.model),
@@ -98,7 +100,7 @@ impl VoiceSession {
         config: VoiceConfig,
         sink: Arc<dyn VoiceToolSink>,
     ) -> Result<Self, VoiceError> {
-        let mut request = config.endpoint().into_client_request()?;
+        let mut request = config.endpoint_url().into_client_request()?;
         // The key only exists in this scope; nothing below logs the request.
         let authorization = HeaderValue::from_str(&format!("Bearer {}", config.api_key))
             .map_err(|_| VoiceError::InvalidAuthorization)?;
@@ -426,11 +428,11 @@ mod tests {
     fn default_endpoint_carries_the_model() {
         let config = VoiceConfig::new("key", "gpt-realtime");
         assert_eq!(
-            config.endpoint(),
+            config.endpoint_url(),
             "wss://api.openai.com/v1/realtime?model=gpt-realtime"
         );
         let config = config.with_endpoint("ws://127.0.0.1:9999/v1/realtime");
-        assert_eq!(config.endpoint(), "ws://127.0.0.1:9999/v1/realtime");
+        assert_eq!(config.endpoint_url(), "ws://127.0.0.1:9999/v1/realtime");
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub enum ChatViewEvent {
     Focused,
     Selected(Option<String>),
     HumanSubmitted(String, crate::input_origin::HumanInput),
+    /// The pane composer's mic button; the workspace owns the one session.
+    VoiceToggled,
 }
 
 impl EventEmitter<ChatViewEvent> for ChatView {}
@@ -51,8 +53,12 @@ impl ChatView {
                     cx.emit(ChatViewEvent::HumanSubmitted(chat_id.clone(), *proof));
                     return;
                 }
+                if matches!(event, ComposerEvent::VoiceToggled) {
+                    cx.emit(ChatViewEvent::VoiceToggled);
+                    return;
+                }
                 transcript.update(cx, |transcript, cx| match event {
-                    ComposerEvent::HumanSubmitted { .. } => {}
+                    ComposerEvent::HumanSubmitted { .. } | ComposerEvent::VoiceToggled => {}
                     ComposerEvent::Sent { chat_id, message_id } => {
                         transcript.on_own_send(chat_id.clone(), message_id.clone(), cx);
                     }
@@ -81,6 +87,13 @@ impl ChatView {
             self.composer.read(cx).input.clone().update(cx, |input, cx| input.set_pane_active(active, cx));
             cx.notify();
         }
+    }
+
+    /// The workspace's shared voice status, mirrored into this pane's
+    /// composer so every visible mic button shows the same state.
+    pub fn set_voice_status(&mut self, status: crate::voice::VoiceStatus, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.set_voice_status(status, cx));
     }
 
     pub fn select(&mut self, chat: Option<String>, cx: &mut Context<Self>) {

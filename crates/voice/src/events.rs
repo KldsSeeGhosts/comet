@@ -111,7 +111,8 @@ impl AudioConfig {
     }
 }
 
-/// `session.audio.input`: capture format and turn detection.
+/// `session.audio.input`: capture format, turn detection, and server-side
+/// noise reduction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AudioInput {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,11 +120,14 @@ pub struct AudioInput {
     /// Server VAD configuration, e.g. `{"type": "server_vad"}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_detection: Option<Value>,
+    /// Server-side input noise reduction, e.g. `{"type": "near_field"}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_reduction: Option<Value>,
 }
 
 impl AudioInput {
     fn is_empty(&self) -> bool {
-        self.format.is_none() && self.turn_detection.is_none()
+        self.format.is_none() && self.turn_detection.is_none() && self.noise_reduction.is_none()
     }
 }
 
@@ -205,6 +209,14 @@ impl SessionConfig {
         self
     }
 
+    /// Server-side input noise reduction, e.g.
+    /// `serde_json::json!({"type": "near_field"})` for headset-style
+    /// near-field capture.
+    pub fn with_noise_reduction(mut self, noise_reduction: Value) -> Self {
+        self.audio.input.noise_reduction = Some(noise_reduction);
+        self
+    }
+
     /// Text-only replies; used by the headless text harness. Audio arrives with
     /// the later `pcm16_audio` configuration.
     pub fn text_only(mut self) -> Self {
@@ -215,7 +227,7 @@ impl SessionConfig {
     /// 24 kHz PCM16 in and out, matching the codec helpers in [`crate::audio`].
     pub fn pcm16_audio(mut self) -> Self {
         self.audio.input.format = Some(AudioFormat::pcm(Some(24_000)));
-        self.audio.output.format = Some(AudioFormat::pcm(None));
+        self.audio.output.format = Some(AudioFormat::pcm(Some(24_000)));
         self
     }
 }
@@ -620,7 +632,15 @@ mod tests {
             session: SessionConfig::default()
                 .pcm16_audio()
                 .with_voice("marin")
-                .with_turn_detection(serde_json::json!({"type": "server_vad"}))
+                .with_turn_detection(serde_json::json!({
+                    "type": "server_vad",
+                    "threshold": 0.75,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 700,
+                    "create_response": true,
+                    "interrupt_response": true,
+                }))
+                .with_noise_reduction(serde_json::json!({"type": "near_field"}))
                 .with_parallel_tool_calls(false)
                 .with_tools(vec![
                     serde_json::json!({"type": "function", "name": "ping"}),
@@ -632,12 +652,19 @@ mod tests {
         assert_eq!(session["type"], "realtime");
         assert_eq!(session["audio"]["input"]["format"]["type"], "audio/pcm");
         assert_eq!(session["audio"]["input"]["format"]["rate"], 24_000);
+        let turn_detection = &session["audio"]["input"]["turn_detection"];
+        assert_eq!(turn_detection["type"], "server_vad");
+        assert_eq!(turn_detection["threshold"], 0.75);
+        assert_eq!(turn_detection["prefix_padding_ms"], 300);
+        assert_eq!(turn_detection["silence_duration_ms"], 700);
+        assert_eq!(turn_detection["create_response"], true);
+        assert_eq!(turn_detection["interrupt_response"], true);
         assert_eq!(
-            session["audio"]["input"]["turn_detection"]["type"],
-            "server_vad"
+            session["audio"]["input"]["noise_reduction"]["type"],
+            "near_field"
         );
         assert_eq!(session["audio"]["output"]["format"]["type"], "audio/pcm");
-        assert!(session["audio"]["output"]["format"].get("rate").is_none());
+        assert_eq!(session["audio"]["output"]["format"]["rate"], 24_000);
         assert_eq!(session["audio"]["output"]["voice"], "marin");
         assert_eq!(session["parallel_tool_calls"], false);
         assert_eq!(session["tools"][0]["name"], "ping");

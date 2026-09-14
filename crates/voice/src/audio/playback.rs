@@ -44,10 +44,12 @@ use std::{
 /// Output ring capacity in milliseconds of device frames.
 const RING_MS: usize = 80;
 
-/// Playback queue capacity in 20 ms chunks: ~480 ms of 24 kHz audio. The
-/// server streams faster than realtime, so this is the maximum lip-sync
-/// backlog; whatever does not fit is dropped and counted.
-const QUEUE_CHUNKS: usize = 24;
+/// Playback queue capacity in 20 ms chunks: 60 s of 24 kHz audio, about
+/// 2.9 MB of PCM16. Realtime deltas arrive faster than the device drains
+/// them, so the queue is deep enough to hold a normal spoken response
+/// without ever dropping; only chunks past this hard cap are dropped and
+/// counted, never reordered or truncated.
+const QUEUE_CHUNKS: usize = 3_000;
 
 /// Worker wait for the next queued chunk.
 const QUEUE_WAIT: Duration = Duration::from_millis(20);
@@ -131,12 +133,15 @@ impl AudioPlayback {
         if samples.is_empty() {
             return Ok(());
         }
-        let stamp = self.shared.epoch.load(Ordering::Acquire);
         let mut pending = self
             .shared
             .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        // Read under the pending lock so the stamp serializes against
+        // `clear`: a chunk either predates the clear (dropped by the worker)
+        // or postdates it, never straddles it.
+        let stamp = self.shared.epoch.load(Ordering::Acquire);
         let mut result = Ok(());
         let mut dropped = 0u64;
         pending.extend_from_slice(samples);
@@ -164,29 +169,52 @@ impl AudioPlayback {
     /// end at arbitrary boundaries, so `response.output_audio.done` should
     /// call this to release the tail instead of letting it prepend the next
     /// response's audio.
+    ///
+    /// A full queue does not drop the tail: `std::sync::mpsc` has no bounded
+    /// blocking send on this toolchain, so this waits in short sleeps while
+    /// the device drains space, giving up only when the generation changes
+    /// (the chunk would be discarded anyway) or the worker stops. The cap is
+    /// a fixed [`QUEUE_CHUNKS`] waits, so a wedged worker cannot park the
+    /// caller forever.
     pub fn flush(&self) -> Result<(), AudioError> {
-        let mut pending = self
-            .shared
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if pending.is_empty() {
-            return Ok(());
-        }
-        pending.resize(VOICE_CHUNK_FRAMES, 0);
-        let chunk: Vec<i16> = pending.drain(..VOICE_CHUNK_FRAMES).collect();
-        let stamp = self.shared.epoch.load(Ordering::Acquire);
-        match self.shared.queue.try_send((stamp, chunk)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
-                self.shared
-                    .counters
-                    .output_dropped_chunks
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(())
+        let (stamp, chunk): (u64, Vec<i16>) = {
+            let mut pending = self
+                .shared
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if pending.is_empty() {
+                return Ok(());
             }
-            Err(TrySendError::Disconnected(_)) => Err(AudioError::PlaybackStopped),
+            pending.resize(VOICE_CHUNK_FRAMES, 0);
+            // Same lock rule as `play`: the stamp cannot straddle a clear.
+            let stamp = self.shared.epoch.load(Ordering::Acquire);
+            (stamp, pending.drain(..VOICE_CHUNK_FRAMES).collect())
+        };
+        let mut chunk = Some((stamp, chunk));
+        for _ in 0..QUEUE_CHUNKS {
+            let (stamp, queued) = chunk.take().expect("flush chunk held once");
+            match self.shared.queue.try_send((stamp, queued)) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(back)) => {
+                    if self.shared.epoch.load(Ordering::Acquire) != stamp
+                        || self.shared.stop.load(Ordering::Relaxed)
+                    {
+                        return Ok(());
+                    }
+                    chunk = Some(back);
+                    thread::park_timeout(RING_WAIT);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(AudioError::PlaybackStopped);
+                }
+            }
         }
+        self.shared
+            .counters
+            .output_dropped_chunks
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Drops every queued chunk - including the held partial - and silences
@@ -417,13 +445,19 @@ impl PlaybackWorker {
         }
     }
 
-    /// Makes the ring carry the marker for the current generation, resetting
-    /// resampler history and dropping stale queued chunks first. Returns
-    /// `false` when the marker could not be pushed yet.
+    /// Makes the ring carry the marker for the generation current at the
+    /// drain, resetting resampler history and dropping stale queued chunks
+    /// first. The epoch is read after the drain, not before: a clear racing
+    /// the read would otherwise push a marker for a superseded generation,
+    /// and the fresh chunks queued behind it would be drained as stale on
+    /// the next pass. Returns `false` when the marker could not be pushed
+    /// yet.
     fn sync_generation(&mut self) -> bool {
-        let epoch = self.shared.epoch.load(Ordering::Acquire);
-        let slot = convert::generation_slot(epoch);
-        if self.marker == Some(slot) {
+        if self.marker
+            == Some(convert::generation_slot(
+                self.shared.epoch.load(Ordering::Acquire),
+            ))
+        {
             return true;
         }
         self.resampler.reset();
@@ -431,6 +465,7 @@ impl PlaybackWorker {
         if self.shared.stop.load(Ordering::Relaxed) {
             return false;
         }
+        let epoch = self.shared.epoch.load(Ordering::Acquire);
         if self
             .producer
             .try_push(convert::generation_marker(epoch))
@@ -438,7 +473,7 @@ impl PlaybackWorker {
         {
             return false;
         }
-        self.marker = Some(slot);
+        self.marker = Some(convert::generation_slot(epoch));
         true
     }
 
@@ -651,5 +686,123 @@ mod tests {
         );
 
         assert!(playback.play(&[]).is_ok());
+    }
+
+    #[test]
+    fn a_faster_than_realtime_burst_never_drops_or_reorders() {
+        // 10 s of uniquely numbered 20 ms chunks arriving in one burst, the
+        // shape of a Realtime response streamed faster than the device drains.
+        let (queue, queued) = mpsc::sync_channel(QUEUE_CHUNKS);
+        let (playback, shared) = playback(queue);
+        let chunks = 500;
+        for index in 0..chunks {
+            playback
+                .play(&vec![index as i16; VOICE_CHUNK_FRAMES])
+                .unwrap();
+        }
+        assert_eq!(
+            shared
+                .counters
+                .output_dropped_chunks
+                .load(Ordering::Relaxed),
+            0
+        );
+        for index in 0..chunks {
+            let (stamp, chunk) = queued.recv().unwrap();
+            assert_eq!(stamp, 0);
+            assert!(chunk.iter().all(|&sample| sample == index as i16));
+        }
+    }
+
+    #[test]
+    fn only_chunks_past_the_hard_cap_are_dropped() {
+        // A capacity-2 queue: the first two chunks land, the rest of the
+        // burst is counted, and FIFO order survives around the drops.
+        let (queue, queued) = mpsc::sync_channel(2);
+        let (playback, shared) = playback(queue);
+        for index in 0..5 {
+            playback
+                .play(&vec![index as i16; VOICE_CHUNK_FRAMES])
+                .unwrap();
+        }
+        assert_eq!(
+            shared
+                .counters
+                .output_dropped_chunks
+                .load(Ordering::Relaxed),
+            3
+        );
+        let first = queued.recv().unwrap().1;
+        let second = queued.recv().unwrap().1;
+        assert_eq!(first[0], 0);
+        assert_eq!(second[0], 1);
+
+        // Once the queue has room the next chunk still lands in order.
+        playback.play(&vec![9i16; VOICE_CHUNK_FRAMES]).unwrap();
+        assert_eq!(queued.recv().unwrap().1[0], 9);
+    }
+
+    #[test]
+    fn flush_waits_out_a_full_queue_instead_of_dropping_the_tail() {
+        let (queue, queued) = mpsc::sync_channel(1);
+        let (playback, _shared) = playback(queue);
+
+        // Fill the queue, then park a partial tail behind it.
+        playback.play(&[3; VOICE_CHUNK_FRAMES]).unwrap();
+        playback.play(&[5; 7]).unwrap();
+        let flushing = {
+            let playback = playback.clone();
+            thread::spawn(move || playback.flush())
+        };
+        thread::sleep(Duration::from_millis(10));
+        assert!(!flushing.is_finished(), "the full queue keeps flush parked");
+
+        // The device draining one chunk lets the padded tail land intact.
+        assert_eq!(queued.recv().unwrap().1[0], 3);
+        flushing.join().unwrap().unwrap();
+        let tail = queued.recv().unwrap().1;
+        assert!(tail[..7].iter().all(|&sample| sample == 5));
+        assert!(tail[7..].iter().all(|&sample| sample == 0));
+    }
+
+    #[test]
+    fn sync_generation_drains_stale_chunks_and_marks_the_current_epoch() {
+        let (queue, queued) = mpsc::sync_channel(8);
+        let (playback, shared) = playback(queue);
+        let (producer, mut consumer) = HeapRb::<f32>::new(16).split();
+        let resampler = resample::from_voice(48_000).unwrap();
+        let mut worker = PlaybackWorker {
+            shared: Arc::clone(&shared),
+            queue: queued,
+            producer,
+            output: vec![0.0; resampler.output_frames_max()],
+            resampler,
+            input: vec![0.0; VOICE_CHUNK_FRAMES],
+            marker: None,
+        };
+
+        // Generation 0 arms on the first pass and pushes its marker.
+        assert!(worker.sync_generation());
+        assert_eq!(worker.marker, Some(0));
+        assert_eq!(consumer.try_pop().map(convert::marker_epoch), Some(Some(0)));
+
+        // A clear invalidates queued generation-0 audio; the drain drops it
+        // and the pushed marker carries the current epoch.
+        playback.play(&vec![1i16; VOICE_CHUNK_FRAMES]).unwrap();
+        shared.epoch.fetch_add(1, Ordering::AcqRel);
+        assert!(worker.sync_generation());
+        assert_eq!(worker.marker, Some(1));
+        assert!(worker.queue.try_recv().is_err(), "stale chunks drained");
+        assert_eq!(consumer.try_pop().map(convert::marker_epoch), Some(Some(1)));
+
+        // A no-op pass keeps the marker and leaves the resampler alone.
+        assert!(worker.sync_generation());
+        assert_eq!(worker.marker, Some(1));
+
+        // Post-clear chunks stay queued for the new generation.
+        playback.play(&vec![2i16; VOICE_CHUNK_FRAMES]).unwrap();
+        let (stamp, chunk) = worker.queue.recv().unwrap();
+        assert_eq!(stamp, 1);
+        assert_eq!(chunk[0], 2);
     }
 }

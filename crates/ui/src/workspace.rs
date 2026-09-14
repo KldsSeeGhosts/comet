@@ -96,8 +96,8 @@ pub enum TabItem {
     Terminal(Entity<TerminalPanel>),
 }
 
-struct PaneRuntime {
-    chat: Entity<ChatView>,
+pub(crate) struct PaneRuntime {
+    pub(crate) chat: Entity<ChatView>,
     item: TabItem,
     terminal: Option<Entity<TerminalPanel>>,
     _chat_events: Subscription,
@@ -279,10 +279,12 @@ impl Render for ControlTooltip {
 
 pub struct Workspace {
     pub layout: WorkspaceLayout,
-    source: Entity<AppState>,
+    // Crate-visible so `crate::voice`'s controller can spawn the tool sink.
+    pub(crate) source: Entity<AppState>,
     source_selected: Option<String>,
     path: PathBuf,
-    panes: BTreeMap<PaneId, PaneRuntime>,
+    // Crate-visible so `crate::voice` can publish one status to every pane.
+    pub(crate) panes: BTreeMap<PaneId, PaneRuntime>,
     pending_close: BTreeSet<PaneId>,
     error: Option<String>,
     drop_preview: Option<(PaneId, Option<Direction>)>,
@@ -307,6 +309,8 @@ pub struct Workspace {
     /// bb's pane maximize: when set, only this pane paints full-bleed in its
     /// tab (siblings stay in the tree for restore). Session-local, not persisted.
     maximized_pane: Option<PaneId>,
+    /// One workspace-wide live voice session, started lazily by the mic button.
+    pub(crate) voice: Option<crate::voice::VoiceController>,
     view_motion: TreeMotion<ViewId>,
     tab_motion: BTreeMap<(ViewId, TabId), TreeMotion<PaneId>>,
     snap_motion: bool,
@@ -351,6 +355,7 @@ impl Workspace {
             pending_close_confirm: None,
             context_menu: Default::default(),
             maximized_pane: None,
+            voice: None,
         }
     }
 
@@ -708,6 +713,7 @@ impl Workspace {
         let chat = cx.new(|cx| ChatView::new(&source, state.session_id, cx));
         let events = cx.subscribe(&chat, move |this, _, event, cx| match event {
             ChatViewEvent::Focused => this.focus(id, cx),
+            ChatViewEvent::VoiceToggled => this.voice_toggle(cx),
             ChatViewEvent::HumanSubmitted(chat, proof) => this.control_mark_human_input(chat, *proof, cx),
             ChatViewEvent::Selected(selected) => match selected {
                 // A real switch to another chat lands in the layout.
@@ -733,6 +739,11 @@ impl Workspace {
                 }
             }
         });
+        // A pane mounted mid-session shows the current live voice state.
+        let status = self.voice_status();
+        if status.phase != crate::voice::VoicePhase::Idle {
+            chat.update(cx, |chat, cx| chat.set_voice_status(status, cx));
+        }
         self.panes.insert(id, PaneRuntime {
             item: TabItem::Chat(chat.clone()), chat, terminal: None,
             _chat_events: events, terminal_events: None, terminal_state: None, terminal_human_events: None,

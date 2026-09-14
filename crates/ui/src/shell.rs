@@ -1413,7 +1413,9 @@ impl Shell {
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
             move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
-                ComposerEvent::HumanSubmitted { .. } => {}
+                // The workspace owns the voice session; its pane composers
+                // are the only live mic buttons when the workspace is mounted.
+                ComposerEvent::HumanSubmitted { .. } | ComposerEvent::VoiceToggled => {}
                 ComposerEvent::Sent {
                     chat_id,
                     message_id,

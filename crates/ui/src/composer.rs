@@ -3799,6 +3799,8 @@ pub enum ComposerEvent {
     /// yet: the transcript remembers the stable id and promotes it to an
     /// own-turn anchor only when the host materializes the matching bubble.
     Queued { chat_id: String, message_id: String },
+    /// The mic/waveform button beside send. The workspace owns the live session.
+    VoiceToggled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4067,6 +4069,8 @@ pub struct Composer {
     /// Set on every session/route change: flips committed before this instant
     /// SNAP instead of morphing (see [`ROUTE_SNAP_MS`]).
     route_snap_until: Option<Instant>,
+    /// Shared workspace live-voice status shown by the mic button.
+    voice: crate::voice::VoiceStatus,
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
@@ -4220,6 +4224,7 @@ impl Composer {
             height_morph: None,
             morph_clock: Instant::now(),
             route_snap_until: None,
+            voice: crate::voice::VoiceStatus::default(),
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
@@ -4270,6 +4275,14 @@ impl Composer {
 
     pub fn is_sending(&self) -> bool {
         self.sending
+    }
+
+    /// Mirrors the workspace's live-voice status onto this composer.
+    pub fn set_voice_status(&mut self, status: crate::voice::VoiceStatus, cx: &mut Context<Self>) {
+        if self.voice != status {
+            self.voice = status;
+            cx.notify();
+        }
     }
 
     /// The transcript's rewind affordance lands the removed turn's text here
@@ -6910,6 +6923,115 @@ impl Composer {
             }
         }
     }
+
+    /// The mic/waveform button beside send: one live voice session per
+    /// workspace, so every pane's composer renders the same status and emits
+    /// the same event. Click in idle or after an error starts the session and
+    /// opens the microphone for good - server VAD ends each utterance and
+    /// submits it, so the user never clicks to send; click while the session
+    /// runs stops it.
+    fn render_voice_button(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let phase = self.voice.phase;
+        let label: SharedString = match phase {
+            crate::voice::VoicePhase::Idle => "Start live voice".into(),
+            crate::voice::VoicePhase::Connecting
+            | crate::voice::VoicePhase::Listening
+            | crate::voice::VoicePhase::Thinking
+            | crate::voice::VoicePhase::Speaking => "Stop live voice".into(),
+            crate::voice::VoicePhase::Error => self
+                .voice
+                .error
+                .clone()
+                .unwrap_or_else(|| "Voice failed".into()),
+        };
+        // While the gate is open the live meter level replaces the glyph with
+        // three rising bars; the pulse lease keeps this frame repainting at
+        // the shared 30Hz loader tick, and it parks when the gate closes.
+        let level = if phase == crate::voice::VoicePhase::Listening {
+            motion::pulse_lease(cx.entity_id(), cx);
+            self.voice.level()
+        } else {
+            0.0
+        };
+        let (icon_path, icon_color): (&'static str, gpui::Hsla) = match phase {
+            crate::voice::VoicePhase::Idle => (crate::icons::MICROPHONE, theme.text_muted),
+            crate::voice::VoicePhase::Connecting => (crate::icons::MICROPHONE, theme.text_faint),
+            crate::voice::VoicePhase::Listening => (crate::icons::WAVEFORM, theme.accent),
+            crate::voice::VoicePhase::Thinking | crate::voice::VoicePhase::Speaking => {
+                (crate::icons::VOLUME_LOUD, theme.accent)
+            }
+            crate::voice::VoicePhase::Error => (crate::icons::DANGER_TRIANGLE, theme.danger),
+        };
+        let mut button = div()
+            .id("composer-voice")
+            .size(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                "composer-voice",
+                if phase == crate::voice::VoicePhase::Idle {
+                    gpui::transparent_black()
+                } else {
+                    theme.surface_raised
+                },
+                crate::theme::ink(0.10),
+            ))
+            .on_hover(motion::hover_listener("composer-voice"))
+            .role(gpui::Role::Button)
+            .aria_label(label.clone())
+            .tooltip(move |_, cx| cx.new(|_| VoiceTooltip(label.clone())).into())
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::VoiceToggled)));
+        button = if phase == crate::voice::VoicePhase::Connecting {
+            button.child(crate::loaders::mini_mono_spinner(
+                "composer-voice",
+                2.5,
+                theme.text_muted,
+                cx.entity_id(),
+                cx,
+            ))
+        } else if level > 0.05 {
+            // Bars rise from a 3px floor with the meter peak.
+            button.child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap(px(2.0))
+                    .children([0.35, 1.0, 0.55].map(|weight| {
+                        let height = 3.0 + (level * weight) * 12.0;
+                        div()
+                            .w(px(2.0))
+                            .h(px(height))
+                            .rounded(px(1.0))
+                            .bg(theme.accent)
+                    })),
+            )
+        } else {
+            button.child(
+                crate::icons::icon(icon_path)
+                    .size(px(15.0))
+                    .text_color(icon_color),
+            )
+        };
+        button.into_any_element()
+    }
+}
+
+struct VoiceTooltip(SharedString);
+impl Render for VoiceTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(4.0))
+            .text_size(px(12.0))
+            .bg(Theme::of(cx).surface_overlay)
+            .text_color(Theme::of(cx).text)
+            .child(self.0.clone())
+    }
 }
 
 /// Focus lands on the prompt input (window-level focus fallbacks — e.g. after
@@ -7327,6 +7449,7 @@ impl Render for Composer {
         });
 
         let send_button = self.render_send_button(mode, cx);
+        let voice_button = self.render_voice_button(&theme, cx);
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. The parent action cluster owns the spacing: adding a
@@ -7440,7 +7563,8 @@ impl Render for Composer {
                                 .justify_end()
                                 .gap(px(ACTION_UTILITY_GAP))
                                 .child(self.pickers.clone())
-                                .child(attach),
+                                .child(attach)
+                                .child(voice_button),
                         )
                         .child(send_button),
                 )
@@ -7501,7 +7625,8 @@ impl Render for Composer {
                                         .items_center()
                                         .gap(px(ACTION_UTILITY_GAP))
                                         .child(self.pickers.clone())
-                                        .child(attach),
+                                        .child(attach)
+                                        .child(voice_button),
                                 )
                                 .child(send_button),
                         ),

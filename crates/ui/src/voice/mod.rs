@@ -16,6 +16,11 @@
 #[cfg(test)]
 mod tests;
 
+mod controller;
+
+pub(crate) use controller::VoiceController;
+pub use controller::{VoicePhase, VoiceStatus};
+
 use std::sync::Arc;
 
 use gpui::{App, AsyncApp, WeakEntity};

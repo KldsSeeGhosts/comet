@@ -35,8 +35,11 @@ use tokio::sync::mpsc;
 /// scheduling jitter; anything beyond that is dropped, never queued.
 const RING_MS: usize = 80;
 
-/// Capture channel capacity in 20 ms chunks (160 ms of audio).
-const CHANNEL_CHUNKS: usize = 8;
+/// Capture channel capacity in 20 ms chunks: 5 s of audio. A brief stall in
+/// the consumer - a CPA reconnect, a busy scheduler - must not discard
+/// microphone chunks mid-utterance; anything past the cap is dropped and
+/// counted, never reordered.
+const CHANNEL_CHUNKS: usize = 250;
 
 /// Worker sleep while the ring holds fewer frames than the next chunk needs.
 const POLL: Duration = Duration::from_millis(2);

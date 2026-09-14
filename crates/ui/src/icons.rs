@@ -162,6 +162,11 @@ icon_assets![
     // plus/return ports) — the embedded set has neither.
     (BELL, "bell"),
     (VOLUME_LOUD, "volume-loud"),
+    // Hand-drawn mic capsule + waveform bars in the Solar Linear style (like
+    // the terminal/plus/return ports) — the embedded set ships neither. The
+    // composer's voice button swaps between them by session state.
+    (MICROPHONE, "microphone"),
+    (WAVEFORM, "waveform"),
     // Hand-drawn zeron glyphs (terminal-panel.tsx / composer-actions.tsx /
     // menu-check.tsx / logo.tsx).
     (TERMINAL, "terminal"),
