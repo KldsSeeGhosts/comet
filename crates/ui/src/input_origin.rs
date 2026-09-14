@@ -4,9 +4,13 @@ pub struct HumanInput(());
 
 pub fn is_human_input() -> bool {
     #[cfg(target_os = "linux")]
-    { gpui_linux::is_physical_input_dispatch() }
+    {
+        gpui_linux::is_physical_input_dispatch()
+    }
     #[cfg(not(target_os = "linux"))]
-    { false }
+    {
+        false
+    }
 }
 
 pub fn capture() -> Option<HumanInput> {

@@ -213,7 +213,12 @@ TEMP_FILES+=("$unit_tmp")
 cat <<EOF > "$unit_tmp"
 [Unit]
 Description=Noches native headless engine${variant:+ ($variant)}
-After=network-online.target
+After=network-online.target graphical-session.target
+# uwsm finalizes WAYLAND_DISPLAY/HYPRLAND_INSTANCE_SIGNATURE into the systemd
+# user manager environment only once the graphical session is up. The driver
+# needs them to reach the compositor, so the service must start after that
+# point, not at default.target which can precede the compositor.
+Wants=graphical-session.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
@@ -224,6 +229,13 @@ RestartSec=5
 Environment=ZERON_DATA_DIR=$data_dir
 Environment=ZERON_IPC_PORT=$ipc_port
 EnvironmentFile=-$data_dir/env
+# The engine spawns the CUA driver, which resolves the compositor through
+# WAYLAND_DISPLAY/DISPLAY and locates Hyprland IPC via XDG_RUNTIME_DIR plus
+# HYPRLAND_INSTANCE_SIGNATURE. Those live in the systemd user manager
+# environment (imported by uwsm), not the service's default env, so pass them
+# through. Absent values are ignored; a stale signature is re-attested against
+# the live compositor by the driver rather than trusted.
+PassEnvironment=WAYLAND_DISPLAY DISPLAY HYPRLAND_INSTANCE_SIGNATURE XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
 
 [Install]
 WantedBy=default.target

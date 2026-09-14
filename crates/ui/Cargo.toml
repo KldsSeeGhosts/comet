@@ -39,9 +39,14 @@ zeron-rpc.workspace = true
 zeron-update.workspace = true
 zeron-syntax.workspace = true
 zeron-theme.workspace = true
+zeron-voice.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
+# Model-price fetches (the picker's cost bars): the models.dev catalog plus
+# the optional CPA management source. (macOS already pulled it for the
+# browser; this makes it a common dependency.)
+reqwest.workspace = true
 gpui-base.workspace = true
 tokio.workspace = true
 futures.workspace = true

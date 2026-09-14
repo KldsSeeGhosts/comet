@@ -82,7 +82,10 @@ pub fn plan_progress_from_items(items: &[TodoItem]) -> Option<PlanProgress> {
     Some(PlanProgress {
         total: items.len(),
         done: items.iter().filter(|item| item.done).count(),
-        current: items.iter().find(|item| !item.done).map(|item| item.text.clone()),
+        current: items
+            .iter()
+            .find(|item| !item.done)
+            .map(|item| item.text.clone()),
     })
 }
 
@@ -247,11 +250,14 @@ mod tests {
 
     #[test]
     fn derivation_reports_total_done_and_first_open_step() {
-        let progress = plan_progress(&[entry(vec![todo("p0", &[
-            ("ship the parser", true),
-            ("wire the hud", false),
-            ("polish", false),
-        ])])])
+        let progress = plan_progress(&[entry(vec![todo(
+            "p0",
+            &[
+                ("ship the parser", true),
+                ("wire the hud", false),
+                ("polish", false),
+            ],
+        )])])
         .unwrap();
         assert_eq!(
             progress,
@@ -296,7 +302,10 @@ mod tests {
             todo("p0", &[("older", false)]),
             todo("p1", &[("newer", false)]),
         ])];
-        assert_eq!(plan_progress(&same_entry).unwrap().current.as_deref(), Some("newer"));
+        assert_eq!(
+            plan_progress(&same_entry).unwrap().current.as_deref(),
+            Some("newer")
+        );
     }
 
     #[test]

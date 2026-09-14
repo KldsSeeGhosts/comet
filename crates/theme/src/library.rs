@@ -72,7 +72,9 @@ impl CustomThemeSource {
 pub enum CustomThemeStatus {
     #[default]
     Ready,
-    Warning { message: String },
+    Warning {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

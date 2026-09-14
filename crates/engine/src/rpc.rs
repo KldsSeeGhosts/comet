@@ -2216,26 +2216,48 @@ impl RpcService for EngineRpc {
             }
             methods::OPEN_SESSION_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
-                let terminal = self.sessions.session_views().open(
-                    self.sessions.clone(), self.workspace.clone(), self.terminals.clone(),
-                    p.chat_id, p.cols, p.rows,
-                ).await.map_err(|e| RpcError::Failed(e.to_string()))?;
+                let terminal = self
+                    .sessions
+                    .session_views()
+                    .open(
+                        self.sessions.clone(),
+                        self.workspace.clone(),
+                        self.terminals.clone(),
+                        p.chat_id,
+                        p.cols,
+                        p.rows,
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&terminal)
             }
             methods::CLOSE_SESSION_TERMINAL => {
                 let p: ChatParams = parse_params(params)?;
-                let outcome = self.sessions.session_views().close(
-                    self.sessions.clone(), self.workspace.clone(), self.doc_host.clone(),
-                    self.terminals.clone(), p.chat_id,
-                ).await.map_err(|e| RpcError::Failed(e.to_string()))?;
+                let outcome = self
+                    .sessions
+                    .session_views()
+                    .close(
+                        self.sessions.clone(),
+                        self.workspace.clone(),
+                        self.doc_host.clone(),
+                        self.terminals.clone(),
+                        p.chat_id,
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&outcome)
             }
             methods::GET_SESSION_VIEW => {
                 let p: ChatParams = parse_params(params)?;
-                let chat = self.workspace.chat(&p.chat_id).map_err(|e| RpcError::Failed(e.to_string()))?
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
                     .ok_or_else(|| RpcError::Failed("Chat not found".into()))?;
                 if chat.device_id != self.workspace.device_id() {
-                    return Err(RpcError::Failed("GetSessionView must run on the chat's host device".into()));
+                    return Err(RpcError::Failed(
+                        "GetSessionView must run on the chat's host device".into(),
+                    ));
                 }
                 // The canonical provider identity comes from the Chat record;
                 // a live handoff overrides it inside SessionViews.

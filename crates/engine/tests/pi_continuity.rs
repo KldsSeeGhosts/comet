@@ -168,7 +168,8 @@ impl ModelServer {
         Ok(Self {
             url,
             requests,
-            second_started, release_second,
+            second_started,
+            release_second,
             task,
         })
     }
@@ -384,20 +385,45 @@ async fn rpc_turn(core: &EngineCore, root: &Path, cwd: &str, turn: usize) -> Res
     Ok(session)
 }
 
-async fn blank_pi_cli_round_trip(core: &EngineCore, root: &Path, cwd: &str, server: &ModelServer) -> Result<String> {
+async fn blank_pi_cli_round_trip(
+    core: &EngineCore,
+    root: &Path,
+    cwd: &str,
+    server: &ModelServer,
+) -> Result<String> {
     let chat_id = CHAT;
     let views = core.sessions.session_views();
     let mut expected_session = None;
     for cycle in 0..2 {
-        let terminal = views.open(core.sessions.clone(), core.workspace.clone(), core.terminals.clone(), chat_id.into(), 120, 40).await
+        let terminal = views
+            .open(
+                core.sessions.clone(),
+                core.workspace.clone(),
+                core.terminals.clone(),
+                chat_id.into(),
+                120,
+                40,
+            )
+            .await
             .context("open blank Pi CLI without a prompt")?;
         let result = async {
             ensure!(terminal.cwd == cwd, "blank CLI lost chosen cwd");
-            let chat = core.workspace.chat(chat_id)?.context("blank chat missing")?;
-            let session = chat.harness_session_id.context("blank chat has no persisted native identity")?;
-            ensure!(Path::new(&session).starts_with(root.join("engine")), "blank session escaped isolated engine profile");
+            let chat = core
+                .workspace
+                .chat(chat_id)?
+                .context("blank chat missing")?;
+            let session = chat
+                .harness_session_id
+                .context("blank chat has no persisted native identity")?;
+            ensure!(
+                Path::new(&session).starts_with(root.join("engine")),
+                "blank session escaped isolated engine profile"
+            );
             if let Some(expected) = &expected_session {
-                ensure!(&session == expected, "reopening blank CLI changed native session");
+                ensure!(
+                    &session == expected,
+                    "reopening blank CLI changed native session"
+                );
             } else {
                 expected_session = Some(session.clone());
             }
@@ -409,39 +435,89 @@ async fn blank_pi_cli_round_trip(core: &EngineCore, root: &Path, cwd: &str, serv
                         TerminalEvent::Data { data, .. } => {
                             pty.extend(STANDARD.decode(data)?);
                             std::fs::write(root.join(format!("blank-pty-{cycle}.bin")), &pty)?;
-                            if String::from_utf8_lossy(&pty).contains("continuity-model") { return Ok(()); }
+                            if String::from_utf8_lossy(&pty).contains("continuity-model") {
+                                return Ok(());
+                            }
                         }
-                        TerminalEvent::Exit { .. } => bail!("blank Pi PTY exited before showing configured model"),
+                        TerminalEvent::Exit { .. } => {
+                            bail!("blank Pi PTY exited before showing configured model")
+                        }
                     }
                 }
                 bail!("blank Pi output closed before ready")
-            }).await.context("waiting for real blank Pi TUI")??;
+            })
+            .await
+            .context("waiting for real blank Pi TUI")??;
             timeout(DEADLINE, async {
                 loop {
-                    if serde_json::to_value(views.get(chat_id))?["nativeActivity"] == "idle" { return Ok::<_, anyhow::Error>(()); }
+                    if serde_json::to_value(views.get(chat_id))?["nativeActivity"] == "idle" {
+                        return Ok::<_, anyhow::Error>(());
+                    }
                     sleep(Duration::from_millis(10)).await;
                 }
-            }).await.context("waiting for blank Pi authenticated idle")??;
-            let outcome = views.close(core.sessions.clone(), core.workspace.clone(), core.doc_host.clone(), core.terminals.clone(), chat_id.into()).await
+            })
+            .await
+            .context("waiting for blank Pi authenticated idle")??;
+            let outcome = views
+                .close(
+                    core.sessions.clone(),
+                    core.workspace.clone(),
+                    core.doc_host.clone(),
+                    core.terminals.clone(),
+                    chat_id.into(),
+                )
+                .await
                 .context("return blank Pi CLI to Chat")?;
-            ensure!(outcome.imported_messages == 0, "blank CLI manufactured chat messages");
-            ensure!(serde_json::to_value(&outcome.view)?["owner"] == "chat", "blank Chat ownership not restored");
+            ensure!(
+                outcome.imported_messages == 0,
+                "blank CLI manufactured chat messages"
+            );
+            ensure!(
+                serde_json::to_value(&outcome.view)?["owner"] == "chat",
+                "blank Chat ownership not restored"
+            );
             let doc = core.doc_host.open(chat_id)?;
-            ensure!(doc.doc().read_entries()?.is_empty() && doc.doc().read_commands()?.is_empty(), "blank round trip created a prompt or command");
-            let chat = core.workspace.chat(chat_id)?.context("blank Chat missing after close")?;
-            ensure!(chat.config == Some(config()) && chat.cwd.as_deref() == Some(cwd), "blank round trip lost config or cwd");
-            ensure!(chat.harness_session_id.as_deref() == Some(&session) && chat.harness_session_cwd.as_deref() == Some(cwd), "blank round trip lost native identity");
+            ensure!(
+                doc.doc().read_entries()?.is_empty() && doc.doc().read_commands()?.is_empty(),
+                "blank round trip created a prompt or command"
+            );
+            let chat = core
+                .workspace
+                .chat(chat_id)?
+                .context("blank Chat missing after close")?;
+            ensure!(
+                chat.config == Some(config()) && chat.cwd.as_deref() == Some(cwd),
+                "blank round trip lost config or cwd"
+            );
+            ensure!(
+                chat.harness_session_id.as_deref() == Some(&session)
+                    && chat.harness_session_cwd.as_deref() == Some(cwd),
+                "blank round trip lost native identity"
+            );
             let history = parse_history(HarnessId::Pi, &std::fs::read_to_string(&session)?)?;
-            ensure!(history.messages.is_empty() && history.cwd == cwd, "blank native history changed");
-            ensure!(history.model.as_deref() == Some(MODEL) && history.reasoning == Some(ReasoningLevel::Medium), "blank native config changed");
-            ensure!(server.requests.lock().unwrap().is_empty(), "blank CLI made a model request");
+            ensure!(
+                history.messages.is_empty() && history.cwd == cwd,
+                "blank native history changed"
+            );
+            ensure!(
+                history.model.as_deref() == Some(MODEL)
+                    && history.reasoning == Some(ReasoningLevel::Medium),
+                "blank native config changed"
+            );
+            ensure!(
+                server.requests.lock().unwrap().is_empty(),
+                "blank CLI made a model request"
+            );
             std::fs::copy(&session, root.join(format!("blank-native-{cycle}.jsonl")))?;
             Ok::<_, anyhow::Error>(())
-        }.await;
+        }
+        .await;
         let _ = core.terminals.terminate_and_wait(&terminal.id).await;
         result?;
     }
-    eprintln!("Blank Pi: real CLI opened twice and returned to empty Chat with the same native identity, cwd, model and effort; zero model requests");
+    eprintln!(
+        "Blank Pi: real CLI opened twice and returned to empty Chat with the same native identity, cwd, model and effort; zero model requests"
+    );
     expected_session.context("blank Pi never recorded a native session")
 }
 

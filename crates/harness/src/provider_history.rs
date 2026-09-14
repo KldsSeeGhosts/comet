@@ -420,7 +420,11 @@ mod tests {
                 "high"
             ]
         );
-        assert!(!args.iter().any(|a| a == "-c" || a == "--continue" || a.contains("bypass")));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "-c" || a == "--continue" || a.contains("bypass"))
+        );
         // Claude cannot preserve Pi's off/minimal thinking levels.
         let mut off = config.clone();
         off.reasoning = Some(ReasoningLevel::Off);

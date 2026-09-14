@@ -1037,9 +1037,7 @@ async fn handle_call(
         driver.call(action, args).await
     };
     match result {
-        Ok(result) => {
-            attach_seat_marker_evidence(normalize_driver_outcome(result), marker_pid)
-        }
+        Ok(result) => attach_seat_marker_evidence(normalize_driver_outcome(result), marker_pid),
         Err(err) => {
             turn.cancel();
             state.clean_runtime(&mut runtime, false).await;
@@ -1110,14 +1108,18 @@ impl Driver {
                 command.env_remove(key);
             }
         }
-        // CUA_DRIVER_RS_ENABLE_WAYLAND alone selects the production Hyprland
-        // isolated-input lanes (cua-input-v3.sock) bound by the
-        // cua-hyprland-plugin. Setting CUA_DRIVER_EXPERIMENTAL_HYPRLAND_INPUT
-        // would switch the driver to the experimental test protocol and look
-        // for cua-input-test.sock instead, so it must stay unset.
+        // Select CUA's production Hyprland backend and the native input-v3
+        // route that this host explicitly enables in its compositor config.
+        // The driver still requires an exact target and the engine still
+        // permits background-only input; this only avoids silently restoring
+        // the driver's narrow package matrix after the engine sanitizes CUA_*.
+        // Setting CUA_DRIVER_EXPERIMENTAL_HYPRLAND_INPUT would instead select
+        // the test protocol and look for cua-input-test.sock, so it must stay
+        // unset.
         command
             .env("CUA_DRIVER_PERMISSION_MODE", "standard")
-            .env("CUA_DRIVER_RS_ENABLE_WAYLAND", "1");
+            .env("CUA_DRIVER_RS_ENABLE_WAYLAND", "1")
+            .env("CUA_HYPRLAND_OPEN_INPUT", "1");
         command
     }
 
@@ -1499,13 +1501,9 @@ fn parse_agent_seat_marker(contents: &str) -> Option<Value> {
 fn agent_seat_marker(pid: u64) -> Option<Value> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe {
-            libc::geteuid()
-        })));
-    let contents = std::fs::read_to_string(
-        runtime.join("noches-gpui-input").join(pid.to_string()),
-    )
-    .ok()?;
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })));
+    let contents =
+        std::fs::read_to_string(runtime.join("noches-gpui-input").join(pid.to_string())).ok()?;
     parse_agent_seat_marker(&contents)
 }
 
@@ -1516,8 +1514,9 @@ fn agent_seat_marker(pid: u64) -> Option<Value> {
 fn attach_seat_marker_evidence(mut result: Value, pid: Option<u64>) -> Value {
     if classify_driver_outcome(&result) == DriverOutcome::Refused
         && let Some(marker) = pid.and_then(agent_seat_marker)
-        && let Some(structured) =
-            result.get_mut("structuredContent").and_then(Value::as_object_mut)
+        && let Some(structured) = result
+            .get_mut("structuredContent")
+            .and_then(Value::as_object_mut)
     {
         structured.insert("agentSeatMarker".into(), marker);
     }

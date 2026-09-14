@@ -60,6 +60,11 @@ pub struct ComposerDefaults {
     pub no_project: bool,
     /// Starred models (the picker's favorites rail), in starring order.
     pub favorites: Vec<FavoriteModel>,
+    /// Recently picked models, most recent first (the picker's "Recently
+    /// Used" section). Same keying as favorites; capped, oldest entries fall
+    /// off. Absent on pre-existing files (serde default).
+    #[serde(default)]
+    pub recent_models: Vec<FavoriteModel>,
 }
 
 impl ComposerDefaults {
@@ -165,6 +170,35 @@ impl ComposerDefaults {
         }
         changed
     }
+
+    /// Record a model pick in the recents list: moved to front when already
+    /// present, appended otherwise, oldest entries dropped past the cap.
+    /// Returns whether the list changed (callers only save when it did).
+    pub fn record_recent(&mut self, harness: HarnessId, model: &str) -> bool {
+        const RECENTS_CAP: usize = 8;
+        self.recent_models
+            .iter()
+            .position(|f| f.harness == harness && f.model == model)
+            .map(|at| {
+                if at == 0 {
+                    return false;
+                }
+                let entry = self.recent_models.remove(at);
+                self.recent_models.insert(0, entry);
+                true
+            })
+            .unwrap_or_else(|| {
+                self.recent_models.insert(
+                    0,
+                    FavoriteModel {
+                        harness,
+                        model: model.to_string(),
+                    },
+                );
+                self.recent_models.truncate(RECENTS_CAP);
+                true
+            })
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +240,36 @@ mod tests {
             ComposerDefaults::load(dir.path()),
             ComposerDefaults::default()
         );
+    }
+
+    #[test]
+    fn recents_dedupe_reorder_and_cap() {
+        let mut defaults = ComposerDefaults::default();
+        for model in ["a", "b", "c"] {
+            defaults.record_recent(HarnessId::Pi, model);
+        }
+        let order = |d: &ComposerDefaults| -> Vec<String> {
+            d.recent_models.iter().map(|f| f.model.clone()).collect()
+        };
+        assert_eq!(order(&defaults), ["c", "b", "a"]);
+        // Re-picking an older entry moves it to the front, no duplicate.
+        assert!(defaults.record_recent(HarnessId::Pi, "a"));
+        assert_eq!(order(&defaults), ["a", "c", "b"]);
+        // Re-picking the front entry is a no-op.
+        assert!(!defaults.record_recent(HarnessId::Pi, "a"));
+        // Different harness, same id — a distinct entry.
+        assert!(defaults.record_recent(HarnessId::Codex, "a"));
+        assert_eq!(
+            defaults.recent_models[0],
+            FavoriteModel {
+                harness: HarnessId::Codex,
+                model: "a".into(),
+            }
+        );
+        for i in 0..12 {
+            defaults.record_recent(HarnessId::Grok, &format!("m{i}"));
+        }
+        assert_eq!(defaults.recent_models.len(), 8);
     }
 
     #[test]

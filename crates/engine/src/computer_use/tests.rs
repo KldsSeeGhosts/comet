@@ -1,6 +1,39 @@
 use super::*;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[test]
+fn managed_driver_explicitly_enables_the_reviewed_hyprland_input_route() {
+    let command = Driver::base_command(Path::new("/usr/bin/cua-driver"));
+    let environment: BTreeMap<String, Option<String>> = command
+        .as_std()
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        environment.get("CUA_DRIVER_PERMISSION_MODE"),
+        Some(&Some("standard".into()))
+    );
+    assert_eq!(
+        environment.get("CUA_DRIVER_RS_ENABLE_WAYLAND"),
+        Some(&Some("1".into()))
+    );
+    assert_eq!(
+        environment.get("CUA_HYPRLAND_OPEN_INPUT"),
+        Some(&Some("1".into()))
+    );
+    assert!(
+        !environment.contains_key("CUA_DRIVER_EXPERIMENTAL_HYPRLAND_INPUT"),
+        "the managed driver must not select CUA's test-only input protocol"
+    );
+}
 
 #[test]
 fn real_daemon_args_carry_serve_standard_mode_and_existing_profile_grant() {
@@ -492,10 +525,9 @@ fn agent_seat_marker_parses_json_and_legacy_payloads() {
 
     // Backward compatibility: a bare legacy state token still parses, with
     // no invented reason or pid.
-    let legacy = parse_agent_seat_marker(
-        "noches-gpui-agent-seat-v1\n1\n2\n3\n4\nprimary_client_busy\n",
-    )
-    .unwrap();
+    let legacy =
+        parse_agent_seat_marker("noches-gpui-agent-seat-v1\n1\n2\n3\n4\nprimary_client_busy\n")
+            .unwrap();
     assert_eq!(legacy["state"], "primary_client_busy");
     assert!(legacy.get("reason").is_none());
     assert!(legacy.get("pid").is_none());
@@ -506,7 +538,10 @@ fn agent_seat_marker_parses_json_and_legacy_payloads() {
     assert_eq!(parse_agent_seat_marker(""), None);
     assert_eq!(parse_agent_seat_marker("\n \n"), None);
     assert_eq!(parse_agent_seat_marker("qualified_somewhere_else\n"), None);
-    assert_eq!(parse_agent_seat_marker("{\"state\":\"ready\" truncated\n"), None);
+    assert_eq!(
+        parse_agent_seat_marker("{\"state\":\"ready\" truncated\n"),
+        None
+    );
     // JSON without a usable state token is rejected.
     assert_eq!(parse_agent_seat_marker("{\"pid\":1}\n"), None);
 }

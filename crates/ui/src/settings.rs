@@ -20,9 +20,11 @@ pub mod archived;
 pub mod composer;
 pub mod devices;
 pub mod files;
+pub mod handsfree;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
+pub mod voice;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -161,6 +163,8 @@ pub enum SavePolicy {
     Debounced,
     Immediate,
 }
+
+pub use voice::{NoiseReductionMode, VoiceSettings, VoiceStartSnapshot};
 
 /// The sole in-process owner and writer of `ui-settings.json`.
 ///
@@ -420,6 +424,10 @@ pub struct UiSettings {
     pub diff_split: bool,
     /// Changes pane: wrap long source lines instead of scrolling horizontally.
     pub diff_wrap: bool,
+    /// Automatically expand diff and edit tool cards in transcripts.
+    pub auto_expand_edits: bool,
+    /// Confirm before closing a tab or pane with a live, running native CLI session.
+    pub confirm_before_closing_running_tab: bool,
     /// Agent-sent Markdown fences: wrap long lines to the chat width instead
     /// of exposing their horizontal scroll plane.
     pub code_fences_fit_content: bool,
@@ -437,6 +445,10 @@ pub struct UiSettings {
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
     pub surface: zeron_theme::SurfacePreference,
+    /// Live voice session preferences (model/voice picks, mic, VAD, DSP).
+    /// The block is fully serde-defaulted, so files from before voice
+    /// settings existed load with the compiled defaults.
+    pub voice: voice::VoiceSettings,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -478,6 +490,8 @@ impl Default for UiSettings {
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
             diff_wrap: false,
+            auto_expand_edits: false,
+            confirm_before_closing_running_tab: true,
             code_fences_fit_content: false,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
@@ -486,6 +500,7 @@ impl Default for UiSettings {
             files_show_all: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
+            voice: voice::VoiceSettings::default(),
             legacy_accent_color: None,
         }
     }
@@ -529,11 +544,13 @@ pub enum ShortcutId {
     NextSession,
     PrevSession,
     ArchiveSession,
+    ToggleVoice,
+    MuteVoice,
     JumpSession(usize),
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 9 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 11 + JUMP_SLOTS] = [
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
         ShortcutId::ToggleSidebar,
@@ -543,6 +560,8 @@ impl ShortcutId {
         ShortcutId::NextSession,
         ShortcutId::PrevSession,
         ShortcutId::ArchiveSession,
+        ShortcutId::ToggleVoice,
+        ShortcutId::MuteVoice,
         ShortcutId::JumpSession(0),
         ShortcutId::JumpSession(1),
         ShortcutId::JumpSession(2),
@@ -566,6 +585,8 @@ impl ShortcutId {
             ShortcutId::NextSession => "Next session",
             ShortcutId::PrevSession => "Previous session",
             ShortcutId::ArchiveSession => "Archive session",
+            ShortcutId::ToggleVoice => "Toggle Handsfree",
+            ShortcutId::MuteVoice => "Mute Handsfree microphone",
             ShortcutId::JumpSession(slot) => JUMP_LABELS.get(slot).copied().unwrap_or(""),
         }
     }
@@ -603,6 +624,8 @@ impl ShortcutId {
             // Mod+A is the composer's Select all, so archiving takes the
             // shifted combo.
             ShortcutId::ArchiveSession => "mod-shift-a",
+            ShortcutId::ToggleVoice => "mod-shift-h",
+            ShortcutId::MuteVoice => "mod-shift-u",
             ShortcutId::JumpSession(slot) => JUMP_DEFAULTS.get(slot).copied().unwrap_or(""),
         }
     }
@@ -630,6 +653,10 @@ pub struct KeymapConfig {
     pub next_session: String,
     pub prev_session: String,
     pub archive_session: String,
+    /// Global Handsfree session toggle (start/stop the live voice session).
+    pub toggle_voice: String,
+    /// Global Handsfree microphone mute toggle.
+    pub mute_voice: String,
     /// One combo per jump slot, in slot order. A list rather than nine fields:
     /// [`UiSettings::load`] discards the WHOLE file on a parse error, so a
     /// fixed-length array would let one malformed entry reset every unrelated
@@ -649,6 +676,8 @@ impl Default for KeymapConfig {
             next_session: ShortcutId::NextSession.default_combo().into(),
             prev_session: ShortcutId::PrevSession.default_combo().into(),
             archive_session: ShortcutId::ArchiveSession.default_combo().into(),
+            toggle_voice: ShortcutId::ToggleVoice.default_combo().into(),
+            mute_voice: ShortcutId::MuteVoice.default_combo().into(),
             jump_session: JUMP_DEFAULTS.iter().map(|c| (*c).to_string()).collect(),
         }
     }
@@ -666,6 +695,8 @@ impl KeymapConfig {
             ShortcutId::NextSession => &self.next_session,
             ShortcutId::PrevSession => &self.prev_session,
             ShortcutId::ArchiveSession => &self.archive_session,
+            ShortcutId::ToggleVoice => &self.toggle_voice,
+            ShortcutId::MuteVoice => &self.mute_voice,
             ShortcutId::JumpSession(slot) => self
                 .jump_session
                 .get(slot)
@@ -685,6 +716,8 @@ impl KeymapConfig {
             ShortcutId::NextSession => self.next_session = combo,
             ShortcutId::PrevSession => self.prev_session = combo,
             ShortcutId::ArchiveSession => self.archive_session = combo,
+            ShortcutId::ToggleVoice => self.toggle_voice = combo,
+            ShortcutId::MuteVoice => self.mute_voice = combo,
             ShortcutId::JumpSession(slot) => {
                 if slot < JUMP_SLOTS {
                     if self.jump_session.len() < JUMP_SLOTS {
@@ -931,6 +964,7 @@ impl UiSettings {
         self.git_history_column_widths = self.git_history_column_widths.clamped();
         self.git_history_column_order = self.git_history_column_order.normalized();
         self.ui_font_size = self.ui_font_size.normalized();
+        self.voice = self.voice.clamped();
         self.keymap.heal_jump_slots();
         self.keymap.heal_reserved_composer_shortcuts();
         self
@@ -1070,6 +1104,18 @@ mod tests {
     }
 
     #[test]
+    fn auto_expand_edits_and_confirm_close_camel_case_round_trip() {
+        let json = r#"{"autoExpandEdits":true,"confirmBeforeClosingRunningTab":false}"#;
+        let loaded: UiSettings = serde_json::from_str(json).unwrap();
+        assert!(loaded.auto_expand_edits);
+        assert!(!loaded.confirm_before_closing_running_tab);
+
+        let empty: UiSettings = serde_json::from_str("{}").unwrap();
+        assert!(!empty.auto_expand_edits);
+        assert!(empty.confirm_before_closing_running_tab);
+    }
+
+    #[test]
     fn obsolete_steering_preference_does_not_reset_other_settings() {
         let loaded: UiSettings = serde_json::from_str(
             r#"{"activeTurnSendBehavior":"steer","sidebarWidth":300,"soundEnabled":false}"#,
@@ -1142,6 +1188,8 @@ mod tests {
             },
             diff_split: true,
             diff_wrap: true,
+            auto_expand_edits: true,
+            confirm_before_closing_running_tab: false,
             code_fences_fit_content: true,
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
@@ -1150,6 +1198,7 @@ mod tests {
             files_show_all: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
+            voice: voice::VoiceSettings::default(),
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
@@ -1690,6 +1739,42 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
+    }
+
+    #[test]
+    fn handsfree_shortcuts_default_set_and_reset() {
+        let mut keymap = KeymapConfig::default();
+        assert_eq!(keymap.get(ShortcutId::ToggleVoice), "mod-shift-h");
+        assert_eq!(keymap.get(ShortcutId::MuteVoice), "mod-shift-u");
+        assert_eq!(ShortcutId::ToggleVoice.label(), "Toggle Handsfree");
+        assert_eq!(ShortcutId::MuteVoice.label(), "Mute Handsfree microphone");
+        assert_eq!(ShortcutId::ToggleVoice.jump_slot(), None);
+        assert_eq!(ShortcutId::MuteVoice.jump_slot(), None);
+
+        keymap.set(ShortcutId::ToggleVoice, "mod-alt-v".into());
+        keymap.set(ShortcutId::MuteVoice, "mod-alt-m".into());
+        assert_eq!(keymap.get(ShortcutId::ToggleVoice), "mod-alt-v");
+        assert_eq!(keymap.get(ShortcutId::MuteVoice), "mod-alt-m");
+        keymap.reset(ShortcutId::ToggleVoice);
+        keymap.reset(ShortcutId::MuteVoice);
+        assert_eq!(keymap.get(ShortcutId::ToggleVoice), "mod-shift-h");
+        assert_eq!(keymap.get(ShortcutId::MuteVoice), "mod-shift-u");
+    }
+
+    #[test]
+    fn handsfree_shortcuts_default_for_old_settings_files() {
+        // Files written before the Handsfree bindings existed keep every
+        // customization and default only the new rows.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"keymap": {"toggleSidebar": "mod-shift-x"}}"#,
+        )
+        .unwrap();
+        let keymap = UiSettings::load(dir.path()).keymap;
+        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
+        assert_eq!(keymap.get(ShortcutId::ToggleVoice), "mod-shift-h");
+        assert_eq!(keymap.get(ShortcutId::MuteVoice), "mod-shift-u");
     }
 
     #[test]

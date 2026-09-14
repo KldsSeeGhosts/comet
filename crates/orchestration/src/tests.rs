@@ -568,7 +568,10 @@ fn recovery_skips_undecodable_rows_and_recovers_the_rest() {
         inner
             .db
             // Valid JSON that decodes to no team, surviving the json_valid guard.
-            .execute("UPDATE teams SET data='null' WHERE id=?1", params![corrupt.id])
+            .execute(
+                "UPDATE teams SET data='null' WHERE id=?1",
+                params![corrupt.id],
+            )
             .unwrap();
         inner
             .db
@@ -586,11 +589,14 @@ fn recovery_skips_undecodable_rows_and_recovers_the_rest() {
             .unwrap();
     }
     let recovered = store.recover_interrupted().unwrap();
-    assert_eq!(recovered, vec![{
-        let mut team = good.clone();
-        team.status = TeamStatus::Interrupted;
-        team
-    }]);
+    assert_eq!(
+        recovered,
+        vec![{
+            let mut team = good.clone();
+            team.status = TeamStatus::Interrupted;
+            team
+        }]
+    );
     {
         let inner = store.lock().unwrap();
         assert_eq!(
@@ -605,7 +611,10 @@ fn recovery_skips_undecodable_rows_and_recovers_the_rest() {
             "null",
             "the skipped row keeps its stored bytes"
         );
-        for (id, status) in [(&mismatched.id, "running"), (&String::from("renamed"), "running")] {
+        for (id, status) in [
+            (&mismatched.id, "running"),
+            (&String::from("renamed"), "running"),
+        ] {
             assert_eq!(
                 inner
                     .db

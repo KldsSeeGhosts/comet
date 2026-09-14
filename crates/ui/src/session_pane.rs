@@ -1,6 +1,6 @@
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton,
-    Render, Subscription, Window, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, Render,
+    Subscription, Window, div, prelude::*, px,
 };
 
 use crate::composer::{Composer, ComposerEvent};
@@ -26,6 +26,11 @@ pub enum ChatViewEvent {
     Focused,
     Selected(Option<String>),
     HumanSubmitted(String, crate::input_origin::HumanInput),
+    /// The pane composer's mic button; the workspace owns the one session.
+    VoiceToggled,
+    /// A mic-mute request from a pane composer; the workspace flips the
+    /// capture gate without touching the live session.
+    VoiceMuted,
 }
 
 impl EventEmitter<ChatViewEvent> for ChatView {}
@@ -46,20 +51,28 @@ impl ChatView {
         });
         let events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
-            move |_: &mut Self, _, event, cx| {
-                if let ComposerEvent::HumanSubmitted { chat_id, proof } = event {
+            move |_: &mut Self, _, event, cx| match event {
+                ComposerEvent::HumanSubmitted { chat_id, proof } => {
                     cx.emit(ChatViewEvent::HumanSubmitted(chat_id.clone(), *proof));
-                    return;
                 }
-                transcript.update(cx, |transcript, cx| match event {
-                    ComposerEvent::HumanSubmitted { .. } => {}
-                    ComposerEvent::Sent { chat_id, message_id } => {
+                ComposerEvent::VoiceToggled => cx.emit(ChatViewEvent::VoiceToggled),
+                ComposerEvent::VoiceMuted => cx.emit(ChatViewEvent::VoiceMuted),
+                ComposerEvent::Sent {
+                    chat_id,
+                    message_id,
+                } => {
+                    transcript.update(cx, |transcript, cx| {
                         transcript.on_own_send(chat_id.clone(), message_id.clone(), cx);
-                    }
-                    ComposerEvent::Queued { chat_id, message_id } => {
+                    });
+                }
+                ComposerEvent::Queued {
+                    chat_id,
+                    message_id,
+                } => {
+                    transcript.update(cx, |transcript, cx| {
                         transcript.on_own_queued_send(chat_id.clone(), message_id.clone(), cx);
-                    }
-                });
+                    });
+                }
             }
         });
         Self {
@@ -78,14 +91,26 @@ impl ChatView {
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.active != active {
             self.active = active;
-            self.composer.read(cx).input.clone().update(cx, |input, cx| input.set_pane_active(active, cx));
+            self.composer
+                .read(cx)
+                .input
+                .clone()
+                .update(cx, |input, cx| input.set_pane_active(active, cx));
             cx.notify();
         }
     }
 
+    /// The workspace's shared voice status, mirrored into this pane's
+    /// composer so every visible mic button shows the same state.
+    pub fn set_voice_status(&mut self, status: crate::voice::VoiceStatus, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.set_voice_status(status, cx));
+    }
+
     pub fn select(&mut self, chat: Option<String>, cx: &mut Context<Self>) {
         if self.state.read(cx).selected_chat != chat {
-            self.state.update(cx, |state, cx| state.select_chat(chat, cx));
+            self.state
+                .update(cx, |state, cx| state.select_chat(chat, cx));
         }
     }
 }
@@ -123,19 +148,27 @@ impl Render for ChatView {
             .flex()
             .flex_col()
             .when(!self.active, |element| element.opacity(0.88))
-            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
-                cx.emit(ChatViewEvent::Focused);
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.emit(ChatViewEvent::Focused);
+                }),
+            )
             .child(
-                gpui::canvas(move |bounds, _, cx| {
-                    let width = f32::from(bounds.size.width);
-                    let _ = pane.update(cx, |pane, cx| {
-                        if (pane.width - width).abs() > 0.5 {
-                            pane.width = width;
-                            cx.notify();
-                        }
-                    });
-                }, |_, _, _, _| {}).absolute().inset_0(),
+                gpui::canvas(
+                    move |bounds, _, cx| {
+                        let width = f32::from(bounds.size.width);
+                        let _ = pane.update(cx, |pane, cx| {
+                            if (pane.width - width).abs() > 0.5 {
+                                pane.width = width;
+                                cx.notify();
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
             )
             .child(div().absolute().inset_0().child(self.transcript.clone()))
             .child(div().flex_1().min_h_0())
@@ -145,17 +178,27 @@ impl Render for ChatView {
                 element.child(plan_hud::render(&plan, &theme))
             })
             .child(
-                div().relative().flex_none().pb(px(4.0))
+                div()
+                    .relative()
+                    .flex_none()
+                    .pb(px(4.0))
                     .bg(theme.bg)
-                    .child(gpui::canvas(move |bounds, _, cx| {
-                        let height = f32::from(bounds.size.height);
-                        let _ = footer.update(cx, |pane, cx| {
-                            if (pane.composer_height - height).abs() > 0.5 {
-                                pane.composer_height = height;
-                                cx.notify();
-                            }
-                        });
-                    }, |_, _, _, _| {}).absolute().inset_0())
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, cx| {
+                                let height = f32::from(bounds.size.height);
+                                let _ = footer.update(cx, |pane, cx| {
+                                    if (pane.composer_height - height).abs() > 0.5 {
+                                        pane.composer_height = height;
+                                        cx.notify();
+                                    }
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
                     .child(self.composer.clone()),
             )
     }
@@ -166,7 +209,7 @@ mod chat_view_tests {
     use super::*;
     use gpui::{TestAppContext, point, px, size};
     use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
-    use zeron_proto::{ToolCall, TodoItem};
+    use zeron_proto::{TodoItem, ToolCall};
 
     use crate::transcript::plan_hud::PlanProgress;
 

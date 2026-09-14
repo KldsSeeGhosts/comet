@@ -511,7 +511,8 @@ fn route(command: Command) -> Result<Call> {
                                 );
                             }
                             ensure!(
-                                p.get("ui").is_some_and(|ui| ui == "chat" || ui == "terminal"),
+                                p.get("ui")
+                                    .is_some_and(|ui| ui == "chat" || ui == "terminal"),
                                 "layout apply requires --ui chat or --ui terminal; auto is not supported"
                             );
                             ("apply", p)
@@ -980,14 +981,13 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["noches", "layout", "apply", "recipe"]).unwrap();
         assert!(route(cli.command).is_err());
-        let cli = Cli::try_parse_from(["noches", "layout", "apply", "recipe", "--ui", "chat"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["noches", "layout", "apply", "recipe", "--ui", "chat"]).unwrap();
         assert_eq!(
             route(cli.command).unwrap().params,
             json!({"name":"recipe", "ui":"chat"})
         );
-        let cli =
-            Cli::try_parse_from(["noches", "layout", "save", "recipe", "--force"]).unwrap();
+        let cli = Cli::try_parse_from(["noches", "layout", "save", "recipe", "--force"]).unwrap();
         assert_eq!(
             route(cli.command).unwrap().params,
             json!({"name":"recipe", "overwrite":true})

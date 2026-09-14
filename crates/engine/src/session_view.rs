@@ -259,7 +259,11 @@ impl SessionViews {
         SessionView {
             chat_id: chat_id.into(),
             owner: h.map_or(SessionOwner::Chat, |h| h.owner),
-            native_activity: self.inner.hooks.get().and_then(|hooks| hooks.activity(chat_id)),
+            native_activity: self
+                .inner
+                .hooks
+                .get()
+                .and_then(|hooks| hooks.activity(chat_id)),
             provider,
             native_session_id,
             worktree_path,
@@ -365,31 +369,51 @@ impl SessionViews {
                 || chat.last_message_preview.is_some()
                 || !sessions.chat_is_empty(chat_id)?
             {
-                return Err(failed("Only an empty Pi chat can start a new native CLI session"));
+                return Err(failed(
+                    "Only an empty Pi chat can start a new native CLI session",
+                ));
             }
-            let cwd = chat.cwd.as_deref()
+            let cwd = chat
+                .cwd
+                .as_deref()
                 .map(crate::sessions::expand_home)
                 .ok_or_else(|| failed("Choose a working directory before opening CLI"))?;
             (None, cwd)
         } else {
-            let native = chat.harness_session_id.as_deref()
+            let native = chat
+                .harness_session_id
+                .as_deref()
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| failed("Chat has no native session to resume"))?;
-            let cwd = chat.harness_session_cwd.as_deref()
+            let cwd = chat
+                .harness_session_cwd
+                .as_deref()
                 .ok_or_else(|| failed("Native session cwd is missing"))?;
-            if chat.cwd.as_deref().map(crate::sessions::expand_home).is_some_and(|c| c != cwd) {
-                return Err(failed("Chat cwd changed since its native session was created"));
+            if chat
+                .cwd
+                .as_deref()
+                .map(crate::sessions::expand_home)
+                .is_some_and(|c| c != cwd)
+            {
+                return Err(failed(
+                    "Chat cwd changed since its native session was created",
+                ));
             }
             (Some(native.to_owned()), cwd.to_owned())
         };
         let config_for_probe = config.clone();
-        let new_session_dir = self.inner.path.as_ref().and_then(|path| path.parent())
+        let new_session_dir = self
+            .inner
+            .path
+            .as_ref()
+            .and_then(|path| path.parent())
             .map(|parent| parent.join("native-sessions"));
         let command = tokio::task::spawn_blocking(move || -> Result<ResumeCommand, EngineError> {
             if let Some(native) = native {
                 return Ok(prepare_resume(&config_for_probe, &native, &cwd)?);
             }
-            let dir = new_session_dir.ok_or_else(|| failed("Native session storage is unavailable"))?;
+            let dir =
+                new_session_dir.ok_or_else(|| failed("Native session storage is unavailable"))?;
             let path = create_empty_pi_session(&dir, &cwd)?;
             match prepare_resume(&config_for_probe, &path.to_string_lossy(), &cwd) {
                 Ok(command) => Ok(command),
@@ -398,7 +422,9 @@ impl SessionViews {
                     Err(error.into())
                 }
             }
-        }).await.map_err(|e| failed(e.to_string()))??;
+        })
+        .await
+        .map_err(|e| failed(e.to_string()))??;
         let baseline = read_history(command.clone()).await?;
         // No state change or interrupt occurs until the native file and argv validate.
         // Recheck after the blocking probe, before interrupting anything.
@@ -446,7 +472,12 @@ impl SessionViews {
                 let hooks = HookRuntime::start()?;
                 let _ = self.inner.hooks.set(hooks);
             }
-            match self.inner.hooks.get().unwrap().prepare(chat_id, &command, &h.baseline.identity, &python) {
+            match self.inner.hooks.get().unwrap().prepare(
+                chat_id,
+                &command,
+                &h.baseline.identity,
+                &python,
+            ) {
                 Ok(program) => program,
                 Err(error) => {
                     h.process = ProcessState::NotSpawned;
@@ -466,7 +497,9 @@ impl SessionViews {
         ) {
             Ok(terminal) => terminal,
             Err(error) => {
-                if let Some(hooks) = self.inner.hooks.get() { hooks.revoke(chat_id); }
+                if let Some(hooks) = self.inner.hooks.get() {
+                    hooks.revoke(chat_id);
+                }
                 h.process = ProcessState::NotSpawned;
                 self.put(chat_id, h)?;
                 self.recovery(chat_id, &error)?;
@@ -586,7 +619,9 @@ impl SessionViews {
         match result {
             Ok(imported_messages) => {
                 self.release(chat_id)?;
-                if let Some(hooks) = self.inner.hooks.get() { hooks.revoke(chat_id); }
+                if let Some(hooks) = self.inner.hooks.get() {
+                    hooks.revoke(chat_id);
+                }
                 if let Some(terminal) = &h.terminal
                     && terminals.contains(&terminal.id)
                 {
@@ -687,13 +722,19 @@ fn create_empty_pi_session(dir: &Path, cwd: &str) -> Result<PathBuf, EngineError
     let id = uuid::Uuid::new_v4().to_string();
     let path = dir.join(format!("{id}.jsonl"));
     let mut staged = tempfile::NamedTempFile::new_in(dir)?;
-    serde_json::to_writer(&mut staged, &serde_json::json!({
-        "type": "session", "version": 3, "id": id,
-        "timestamp": chrono::Utc::now().to_rfc3339(), "cwd": cwd,
-    })).map_err(|error| failed(error.to_string()))?;
+    serde_json::to_writer(
+        &mut staged,
+        &serde_json::json!({
+            "type": "session", "version": 3, "id": id,
+            "timestamp": chrono::Utc::now().to_rfc3339(), "cwd": cwd,
+        }),
+    )
+    .map_err(|error| failed(error.to_string()))?;
     staged.write_all(b"\n")?;
     staged.as_file().sync_all()?;
-    staged.persist_noclobber(&path).map_err(|error| failed(error.to_string()))?;
+    staged
+        .persist_noclobber(&path)
+        .map_err(|error| failed(error.to_string()))?;
     std::fs::File::open(dir)?.sync_all()?;
     Ok(path)
 }
@@ -738,7 +779,9 @@ fn hydrate_entries(
     after: &NativeHistory,
     device: &str,
 ) -> Result<Vec<SessionMessageEntry>, EngineError> {
-    hydrate_entries_with_images(before, after, device, &|_| Err(failed("Image resolver is unavailable")))
+    hydrate_entries_with_images(before, after, device, &|_| {
+        Err(failed("Image resolver is unavailable"))
+    })
 }
 
 fn hydrate_entries_with_images(
@@ -778,9 +821,15 @@ fn hydrate_entries_with_images(
                     let name = field(block, "name")?;
                     let arguments = block.get("arguments").or_else(|| block.get("input"));
                     let call = if block["type"] == "toolCall" {
-                        zeron_harness::provider_history::pi_tool_call(name, arguments.unwrap_or(&Value::Null))
+                        zeron_harness::provider_history::pi_tool_call(
+                            name,
+                            arguments.unwrap_or(&Value::Null),
+                        )
                     } else {
-                        ToolCall::Unknown { name: name.into(), input: arguments.cloned() }
+                        ToolCall::Unknown {
+                            name: name.into(),
+                            input: arguments.cloned(),
+                        }
                     };
                     tools.insert(tool_id, (entries.len(), parts.len(), call.clone()));
                     parts.push(MessagePart::Tool {
@@ -817,8 +866,11 @@ fn hydrate_entries_with_images(
                         ..
                     } = &mut target.parts[*part]
                     {
-                        *output =
-                            zeron_doc::summarize_tool_output(&content_text(&block["content"], image, &mut images)?);
+                        *output = zeron_doc::summarize_tool_output(&content_text(
+                            &block["content"],
+                            image,
+                            &mut images,
+                        )?);
                         *resolved = true;
                         *is_error = block["is_error"] == true;
                         if !*is_error {
@@ -834,7 +886,11 @@ fn hydrate_entries_with_images(
             }
         }
         if !images.is_empty() {
-            let refs = images.iter().map(|path| format!("- {path}")).collect::<Vec<_>>().join("\n");
+            let refs = images
+                .iter()
+                .map(|path| format!("- {path}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             parts.push(MessagePart::Text {
                 id: format!("{id}-images"),
                 text: format!("\n\nAttached images (local files):\n{refs}"),
@@ -928,7 +984,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         assert!(create_empty_pi_session(dir.path(), "relative-directory").is_err());
     }
@@ -938,25 +997,61 @@ mod tests {
         use zeron_proto::HarnessId;
         let dir = tempfile::tempdir().unwrap();
         let core = crate::EngineCore::assemble_with_identity(
-            &dir.path().join("engine"), Arc::new(crate::HarnessRegistry::new()),
-            HarnessId::Pi, None, "org", "user",
-        ).unwrap();
+            &dir.path().join("engine"),
+            Arc::new(crate::HarnessRegistry::new()),
+            HarnessId::Pi,
+            None,
+            "org",
+            "user",
+        )
+        .unwrap();
         let views = core.sessions.session_views();
-        for harness in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Cursor, HarnessId::Opencode] {
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Cursor,
+            HarnessId::Opencode,
+        ] {
             let id = format!("unsupported-{harness:?}");
             let mut config = fixture_handoff().config;
             config.harness = harness;
-            core.workspace.create_chat(&id, None, Some(&core.device_id),
-                Some(config), Some(dir.path().to_str().unwrap().into())).unwrap();
+            core.workspace
+                .create_chat(
+                    &id,
+                    None,
+                    Some(&core.device_id),
+                    Some(config),
+                    Some(dir.path().to_str().unwrap().into()),
+                )
+                .unwrap();
             // A native identity exists, but opening must refuse before trying
             // to find its executable or history in the real user's profile.
-            core.sessions.remember_native_session(&id, "ad66b593-8b4e-4308-82b6-8d4a597e202c", dir.path().to_str().unwrap());
+            core.sessions.remember_native_session(
+                &id,
+                "ad66b593-8b4e-4308-82b6-8d4a597e202c",
+                dir.path().to_str().unwrap(),
+            );
             let before = core.workspace.chat(&id).unwrap().unwrap();
-            let error = views.open(core.sessions.clone(), core.workspace.clone(), core.terminals.clone(), id.clone(), 80, 24)
-                .await.unwrap_err();
-            assert!(error.to_string().contains("CLI handoff is unavailable"), "{error}");
+            let error = views
+                .open(
+                    core.sessions.clone(),
+                    core.workspace.clone(),
+                    core.terminals.clone(),
+                    id.clone(),
+                    80,
+                    24,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("CLI handoff is unavailable"),
+                "{error}"
+            );
             if harness == HarnessId::ClaudeCode {
-                assert!(error.to_string().contains("automatic continuations"), "{error}");
+                assert!(
+                    error.to_string().contains("automatic continuations"),
+                    "{error}"
+                );
             }
             assert_eq!(core.workspace.chat(&id).unwrap().unwrap(), before);
             assert!(matches!(views.get(&id).owner, SessionOwner::Chat));
@@ -972,35 +1067,81 @@ mod tests {
         use zeron_doc::{SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
         let dir = tempfile::tempdir().unwrap();
         let core = crate::EngineCore::assemble_with_identity(
-            &dir.path().join("engine"), Arc::new(crate::HarnessRegistry::new()),
-            zeron_proto::HarnessId::Pi, None, "org", "user",
-        ).unwrap();
+            &dir.path().join("engine"),
+            Arc::new(crate::HarnessRegistry::new()),
+            zeron_proto::HarnessId::Pi,
+            None,
+            "org",
+            "user",
+        )
+        .unwrap();
         for id in ["messages", "commands"] {
-            core.workspace.create_chat(id, None, Some(&core.device_id),
-                Some(fixture_handoff().config), Some(dir.path().to_str().unwrap().into())).unwrap();
+            core.workspace
+                .create_chat(
+                    id,
+                    None,
+                    Some(&core.device_id),
+                    Some(fixture_handoff().config),
+                    Some(dir.path().to_str().unwrap().into()),
+                )
+                .unwrap();
             assert!(core.sessions.chat_is_empty(id).unwrap());
             let doc = core.doc_host.open(id).unwrap();
             if id == "messages" {
-                doc.doc().push_message(&SessionMessageEntry {
-                    id: "prior".into(), role: MessageRole::User,
-                    parts: vec![MessagePart::Text { id: "text".into(), text: "keep this history".into() }],
-                    created_at: 1, device_id: core.device_id.clone(),
-                    status: Some(MessageStatus::Complete), continuation_of: None,
-                }).unwrap();
+                doc.doc()
+                    .push_message(&SessionMessageEntry {
+                        id: "prior".into(),
+                        role: MessageRole::User,
+                        parts: vec![MessagePart::Text {
+                            id: "text".into(),
+                            text: "keep this history".into(),
+                        }],
+                        created_at: 1,
+                        device_id: core.device_id.clone(),
+                        status: Some(MessageStatus::Complete),
+                        continuation_of: None,
+                    })
+                    .unwrap();
             } else {
-                doc.doc().queue_command(&SessionCommandEntry {
-                    id: "prior-command".into(), payload: SessionCommandPayload::Interrupt {},
-                    issued_by: core.device_id.clone(), issued_at: 1,
-                    based_on: None, expires_at: None, status: SessionCommandStatus::Applied,
-                    resolution: None,
-                }).unwrap();
+                doc.doc()
+                    .queue_command(&SessionCommandEntry {
+                        id: "prior-command".into(),
+                        payload: SessionCommandPayload::Interrupt {},
+                        issued_by: core.device_id.clone(),
+                        issued_at: 1,
+                        based_on: None,
+                        expires_at: None,
+                        status: SessionCommandStatus::Applied,
+                        resolution: None,
+                    })
+                    .unwrap();
             }
             assert!(!core.sessions.chat_is_empty(id).unwrap());
-            let error = core.sessions.session_views().open(
-                core.sessions.clone(), core.workspace.clone(), core.terminals.clone(), id.into(), 80, 24,
-            ).await.unwrap_err();
-            assert!(error.to_string().contains("Only an empty Pi chat"), "{error}");
-            assert!(core.workspace.chat(id).unwrap().unwrap().harness_session_id.is_none());
+            let error = core
+                .sessions
+                .session_views()
+                .open(
+                    core.sessions.clone(),
+                    core.workspace.clone(),
+                    core.terminals.clone(),
+                    id.into(),
+                    80,
+                    24,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Only an empty Pi chat"),
+                "{error}"
+            );
+            assert!(
+                core.workspace
+                    .chat(id)
+                    .unwrap()
+                    .unwrap()
+                    .harness_session_id
+                    .is_none()
+            );
             assert!(!core.terminals.any_open());
         }
         core.doc_host.shutdown_workers().await;
@@ -1114,7 +1255,10 @@ mod tests {
         chat.harness_session_id = Some("stale-native".into());
         let view = views.view("chat", Some(&chat));
         assert_eq!(view.provider, Some(HarnessId::Pi));
-        assert_eq!(view.native_session_id.as_deref(), Some(h.command.session_id.as_str()));
+        assert_eq!(
+            view.native_session_id.as_deref(),
+            Some(h.command.session_id.as_str())
+        );
         assert_eq!(view.worktree_path.as_deref(), Some(h.command.cwd.as_str()));
         assert_eq!(view.model.as_deref(), Some("provider/model"));
         assert_eq!(view.reasoning, Some(ReasoningLevel::Medium));
@@ -1140,7 +1284,12 @@ mod tests {
         assert!(plain.worktree_path.is_none());
         assert!(plain.model.is_none());
         assert!(plain.reasoning.is_none());
-        assert!(serde_json::to_value(&plain).unwrap().get("provider").is_none());
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("provider")
+                .is_none()
+        );
         let unknown = views.view("unknown", None);
         assert!(unknown.provider.is_none() && unknown.native_session_id.is_none());
     }
@@ -1473,10 +1622,23 @@ mod tests {
         );
         // This shell fixture has no provider lifecycle. It must be refused
         // while live, then explicitly stopped before testing failed hydration.
-        assert!(views.close(core.sessions.clone(), core.workspace.clone(), core.doc_host.clone(),
-            core.terminals.clone(), "handoff-chat".into()).await.is_err());
+        assert!(
+            views
+                .close(
+                    core.sessions.clone(),
+                    core.workspace.clone(),
+                    core.doc_host.clone(),
+                    core.terminals.clone(),
+                    "handoff-chat".into()
+                )
+                .await
+                .is_err()
+        );
         assert!(matches!(views.get("handoff-chat").owner, SessionOwner::Cli));
-        core.terminals.terminate_and_wait(&terminal.id).await.unwrap();
+        core.terminals
+            .terminate_and_wait(&terminal.id)
+            .await
+            .unwrap();
         std::fs::write(&path, format!("{after}{{")).unwrap();
         let close = || {
             views.close(
@@ -1569,7 +1731,10 @@ mod tests {
     fn pi_hydration_preserves_thinking_typed_tools_and_diffs() {
         use serde_json::json;
         use zeron_harness::provider_history::parse_history;
-        let before = format!("{}\n", json!({"type":"session","version":3,"id":"pi-session","cwd":"/tmp"}));
+        let before = format!(
+            "{}\n",
+            json!({"type":"session","version":3,"id":"pi-session","cwd":"/tmp"})
+        );
         let mut after = before.clone();
         for record in [
             json!({"type":"message","id":"a","parentId":null,"message":{
@@ -1591,8 +1756,19 @@ mod tests {
         let after = parse_history(zeron_proto::HarnessId::Pi, &after).unwrap();
         let entries = hydrate_entries(&before, &after, "device").unwrap();
         assert_eq!(entries.len(), 2);
-        assert!(matches!(&entries[0].parts[0], MessagePart::Reasoning { text, .. } if text == "Check the file"));
-        let MessagePart::Tool { call, resolved, output, diff, .. } = &entries[0].parts[1] else { panic!("tool missing") };
+        assert!(
+            matches!(&entries[0].parts[0], MessagePart::Reasoning { text, .. } if text == "Check the file")
+        );
+        let MessagePart::Tool {
+            call,
+            resolved,
+            output,
+            diff,
+            ..
+        } = &entries[0].parts[1]
+        else {
+            panic!("tool missing")
+        };
         assert!(matches!(call, ToolCall::EditFile { path, .. } if path == "/tmp/example.txt"));
         assert!(*resolved);
         assert_eq!(output.as_deref(), Some("Updated example.txt"));
@@ -1606,24 +1782,61 @@ mod tests {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
-        let core = crate::EngineCore::assemble_with_identity(dir.path(),
-            Arc::new(crate::HarnessRegistry::new()), zeron_proto::HarnessId::Pi, None, "org", "user").unwrap();
-        let bytes = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist/zeron.png")).unwrap();
+        let core = crate::EngineCore::assemble_with_identity(
+            dir.path(),
+            Arc::new(crate::HarnessRegistry::new()),
+            zeron_proto::HarnessId::Pi,
+            None,
+            "org",
+            "user",
+        )
+        .unwrap();
+        let bytes =
+            std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist/zeron.png"))
+                .unwrap();
         let data = STANDARD.encode(&bytes);
-        let before = NativeHistory { identity: "pi-images".into(), cwd: dir.path().display().to_string(), model: None, reasoning: None, messages: vec![] };
+        let before = NativeHistory {
+            identity: "pi-images".into(),
+            cwd: dir.path().display().to_string(),
+            model: None,
+            reasoning: None,
+            messages: vec![],
+        };
         let mut after = before.clone();
         after.messages.push(NativeMessage { id: "user-image".into(), role: "user".into(), timestamp: json!(1), aborted: false,
             content: json!([{"type":"text","text":"Inspect this"}, {"type":"image","data":data,"mimeType":"image/png"}]) });
-        let resolve = |block: &Value| core.doc_host.store_native_image(field(block, "data")?, field(block, "mimeType")?);
+        let resolve = |block: &Value| {
+            core.doc_host
+                .store_native_image(field(block, "data")?, field(block, "mimeType")?)
+        };
         let entries = hydrate_entries_with_images(&before, &after, "device", &resolve).unwrap();
-        assert_eq!(entries, hydrate_entries_with_images(&before, &after, "device", &resolve).unwrap());
-        let MessagePart::Text { text, .. } = &entries[0].parts[1] else { panic!("attachment refs missing") };
-        let path = text.lines().find_map(|line| line.strip_prefix("- ")).unwrap();
+        assert_eq!(
+            entries,
+            hydrate_entries_with_images(&before, &after, "device", &resolve).unwrap()
+        );
+        let MessagePart::Text { text, .. } = &entries[0].parts[1] else {
+            panic!("attachment refs missing")
+        };
+        let path = text
+            .lines()
+            .find_map(|line| line.strip_prefix("- "))
+            .unwrap();
         assert!(Path::new(path).starts_with(core.uploads.dir()));
         assert_eq!(std::fs::read(path).unwrap(), bytes);
-        assert_eq!(core.uploads.read_chunk(path, 0, &[]).unwrap().mime_type, "image/png");
-        assert!(core.doc_host.store_native_image(&data, "image/svg+xml").is_err());
-        assert!(core.doc_host.store_native_image("not base64", "image/png").is_err());
+        assert_eq!(
+            core.uploads.read_chunk(path, 0, &[]).unwrap().mime_type,
+            "image/png"
+        );
+        assert!(
+            core.doc_host
+                .store_native_image(&data, "image/svg+xml")
+                .is_err()
+        );
+        assert!(
+            core.doc_host
+                .store_native_image("not base64", "image/png")
+                .is_err()
+        );
         assert_eq!(std::fs::read_dir(core.uploads.dir()).unwrap().count(), 1);
         core.doc_host.shutdown_workers().await;
     }

@@ -1,0 +1,22 @@
+[package]
+name = "zeron-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+cpal.workspace = true
+futures.workspace = true
+ringbuf.workspace = true
+rubato.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true

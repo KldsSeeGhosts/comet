@@ -288,7 +288,11 @@ async fn dispatch(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.split(',').any(|v| v.trim() == "text/event-stream"));
     if streaming && !matches!(verb.as_str(), "watch" | "subscribe") {
-        return error(StatusCode::BAD_REQUEST, "invalid_subscription", "only watch/subscribe methods may stream");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_subscription",
+            "only watch/subscribe methods may stream",
+        );
     }
     if streaming && headers.contains_key("last-event-id") {
         return error(

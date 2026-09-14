@@ -4038,26 +4038,29 @@ mod tests {
 
     #[test]
     fn explicit_capabilities_distinguish_same_version_builds() {
-        let state = AppState { devices: vec![
-            Device {
-                id: "personal".into(),
-                name: "personal".into(),
-                platform: "macos".into(),
-                last_seen_at: None,
-                created_at: None,
-                version: Some("0.2.31".into()),
-                capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
-            },
-            Device {
-                id: "upstream".into(),
-                name: "upstream".into(),
-                platform: "macos".into(),
-                last_seen_at: None,
-                created_at: None,
-                version: Some("0.2.31".into()),
-                capabilities: Vec::new(),
-            },
-        ], ..Default::default() };
+        let state = AppState {
+            devices: vec![
+                Device {
+                    id: "personal".into(),
+                    name: "personal".into(),
+                    platform: "macos".into(),
+                    last_seen_at: None,
+                    created_at: None,
+                    version: Some("0.2.31".into()),
+                    capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
+                },
+                Device {
+                    id: "upstream".into(),
+                    name: "upstream".into(),
+                    platform: "macos".into(),
+                    last_seen_at: None,
+                    created_at: None,
+                    version: Some("0.2.31".into()),
+                    capabilities: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
 
         assert!(state.device_supports("personal", zeron_proto::capabilities::MESSAGE_QUEUE_V1));
         assert!(!state.device_supports("upstream", zeron_proto::capabilities::MESSAGE_QUEUE_V1));
@@ -4067,7 +4070,10 @@ mod tests {
     fn delivery_degradation_and_queued_sends_tell_the_truth() {
         use zeron_proto::{ChatConnectivity, ConnectivityState};
         let now = Utc::now();
-        let mut s = AppState { local_device_id: Some("local".into()), ..Default::default() };
+        let mut s = AppState {
+            local_device_id: Some("local".into()),
+            ..Default::default()
+        };
         let mut remote = chat("c-remote", 0, None);
         remote.device_id = "remote".into();
         let mut local = chat("c-local", 0, None);

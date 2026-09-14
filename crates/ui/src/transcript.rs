@@ -344,6 +344,22 @@ fn is_agent_call(call: &ToolCall) -> bool {
     call.is_subagent_spawn()
 }
 
+fn is_edit_or_diff_chip(tool: &ToolItem, detail: Option<&ToolDetail>) -> bool {
+    matches!(
+        tool.call,
+        ToolCall::EditFile { .. } | ToolCall::WriteFile { .. } | ToolCall::ApplyPatch { .. }
+    ) || matches!(
+        detail,
+        Some(ToolDetail::Diff { .. } | ToolDetail::Stats { .. })
+    ) || tool.diff_ref.is_some()
+        || match &tool.call {
+            ToolCall::Unknown { name, .. } => {
+                name.contains("edit") || name.contains("patch") || name.contains("write")
+            }
+            _ => false,
+        }
+}
+
 /// The chip's GENUS is the call itself, never the ref: docs written before
 /// the claude-driver fix carry stray `subagent_ref`s on ordinary Run chips
 /// (a background shell's `task_notification` was mis-tagged as subagent
@@ -978,6 +994,9 @@ pub enum RowKind {
         /// up until the user answers, and the engine delivers a dead run's
         /// answer as a resumed turn).
         header: SharedString,
+        /// First question's body text — Claude's `Asking {header}` row
+        /// expands to show it.
+        question: SharedString,
         resolved: bool,
     },
     ErrorChip {
@@ -1394,7 +1413,9 @@ pub fn rows_for_entry(
                         resolved,
                         ..
                     } => {
-                        // Model-generated header onto the one-line chip.
+                        // Model-generated header + the question text —
+                        // Claude's transcript shows an `Asking {header}`
+                        // disclosure whose body is the question.
                         let header: SharedString = single_line(
                             &questions
                                 .first()
@@ -1402,12 +1423,21 @@ pub fn rows_for_entry(
                                 .unwrap_or_else(|| "Question".to_string()),
                         )
                         .into();
+                        let question: SharedString = single_line(
+                            &questions
+                                .first()
+                                .map(|q| q.question.clone())
+                                .unwrap_or_default(),
+                        )
+                        .into();
                         rows.push(Row {
                             id: format!("{}#{}", entry.id, part_id).into(),
-                            version: fnv1a(header.as_bytes()) << 1 | *resolved as u64,
+                            version: fnv1a(header.as_bytes()) ^ fnv1a(question.as_bytes()) << 1
+                                | *resolved as u64,
                             turn_start: false,
                             kind: RowKind::InputChip {
                                 header,
+                                question,
                                 resolved: *resolved,
                             },
                             entry_id: entry_id.clone(),
@@ -3020,7 +3050,9 @@ impl Transcript {
         // thumb mid-drag (`max_offset_for_scrollbar` reports the same frozen
         // value the offset mapping uses).
         self.list.scrollbar_drag_started();
-        let scroll_top = self.scrollbar.press(metrics, track_top, f32::from(event.position.y));
+        let scroll_top = self
+            .scrollbar
+            .press(metrics, track_top, f32::from(event.position.y));
         self.apply_scrollbar_offset(scroll_top);
         self.refresh_after_viewport_input(cx);
         // A press on the rail is not a text-selection gesture.
@@ -3075,13 +3107,10 @@ impl Transcript {
                 .render_rail("transcript-scrollbar", theme, &metrics)
                 .on_hover(cx.listener(Self::on_scrollbar_rail_hover))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_scrollbar_press))
-                .on_drag(
-                    scrollbar::ScrollbarDrag,
-                    |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.new(|_| scrollbar::ScrollbarDragGhost)
-                    },
-                )
+                .on_drag(scrollbar::ScrollbarDrag, |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| scrollbar::ScrollbarDragGhost)
+                })
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_scrollbar_release))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_scrollbar_release))
                 .into_any_element(),
@@ -5165,9 +5194,11 @@ impl Transcript {
             RowKind::ToolGroup { tools, auto_open } => {
                 self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
             }
-            RowKind::InputChip { header, resolved } => {
-                input_chip(header.clone(), *resolved, &theme)
-            }
+            RowKind::InputChip {
+                header,
+                question,
+                resolved,
+            } => self.input_chip(&row.id, header, question, *resolved, &theme, cx),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
         };
 
@@ -5360,28 +5391,27 @@ impl Transcript {
             .map(|(_, ix)| *ix);
         let row_key = row_id.clone();
         let entity = cx.weak_entity();
-        let handler: render::CopyHandler =
-            Rc::new(move |ix, code, _window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
-                let row_key = row_key.clone();
-                entity
-                    .update(cx, |this, cx| {
-                        this.copied_code = Some((row_key, ix));
-                        this.copied_clear = Some(cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(1200))
-                                .await;
-                            this.update(cx, |this, cx| {
-                                this.copied_code = None;
-                                this.copied_clear = None;
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
-                        cx.notify();
-                    })
-                    .ok();
-            });
+        let handler: render::CopyHandler = Rc::new(move |ix, code, _window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+            let row_key = row_key.clone();
+            entity
+                .update(cx, |this, cx| {
+                    this.copied_code = Some((row_key, ix));
+                    this.copied_clear = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1200))
+                            .await;
+                        this.update(cx, |this, cx| {
+                            this.copied_code = None;
+                            this.copied_clear = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    }));
+                    cx.notify();
+                })
+                .ok();
+        });
         render::CopyUi { handler, copied_ix }
     }
 
@@ -5601,10 +5631,10 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
+        let auto_expand_edits = crate::settings::current(cx).auto_expand_edits;
         // Agent/spawn chips never fold: they are their own row, always open,
         // no "Called N tools" header — a running subagent stays visible.
         let collapses = tool_group_collapses(tools);
-        let open = !collapses || fold.open.unwrap_or(auto_open);
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
         // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
         // Resolved per paint (a HashMap probe per chip) so fetched content
@@ -5633,6 +5663,13 @@ impl Transcript {
                 best.map(|(_, d)| d).or_else(|| tool.detail.clone())
             })
             .collect();
+        let auto_expand = auto_expand_edits
+            && tools
+                .iter()
+                .zip(&details)
+                .any(|(tool, detail)| is_edit_or_diff_chip(tool, detail.as_deref()));
+        let effective_auto_open = auto_open || auto_expand;
+        let open = !collapses || fold.open.unwrap_or(effective_auto_open);
         // Full-invocation blocks — with them, EVERY chip expands: the click
         // always answers "what exactly was this call?", output or not.
         let invocations: Vec<Option<Arc<ToolDetail>>> = tools
@@ -5717,7 +5754,8 @@ impl Transcript {
                 // A STREAMING thought chip defaults open (the live thinking
                 // is the point); settled chips default closed. A user toggle
                 // overrides either way.
-                let default_open = tool.is_thought && !tool.resolved;
+                let default_open = (tool.is_thought && !tool.resolved)
+                    || (auto_expand_edits && is_edit_or_diff_chip(tool, detail.as_deref()));
                 (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(default_open)
             })
             .collect();
@@ -5773,7 +5811,7 @@ impl Transcript {
             .text_color(theme.text_muted)
             .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_fold(toggle_id.clone(), open_height, auto_open);
+                this.toggle_fold(toggle_id.clone(), open_height, effective_auto_open);
                 cx.notify();
             }))
             .child(
@@ -6223,68 +6261,83 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// A passive one-line chip marking a question the agent asked — the
-/// interactive controls live in the composer (chat-view.tsx `InputChip`):
-/// 34px row, `rounded-[10px] border-white/[0.08] bg-white/[0.045] px-2
-/// text-[12px]`, a 20px `bg-white/[0.09]` icon tile with a 12px
-/// ChatRoundLine, the medium "Question" label, then the truncating value —
-/// the first question's header once resolved, "Awaiting your answer…" while
-/// pending. Neutral tones throughout; resolution never recolors the chip.
-fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement {
-    let value: SharedString = if resolved {
-        header
-    } else {
-        "Awaiting your answer…".into()
-    };
-    div()
-        .py(px(4.0))
-        .w_full()
-        .child(
-            div()
-                .h(px(34.0))
-                .w_full()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .overflow_hidden()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(crate::theme::hairline(0.08))
-                .bg(crate::theme::ink(0.045))
-                .px(px(8.0))
-                .text_size(px(12.0))
-                .child(
+impl Transcript {
+    /// The transcript row for a pending/answered question — Claude code
+    /// mode's `Asking {header}` disclosure: a plain text line with a
+    /// trailing chevron that expands to the question body. The interactive
+    /// card itself lives above the composer; this row is the transcript's
+    /// record of it. Resolved reads as a settled `Asked {header}`.
+    fn input_chip(
+        &mut self,
+        row_id: &SharedString,
+        header: &SharedString,
+        question: &SharedString,
+        resolved: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fold = self.folds.get(row_id).copied().unwrap_or_default();
+        let open = fold.open.unwrap_or(!resolved);
+        let label: SharedString = if resolved {
+            format!("Asked {header}").into()
+        } else {
+            format!("Asking {header}").into()
+        };
+        let chevron = crate::icons::icon(crate::icons::ALT_ARROW_RIGHT)
+            .size(px(12.0))
+            .text_color(theme.text_muted.opacity(0.7))
+            .map(|icon| {
+                if open {
+                    icon.with_transformation(gpui::Transformation::rotate(gpui::percentage(0.25)))
+                } else {
+                    icon
+                }
+            });
+        let row = row_id.clone();
+        div()
+            .py(px(4.0))
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id(SharedString::from(format!("{row_id}-asking")))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .cursor_pointer()
+                    .text_size(px(12.0))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let entry = this.folds.entry(row.clone()).or_default();
+                        let currently = entry.open.unwrap_or(!resolved);
+                        entry.open = Some(!currently);
+                        entry.epoch += 1;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child(label),
+                    )
+                    .child(chevron),
+            )
+            .when(open && !question.is_empty(), |el| {
+                el.child(
                     div()
-                        .flex_none()
-                        .size(px(20.0))
-                        .rounded(px(6.0))
-                        .bg(crate::theme::ink(0.09))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
-                                .size(px(12.0))
-                                .text_color(theme.text_muted),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("Question")),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
+                        .pt(px(4.0))
+                        .text_size(crate::typography::ui_rems(13.0))
+                        .line_height(px(19.0))
                         .text_color(theme.text.opacity(0.9))
-                        .child(value),
-                ),
-        )
-        .into_any_element()
+                        .child(question.clone()),
+                )
+            })
+            .into_any_element()
+    }
 }
 
 /// A small glyph standing in for the tool's icon (zeron uses an icon set; a

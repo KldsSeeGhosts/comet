@@ -37,6 +37,32 @@ fn compare_sidebar_chats(
     primary.then_with(|| left.id.cmp(&right.id))
 }
 
+/// bb's sidebar rule: sessions that need attention float above the rest,
+/// ordered by indicator priority (Input > Failed > Working); Done and Idle
+/// stay in the user's chosen sort. Priority ranks come from the workspace's
+/// tab aggregation so the sidebar and pane tabs agree on what "active" is.
+fn session_attention_rank(status: ChatIndicator) -> u8 {
+    let priority = crate::workspace::indicator_priority(status);
+    if priority > crate::workspace::indicator_priority(ChatIndicator::Completed) {
+        priority
+    } else {
+        0
+    }
+}
+
+/// The sidebar's whole ordering in one place: attention floats first, then
+/// the user's sort. Both the drawn list and `sidebar_visible_order` (jump
+/// slots, cycling) go through this comparator so they cannot drift.
+fn compare_sidebar_rows(
+    sort: SidebarSort,
+    left: &(ChatIndicator, zeron_proto::Chat),
+    right: &(ChatIndicator, zeron_proto::Chat),
+) -> std::cmp::Ordering {
+    session_attention_rank(right.0)
+        .cmp(&session_attention_rank(left.0))
+        .then_with(|| compare_sidebar_chats(sort, &left.1, &right.1))
+}
+
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
 /// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
@@ -132,10 +158,7 @@ pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
 /// full name sort: local context leads, then the user's chosen chat sort wins.
 type DeviceGroups<T> = Vec<(Option<(String, String)>, Vec<T>)>;
 
-fn promote_local_device_group<T>(
-    groups: &mut DeviceGroups<T>,
-    local_device_id: Option<&str>,
-) {
+fn promote_local_device_group<T>(groups: &mut DeviceGroups<T>, local_device_id: Option<&str>) {
     let Some(local_device_id) = local_device_id else {
         return;
     };
@@ -247,7 +270,7 @@ pub(super) struct RenameSpaceDialog {
 }
 
 /// Dot color for a chat's display status (tab dots + Sessions rows).
-pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
+pub(crate) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
     match status {
         // Preset activity tone, not warning amber: running is routine.
         // Non-done statuses sit well below full
@@ -1063,12 +1086,13 @@ impl Shell {
     pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
         let filter = self.settings.space_filter.clone();
         let state = self.state.read(cx);
-        let mut chats: Vec<zeron_proto::Chat> = state
+        let mut chats: Vec<(ChatIndicator, zeron_proto::Chat)> = state
             .sidebar_chats(Utc::now(), filter.as_deref())
             .into_iter()
-            .map(|(_, chat)| chat.clone())
+            .map(|(status, chat)| (status, chat.clone()))
             .collect();
-        chats.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        chats.sort_by(|left, right| compare_sidebar_rows(self.settings.sidebar_sort, left, right));
+        let chats: Vec<zeron_proto::Chat> = chats.into_iter().map(|(_, chat)| chat).collect();
         if self.settings.sidebar_organization != SidebarOrganization::ByDevice {
             return chats.into_iter().map(|chat| chat.id).collect();
         }
@@ -1099,6 +1123,13 @@ impl Shell {
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
+        // bb's open-in-split row state: which sessions any workspace pane
+        // already shows (accent edge marker on the row).
+        let open_sessions = self
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.read(cx).open_session_ids())
+            .unwrap_or_default();
         let mut rows: Vec<ActiveChatRow> = {
             let state = self.state.read(cx);
             let mut chats: Vec<_> = state
@@ -1107,7 +1138,7 @@ impl Shell {
                 .map(|(status, chat)| (status, chat.clone()))
                 .collect();
             chats.sort_by(|left, right| {
-                compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
+                compare_sidebar_rows(self.settings.sidebar_sort, left, right)
             });
             chats
                 .into_iter()
@@ -1228,6 +1259,7 @@ impl Shell {
                     status,
                     is_selected,
                     false,
+                    open_sessions.contains(chat.id.as_str()),
                     jump_label,
                     theme,
                     cx,
@@ -1728,9 +1760,9 @@ impl Shell {
             let text = flow.search.read(cx).text().to_string();
             if (text.starts_with('/') || text.starts_with('~'))
                 && let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref())
-                {
-                    self.add_space_descend(target, false, cx);
-                }
+            {
+                self.add_space_descend(target, false, cx);
+            }
             return;
         }
         let Some(listing) = flow.browser.ready() else {
@@ -2556,24 +2588,28 @@ impl Shell {
         //    Locations (home + the picked device's mounted drives), an info
         //    line naming the browsed device. Rows are the tab recipe (h-28
         //    rounded-8 washes), vertical.
-        let location_rows: Vec<(LocationRow, SharedString, &'static str, Option<String>)> = if device
-            .is_some() { {
-                std::iter::once((
-                    LocationRow::Home,
-                    SharedString::from("Home"),
-                    icons::HOME,
-                    None,
-                ))
-                .chain(drives.iter().enumerate().map(|(ix, drive)| {
-                    (
-                        LocationRow::Drive(ix),
-                        SharedString::from(drive.name.clone()),
-                        icons::HARD_DRIVE,
-                        Some(drive.path.clone()),
-                    )
-                }))
-                .collect()
-            } } else { Default::default() };
+        let location_rows: Vec<(LocationRow, SharedString, &'static str, Option<String>)> =
+            if device.is_some() {
+                {
+                    std::iter::once((
+                        LocationRow::Home,
+                        SharedString::from("Home"),
+                        icons::HOME,
+                        None,
+                    ))
+                    .chain(drives.iter().enumerate().map(|(ix, drive)| {
+                        (
+                            LocationRow::Drive(ix),
+                            SharedString::from(drive.name.clone()),
+                            icons::HARD_DRIVE,
+                            Some(drive.path.clone()),
+                        )
+                    }))
+                    .collect()
+                }
+            } else {
+                Default::default()
+            };
         let rail = div()
             .id("add-space-rail")
             .w(px(196.0))
@@ -3041,8 +3077,9 @@ impl Shell {
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
-    use super::{compare_sidebar_chats, promote_local_device_group};
+    use super::{compare_sidebar_rows, promote_local_device_group};
     use crate::settings::SidebarSort;
+    use zeron_proto::ChatIndicator;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
         (Some((device.into(), device.into())), vec![value])
@@ -3074,8 +3111,56 @@ mod tests {
     fn equal_sidebar_timestamps_sort_by_stable_chat_id() {
         let alpha = chat("alpha");
         let beta = chat("beta");
-        assert!(compare_sidebar_chats(SidebarSort::Created, &alpha, &beta).is_lt());
-        assert!(compare_sidebar_chats(SidebarSort::LastUpdated, &alpha, &beta).is_lt());
+        assert!(
+            compare_sidebar_rows(
+                SidebarSort::Created,
+                &(ChatIndicator::Idle, alpha.clone()),
+                &(ChatIndicator::Idle, beta.clone())
+            )
+            .is_lt()
+        );
+        assert!(
+            compare_sidebar_rows(
+                SidebarSort::LastUpdated,
+                &(ChatIndicator::Idle, alpha),
+                &(ChatIndicator::Idle, beta)
+            )
+            .is_lt()
+        );
+    }
+
+    #[test]
+    fn attention_floats_above_the_users_sort() {
+        // bb's rule: sessions needing attention (Input > Failed > Working)
+        // float above Done/Idle rows whatever the underlying sort says —
+        // the older idle chat must not outrank a busy one.
+        let older_idle = chat("older-idle");
+        let newer_idle = chat("newer-idle");
+        let working = chat("working");
+        let failed = chat("failed");
+        let input = chat("input");
+
+        let mut rows = vec![
+            (ChatIndicator::Idle, newer_idle),
+            (ChatIndicator::Idle, older_idle),
+            (ChatIndicator::Working, working),
+            (ChatIndicator::Errored, failed),
+            (ChatIndicator::AwaitingInput, input),
+        ];
+        rows.sort_by(|left, right| compare_sidebar_rows(SidebarSort::LastUpdated, left, right));
+        let order: Vec<&str> = rows.iter().map(|(_, chat)| chat.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["input", "failed", "working", "newer-idle", "older-idle"]
+        );
+
+        // Done reads as settled: it stays in the user's sort, below busy work.
+        let mut rows = vec![
+            (ChatIndicator::Completed, chat("done")),
+            (ChatIndicator::Working, chat("working")),
+        ];
+        rows.sort_by(|left, right| compare_sidebar_rows(SidebarSort::Created, left, right));
+        assert_eq!(rows[0].1.id, "working");
     }
 
     #[test]

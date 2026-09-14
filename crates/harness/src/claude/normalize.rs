@@ -68,8 +68,12 @@ fn opt_str_field(input: &Value, key: &str) -> Option<String> {
 }
 
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
-pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
-    match name {
+/// `AskUserQuestion` returns `None` — the control-channel intercept owns its
+/// whole lifecycle; letting its JSON input reach the transcript leaks the raw
+/// question + option previews as a tool-call detail body.
+pub(crate) fn decode_tool_use(name: &str, input: &Value) -> Option<ToolCall> {
+    Some(match name {
+        "AskUserQuestion" => return None,
         "Bash" => ToolCall::Exec {
             command: str_field(input, "command"),
         },
@@ -138,7 +142,7 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
                 input: (!input.is_null()).then(|| input.clone()),
             },
         },
-    }
+    })
 }
 
 fn new_message_id() -> String {
@@ -365,13 +369,15 @@ impl Normalizer {
                                     text: format!("{}\n\n", b.text.trim_end()),
                                 },
                             )),
-                            "tool_use" => Some(tag(
-                                parent,
-                                AgentEvent::ToolCall {
-                                    id: b.id.clone(),
-                                    call: decode_tool_use(&b.name, &b.input),
-                                },
-                            )),
+                            "tool_use" => decode_tool_use(&b.name, &b.input).map(|call| {
+                                tag(
+                                    parent,
+                                    AgentEvent::ToolCall {
+                                        id: b.id.clone(),
+                                        call,
+                                    },
+                                )
+                            }),
                             _ => None,
                         })
                         .collect();
@@ -396,11 +402,13 @@ impl Normalizer {
                     .message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_use")
-                    .flat_map(|b| {
-                        let call = AgentEvent::ToolCall {
-                            id: b.id.clone(),
-                            call: decode_tool_use(&b.name, &b.input),
-                        };
+                    .filter_map(|b| {
+                        let call = decode_tool_use(&b.name, &b.input).map(|call| {
+                            AgentEvent::ToolCall {
+                                id: b.id.clone(),
+                                call,
+                            }
+                        })?;
                         // A spawn's `prompt` is the subagent's opening user
                         // message — the wire never echoes it on the child
                         // feed (child user frames carry tool results and
@@ -442,8 +450,9 @@ impl Normalizer {
                                 ))
                             })
                             .flatten();
-                        std::iter::once(call).chain(opening).chain(steer)
+                        Some(std::iter::once(call).chain(opening).chain(steer))
                     })
+                    .flatten()
                     .collect();
                 self.last_model = f.message.model.clone().or(self.last_model.take());
                 if let Some(usage) = &f.message.usage {
@@ -664,45 +673,48 @@ mod tests {
     fn decodes_typed_tools() {
         assert_eq!(
             decode_tool_use("Bash", &json!({"command": "ls -la"})),
-            ToolCall::Exec {
+            Some(ToolCall::Exec {
                 command: "ls -la".into()
-            }
+            })
         );
         assert_eq!(
             decode_tool_use(
                 "Edit",
                 &json!({"file_path": "/a", "old_string": "x", "new_string": "y"})
             ),
-            ToolCall::EditFile {
+            Some(ToolCall::EditFile {
                 path: "/a".into(),
                 old_string: Some("x".into()),
                 new_string: Some("y".into())
-            }
+            })
         );
         assert_eq!(
             decode_tool_use(
                 "TodoWrite",
                 &json!({"todos": [{"content": "t", "status": "completed"}]})
             ),
-            ToolCall::Todo {
+            Some(ToolCall::Todo {
                 items: vec![TodoItem {
                     text: "t".into(),
                     done: true
                 }]
-            }
+            })
         );
         assert_eq!(
             decode_tool_use("mcp__linear__search", &json!({"q": "bug"})),
-            ToolCall::Mcp {
+            Some(ToolCall::Mcp {
                 server: "linear".into(),
                 tool: "search".into(),
                 input: Some(json!({"q": "bug"}))
-            }
+            })
         );
         assert!(matches!(
             decode_tool_use("Mystery", &json!({})),
-            ToolCall::Unknown { .. }
+            Some(ToolCall::Unknown { .. })
         ));
+        // AskUserQuestion's tool_use echo is dropped — the control-channel
+        // intercept owns it; its raw input must not render as a tool body.
+        assert!(decode_tool_use("AskUserQuestion", &json!({"questions": []})).is_none());
     }
 
     fn normalize_one(raw: &str) -> Vec<AgentEvent> {

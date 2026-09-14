@@ -367,10 +367,32 @@ async fn active_registration_and_replacement_cleanup_are_safe() {
 #[tokio::test]
 async fn report_get_and_mutation_streams_never_reach_the_bridge() {
     let (_dir, api, mut receiver) = start().await;
-    let raw = reqwest::Client::builder().unix_socket(api.socket_path().to_owned()).no_proxy().build().unwrap();
-    assert_eq!(raw.get("http://localhost/api/v1/team/report").send().await.unwrap().status(),405);
-    assert_eq!(raw.post("http://localhost/api/v1/team/run").header("accept","text/event-stream")
-        .json(&json!({})).send().await.unwrap().status(),400);
-    assert!(matches!(receiver.try_recv(),Err(mpsc::error::TryRecvError::Empty)));
+    let raw = reqwest::Client::builder()
+        .unix_socket(api.socket_path().to_owned())
+        .no_proxy()
+        .build()
+        .unwrap();
+    assert_eq!(
+        raw.get("http://localhost/api/v1/team/report")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        405
+    );
+    assert_eq!(
+        raw.post("http://localhost/api/v1/team/run")
+            .header("accept", "text/event-stream")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
     api.shutdown().await.unwrap();
 }

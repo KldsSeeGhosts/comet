@@ -596,6 +596,9 @@ pub struct Wizard {
     pub page: usize,
     picked: Vec<Vec<usize>>,
     typed: Vec<String>,
+    /// Collapsed to just the header row (Claude's `data-collapsed` state —
+    /// the caret chevron toggles it).
+    pub collapsed: bool,
 }
 
 impl Wizard {
@@ -607,8 +610,16 @@ impl Wizard {
             page: 0,
             picked: vec![Vec::new(); n],
             typed: vec![String::new(); n],
+            collapsed: false,
         }
     }
+
+    /// The skip sentinel Claude sends for a page submitted with no pick
+    /// (`"[No preference]"`).
+    pub const SKIP_LABEL: &'static str = "[No preference]";
+    /// The dismiss sentinel the X button sends for EVERY question.
+    pub const DISMISS_LABEL: &'static str =
+        "[User dismissed \u{2014} do not proceed, wait for next instruction]";
 
     pub fn counter(&self) -> String {
         format!("{}/{}", self.page + 1, self.questions.len().max(1))
@@ -669,6 +680,13 @@ impl Wizard {
         }
     }
 
+    /// Write a typed answer to a specific page (skip/dismiss fill).
+    pub fn set_typed_at(&mut self, page: usize, text: String) {
+        if let Some(slot) = self.typed.get_mut(page) {
+            *slot = text;
+        }
+    }
+
     /// Explicit submit / auto-advance landing.
     pub fn advance(&mut self) -> WizardStep {
         if self.page + 1 < self.questions.len() {
@@ -704,7 +722,7 @@ impl Wizard {
                         .map(|picked| {
                             picked
                                 .iter()
-                                .filter_map(|&p| q.options.get(p).cloned())
+                                .filter_map(|&p| q.options.get(p).map(|o| o.label.clone()))
                                 .collect()
                         })
                         .unwrap_or_default()
@@ -1721,7 +1739,7 @@ impl ComposerInput {
         self
     }
 
-    fn set_key_context(&mut self, key_context: &'static str, cx: &mut Context<Self>) {
+    pub(crate) fn set_key_context(&mut self, key_context: &'static str, cx: &mut Context<Self>) {
         if self.key_context != key_context {
             self.key_context = key_context;
             cx.notify();
@@ -1930,7 +1948,10 @@ impl ComposerInput {
     }
 
     fn display_placeholder(&self) -> SharedString {
-        self.inactive_placeholder.as_ref().unwrap_or(&self.placeholder).clone()
+        self.inactive_placeholder
+            .as_ref()
+            .unwrap_or(&self.placeholder)
+            .clone()
     }
 
     pub fn set_placeholder(
@@ -2559,9 +2580,11 @@ impl ComposerInput {
         match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
             EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
             EnterOutcome::Submit => {
-                cx.emit(ComposerInputEvent::SubmissionOrigin(crate::input_origin::capture()));
+                cx.emit(ComposerInputEvent::SubmissionOrigin(
+                    crate::input_origin::capture(),
+                ));
                 cx.emit(ComposerInputEvent::Submitted);
-            },
+            }
             EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
         }
     }
@@ -2570,9 +2593,11 @@ impl ComposerInput {
         match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
             EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
             EnterOutcome::Submit => {
-                cx.emit(ComposerInputEvent::SubmissionOrigin(crate::input_origin::capture()));
+                cx.emit(ComposerInputEvent::SubmissionOrigin(
+                    crate::input_origin::capture(),
+                ));
                 cx.emit(ComposerInputEvent::ModifiedSubmitted);
-            },
+            }
             EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
         }
     }
@@ -3772,7 +3797,10 @@ impl Render for ComposerInput {
 /// Events the shell listens for.
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
-    HumanSubmitted { chat_id: String, proof: crate::input_origin::HumanInput },
+    HumanSubmitted {
+        chat_id: String,
+        proof: crate::input_origin::HumanInput,
+    },
     /// A prompt was sent optimistically — give the transcript its exact row
     /// identity so it can anchor the prompt at the top with the reply's
     /// reserved space below it.
@@ -3781,6 +3809,13 @@ pub enum ComposerEvent {
     /// yet: the transcript remembers the stable id and promotes it to an
     /// own-turn anchor only when the host materializes the matching bubble.
     Queued { chat_id: String, message_id: String },
+    /// The mic/waveform button beside send. The workspace owns the single
+    /// push-to-talk session; the composer only forwards presses.
+    VoiceToggled,
+    /// Alt-click on the live mic button: flip the capture gate without
+    /// stopping the session. The global mute shortcut reaches the workspace
+    /// through the same path's other end (`ChatViewEvent::VoiceMuted`).
+    VoiceMuted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3965,6 +4000,15 @@ pub struct Composer {
     failure_key: Option<String>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
+    /// Dedicated free-text input for the wizard's "Other" row — a separate
+    /// entity from `input` so the composer stays live below the question
+    /// card (Claude code mode mounts its own textarea inside the card).
+    wizard_input: Option<Entity<ComposerInput>>,
+    /// Subscription feeding the wizard's typed answer — held while the
+    /// wizard's own input entity is alive.
+    wizard_input_events: Option<gpui::Subscription>,
+    /// Focus the card on the next render after it mounts.
+    wizard_focus_pending: bool,
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
@@ -4040,6 +4084,9 @@ pub struct Composer {
     /// Set on every session/route change: flips committed before this instant
     /// SNAP instead of morphing (see [`ROUTE_SNAP_MS`]).
     route_snap_until: Option<Instant>,
+    /// The workspace's shared push-to-talk status, mirrored onto the mic
+    /// button next to send.
+    voice: crate::voice::VoiceStatus,
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
@@ -4154,6 +4201,9 @@ impl Composer {
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
+            wizard_input: None,
+            wizard_input_events: None,
+            wizard_focus_pending: false,
             answered_requests: HashSet::new(),
             failure_key: None,
             action_task: None,
@@ -4190,6 +4240,7 @@ impl Composer {
             height_morph: None,
             morph_clock: Instant::now(),
             route_snap_until: None,
+            voice: crate::voice::VoiceStatus::default(),
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
@@ -4240,6 +4291,15 @@ impl Composer {
 
     pub fn is_sending(&self) -> bool {
         self.sending
+    }
+
+    /// Pushes the workspace's shared voice status onto this composer's mic
+    /// button. Called by the pane for every session update.
+    pub fn set_voice_status(&mut self, status: crate::voice::VoiceStatus, cx: &mut Context<Self>) {
+        if self.voice != status {
+            self.voice = status;
+            cx.notify();
+        }
     }
 
     /// The transcript's rewind affordance lands the removed turn's text here
@@ -5369,10 +5429,37 @@ impl Composer {
                     self.reset_mention(None, cx);
                     self.wizard = Some(Wizard::new(request_id, questions));
                     self.advance_task = None;
-                    // The shared input becomes the panel's free-text override.
-                    self.input.update(cx, |input, cx| {
-                        input.set_placeholder("Type your own answer, or pick an option above", cx)
+                    // The wizard owns a dedicated "Type your own answer here"
+                    // input (Claude's Other textarea) — the composer input
+                    // below stays live for normal prompts.
+                    let input = cx.new(|cx| {
+                        ComposerInput::with_context(
+                            "Type your own answer here",
+                            MESSAGE_COMPOSER_CONTEXT,
+                            cx,
+                        )
                     });
+                    self.wizard_input_events = Some(cx.subscribe(&input, |this, _, event, cx| {
+                        match event {
+                            // Enter inside the Other field submits the page.
+                            ComposerInputEvent::Submitted => this.wizard_advance(cx),
+                            ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
+                                let text = this
+                                    .wizard_input
+                                    .as_ref()
+                                    .map(|i| i.read(cx).text().to_string())
+                                    .unwrap_or_default();
+                                if let Some(w) = this.wizard.as_mut() {
+                                    w.set_typed(text);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }));
+                    self.wizard_input = Some(input);
+                    // Claude focuses the card container on mount so digit
+                    // shortcuts work immediately.
+                    self.wizard_focus_pending = true;
                 }
             }
             _ => {
@@ -5393,8 +5480,8 @@ impl Composer {
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
-                        self.input
-                            .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+                        self.wizard_input = None;
+                        self.wizard_input_events = None;
                     }
                 }
             }
@@ -5450,15 +5537,6 @@ impl Composer {
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
         if self.commit_queue_edit(cx) {
-            return;
-        }
-        if self.wizard.is_some() {
-            // Enter inside the panel's free-text input submits the page.
-            let typed = self.input.read(cx).text().trim().to_string();
-            if let Some(w) = self.wizard.as_mut() {
-                w.set_typed(typed);
-            }
-            self.wizard_advance(cx);
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
@@ -6193,16 +6271,18 @@ impl Composer {
         };
         let step = wizard.select(option_ix);
         let has_pick = wizard.page_has_pick();
-        self.input.update(cx, |input, cx| {
-            input.set_placeholder(
-                if has_pick {
-                    "Type your own answer, or leave this blank to use the selected option"
-                } else {
-                    "Type your own answer, or pick an option above"
-                },
-                cx,
-            )
-        });
+        if let Some(input) = self.wizard_input.as_ref() {
+            input.update(cx, |input, cx| {
+                input.set_placeholder(
+                    if has_pick {
+                        "Type your own answer, or leave this blank to use the selected option"
+                    } else {
+                        "Type your own answer here"
+                    },
+                    cx,
+                )
+            });
+        }
         match step {
             WizardStep::AutoAdvance => self.schedule_auto_advance(cx),
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
@@ -6229,8 +6309,10 @@ impl Composer {
         match wizard.advance() {
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             _ => {
-                // Moving on: clear the shared free-text input for the next page.
-                self.input.update(cx, |input, cx| input.set_text("", cx));
+                // Moving on: clear the Other field for the next page.
+                if let Some(input) = self.wizard_input.as_ref() {
+                    input.update(cx, |input, cx| input.set_text("", cx));
+                }
                 cx.notify();
             }
         }
@@ -6243,6 +6325,49 @@ impl Composer {
         }
     }
 
+    /// The caret chevron: collapse the card to just its header row.
+    fn wizard_toggle_collapse(&mut self, cx: &mut Context<Self>) {
+        if let Some(wizard) = self.wizard.as_mut() {
+            wizard.collapsed = !wizard.collapsed;
+            cx.notify();
+        }
+    }
+
+    /// Skip the current page with Claude's `"[No preference]"` sentinel —
+    /// same as Submit with nothing picked, but explicit.
+    fn wizard_skip(&mut self, cx: &mut Context<Self>) {
+        self.submission_origin = crate::input_origin::capture().or(self.submission_origin);
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        // Stash the sentinel as this page's typed answer, then advance.
+        let ix = wizard.page;
+        wizard.set_typed_at(ix, Wizard::SKIP_LABEL.to_string());
+        match wizard.advance() {
+            WizardStep::Done(answers) => self.wizard_finish(answers, cx),
+            _ => {
+                if let Some(input) = self.wizard_input.as_ref() {
+                    input.update(cx, |input, cx| input.set_text("", cx));
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// The X button: dismiss the whole request — every question answered with
+    /// the "do not proceed" sentinel, then submit.
+    fn wizard_dismiss(&mut self, cx: &mut Context<Self>) {
+        self.submission_origin = crate::input_origin::capture().or(self.submission_origin);
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        for ix in 0..wizard.questions.len() {
+            wizard.set_typed_at(ix, Wizard::DISMISS_LABEL.to_string());
+        }
+        let answers = wizard.answers();
+        self.wizard_finish(answers, cx);
+    }
+
     /// Submit RespondInput and retire the panel.
     fn wizard_finish(&mut self, answers: Vec<UserInputAnswer>, cx: &mut Context<Self>) {
         let submission_origin = crate::input_origin::capture().or(self.submission_origin.take());
@@ -6251,12 +6376,8 @@ impl Composer {
         };
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
-        self.input.update(cx, |input, cx| {
-            input.set_text("", cx);
-            // The panel borrowed the composer input; hand back its identity.
-            input.set_placeholder("Do anything…", cx);
-            input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
-        });
+        self.wizard_input = None;
+        self.wizard_input_events = None;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -6288,7 +6409,12 @@ impl Composer {
                 return;
             }
             if let Some(proof) = submission_origin {
-                let _ = this.update(cx, |_, cx| cx.emit(ComposerEvent::HumanSubmitted { chat_id: chat_id.clone(), proof }));
+                let _ = this.update(cx, |_, cx| {
+                    cx.emit(ComposerEvent::HumanSubmitted {
+                        chat_id: chat_id.clone(),
+                        proof,
+                    })
+                });
             }
             // Safety net against a dead-looking session: the command queued,
             // but the host may still REJECT it (e.g. the run's resolver is
@@ -6310,12 +6436,18 @@ impl Composer {
         cx.notify();
     }
 
-    fn on_wizard_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+    fn on_wizard_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Keys bubbling out of the free-text input must not double-handle:
         // digits select options only while the input is empty, and Enter is the
         // input's own Submit action when it has focus.
-        let input_focused = self.input.read(cx).focus_handle.is_focused(window);
-        let input_empty = self.input.read(cx).is_empty();
+        let input_focused = self
+            .wizard_input
+            .as_ref()
+            .is_some_and(|i| i.read(cx).focus_handle.is_focused(window));
+        let input_empty = self
+            .wizard_input
+            .as_ref()
+            .is_none_or(|i| i.read(cx).is_empty());
         let key = event.keystroke.key.as_str();
         // A BARE digit picks an option. With a modifier held the keystroke
         // belongs to an app shortcut — ⌘1..⌘9 jump to a sidebar row — and the
@@ -6325,9 +6457,24 @@ impl Composer {
             && !event.keystroke.modifiers.modified()
         {
             if !input_focused || input_empty {
-                self.wizard_select(digit - 1, cx);
-                // Consumed as a selection: stop the platform from also
-                // inserting the digit into the focused free-text input.
+                // Digit N+1 (past the last option) is the "Type something
+                // else" row — focus the free-text input rather than
+                // selecting (Claude's `optionNumber = options.length + 1`).
+                let option_count = self
+                    .wizard
+                    .as_ref()
+                    .and_then(|w| w.current().map(|q| q.options.len()))
+                    .unwrap_or(0);
+                if digit - 1 == option_count
+                    && let Some(input) = self.wizard_input.as_ref()
+                {
+                    let focus = input.read(cx).focus_handle.clone();
+                    window.focus(&focus, cx);
+                } else {
+                    self.wizard_select(digit - 1, cx);
+                }
+                // Consumed: stop the platform from also inserting the digit
+                // into the focused free-text input.
                 cx.stop_propagation();
             }
         } else if key == "enter" {
@@ -6345,11 +6492,15 @@ impl Composer {
 
     // ---- render pieces ----
 
-    /// The agent-asked-a-question panel (zeron question-panel.tsx), rendered in
-    /// place of the composer: the same floating-pill chrome (`rounded-[26px]
-    /// border-white/[0.08] bg-white/[0.03] shadow-xl`), uppercase header +
-    /// "1/3" counter chip, option rows with number kbd chips, a free-text
-    /// override over a hairline, and Back / Next-Submit footer.
+    /// The agent-asked-a-question panel, rendered in place of the composer.
+    /// Restyled to match Claude Desktop code mode's `AskUserQuestionToolUseCell`:
+    /// a `rounded-xl border-0.5 border-border-300 bg-surface-3 p-4` card,
+    /// header = question `font-base text-primary` + a right-aligned
+    /// `{n}/{total}` `font-small text-secondary` counter, options joined in
+    /// one `rounded-lg border border-border-300` list (rows split by `border-t`
+    /// hairlines), a trailing number chip per row, a "Type something else…"
+    /// last row hosting the free-text input, and a `mt-4` footer of Back ghost
+    /// + primary Submit/Next.
     fn render_wizard(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(wizard) = self.wizard.clone() else {
@@ -6361,185 +6512,333 @@ impl Composer {
         };
         let page = wizard.page;
         let last = page + 1 >= wizard.questions.len();
-        let typed_empty = self.input.read(cx).is_empty();
+        let typed_empty = self
+            .wizard_input
+            .as_ref()
+            .is_none_or(|i| i.read(cx).is_empty());
         let can_advance = wizard.page_has_pick() || !typed_empty;
+        let multi = question.multi_select;
 
-        let options = question.options.iter().enumerate().map(|(ix, label)| {
-            // Selection reads on the row only while no typed override exists
-            // (typed answers win — zeron question-panel.tsx `isSel`).
+        // Claude option rows (Eie): a `flex flex-col gap-0.75` stack of
+        // separate `rounded-[5px] px-md py-md` buttons — `bg-alpha-1
+        // hover:bg-alpha-2`, selected = `bg-alpha-2` + a 1px inset ring. Each
+        // row: `flex items-center gap-sm`, label `text-body text-primary`
+        // (medium), optional `text-footnote text-muted` description under it,
+        // multi-select gets a trailing checkbox; single-select a trailing
+        // kbd chip with the digit.
+        let options = question.options.iter().enumerate().map(|(ix, option)| {
             let picked = wizard.is_picked(ix) && typed_empty;
-            div()
+            let hover_key = format!("wizard-option-{ix}");
+            let mut row = div()
                 .id(("wizard-option", ix))
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(12.0))
-                .px(px(14.0))
+                .w_full()
+                .rounded(px(5.0))
+                .px(px(12.0))
                 .py(px(10.0))
-                .rounded(px(12.0))
                 .border_1()
                 .border_color(if picked {
-                    crate::theme::ink(0.16)
+                    theme.border_strong
                 } else {
                     gpui::transparent_black()
                 })
-                // zeron question-panel.tsx option rows: `transition-colors`.
                 .bg(if picked {
-                    crate::theme::ink(0.09)
+                    crate::theme::ink(0.06)
                 } else {
                     motion::hover_blend(
-                        &format!("wizard-option-{ix}"),
-                        crate::theme::ink(0.025),
-                        crate::theme::ink(0.06),
+                        &hover_key,
+                        crate::theme::ink(0.03),
+                        crate::theme::ink(0.05),
                     )
                 })
-                .on_hover(motion::hover_listener(format!("wizard-option-{ix}")))
+                .on_hover(motion::hover_listener(hover_key))
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| this.wizard_select(ix, cx)))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(crate::typography::ui_rems(13.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(if picked {
-                            theme.text
-                        } else {
-                            theme.text.opacity(0.9)
-                        })
-                        .child(SharedString::from(label.clone())),
-                )
-                .when(ix < 9, |el| {
-                    el.child(
-                        // Number kbd chip: `size-[22px] rounded-md text-[11px]`.
-                        div()
-                            .flex_none()
-                            .size(px(22.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .bg(if picked {
-                                crate::theme::ink(0.16)
-                            } else {
-                                crate::theme::ink(0.05)
-                            })
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .text_color(if picked {
-                                theme.text
-                            } else {
-                                theme.text_muted.opacity(0.6)
-                            })
-                            .child(SharedString::from(format!("{}", ix + 1))),
-                    )
-                })
-        });
-
-        div()
-            .id("question-panel")
-            .track_focus(&self.wizard_focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.on_wizard_key(event, window, cx)
-            }))
-            .rounded(px(COMPOSER_RADIUS))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.input_glass_bg())
-            .when(!theme.is_frost(), |el| el.shadow_lg())
-            .flex()
-            .flex_col()
-            .child(
+                .on_click(cx.listener(move |this, _, _, cx| this.wizard_select(ix, cx)));
+            row = row.child(
                 div()
-                    .px(px(16.0))
-                    .pt(px(16.0))
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_col()
-                    // Header: tracked uppercase + counter chip when paged.
+                    .gap(px(2.0))
                     .child(
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.0))
-                            .child(
-                                div()
-                                    .text_size(crate::typography::ui_rems(10.5))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(crate::popover::tracked_upper(
-                                        &question.header,
-                                    ))),
-                            )
-                            .when(wizard.questions.len() > 1, |el| {
-                                el.child(
-                                    div()
-                                        .h(px(20.0))
-                                        .px(px(6.0))
-                                        .flex()
-                                        .items_center()
-                                        .rounded(px(6.0))
-                                        .bg(crate::theme::ink(0.06))
-                                        .text_size(crate::typography::ui_rems(10.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text_muted.opacity(0.6))
-                                        .child(SharedString::from(counter)),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .mt(px(6.0))
-                            .text_size(crate::typography::ui_rems(15.0))
-                            .line_height(px(20.0))
+                            .text_size(crate::typography::ui_rems(14.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
-                            .child(SharedString::from(question.question.clone())),
+                            .child(SharedString::from(option.label.clone())),
                     )
-                    .when(question.multi_select, |el| {
+                    .when_some(option.description.clone(), |el, desc| {
                         el.child(
                             div()
-                                .mt(px(4.0))
                                 .text_size(crate::typography::ui_rems(12.0))
-                                .text_color(theme.text_muted.opacity(0.65))
-                                .child(SharedString::from("Select one or more options.")),
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(desc)),
+                        )
+                    }),
+            );
+            if multi {
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .size(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(if picked {
+                            theme.accent
+                        } else {
+                            theme.border_strong
+                        })
+                        .bg(if picked {
+                            theme.accent
+                        } else {
+                            theme.surface_card
+                        })
+                        .when(picked, |el| {
+                            el.child(
+                                crate::icons::icon(crate::icons::CHECK)
+                                    .size(px(12.0))
+                                    .text_color(theme.on_accent),
+                            )
+                        }),
+                );
+            } else if ix < 9 {
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .size(px(24.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.0))
+                        .bg(crate::theme::ink(0.06))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(format!("{}", ix + 1))),
+                );
+            }
+            row.into_any_element()
+        });
+
+        // "Other" card (Eie): a `flex-col gap-[12px] rounded-[5px] px-md
+        // py-md bg-alpha-1` box holding an "Other" row (with its own trailing
+        // number chip or multi checkbox) and the inner textarea.
+        let other_picked = !typed_empty;
+        let typed_row = div()
+            .id("wizard-option-other")
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .rounded(px(5.0))
+            .px(px(12.0))
+            .py(px(12.0))
+            .bg(if other_picked {
+                crate::theme::ink(0.05)
+            } else {
+                motion::hover_blend(
+                    "wizard-option-other",
+                    crate::theme::ink(0.03),
+                    crate::theme::ink(0.05),
+                )
+            })
+            .on_hover(motion::hover_listener("wizard-option-other"))
+            .child(
+                div()
+                    .id("wizard-option-other-row")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .w_full()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(input) = this.wizard_input.as_ref() {
+                            let focus = input.read(cx).focus_handle.clone();
+                            window.focus(&focus, cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(crate::typography::ui_rems(14.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from("Other")),
+                    )
+                    .when(question.options.len() < 9, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .size(px(24.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.0))
+                                .bg(crate::theme::ink(0.06))
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(format!(
+                                    "{}",
+                                    question.options.len() + 1
+                                ))),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(14.0))
+                    .text_color(theme.text)
+                    .when_some(self.wizard_input.clone(), |el, input| el.child(input)),
+            );
+
+        let collapsed = wizard.collapsed;
+        // Header row (Claude `lm`): [n/total pill when paged] question text
+        // (selectable, wraps) then ghost icon buttons — caret collapse toggle
+        // (rotates 90° while expanded) and X dismiss.
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .when(wizard.questions.len() > 1, |el| {
+                        el.child(
+                            // `rounded-full bg-warning text-warning` counter
+                            // pill (Claude's leading slot).
+                            div()
+                                .flex_none()
+                                .h(px(20.0))
+                                .px(px(8.0))
+                                .flex()
+                                .items_center()
+                                .rounded_full()
+                                .bg(theme.warning.opacity(0.18))
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.warning)
+                                .child(SharedString::from(counter)),
                         )
                     })
                     .child(
                         div()
-                            .id("wizard-options")
-                            .mt(px(12.0))
-                            // The panel replaces the composer but can outgrow
-                            // the viewport (many options): cap and scroll so
-                            // the footer and input stay on screen.
-                            .max_h(window.viewport_size().height * 0.4)
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.0))
-                            .overflow_y_scroll()
-                            .children(options),
-                    )
-                    // Free-text override over a hairline (shares the composer
-                    // input entity).
-                    .child(
-                        div()
-                            .mt(px(12.0))
-                            .border_t_1()
-                            .border_color(crate::theme::hairline(0.06))
-                            .pt(px(12.0))
-                            .pb(px(4.0))
-                            .px(px(4.0))
-                            .child(self.input.clone()),
+                            .min_w_0()
+                            .text_size(crate::typography::ui_rems(14.0))
+                            .line_height(px(20.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from(question.question.clone())),
                     ),
             )
             .child(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_row()
-                    .justify_between()
                     .items_center()
-                    .px(px(16.0))
-                    .pb(px(16.0))
-                    .pt(px(4.0))
+                    .gap(px(2.0))
+                    .child(
+                        // Collapse chevron — CaretRight rotated 90° while
+                        // expanded (Eie's `rotate-90` on !collapsed).
+                        div()
+                            .id("wizard-collapse")
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_color(motion::hover_blend(
+                                "wizard-collapse",
+                                theme.text_muted,
+                                theme.text,
+                            ))
+                            .bg(motion::hover_blend(
+                                "wizard-collapse",
+                                crate::theme::wash(0.0),
+                                crate::theme::ink(0.06),
+                            ))
+                            .on_hover(motion::hover_listener("wizard-collapse"))
+                            .on_click(cx.listener(|this, _, _, cx| this.wizard_toggle_collapse(cx)))
+                            .child(
+                                crate::icons::icon(crate::icons::ALT_ARROW_RIGHT)
+                                    .size(px(14.0))
+                                    .map(|icon| {
+                                        if collapsed {
+                                            icon
+                                        } else {
+                                            icon.with_transformation(gpui::Transformation::rotate(
+                                                gpui::percentage(0.25),
+                                            ))
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("wizard-dismiss")
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_color(motion::hover_blend(
+                                "wizard-dismiss",
+                                theme.text_muted,
+                                theme.text,
+                            ))
+                            .bg(motion::hover_blend(
+                                "wizard-dismiss",
+                                crate::theme::wash(0.0),
+                                crate::theme::ink(0.06),
+                            ))
+                            .on_hover(motion::hover_listener("wizard-dismiss"))
+                            .on_click(cx.listener(|this, _, _, cx| this.wizard_dismiss(cx)))
+                            .child(crate::icons::icon(crate::icons::CLOSE).size(px(14.0))),
+                    ),
+            );
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("wizard-options")
+                    .mt(px(12.0))
+                    .flex()
+                    .flex_col()
+                    // Claude: `gap-0.75` between option rows.
+                    .gap(px(3.0))
+                    // Cap and scroll so the footer stays on screen when the
+                    // option list is long.
+                    .max_h(window.viewport_size().height * 0.4)
+                    .overflow_y_scroll()
+                    .children(options)
+                    .child(typed_row),
+            )
+            // Footer (Eie): `flex items-center justify-end gap-[8px]` — Back
+            // `mr-auto` (only paged-back), Skip secondary, Submit/Next
+            // primary (disabled until a pick).
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.0))
                     .child(if page > 0 {
                         crate::popover::btn_ghost(&theme, "Back", "wizard-back")
                             .id("wizard-back")
@@ -6548,6 +6847,12 @@ impl Composer {
                     } else {
                         gpui::Empty.into_any_element()
                     })
+                    .child(div().flex_1())
+                    .child(
+                        crate::popover::btn_ghost(&theme, "Skip", "wizard-skip")
+                            .id("wizard-skip")
+                            .on_click(cx.listener(|this, _, _, cx| this.wizard_skip(cx))),
+                    )
                     .child(
                         crate::popover::btn_primary(&theme, if last { "Submit" } else { "Next" })
                             .id("wizard-submit")
@@ -6555,7 +6860,26 @@ impl Composer {
                             .when(!can_advance, |el| el.opacity(0.4))
                             .on_click(cx.listener(|this, _, _, cx| this.wizard_advance(cx))),
                     ),
-            )
+            );
+
+        div()
+            .id("question-panel")
+            .track_focus(&self.wizard_focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.on_wizard_key(event, window, cx)
+            }))
+            // Claude `Im` card: `rounded-xl border-0.5 border-border-300
+            // bg-surface-3 p-4` — an inline card on the transcript's surface,
+            // NOT a floating composer pill (no shadow).
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.input_glass_bg())
+            .p(px(16.0))
+            .flex()
+            .flex_col()
+            .child(header)
+            .when(!collapsed, |el| el.child(body))
             .into_any_element()
     }
 
@@ -6610,6 +6934,128 @@ impl Composer {
             }
         }
     }
+
+    /// The mic/waveform button beside send: one live voice session per
+    /// workspace, so every pane's composer renders the same status and emits
+    /// the same event. Click in idle or after an error starts the session and
+    /// opens the microphone for good - server VAD ends each utterance and
+    /// submits it, so the user never clicks to send; click while the session
+    /// runs stops it. Alt-click on a live session mutes the microphone gate
+    /// instead of stopping; the same action will land on the global shortcut
+    /// through `ChatViewEvent::VoiceMuted`.
+    fn render_voice_button(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let phase = self.voice.phase;
+        let muted = self.voice.muted;
+        let label: SharedString = match phase {
+            crate::voice::VoicePhase::Idle => "Start Handsfree voice".into(),
+            crate::voice::VoicePhase::Listening if muted => "Microphone muted".into(),
+            crate::voice::VoicePhase::Connecting
+            | crate::voice::VoicePhase::Listening
+            | crate::voice::VoicePhase::Thinking
+            | crate::voice::VoicePhase::Speaking => "Stop live voice".into(),
+            crate::voice::VoicePhase::Error => self
+                .voice
+                .error
+                .clone()
+                .unwrap_or_else(|| "Voice failed".into()),
+        };
+        // While the gate is open and unmuted the live meter level replaces
+        // the glyph with three rising bars; the pulse lease keeps this frame
+        // repainting at the shared 30Hz loader tick, and it parks when the
+        // gate closes.
+        let level = if phase == crate::voice::VoicePhase::Listening && !muted {
+            motion::pulse_lease(cx.entity_id(), cx);
+            self.voice.level()
+        } else {
+            0.0
+        };
+        let (icon_path, icon_color): (&'static str, gpui::Hsla) = match phase {
+            crate::voice::VoicePhase::Idle => (crate::icons::WAVEFORM, theme.text_muted),
+            crate::voice::VoicePhase::Connecting => (crate::icons::WAVEFORM, theme.text_faint),
+            crate::voice::VoicePhase::Listening if muted => {
+                (crate::icons::WAVEFORM, theme.text_muted)
+            }
+            crate::voice::VoicePhase::Listening => (crate::icons::WAVEFORM, theme.accent),
+            crate::voice::VoicePhase::Thinking => (crate::icons::WAVEFORM, theme.text_muted),
+            crate::voice::VoicePhase::Speaking => (crate::icons::WAVEFORM, theme.accent),
+            crate::voice::VoicePhase::Error => (crate::icons::DANGER_TRIANGLE, theme.danger),
+        };
+        let mut button = div()
+            .id("composer-voice")
+            .size(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                "composer-voice",
+                if phase == crate::voice::VoicePhase::Idle {
+                    gpui::transparent_black()
+                } else {
+                    theme.surface_raised
+                },
+                crate::theme::ink(0.10),
+            ))
+            .on_hover(motion::hover_listener("composer-voice"))
+            .role(gpui::Role::Button)
+            .aria_label(label.clone())
+            .tooltip(move |_, cx| cx.new(|_| VoiceTooltip(label.clone())).into())
+            .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                if event.modifiers().alt {
+                    cx.emit(ComposerEvent::VoiceMuted);
+                } else {
+                    cx.emit(ComposerEvent::VoiceToggled);
+                }
+            }));
+        button = if phase == crate::voice::VoicePhase::Connecting {
+            button.child(crate::loaders::mini_mono_spinner(
+                "composer-voice",
+                2.5,
+                theme.text_muted,
+                cx.entity_id(),
+                cx,
+            ))
+        } else if level > 0.05 {
+            // Bars rise from a 3px floor with the meter peak.
+            button.child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap(px(2.0))
+                    .children([0.35, 1.0, 0.55].map(|weight| {
+                        let height = 3.0 + (level * weight) * 12.0;
+                        div()
+                            .w(px(2.0))
+                            .h(px(height))
+                            .rounded(px(1.0))
+                            .bg(theme.accent)
+                    })),
+            )
+        } else {
+            button.child(
+                crate::icons::icon(icon_path)
+                    .size(px(15.0))
+                    .text_color(icon_color),
+            )
+        };
+        button.into_any_element()
+    }
+}
+
+struct VoiceTooltip(SharedString);
+impl Render for VoiceTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(4.0))
+            .text_size(px(12.0))
+            .bg(Theme::of(cx).surface_overlay)
+            .text_color(Theme::of(cx).text)
+            .child(self.0.clone())
+    }
 }
 
 /// Focus lands on the prompt input (window-level focus fallbacks — e.g. after
@@ -6626,6 +7072,10 @@ impl Render for Composer {
             self.queue_edit_focus_pending = false;
             let focus = self.input.focus_handle(cx);
             window.focus(&focus, cx);
+        }
+        if self.wizard_focus_pending {
+            self.wizard_focus_pending = false;
+            window.focus(&self.wizard_focus, cx);
         }
         let theme = Theme::of(cx).clone();
         let wizard_active = self.wizard.is_some();
@@ -6887,10 +7337,20 @@ impl Render for Composer {
                 ))
             });
 
-        if wizard_active {
-            let wizard = self.render_wizard(window, cx);
-            return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
-        }
+        // Claude code mode: the question card docks ABOVE the composer,
+        // which stays live below it. The wizard's Other field is its own
+        // input entity, so both can render at once.
+        let container = if wizard_active {
+            container.child(motion::fade_quick(
+                "composer-wizard",
+                div()
+                    .mx(px(QUEUE_SIDE_INSET))
+                    .mb(px(4.0))
+                    .child(self.render_wizard(window, cx)),
+            ))
+        } else {
+            container
+        };
 
         // What is waiting to be sent, stacked directly above the box it was
         // typed in — the queue is a property of this composer, not a panel
@@ -7014,6 +7474,7 @@ impl Render for Composer {
         });
 
         let send_button = self.render_send_button(mode, cx);
+        let voice_button = self.render_voice_button(&theme, cx);
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. The parent action cluster owns the spacing: adding a
@@ -7127,7 +7588,8 @@ impl Render for Composer {
                                 .justify_end()
                                 .gap(px(ACTION_UTILITY_GAP))
                                 .child(self.pickers.clone())
-                                .child(attach),
+                                .child(attach)
+                                .child(voice_button),
                         )
                         .child(send_button),
                 )
@@ -7188,7 +7650,8 @@ impl Render for Composer {
                                         .items_center()
                                         .gap(px(ACTION_UTILITY_GAP))
                                         .child(self.pickers.clone())
-                                        .child(attach),
+                                        .child(attach)
+                                        .child(voice_button),
                                 )
                                 .child(send_button),
                         ),
@@ -7711,7 +8174,7 @@ mod tests {
             id: id.into(),
             header: "Header".into(),
             question: format!("Question {id}"),
-            options: options.iter().map(|s| s.to_string()).collect(),
+            options: options.iter().map(|s| (*s).into()).collect(),
             multi_select: multi,
         }
     }

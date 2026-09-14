@@ -2,8 +2,8 @@
 //!
 //! Structural methods validate and commit atomically, incrementing `revision` once.
 //! Public fields and `pane_mut` support draft editing; use `compose` to commit those edits.
-mod persistence;
 mod arrange;
+mod persistence;
 mod tree;
 
 use serde::{Deserialize, Serialize};
@@ -157,13 +157,18 @@ impl ViewLayout {
     }
 
     pub fn ordered_tabs(&self) -> Vec<TabId> {
-        if self.tab_order.is_empty() { self.tabs.keys().copied().collect() }
-        else { self.tab_order.clone() }
+        if self.tab_order.is_empty() {
+            self.tabs.keys().copied().collect()
+        } else {
+            self.tab_order.clone()
+        }
     }
 
     fn insert_tab(&mut self, tab: TabId, state: SplitTabLayout) {
         self.tab_order = self.ordered_tabs();
-        if !self.tabs.contains_key(&tab) { self.tab_order.push(tab); }
+        if !self.tabs.contains_key(&tab) {
+            self.tab_order.push(tab);
+        }
         self.tabs.insert(tab, state);
     }
 }
@@ -439,6 +444,8 @@ impl WorkspaceLayout {
 
     /// Move an existing pane next to the target without changing its ID or state.
     /// Empty source tabs/views are removed. Moving onto itself is rejected.
+    /// When the source is already a direct sibling of the target in the
+    /// requested direction, the panes swap instead of nesting a new split.
     pub fn move_pane(&mut self, pane: PaneId, target: PaneId, direction: Direction) -> Result<()> {
         self.compose(self.revision, |draft| {
             if pane == target {
@@ -447,6 +454,29 @@ impl WorkspaceLayout {
             let (view, tab) = draft
                 .pane_location(target)
                 .ok_or(LayoutError::NotFound("target pane"))?;
+            // Same-tab sibling in the drop direction → swap leaves.
+            let should_swap = draft.pane_location(pane).is_some_and(|(sv, st)| {
+                sv == view
+                    && st == tab
+                    && draft.views[&view].tabs[&tab]
+                        .root
+                        .is_sibling_in_direction(pane, target, direction)
+            });
+            if should_swap {
+                tree::swap_leaves(
+                    &mut draft
+                        .views
+                        .get_mut(&view)
+                        .unwrap()
+                        .tabs
+                        .get_mut(&tab)
+                        .unwrap()
+                        .root,
+                    pane,
+                    target,
+                );
+                return draft.focus_pane_inner(pane);
+            }
             let state = draft.detach_pane(pane)?;
             let destination = draft.tab_mut(view, tab)?;
             destination.root.insert(target, pane, direction);
@@ -502,8 +532,13 @@ impl WorkspaceLayout {
                 return Err(LayoutError::Invalid("view has no tabs"));
             }
             let order = view.ordered_tabs();
-            if order.len() != view.tabs.len() || order.iter().copied().collect::<BTreeSet<_>>() != view.tabs.keys().copied().collect() {
-                return Err(LayoutError::Invalid("tab order must contain each tab exactly once"));
+            if order.len() != view.tabs.len()
+                || order.iter().copied().collect::<BTreeSet<_>>()
+                    != view.tabs.keys().copied().collect()
+            {
+                return Err(LayoutError::Invalid(
+                    "tab order must contain each tab exactly once",
+                ));
             }
             tabs += view.tabs.len();
             if tabs > MAX_TABS {

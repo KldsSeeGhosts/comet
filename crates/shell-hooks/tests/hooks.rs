@@ -528,9 +528,12 @@ fn invalid_names_do_not_consume_the_drain_budget() {
     .unwrap();
     for n in 0..10 {
         assert!(
-            notify(&hooks, &["Stop", &format!("{{\"noches_event_id\":\"{n}\"}}")])
-                .status
-                .success()
+            notify(
+                &hooks,
+                &["Stop", &format!("{{\"noches_event_id\":\"{n}\"}}")]
+            )
+            .status
+            .success()
         );
     }
     fs::remove_dir(hooks.directory.join("drain.lock")).unwrap();
@@ -564,10 +567,9 @@ fn claude_hooks_register_only_real_claude_code_events() {
         .register(binding(dir.path(), "a", Provider::Claude))
         .unwrap();
     let hooks = generate(&reg, &options(dir.path(), false)).unwrap();
-    let settings: Value = serde_json::from_slice(
-        &fs::read(hooks.directory.join("claude-settings.json")).unwrap(),
-    )
-    .unwrap();
+    let settings: Value =
+        serde_json::from_slice(&fs::read(hooks.directory.join("claude-settings.json")).unwrap())
+            .unwrap();
     let events = settings["hooks"].as_object().unwrap();
     // Claude Code has no SubagentStart event; only SubagentStop exists.
     assert!(!events.contains_key("SubagentStart"), "{events:?}");

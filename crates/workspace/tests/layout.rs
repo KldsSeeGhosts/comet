@@ -49,6 +49,30 @@ fn nested_resize_and_close_promote_exact_sibling() -> Result<()> {
 }
 
 #[test]
+fn swap_panes_exchanges_leaves_in_same_tab() -> Result<()> {
+    let mut layout = WorkspaceLayout::new();
+    let first = layout.active_pane_id().unwrap();
+    let second = layout.split_pane(first, Direction::Right, state("second"))?;
+    // Swap: first and second exchange positions in the tree.
+    layout.swap_panes(first, second)?;
+    // Same tab, same pane count — only the leaf contents moved.
+    let (view, tab) = layout.pane_location(first).unwrap();
+    assert_eq!(layout.pane_location(second), Some((view, tab)));
+    assert_eq!(layout.views[&view].tabs[&tab].panes.len(), 2);
+    // The tree structure is preserved: still a horizontal split.
+    assert!(matches!(
+        &layout.views[&view].tabs[&tab].root,
+        SplitNode::Split {
+            horizontal: true,
+            ..
+        }
+    ));
+    // Self-swap is rejected.
+    assert!(layout.swap_panes(first, first).is_err());
+    layout.validate()
+}
+
+#[test]
 fn nested_views_close_and_focus() -> Result<()> {
     let mut layout = WorkspaceLayout::new();
     let first = layout.active_view_id;

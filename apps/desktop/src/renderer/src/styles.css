@@ -1,0 +1,183 @@
+@import "tailwindcss";
+
+/*
+ * Noches dark theme — the same token ladder crates/ui/src/theme.rs uses
+ * (Claude-Desktop-derived near-black surfaces, indigo accent).
+ */
+@theme {
+  --color-bg: #060606;
+  --color-surface: #0d0d0d;
+  --color-raised: rgb(235 235 235 / 0.235);
+  --color-card: #0e0e0e;
+  --color-dialog: #101010;
+  --color-overlay: #161616;
+  --color-hover: rgb(235 235 235 / 0.11);
+  --color-active: rgb(235 235 235 / 0.16);
+  --color-line: rgb(255 255 255 / 0.08);
+  --color-line-strong: rgb(255 255 255 / 0.14);
+  --color-ink: #ebebeb;
+  --color-ink-muted: #b4b4b4;
+  --color-ink-faint: #8d8d8d;
+  --color-ink-dim: #989898;
+  --color-accent: oklch(0.673 0.182 276.935);
+  --color-accent-strong: oklch(0.585 0.233 277.117);
+  --color-accent-wash: oklch(0.585 0.233 277.117 / 0.45);
+  --color-on-accent: #fafafa;
+  --color-danger: oklch(0.704 0.191 22.216);
+  --color-warning: oklch(0.828 0.189 84.429);
+  --color-success: oklch(0.765 0.177 163.223);
+  --color-input: rgb(255 255 255 / 0.03);
+
+  --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+::selection {
+  background: oklch(0.673 0.182 276.935 / 0.35);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(255 255 255 / 0.16) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgb(255 255 255 / 0.14);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Streaming caret on the live assistant entry. */
+@keyframes noches-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+.streaming-dot {
+  animation: noches-pulse 1.2s ease-in-out infinite;
+}
+
+/* Thin status dot shimmer for working rows. */
+@keyframes noches-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin-slow {
+  animation: noches-spin 1.6s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .streaming-dot,
+  .spin-slow {
+    animation: none;
+  }
+}
+
+/* Markdown body inside the transcript. */
+.md {
+  line-height: 1.55;
+  overflow-wrap: break-word;
+}
+.md p {
+  margin: 0.4em 0;
+}
+.md p:first-child {
+  margin-top: 0;
+}
+.md p:last-child {
+  margin-bottom: 0;
+}
+.md pre {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin: 0.5em 0;
+}
+.md code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: var(--color-hover);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.md pre code {
+  background: transparent;
+  padding: 0;
+}
+.md ul,
+.md ol {
+  padding-left: 1.4em;
+  margin: 0.4em 0;
+}
+.md li {
+  margin: 0.15em 0;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  font-weight: 600;
+  margin: 0.8em 0 0.3em;
+}
+.md h1 {
+  font-size: 1.25em;
+}
+.md h2 {
+  font-size: 1.15em;
+}
+.md h3 {
+  font-size: 1.05em;
+}
+.md a {
+  color: var(--color-accent);
+  text-decoration: underline;
+}
+.md blockquote {
+  border-left: 2px solid var(--color-line-strong);
+  padding-left: 0.8em;
+  color: var(--color-ink-muted);
+  margin: 0.5em 0;
+}
+.md table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+}
+.md th,
+.md td {
+  border: 1px solid var(--color-line);
+  padding: 4px 10px;
+}
+.md hr {
+  border: none;
+  border-top: 1px solid var(--color-line);
+  margin: 0.8em 0;
+}

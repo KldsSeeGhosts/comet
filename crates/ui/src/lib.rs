@@ -36,10 +36,11 @@ pub mod motion;
 pub mod notify;
 pub mod pickers;
 pub mod popover;
+pub mod pricing;
 pub mod queue;
 pub mod rail;
-pub mod settings;
 pub mod session_pane;
+pub mod settings;
 pub mod shell;
 pub mod sound;
 pub mod state;
@@ -50,8 +51,9 @@ pub mod theme;
 pub mod theme_library;
 pub mod transcript;
 pub mod typography;
-mod workspace_links;
+pub mod voice;
 pub mod workspace;
+mod workspace_links;
 
 use std::path::PathBuf;
 

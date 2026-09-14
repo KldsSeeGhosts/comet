@@ -47,12 +47,12 @@ use tokio::sync::mpsc;
 
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunCommand, RunControls, Signal, send_signal, shutdown_child};
-use normalize::{map_update, parse_commands, preferred_allow_option};
+use normalize::{is_question_tool, map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_devin::DevinTracker;
 
@@ -1507,6 +1507,7 @@ fn session_update_events(
     params: &Value,
     session_id: &str,
     subagents: &mut SubagentObserver,
+    question_tool_ids: &mut std::collections::HashSet<String>,
 ) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
@@ -1517,6 +1518,30 @@ fn session_update_events(
             SubagentObserver::Devin(tracker) => tracker.map(update),
             _ => {
                 subagents.observe(update);
+                // Question tool calls (`AskUserQuestion` and friends) are
+                // owned by the permission request → wizard path; their echo
+                // (raw question/options JSON, or a status-only completion
+                // that carries the previews as `content`) must never render
+                // as a transcript tool body. Suppress by id so follow-on
+                // `tool_call_update`s — which carry no name — die with the
+                // opening call.
+                let update_kind = update
+                    .get("sessionUpdate")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if matches!(update_kind, "tool_call" | "tool_call_update") {
+                    let id = update
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if is_question_tool(update) {
+                        question_tool_ids.insert(id.to_owned());
+                        return Vec::new();
+                    }
+                    if question_tool_ids.contains(id) {
+                        return Vec::new();
+                    }
+                }
                 map_update(update)
             }
         },
@@ -1662,6 +1687,7 @@ fn handle_server_request_live(
     method: &str,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
+    question_tool_ids: &mut std::collections::HashSet<String>,
 ) -> Vec<AgentEvent> {
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
@@ -1674,15 +1700,16 @@ fn handle_server_request_live(
     if !is_user_question(&options) {
         return handle_server_request(client, id, method, params);
     }
-    let names: Vec<String> = options
-        .iter()
-        .map(|o| {
-            o.get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        })
-        .collect();
+    // The agent also echoes the prompt as a `tool_call` session update whose
+    // content renders the raw question + option previews. Suppress that id
+    // so neither the call nor its completion reaches the transcript.
+    if let Some(tool_call_id) = params
+        .get("toolCall")
+        .and_then(|t| t.get("toolCallId"))
+        .and_then(Value::as_str)
+    {
+        question_tool_ids.insert(tool_call_id.to_owned());
+    }
     let question = UserInputQuestion {
         id: new_message_id(),
         header: "Agent question".into(),
@@ -1692,7 +1719,20 @@ fn handle_server_request_live(
             .and_then(Value::as_str)
             .unwrap_or("The agent needs your input.")
             .to_owned(),
-        options: names.clone(),
+        options: options
+            .iter()
+            .map(|o| UserInputOption {
+                label: o
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                description: o
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+            .collect(),
         multi_select: false,
     };
     let client = client.clone();
@@ -2107,6 +2147,11 @@ async fn run_session(session: Session) {
         ))
     };
 
+    // Tool-call ids of question prompts (`AskUserQuestion`): the permission
+    // request owns them; their `tool_call_update` completions carry no name,
+    // so the ids are remembered here and suppressed for the session's life.
+    let mut question_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     // ---- main loop --------------------------------------------------------
     // Prompt-completion settlement state (the prompt-complete extension):
     // one prompt is outstanding at a time, identified by `current_prompt_id`;
@@ -2254,7 +2299,13 @@ async fn run_session(session: Session) {
                     match inc {
                         Incoming::Notification { method, params } => {
                             let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
+                                session_update_events(
+                                    &method,
+                                    &params,
+                                    &session_id,
+                                    &mut subagents,
+                                    &mut question_tool_ids,
+                                );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2269,6 +2320,7 @@ async fn run_session(session: Session) {
                                 &method,
                                 &params,
                                 &request_input,
+                                &mut question_tool_ids,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2425,7 +2477,13 @@ async fn run_session(session: Session) {
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
                     let events =
-                        session_update_events(&method, &params, &session_id, &mut subagents);
+                        session_update_events(
+                                    &method,
+                                    &params,
+                                    &session_id,
+                                    &mut subagents,
+                                    &mut question_tool_ids,
+                                );
                     for ev in events {
                         track_open_tools(&ev, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -2441,6 +2499,7 @@ async fn run_session(session: Session) {
                         &method,
                         &params,
                         &request_input,
+                        &mut question_tool_ids,
                     ) {
                         if !send(&event_tx, ev).await {
                             break 'main;
@@ -2535,7 +2594,13 @@ async fn run_session(session: Session) {
                             match inc {
                                 Incoming::Notification { method, params } => {
                                     let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents);
+                                        session_update_events(
+                                    &method,
+                                    &params,
+                                    &session_id,
+                                    &mut subagents,
+                                    &mut question_tool_ids,
+                                );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2550,6 +2615,7 @@ async fn run_session(session: Session) {
                                         &method,
                                         &params,
                                         &request_input,
+                                        &mut question_tool_ids,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;

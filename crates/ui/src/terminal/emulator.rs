@@ -322,7 +322,9 @@ impl Emulator {
 
     /// Fullscreen programs without mouse reporting receive wheel events as arrows.
     pub fn alternate_scroll(&self) -> bool {
-        self.term.mode().contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+        self.term
+            .mode()
+            .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
     }
 
     /// Lines scrolled back into history (0 = pinned to the live bottom).

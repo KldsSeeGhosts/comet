@@ -202,12 +202,20 @@ fn main() -> anyhow::Result<()> {
         },
         None => {
             let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
+            let data_dir = std::env::var_os("ZERON_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(dirs_data_dir);
+            // Single instance per variant: a running UI window owns a local-api
+            // registration under this data dir's APP_ID (`zeron`/`zeron-dev`).
+            // Forward an activate to it and exit instead of opening a second
+            // window whose control plane would fail to bind anyway.
+            if activate_running_window(&data_dir) {
+                return Ok(());
+            }
             // Headed: the UI probes ZERON_IPC_PORT and connects to a running
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
             zeron_ui::run_app(zeron_ui::UiConfig {
-                data_dir: std::env::var_os("ZERON_DATA_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(dirs_data_dir),
+                data_dir,
                 ipc_port: std::env::var("ZERON_IPC_PORT")
                     .ok()
                     .and_then(|p| p.parse().ok())
@@ -222,6 +230,38 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// If a UI window for this variant already holds the local-api registration
+/// under `data_dir`, ask it to raise itself and return `true` so the launcher
+/// exits without opening a duplicate. Any failure — no manifest, dead socket,
+/// health mismatch — means no live window, so the caller proceeds to launch.
+fn activate_running_window(data_dir: &std::path::Path) -> bool {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => return false,
+    };
+    runtime.block_on(async move {
+        // Bound the whole probe: a wedged socket must not stall app launch.
+        let probe = async {
+            let client = zeron_local_api::Client::discover(data_dir, None, Some(zeron_ui::APP_ID))
+                .await
+                .ok()?;
+            client
+                .request("window.activate", serde_json::json!({}))
+                .await
+                .ok()?;
+            Some(())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), probe)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    })
 }
 
 /// The env-resolved engine configuration shared by `headless`, `login`,

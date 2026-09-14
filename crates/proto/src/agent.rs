@@ -340,13 +340,61 @@ pub struct ToolDiff {
     pub new_text: String,
 }
 
+/// One selectable choice in a [`UserInputQuestion`]. Mirrors Claude's
+/// `AskUserQuestion` option shape — `label` is the bold row title,
+/// `description` the muted second line (optional).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl From<&str> for UserInputOption {
+    fn from(label: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            description: None,
+        }
+    }
+}
+
+impl From<String> for UserInputOption {
+    fn from(label: String) -> Self {
+        Self {
+            label,
+            description: None,
+        }
+    }
+}
+
+/// Label equality keeps call sites and tests terse — `option == "Yes"`.
+impl PartialEq<str> for UserInputOption {
+    fn eq(&self, other: &str) -> bool {
+        self.label == other
+    }
+}
+
+impl PartialEq<&str> for UserInputOption {
+    fn eq(&self, other: &&str) -> bool {
+        self.label == *other
+    }
+}
+
+impl PartialEq<String> for UserInputOption {
+    fn eq(&self, other: &String) -> bool {
+        self.label == *other
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputQuestion {
     pub id: String,
     pub header: String,
     pub question: String,
-    pub options: Vec<String>,
+    pub options: Vec<UserInputOption>,
     #[serde(default)]
     pub multi_select: bool,
 }

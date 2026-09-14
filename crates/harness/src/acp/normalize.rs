@@ -148,6 +148,26 @@ fn arg_from_title(title: &str) -> Option<String> {
     }
 }
 
+/// True when a tool_call update is actually the AskUserQuestion prompt —
+/// matched on the tool name (`_toolName` in rawInput, or the title) or a
+/// rawInput that carries the `questions` array. The permission request owns
+/// the interaction; the tool-call echo would only leak the raw JSON body.
+pub(crate) fn is_question_tool(update: &Value) -> bool {
+    let raw = update.get("rawInput").filter(|v| !v.is_null());
+    if raw.and_then(|r| r.get("questions")).is_some() {
+        return true;
+    }
+    ["_toolName", "toolName", "tool_name"]
+        .iter()
+        .find_map(|k| raw.and_then(|r| r.get(*k)).and_then(Value::as_str))
+        .map(|n| n == "AskUserQuestion" || n.ends_with("ask_user_question"))
+        .unwrap_or(false)
+        || update
+            .get("title")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "AskUserQuestion")
+}
+
 /// Reduce an ACP tool call (kind + title + rawInput + locations + diff
 /// content) to the typed [`ToolCall`] zeron renders. Best-effort: agents vary
 /// in how much structure they put in `rawInput`, so every arm has a fallback.
@@ -350,6 +370,12 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
         // before this map; a live user chunk is our own prompt echoed back.
         "user_message_chunk" => Vec::new(),
         "tool_call" => {
+            // AskUserQuestion is a permission-style prompt, not a tool — its
+            // rawInput (question + option previews) must never reach the
+            // transcript as a tool-call detail body.
+            if is_question_tool(update) {
+                return Vec::new();
+            }
             let id = str_field(update, "toolCallId");
             let mut events = vec![AgentEvent::ToolCall {
                 id: id.clone(),
@@ -363,6 +389,9 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             events
         }
         "tool_call_update" => {
+            if is_question_tool(update) {
+                return Vec::new();
+            }
             let id = str_field(update, "toolCallId");
             let mut events = Vec::new();
             // Refresh the call only when the update carries new SHAPE — kind,

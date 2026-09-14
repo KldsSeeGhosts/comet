@@ -153,6 +153,51 @@ impl<T: Copy + Eq> SplitNode<T> {
         }
     }
 
+    /// Whether `source` and `target` are direct siblings in a split node,
+    /// with `source` already on the `direction` side of `target`.
+    pub(crate) fn is_sibling_in_direction(
+        &self,
+        source: T,
+        target: T,
+        direction: Direction,
+    ) -> bool {
+        match self {
+            Self::Leaf { .. } => false,
+            Self::Split {
+                first,
+                second,
+                horizontal,
+                ..
+            } => {
+                let source_side = match (&**first, &**second) {
+                    (Self::Leaf { content: a }, Self::Leaf { content: b }) => {
+                        if *a == source && *b == target {
+                            Some(Branch::First)
+                        } else if *a == target && *b == source {
+                            Some(Branch::Second)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(source_branch) = source_side else {
+                    return false;
+                };
+                let matches = matches!(
+                    (source_branch, direction),
+                    (Branch::First, Direction::Left | Direction::Up)
+                        | (Branch::Second, Direction::Right | Direction::Down)
+                );
+                let axis_ok = match direction {
+                    Direction::Left | Direction::Right => *horizontal,
+                    Direction::Up | Direction::Down => !*horizontal,
+                };
+                matches && axis_ok
+            }
+        }
+    }
+
     /// Remove a leaf and promote its sibling. None means the entire tree was removed.
     pub(crate) fn remove(self, target: T) -> Option<Self> {
         match self {
@@ -171,6 +216,23 @@ impl<T: Copy + Eq> SplitNode<T> {
                 }),
                 (first, second) => first.or(second),
             },
+        }
+    }
+}
+
+/// Swap two leaf contents in the tree — used by `move_pane`'s sibling path.
+pub(crate) fn swap_leaves<T: Copy + Eq>(node: &mut SplitNode<T>, a: T, b: T) {
+    match node {
+        SplitNode::Leaf { content } => {
+            if *content == a {
+                *content = b;
+            } else if *content == b {
+                *content = a;
+            }
+        }
+        SplitNode::Split { first, second, .. } => {
+            swap_leaves(first, a, b);
+            swap_leaves(second, a, b);
         }
     }
 }

@@ -274,7 +274,14 @@ pub fn modifier_send_label(is_macos: bool) -> &'static str {
 /// extends the match and appears on the page by construction
 /// (`every_shortcut_lands_in_a_rendered_group` holds the other half: its group
 /// name must be listed here).
-const GROUP_ORDER: [&str; 5] = ["Files", "Browser", "Panels", "Sessions", "Jump to session"];
+const GROUP_ORDER: [&str; 6] = [
+    "Files",
+    "Browser",
+    "Panels",
+    "Sessions",
+    "Handsfree",
+    "Jump to session",
+];
 
 /// The section a shortcut's row renders under.
 fn group(id: ShortcutId) -> &'static str {
@@ -288,6 +295,7 @@ fn group(id: ShortcutId) -> &'static str {
         | ShortcutId::NextSession
         | ShortcutId::PrevSession
         | ShortcutId::ArchiveSession => "Sessions",
+        ShortcutId::ToggleVoice | ShortcutId::MuteVoice => "Handsfree",
         ShortcutId::JumpSession(_) => "Jump to session",
     }
 }
@@ -307,6 +315,8 @@ fn description(id: ShortcutId) -> &'static str {
             "Select the previous session in the sidebar, wrapping at the start."
         }
         ShortcutId::ArchiveSession => "Move the current session to the archived shelf.",
+        ShortcutId::ToggleVoice => "Start or stop the live Handsfree voice session.",
+        ShortcutId::MuteVoice => "Mute or unmute the microphone during a Handsfree session.",
         // One line per slot would repeat itself nine times; the ordinal is
         // already in the row's label.
         ShortcutId::JumpSession(_) => "Open the session at this place in the sidebar list.",
@@ -632,6 +642,27 @@ mod tests {
         assert_eq!(
             conflict_owner(&keymap, ShortcutId::ToggleSidebar, "mod-shift-x"),
             None
+        );
+    }
+
+    #[test]
+    fn handsfree_shortcuts_group_and_conflict_like_the_rest() {
+        // Both rows render under the Handsfree card, which GROUP_ORDER lists.
+        assert_eq!(group(ShortcutId::ToggleVoice), "Handsfree");
+        assert_eq!(group(ShortcutId::MuteVoice), "Handsfree");
+        assert!(GROUP_ORDER.contains(&"Handsfree"));
+
+        // Recording a Handsfree default onto another row is refused, naming
+        // the Handsfree owner.
+        let keymap = KeymapConfig::default();
+        assert_eq!(
+            conflict_owner(&keymap, ShortcutId::ToggleSidebar, "mod-shift-h"),
+            Some(ShortcutId::ToggleVoice)
+        );
+        // And an unrelated combo recorded onto a Handsfree row names its owner.
+        assert_eq!(
+            conflict_owner(&keymap, ShortcutId::ToggleVoice, "mod-b"),
+            Some(ShortcutId::ToggleSidebar)
         );
     }
 
