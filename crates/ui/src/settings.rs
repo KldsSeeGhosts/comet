@@ -807,6 +807,7 @@ pub enum ShortcutId {
     ToggleTerminal,
     NewSession,
     NewProject,
+    OpenModelPicker,
     NextSession,
     PrevSession,
     ArchiveSession,
@@ -819,7 +820,7 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 16 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 17 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
@@ -828,6 +829,7 @@ impl ShortcutId {
         ShortcutId::ToggleTerminal,
         ShortcutId::NewSession,
         ShortcutId::NewProject,
+        ShortcutId::OpenModelPicker,
         ShortcutId::NextSession,
         ShortcutId::PrevSession,
         ShortcutId::ArchiveSession,
@@ -864,6 +866,7 @@ impl ShortcutId {
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::NewSession => "New session",
             ShortcutId::NewProject => "New project",
+            ShortcutId::OpenModelPicker => "Open model picker",
             ShortcutId::NextSession => "Next session",
             ShortcutId::PrevSession => "Previous session",
             ShortcutId::ArchiveSession => "Archive session",
@@ -894,6 +897,7 @@ impl ShortcutId {
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::NewSession => "mod-n",
             ShortcutId::NewProject => "mod-shift-n",
+            ShortcutId::OpenModelPicker => "mod-/",
             // Ctrl+Tab on every platform — but spelled the way THAT platform's
             // recorder spells ctrl (see `combo_from_keystroke`). Off macOS
             // ctrl IS the primary and stores as "mod"; on macOS it is its own
@@ -946,6 +950,7 @@ pub struct KeymapConfig {
     pub toggle_terminal: String,
     pub new_session: String,
     pub new_project: String,
+    pub open_model_picker: String,
     pub next_session: String,
     pub prev_session: String,
     pub archive_session: String,
@@ -975,6 +980,7 @@ impl Default for KeymapConfig {
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
             new_project: ShortcutId::NewProject.default_combo().into(),
+            open_model_picker: ShortcutId::OpenModelPicker.default_combo().into(),
             next_session: ShortcutId::NextSession.default_combo().into(),
             prev_session: ShortcutId::PrevSession.default_combo().into(),
             archive_session: ShortcutId::ArchiveSession.default_combo().into(),
@@ -999,6 +1005,7 @@ impl KeymapConfig {
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
             ShortcutId::NewSession => &self.new_session,
             ShortcutId::NewProject => &self.new_project,
+            ShortcutId::OpenModelPicker => &self.open_model_picker,
             ShortcutId::NextSession => &self.next_session,
             ShortcutId::PrevSession => &self.prev_session,
             ShortcutId::ArchiveSession => &self.archive_session,
@@ -1025,6 +1032,7 @@ impl KeymapConfig {
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
             ShortcutId::NewSession => self.new_session = combo,
             ShortcutId::NewProject => self.new_project = combo,
+            ShortcutId::OpenModelPicker => self.open_model_picker = combo,
             ShortcutId::NextSession => self.next_session = combo,
             ShortcutId::PrevSession => self.prev_session = combo,
             ShortcutId::ArchiveSession => self.archive_session = combo,
