@@ -3674,6 +3674,7 @@ impl Shell {
         self.settings.terminal_font_size = current.terminal_font_size;
         self.settings.code_font_family = current.code_font_family;
         self.settings.code_font_size = current.code_font_size;
+        self.settings.transcript_width = current.transcript_width;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -11937,6 +11938,7 @@ mod exit_regressions {
                 width: 1100.0,
                 height: 750.0,
             });
+            let transcript_width = 736.0 + 16.0 * index as f32;
             window
                 .update(cx, |shell, _, cx| {
                     // Selection changes in Appearance, independently of the shell's
@@ -11951,6 +11953,7 @@ mod exit_regressions {
                         settings.terminal_font_size = terminal_size;
                         settings.code_font_family = code_family.clone();
                         settings.code_font_size = code_size;
+                        settings.transcript_width = transcript_width;
                     });
                     for step in 0..3 {
                         shell.settings.sidebar_width = 290.0 + step as f32;
@@ -11965,6 +11968,7 @@ mod exit_regressions {
                         assert_eq!(current.terminal_font_size, terminal_size);
                         assert_eq!(current.code_font_family, code_family);
                         assert_eq!(current.code_font_size, code_size);
+                        assert_eq!(current.transcript_width, transcript_width);
                     }
                     settings::flush(cx);
                     let loaded = settings::UiSettings::load(dir.path());
@@ -11975,6 +11979,7 @@ mod exit_regressions {
                     assert_eq!(loaded.terminal_font_size, terminal_size);
                     assert_eq!(loaded.code_font_family, code_family);
                     assert_eq!(loaded.code_font_size, code_size);
+                    assert_eq!(loaded.transcript_width, transcript_width);
                     assert_eq!(loaded.sidebar_width, 292.0);
                     assert_eq!(loaded.right_pane_width, 542.0);
                     assert_eq!(loaded.terminal_height, 302.0);
