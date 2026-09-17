@@ -123,9 +123,8 @@ const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
 pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
     std::time::Duration::from_millis(120);
 
-/// Put this machine's device group first without disturbing the recency-based
-/// order of any remote groups. A targeted promotion is more truthful than a
-/// full name sort: local context leads, then the user's chosen chat sort wins.
+/// Put this machine's device groups first without disturbing the recency-based
+/// order within local or remote groups.
 fn promote_local_device_group<T>(
     groups: &mut Vec<(Option<(String, String)>, Vec<T>)>,
     local_device_id: Option<&str>,
@@ -133,17 +132,25 @@ fn promote_local_device_group<T>(
     let Some(local_device_id) = local_device_id else {
         return;
     };
-    let Some(index) = groups.iter().position(|(group, _)| {
-        group
+    let mut local_groups = Vec::new();
+    let mut other_groups = Vec::new();
+    for group in std::mem::take(groups) {
+        if group
+            .0
             .as_ref()
             .is_some_and(|(device_id, _)| device_id == local_device_id)
-    }) else {
-        return;
-    };
-    if index > 0 {
-        let local = groups.remove(index);
-        groups.insert(0, local);
+        {
+            local_groups.push(group);
+        } else {
+            other_groups.push(group);
+        }
     }
+    if local_groups.is_empty() {
+        *groups = other_groups;
+        return;
+    }
+    local_groups.extend(other_groups);
+    *groups = local_groups;
 }
 
 fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyElement) -> gpui::Div {
@@ -274,6 +281,15 @@ impl popover::ScrollRailHost for Shell {
 }
 
 impl Shell {
+    fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+        if self.state.read(cx).space_row(&space_id).is_none() {
+            return;
+        }
+        self.open_new_session(cx);
+        self.state
+            .update(cx, |state, cx| state.select_space(Some(space_id), cx));
+    }
+
     fn begin_sidebar_disclosure_motion(
         &mut self,
         key: &str,
@@ -754,17 +770,23 @@ impl Shell {
         let filter = self.settings.space_filter.clone();
         // Name + the dropdown rows' "@ device" tag on the trigger itself, so
         // the filtered space's host reads without opening the picker.
-        let (label, device_tag): (SharedString, Option<(SharedString, bool)>) = {
+        let (label, device_tag, session_count): (
+            SharedString,
+            Option<(SharedString, bool)>,
+            usize,
+        ) = {
             let state = self.state.read(cx);
+            let session_count = state.sidebar_chats(Utc::now(), filter.as_deref()).len();
             match filter.as_deref().and_then(|id| state.space_row(id)) {
                 Some(space) => {
                     let (tag, offline) = state.space_device_tag(space, Utc::now());
                     (
                         space.display_name().to_string().into(),
                         Some((tag.into(), offline)),
+                        session_count,
                     )
                 }
-                None => (SharedString::from("All projects"), None),
+                None => (SharedString::from("All projects"), None, session_count),
             }
         };
         let open = self.spaces_menu.is_open();
@@ -848,6 +870,14 @@ impl Shell {
                             )
                         })
                     }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(crate::typography::ui_rems(10.0))
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(session_count.to_string()),
             )
             .child(
                 icon(icons::ALT_ARROW_DOWN)
@@ -1151,7 +1181,7 @@ impl Shell {
     }
 
     /// Flat top-to-bottom chat ids exactly as [`Self::render_active_rows`]
-    /// draws them — the user's sort, device grouping, and local-device
+    /// draws them - the user's sort, workspace/device grouping, and local-device
     /// promotion applied. The jump shortcuts and session cycling read THIS
     /// order (not the raw recency list) so keyboard order never drifts from
     /// the screen.
@@ -1169,7 +1199,12 @@ impl Shell {
         }
         let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
         for chat in chats {
-            let key = Some((chat.device_id.clone(), String::new()));
+            let space_id = state
+                .space_for_chat(&chat)
+                .filter(|space| space.device_id == chat.device_id)
+                .map(|space| space.id.clone())
+                .unwrap_or_default();
+            let key = Some((chat.device_id.clone(), space_id));
             if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
                 existing.push(chat);
             } else {
@@ -1232,7 +1267,13 @@ impl Shell {
                         .map(str::to_string);
                     let change_request = state.change_request_for_chat(&chat).cloned();
                     let group = match self.settings.sidebar_organization {
-                        SidebarOrganization::ByDevice => Some((chat.device_id.clone(), device)),
+                        SidebarOrganization::ByDevice => Some((
+                            chat.device_id.clone(),
+                            space
+                                .filter(|space| space.device_id == chat.device_id)
+                                .map(|space| space.id.clone())
+                                .unwrap_or_default(),
+                        )),
                         SidebarOrganization::ByProject | SidebarOrganization::InOneList => None,
                     };
                     ActiveChatRow {
@@ -1331,15 +1372,34 @@ impl Shell {
                 rendered_rows.push((format!("c:{}", chat.id), height, element));
             }
 
-            let Some((key, label)) = group else {
+            let Some((device_id, space_id)) = group else {
                 rendered.extend(rendered_rows);
                 continue;
+            };
+            let (label, device_label, target_space) = {
+                let state = self.state.read(cx);
+                let device_label = state.device_name(&device_id).map(str::to_string);
+                match state
+                    .space_row(&space_id)
+                    .filter(|space| space.device_id == device_id)
+                {
+                    Some(space) => (
+                        space.display_name().to_string(),
+                        device_label,
+                        Some(space.id.clone()),
+                    ),
+                    None => (
+                        device_label.unwrap_or_else(|| "Unknown device".to_string()),
+                        None,
+                        None,
+                    ),
+                }
             };
             let organization = match self.settings.sidebar_organization {
                 SidebarOrganization::ByDevice => "device",
                 SidebarOrganization::ByProject | SidebarOrganization::InOneList => "list",
             };
-            let collapse_key = format!("{organization}:{key}");
+            let collapse_key = format!("{organization}:{device_id}:{space_id}");
             let motion_key = format!("group:{collapse_key}");
             let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
             let row_count = rendered_rows.len();
@@ -1356,16 +1416,23 @@ impl Shell {
                 .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
                 .gap(px(SIDEBAR_LIST_GAP))
                 .children(rendered_rows.into_iter().map(|(_, _, row)| row));
-            let visible_label: SharedString = if collapsed {
-                format!("{label} ({row_count})").into()
+            let label = if collapsed {
+                format!("{label} ({row_count})")
             } else {
-                label.into()
+                label
             };
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let toggle_key = collapse_key.clone();
             let toggle_motion_key = motion_key.clone();
-            let header = sidebar_disclosure_header(theme, visible_label, chevron)
+            let header = div()
                 .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .h(px(SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
+                .px(px(Theme::SPACE_SM))
+                .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
                     this.begin_sidebar_disclosure_motion(
@@ -1379,7 +1446,52 @@ impl Shell {
                         this.sidebar_collapsed_groups.remove(&toggle_key);
                     }
                     cx.notify();
-                }));
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(crate::typography::ui_rems(10.5))
+                        .text_color(theme.text_muted.opacity(0.75))
+                        .child(label),
+                )
+                .when_some(device_label, |el, device_label| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(crate::typography::ui_rems(10.5))
+                            .text_color(theme.text_muted.opacity(0.45))
+                            .child(format!("· {device_label}")),
+                    )
+                })
+                .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6)))
+                .when_some(target_space, |el, space_id| {
+                    let button_id = format!("sidebar-group-new-session-{space_id}");
+                    el.child(
+                        div()
+                            .id(SharedString::from(button_id))
+                            .size(px(20.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .text_color(theme.text_muted.opacity(0.65))
+                            .hover(|el| el.bg(theme.glass_hover()).text_color(theme.text))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_new_session_in_space(space_id.clone(), cx);
+                            }))
+                            .child(icon(icons::PLUS).size(px(12.0))),
+                    )
+                })
+                .child(chevron);
             let body = self.render_sidebar_disclosure_body(
                 &motion_key,
                 !collapsed,
