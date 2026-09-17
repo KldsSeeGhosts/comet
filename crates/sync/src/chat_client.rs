@@ -131,6 +131,11 @@ pub trait ChatDocSink: Send + Sync + 'static {
     /// Import one remote update row with a proposed contiguous cursor. A
     /// pending import must not persist that cursor; the client repairs it.
     fn apply_row(&self, bytes: &[u8], cursor: u64) -> RowImportOutcome;
+    /// Historical rows from a backfill/HTTP pull. The default keeps existing
+    /// sinks compatible; presentation-aware sinks record a replay cutoff.
+    fn apply_replay_row(&self, bytes: &[u8], cursor: u64) -> RowImportOutcome {
+        self.apply_row(bytes, cursor)
+    }
     /// Replace/merge from a checkpoint blob; `cursor` is its checkpointSeq.
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String>;
     /// Client-side precision (replaces the server VV diff): is the server
@@ -278,6 +283,12 @@ struct Shared {
     /// wedge); instead this flag asks the session loop for a rowsReq
     /// backfill from the honest cursor.
     gap_repair: bool,
+    replaying_gap: bool,
+    /// HTTP polling also has a live mode. Reopening/probing a chat or losing
+    /// delivery starts a new replay epoch; a complete pull establishes its
+    /// baseline. Failed socket dials alone do not disable live HTTP animation.
+    http_replay_epoch: u64,
+    http_live_epoch: Option<u64>,
     /// Contiguous room rows can still lack CRDT dependencies. Re-fetch the
     /// checkpoint even if its advertised frontier appears locally contained.
     needs_checkpoint: bool,
@@ -314,7 +325,13 @@ fn ensure_durable(shared: &Mutex<Shared>, sink: &dyn ChatDocSink, push: &Pending
     }
 }
 
-fn apply_remote_row(shared: &Mutex<Shared>, sink: &dyn ChatDocSink, bytes: &[u8], seq: u64) {
+fn apply_remote_row(
+    shared: &Mutex<Shared>,
+    sink: &dyn ChatDocSink,
+    bytes: &[u8],
+    seq: u64,
+    replay: bool,
+) {
     let cursor = {
         let mut shared = lock(shared);
         if seq > shared.cursor.saturating_add(1) {
@@ -326,7 +343,11 @@ fn apply_remote_row(shared: &Mutex<Shared>, sink: &dyn ChatDocSink, bytes: &[u8]
     };
     // Import may fire document subscriptions, so never hold the client lock
     // across the sink call.
-    let outcome = sink.apply_row(bytes, cursor);
+    let outcome = if replay {
+        sink.apply_replay_row(bytes, cursor)
+    } else {
+        sink.apply_row(bytes, cursor)
+    };
     let mut shared = lock(shared);
     match outcome {
         RowImportOutcome::Applied => shared.cursor = shared.cursor.max(cursor),
@@ -624,6 +645,9 @@ impl ChatClient {
 
     /// Liveness hint: probe the room now (deadline-checked).
     pub fn probe(&self) {
+        let mut shared = lock(&self.shared);
+        shared.http_replay_epoch = shared.http_replay_epoch.wrapping_add(1);
+        drop(shared);
         let _ = self.probe.try_send(());
     }
 
@@ -817,6 +841,10 @@ impl Actor {
                     // without any reset, ~7 flaps pinned every future
                     // reconnect at the cap for the life of the client.
                     let joined = self.flags.connected.swap(false, Relaxed);
+                    if joined {
+                        let mut shared = lock(&self.shared);
+                        shared.http_replay_epoch = shared.http_replay_epoch.wrapping_add(1);
+                    }
                     self.flags.disconnects.fetch_add(1, Relaxed);
                     let _ = self.events.send(ChatEvent::Disconnected);
                     if ready.is_some() {
@@ -917,6 +945,7 @@ impl Actor {
             return SessionEnd::Reconnect;
         };
         lock(&self.shared).server = Some(state);
+        lock(&self.shared).replaying_gap = false;
         // Server behind our cursor = the room was reset/wiped. Detect on the
         // RAW persisted cursor, BEFORE the amnesty below rewrites it —
         // plan_catch_up treats the cursor as fresh; SURFACE the signal too:
@@ -1092,7 +1121,7 @@ impl Actor {
                 head_seq = Some(done.head_seq);
                 continue; // frames after ROWS_DONE are steady-state; keep them
             }
-            if !self.handle_frame(frame) {
+            if !self.handle_frame_with_replay(frame, head_seq.is_none()) {
                 return SessionEnd::Reconnect;
             }
         }
@@ -1112,7 +1141,7 @@ impl Actor {
                                 return Some(done.head_seq);
                             }
                             _ => {
-                                if !self.handle_frame(frame) {
+                                if !self.handle_frame_with_replay(frame, true) {
                                     return None;
                                 }
                             }
@@ -1309,11 +1338,17 @@ impl Actor {
                     }
                 }
             }
-            let cursor = lock(&shared).cursor;
+            let (cursor, replay_epoch, mut was_live) = {
+                let mut sh = lock(&shared);
+                let was_live = sh.http_live_epoch.take() == Some(sh.http_replay_epoch);
+                (sh.cursor, sh.http_replay_epoch, was_live)
+            };
             let body = match transport.fetch_rows(cursor).await {
                 Ok(body) => body,
                 Err(err) => {
                     tracing::warn!(error = %err, "chat2: http pull failed; will retry");
+                    let mut sh = lock(&shared);
+                    sh.http_replay_epoch = sh.http_replay_epoch.wrapping_add(1);
                     busy.store(false, Relaxed);
                     return;
                 }
@@ -1351,7 +1386,11 @@ impl Actor {
                     let contained = state.checkpoint_size == 0
                         || (!repair_causal_history && sink.contains_frontier(&state_frame.payload));
                     let plan = plan_catch_up(cursor, &state, contained);
+                    if repair_causal_history || cursor > state.head_seq {
+                        was_live = false;
+                    }
                     if let CatchUpPlan::CheckpointThenRows { .. } = plan {
+                        was_live = false;
                         let fetched =
                             tokio::time::timeout(CHECKPOINT_FETCH_DEADLINE, fetcher.fetch()).await;
                         match fetched {
@@ -1398,10 +1437,26 @@ impl Actor {
                         // contiguous — but hold the rule anyway: a jump
                         // (trimmed log, server surprise) must not stamp the
                         // cursor over rows the doc never saw.
-                        apply_remote_row(&shared, sink.as_ref(), &frame.payload, row.seq);
+                        let replay = {
+                            let sh = lock(&shared);
+                            !was_live || sh.http_replay_epoch != replay_epoch || sh.needs_checkpoint
+                        };
+                        apply_remote_row(&shared, sink.as_ref(), &frame.payload, row.seq, replay);
                         applied = true;
                     }
-                    frame_type::ROWS_DONE => {}
+                    frame_type::ROWS_DONE => {
+                        if let Ok(done) =
+                            serde_json::from_value::<wire::RowsDoneHeader>(frame.header)
+                        {
+                            let mut sh = lock(&shared);
+                            if sh.http_replay_epoch == replay_epoch
+                                && sh.cursor >= done.head_seq
+                                && !sh.needs_checkpoint
+                            {
+                                sh.http_live_epoch = Some(replay_epoch);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1431,6 +1486,7 @@ impl Actor {
         if !repair {
             return true;
         }
+        lock(&self.shared).replaying_gap = true;
         *repairs += 1;
         if *repairs > MAX_GAP_REPAIRS_PER_SESSION {
             tracing::warn!("chat2: gap repairs exhausted; redialing for a full catch-up");
@@ -1490,6 +1546,10 @@ impl Actor {
 
     /// Apply one inbound protocol frame. False = protocol breakdown, redial.
     fn handle_frame(&self, frame: wire::WireFrame) -> bool {
+        self.handle_frame_with_replay(frame, false)
+    }
+
+    fn handle_frame_with_replay(&self, frame: wire::WireFrame, replay: bool) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         match frame.kind {
             frame_type::ROW => {
@@ -1504,7 +1564,14 @@ impl Actor {
                 // gap means rows we never received (live broadcast mid-join)
                 // — apply the bytes (loro parks dependents harmlessly), keep
                 // the honest cursor, and ask for a backfill repair.
-                apply_remote_row(&self.shared, self.sink.as_ref(), &frame.payload, row.seq);
+                let replay = replay || lock(&self.shared).replaying_gap;
+                apply_remote_row(
+                    &self.shared,
+                    self.sink.as_ref(),
+                    &frame.payload,
+                    row.seq,
+                    replay,
+                );
                 let _ = self.events.send(ChatEvent::Applied);
             }
             frame_type::ACK => {
@@ -1546,6 +1613,9 @@ impl Actor {
             }
             frame_type::PRESENCE => {
                 let _ = self.events.send(ChatEvent::Presence);
+            }
+            frame_type::ROWS_DONE => {
+                lock(&self.shared).replaying_gap = false;
             }
             frame_type::PROBE_OK => {
                 if let Ok(probe) = serde_json::from_value::<wire::ProbeOkHeader>(frame.header) {
