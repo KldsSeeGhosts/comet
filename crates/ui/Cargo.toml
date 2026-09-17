@@ -48,6 +48,7 @@ zeron-rpc.workspace = true
 zeron-update.workspace = true
 zeron-syntax.workspace = true
 zeron-theme.workspace = true
+zeron-workspace = { path = "../workspace" }
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true

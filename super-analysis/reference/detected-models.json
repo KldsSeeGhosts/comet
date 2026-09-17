@@ -1,0 +1,491 @@
+{
+  "pi": [
+    {
+      "id": "openai-codex/gpt-5.3-codex-spark",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-5.4",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-5.4-mini",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-5.5",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-5.6-luna",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-5.6-sol",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-5.6-terra",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "openai-codex/gpt-6-astra",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "llamacpp-local/qwen3.8-flash-next-reap-256",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "ninfer-local/qwen3.8-27b",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "xhigh"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/claude-opus-4-6-thinking",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/claude-sonnet-4-6-thinking",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/gpt-5.6-sol",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/gpt-5.6-terra",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/gpt-5.6-luna",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/gpt-6-astra",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/gemini-3.8-flash",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/opencode-go/deepseek-v4.1-flash",
+      "reasoning_efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/opencode-go/muse-spark-1.3-contributor",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/devin/swe-2",
+      "reasoning_efforts": [
+        "medium",
+        "high",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cpa/zai/glm-5.3",
+      "reasoning_efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "cpa/zai/glm-5.3-flash",
+      "reasoning_efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "cpa/cursor-grok-4.6",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    }
+  ],
+  "openai_codex": [
+    {
+      "id": "devin/swe-2",
+      "reasoning_efforts": [
+        "medium",
+        "high",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-6-astra",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "claude-opus-4-6-thinking",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "cursor-grok-4.6",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gemini-3.8-flash-medium",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "zai/glm-5.3",
+      "reasoning_efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "zai/glm-5.3-flash",
+      "reasoning_efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "input_modalities": [
+        "text"
+      ]
+    },
+    {
+      "id": "opencode-go/deepseek-v4.1-flash",
+      "reasoning_efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "opencode-go/muse-spark-1.3-contributor",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "ninfer-local/qwen3.8-27b",
+      "reasoning_efforts": [
+        "low",
+        "medium",
+        "xhigh"
+      ],
+      "input_modalities": [
+        "text",
+        "image"
+      ]
+    }
+  ]
+}

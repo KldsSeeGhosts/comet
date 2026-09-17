@@ -12,6 +12,7 @@ members = [
     "crates/update",
     "crates/ui",
     "crates/syntax",
+    "crates/workspace",
     "apps/zeron",
 ]
 

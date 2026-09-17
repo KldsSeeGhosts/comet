@@ -1,0 +1,157 @@
+super.engineering CLI
+
+Usage:
+  sc instructions [workspace|project|commands|worktree|orchestration|layout|review|browser|instance]
+  sc [--socket PATH] status [--json]
+  sc instance current [--socket PATH] [--json]
+  sc instance list [--socket PATH] [--json]
+  sc history list --cwd PATH --main-repo PATH [--provider KEY] [--offset N] [--limit N]
+  sc history get --provider KEY --session ID --cwd PATH
+  sc chat list [--worktree PATH] [--json]
+  sc chat providers [--json]
+  sc chat new [--worktree PATH] [--provider KEY] [--model ID] [--reasoning LEVEL] [--activate]
+  sc chat select SESSION_ID
+  sc chat send SESSION_ID [--stdin] [--watch] [--model ID] [--reasoning LEVEL] [TEXT]
+  sc chat events SESSION_ID
+  sc chat cancel SESSION_ID
+  sc chat stop SESSION_ID [--output text|json]
+  sc chat close SESSION_ID
+  sc project scripts [check|set|unset] [OPTIONS] [--json]
+  sc commands list|get|create|update|delete [OPTIONS] [--json]
+  sc layout set --target workspace [--count N] [--arrangement grid|vertical|horizontal|SPEC] [--active keep|view:N] [--keep active-view,view:N] [--worktree PATH] [--provider KEY] [--ui auto|chat|terminal] [--json]
+  sc layout set --target tab [--count N] [--arrangement grid|vertical|horizontal|SPEC] [--active keep|pane:N] [--worktree PATH] [--provider KEY] [--ui auto|chat|terminal] [--json]
+  sc layout close --target view:N|active-view[,view:N...] [--worktree PATH] [--json]
+  sc layout insert --target view:N|active-view [--active keep|new] [--worktree PATH] [--provider KEY] [--ui auto|chat|terminal] [--json]
+  sc layout save NAME [--scope user|worktree] [--from view] [--worktree PATH] [--provider KEY] [--ui auto|chat|terminal] [--json]
+  sc layout apply NAME [--scope user|worktree] [--worktree PATH] [--provider KEY] [--ui auto|chat|terminal] [--json]
+  sc layout list [--scope user|worktree] [--worktree PATH] [--json]
+  sc layout show NAME [--scope user|worktree] [--worktree PATH] [--json]
+  sc layout delete NAME [--scope user|worktree] [--worktree PATH] [--json]
+  sc layout run views|tabs|panes [--prompt TEXT] [--initial-message TEXT] [--label LABEL] [--replace-label] [--message label:NAME=TEXT] [--from-file PATH] [--model ID] [--reasoning LEVEL] [--system-prompt TEXT] [--count N] [--prefill] [--dry-run] [--worktree PATH] [--open-if-needed] [--provider KEY] [--ui auto|chat|terminal] [--active keep|new|view:N|pane:N] [--arrangement grid|vertical|horizontal|SPEC] [--replace] [--view N] [--tab N] [--output text|json]
+  sc layout compose (--stdin|--from-file PATH) [--dry-run|--refresh-guard] [--worktree PATH] [--output text|json]
+  sc layout send --to TARGET [--to TARGET...] --prompt TEXT [--prefill] [--dry-run] [--worktree PATH] [--open-if-needed] [--output text|json]
+
+Parked chats restore without changing the selected worktree. session_retiring
+rejects a send during retirement; retry after retirement completes.
+  sc layout views [--worktree PATH] [--output text|json]
+  sc layout capabilities [--output text|json]
+  sc layout state (--self|--to TARGET [--to TARGET...]) [--worktree PATH] [--output text|json]
+  sc layout read --to TARGET [--to TARGET...] [--last N] [--worktree PATH] [--output text|json]
+  sc layout stop --to TARGET [--to TARGET...] [--kill] [--dry-run] [--worktree PATH] [--output text|json]
+
+Capabilities report declarative composition in `layout_orchestration.compose`,
+mutating team workflows in `team_runs`, and read-only `sc team status`/
+`sc team list` access in `team_runs_read`.
+  sc layout move --from tab:N|view:N/tab:N|active-tab|id:ID|label:NAME|group:NAME [--from TARGET...] --to view:N|active-view|new-view[:N] [--position start|end|before:tab:N|after:tab:N] [--active keep|new|view:N|tab:N] [--dry-run] [--worktree PATH] [--output text|json]
+  sc agents list [--worktree PATH] [--output text|json]
+  sc agents get --to TARGET [--worktree PATH] [--output text|json]
+  sc agents label set --to TARGET LABEL [--replace] [--worktree PATH] [--output text|json]
+  sc agents label clear --to TARGET [--worktree PATH] [--output text|json]
+  sc agents group create|add|remove NAME --agent TARGET [--agent TARGET...] [--worktree PATH] [--output text|json]
+  sc agents group delete NAME [--worktree PATH] [--output text|json]
+  sc agents group list [--worktree PATH] [--output text|json]
+  sc agent send (--to TARGET --prompt TEXT|--message TARGET=TEXT|--from-file PATH) [--queue|--wait-until-idle] [--timeout-ms N] [--idempotency-key KEY] [--prefill] [--worktree PATH] [--open-if-needed] [--output text|json]
+  sc agent read --to TARGET [--last N] [--worktree PATH] [--output text|json]
+  sc agent wait (--to TARGET [--to TARGET...]|--group NAME) --idle [--timeout-ms N] [--worktree PATH] [--open-if-needed] [--output text|json]
+  sc agent subscribe --to TARGET [--pattern TEXT] [--from-sequence N|--live-only] [--worktree PATH] [--output text|json]
+  sc agent stop --to TARGET [--to TARGET...] [--kill] [--worktree PATH] [--output text|json]
+  sc agent interrupt --to TARGET [--to TARGET...] [--signal interrupt|escape|ctrl-c] [--worktree PATH] [--output text|json]
+  sc agent should-stop --self [--worktree PATH] [--output text|json]
+
+A successful send confirms dispatch or queue admission, not turn completion.
+--wait-until-idle waits for target availability before dispatch. To collect a
+result, send, then run agent wait --idle and agent read. Provider turn failures
+are returned as target errors; subscribe emits a target_error and stops.
+  sc team run --label LABEL [--provider KEY] --prompt TEXT [--label LABEL [--provider KEY] --prompt TEXT...] [--notify self] [--worktree PATH] [--output text|json]
+  sc team report --run ID --role LABEL --status done|failed --summary TEXT [--result-file PATH] [--worktree PATH] [--output text|json]
+  sc team status [--run ID] [--worktree PATH] [--output text|json]
+  sc team list [--worktree PATH] [--output text|json]
+  sc team cancel --run ID [--worktree PATH] [--output text|json]
+
+run accepts 1-8 labeled roles and launches them in parallel as separate tabs.
+Each role must finish with `sc team report`. Results are delivered to a
+registered launching agent; other CLI callers receive a completion notification
+and can read results with `sc team status --run ID`. Report summaries are
+capped at 16 KiB; use --result-file for detailed output. Status and list are
+read-only. Cancel leaves a run active if any working role does not confirm it
+stopped. After an app restart, every previously nonterminal run is Interrupted
+and is not resumed automatically.
+For strict sequencing (A finishes, then B starts), wait
+with `sc agent wait --to label:A --idle` between launches instead.
+  sc workspace list [--json]
+  sc workspace watch [--json]
+  sc workspace open PATH [--activate] [--json]
+  sc workspace create NAME [--type individual|shared-context|remote] [OPTIONS] [--json]
+  sc workspace get WORKSPACE_ID [--json]
+  sc workspace update WORKSPACE_ID [--name NAME] [ICON] [--json]
+  sc workspace add WORKSPACE_ID (--project PATH|--repository PATH|--remote-project PATH) [--json]
+  sc workspace theme WORKSPACE_ID [OPTIONS] [--json]
+  sc workspace move WORKSPACE_ID (--before TARGET_ID|--after TARGET_ID) [--json]
+  sc workspace delete WORKSPACE_ID --confirm [--json]
+  sc workspace select WORKSPACE_ID [--activate] [--json]
+
+list prints workspaces in sidebar order: sections, project groups, worktree
+rows (resolved sidebar title, status, local Git position, diff, PR), and nested agent-session rows
+with context usage where known. Shared Context rows include shared_context
+metadata: group rows and materialized child repositories with parent_worktree
+and their project icon. Child worktree names retain their canonical group::repo identity.
+watch streams JSONL events: an initial snapshot plus revisioned deltas.
+Opens the super.engineering workspace containing PATH. A linked Git worktree of
+a known project stays in that project's existing workspace; an unknown project
+root creates a new app workspace.
+select changes the in-app workspace selection; --activate also foregrounds the app.
+create supports individual, Shared Context, and remote workspaces; get --json
+returns type-specific configuration and theme overrides; update changes common
+name/icon metadata; add mutates type-specific contents in the background; theme
+changes per-workspace colors; move changes sidebar order; delete requires --confirm
+and uses the UI cleanup lifecycle.
+
+For api_chat rows, stable_id: null means no live view (parked or lazily restored),
+not a deleted conversation. Agent stable_target_id values survive parking.
+  sc coordination-state get KEY [--worktree PATH] [--output text|json]
+  sc coordination-state set KEY JSON [--if-version N] [--worktree PATH] [--output text|json]
+  sc coordination-state delete KEY [--if-version N] [--worktree PATH] [--output text|json]
+  sc coordination-state watch [KEY|--key KEY] [--from-version N] [--worktree PATH] [--output text|json]
+  sc section list [--json]
+  sc section create NAME (--manual|--branch-glob GLOB|--rule DIMENSION=VALUES) [--json]
+  sc section edit SECTION [OPTIONS] [--json]
+  sc section delete SECTION [--json]
+  sc section move SECTION (--before TARGET|--after TARGET) [--json]
+  sc section assign SECTION [--json]
+  sc section unassign [--json]
+  sc worktree create --workspace WORKSPACE_ID --project PROJECT_ID [--worktree-name NAME] [--branch BRANCH | --existing-branch BRANCH | --pr NUMBER] [--background] [--skip-setup-scripts] [--json]
+  sc worktree create [--project NAME_OR_ID] [--prompt TEXT | --stdin | --from-file PATH] [--provider KEY] [--model ID] [--reasoning LEVEL] [--background] [--skip-setup-scripts] [--json]
+  sc worktree open [PATH] [--pr NUMBER] [--activate] [--json]
+  sc worktree select ITEM_ID [--activate] [--json]
+  sc worktree close ITEM_ID [--json]
+  sc worktree delete ITEM_ID [--force] [--json]
+  sc worktree status [--json]
+  sc worktree checks [ITEM_ID] [--json]
+  sc worktree diff-summary [--file PATH] [--json]
+  sc worktree review-checklist [--json]
+  sc worktree review-list [--file PATH] [--status STATUS] [--json]
+  sc worktree review-get COMMENT_ID [--json]
+  sc worktree review-set-status COMMENT_ID STATUS [--json]
+  sc worktree review-add --file PATH (--start-line N --end-line N|--anchor file) [--provider KEY|--author NAME] [--side left|right] [--anchor-text TEXT] [--stdin|BODY] [--json]
+  sc worktree review-reply COMMENT_ID --provider KEY [--resolve] [--stdin|BODY] [--json]
+  sc worktree rename-branch NEW_NAME [--json]
+  sc worktree set-label ITEM_ID LABEL [--json]
+  sc worktree set-target-branch BRANCH [--json]
+  sc tab split --direction up|down|left|right [--active new|keep] [--worktree PATH] [--provider KEY] [--ui auto|chat|terminal] [--json]
+  sc tab split-view --direction up|down|left|right [--active new|keep] [--worktree PATH] [--provider KEY] [--ui auto|chat|terminal] [--json]
+  sc tab stop [--pane N] [--kill] [--output text|json]
+  sc tab title TITLE [--to TARGET [--worktree PATH] | --item ITEM_ID --session SESSION_ID [--workspace WORKSPACE_ID]] [--json]
+  sc browser open URL [--split] [--tab ID] [--json]
+  sc browser snapshot [--interactive-only] [--depth N] [--scope SELECTOR] [--diff] [--tab ID] [--json]
+  sc browser click REF [--double] [--tab ID] [--json]
+  sc browser fill REF VALUE [--tab ID] [--json]
+  sc browser wait (--text TEXT|--selector SEL|--url URL|--load|--fn JS) [--state visible|hidden] [--timeout MS] [--json]
+  sc browser tab list|new URL [--split]|switch ID|close [ID] [--json]
+
+Run `sc help <command>` for details.
+Usage:
+  sc mobile pair [--json]
+  sc mobile devices [--json]
+  sc mobile revoke DEVICE_ID [--json]
+
+Diagnostics only. Enable mobile access in desktop Settings > Mobile first.

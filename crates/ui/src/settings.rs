@@ -730,11 +730,16 @@ pub enum ShortcutId {
     NextSession,
     PrevSession,
     ArchiveSession,
+    SplitPaneRight,
+    SplitPaneDown,
+    SplitViewRight,
+    SplitViewDown,
+    CloseSplitView,
     JumpSession(usize),
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 11 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 16 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
@@ -755,6 +760,13 @@ impl ShortcutId {
         ShortcutId::JumpSession(6),
         ShortcutId::JumpSession(7),
         ShortcutId::JumpSession(8),
+        // Appended (order is element-id stable for the shortcuts page): the
+        // split-pane workspace actions.
+        ShortcutId::SplitPaneRight,
+        ShortcutId::SplitPaneDown,
+        ShortcutId::SplitViewRight,
+        ShortcutId::SplitViewDown,
+        ShortcutId::CloseSplitView,
     ];
 
     pub fn available(self) -> bool {
@@ -775,6 +787,11 @@ impl ShortcutId {
             ShortcutId::NextSession => "Next session",
             ShortcutId::PrevSession => "Previous session",
             ShortcutId::ArchiveSession => "Archive session",
+            ShortcutId::SplitPaneRight => "Split pane right",
+            ShortcutId::SplitPaneDown => "Split pane down",
+            ShortcutId::SplitViewRight => "Split view right",
+            ShortcutId::SplitViewDown => "Split view down",
+            ShortcutId::CloseSplitView => "Close split view",
             ShortcutId::JumpSession(slot) => JUMP_LABELS.get(slot).copied().unwrap_or(""),
         }
     }
@@ -815,6 +832,13 @@ impl ShortcutId {
             // Mod+A is the composer's Select all, so archiving takes the
             // shifted combo.
             ShortcutId::ArchiveSession => "mod-shift-a",
+            // Split-pane workspace chords (⌘D family; ⌥⌘W never touches
+            // ⌘W = CloseWindow).
+            ShortcutId::SplitPaneRight => "mod-d",
+            ShortcutId::SplitPaneDown => "mod-shift-d",
+            ShortcutId::SplitViewRight => "mod-alt-d",
+            ShortcutId::SplitViewDown => "mod-alt-shift-d",
+            ShortcutId::CloseSplitView => "mod-alt-w",
             ShortcutId::JumpSession(slot) => JUMP_DEFAULTS.get(slot).copied().unwrap_or(""),
         }
     }
@@ -845,6 +869,14 @@ pub struct KeymapConfig {
     pub next_session: String,
     pub prev_session: String,
     pub archive_session: String,
+    /// Split-pane workspace chords. Fields the container's `serde(default)`
+    /// fills from [`KeymapConfig::default`] when absent, so settings files
+    /// written before these existed load unchanged.
+    pub split_pane_right: String,
+    pub split_pane_down: String,
+    pub split_view_right: String,
+    pub split_view_down: String,
+    pub close_split_view: String,
     /// One combo per jump slot, in slot order. A list rather than nine fields:
     /// [`UiSettings::load`] discards the WHOLE file on a parse error, so a
     /// fixed-length array would let one malformed entry reset every unrelated
@@ -866,6 +898,11 @@ impl Default for KeymapConfig {
             next_session: ShortcutId::NextSession.default_combo().into(),
             prev_session: ShortcutId::PrevSession.default_combo().into(),
             archive_session: ShortcutId::ArchiveSession.default_combo().into(),
+            split_pane_right: ShortcutId::SplitPaneRight.default_combo().into(),
+            split_pane_down: ShortcutId::SplitPaneDown.default_combo().into(),
+            split_view_right: ShortcutId::SplitViewRight.default_combo().into(),
+            split_view_down: ShortcutId::SplitViewDown.default_combo().into(),
+            close_split_view: ShortcutId::CloseSplitView.default_combo().into(),
             jump_session: JUMP_DEFAULTS.iter().map(|c| (*c).to_string()).collect(),
         }
     }
@@ -885,6 +922,11 @@ impl KeymapConfig {
             ShortcutId::NextSession => &self.next_session,
             ShortcutId::PrevSession => &self.prev_session,
             ShortcutId::ArchiveSession => &self.archive_session,
+            ShortcutId::SplitPaneRight => &self.split_pane_right,
+            ShortcutId::SplitPaneDown => &self.split_pane_down,
+            ShortcutId::SplitViewRight => &self.split_view_right,
+            ShortcutId::SplitViewDown => &self.split_view_down,
+            ShortcutId::CloseSplitView => &self.close_split_view,
             ShortcutId::JumpSession(slot) => self
                 .jump_session
                 .get(slot)
@@ -906,6 +948,11 @@ impl KeymapConfig {
             ShortcutId::NextSession => self.next_session = combo,
             ShortcutId::PrevSession => self.prev_session = combo,
             ShortcutId::ArchiveSession => self.archive_session = combo,
+            ShortcutId::SplitPaneRight => self.split_pane_right = combo,
+            ShortcutId::SplitPaneDown => self.split_pane_down = combo,
+            ShortcutId::SplitViewRight => self.split_view_right = combo,
+            ShortcutId::SplitViewDown => self.split_view_down = combo,
+            ShortcutId::CloseSplitView => self.close_split_view = combo,
             ShortcutId::JumpSession(slot) => {
                 if slot < JUMP_SLOTS {
                     if self.jump_session.len() < JUMP_SLOTS {
@@ -2117,7 +2164,8 @@ mod tests {
 
     #[test]
     fn new_project_shortcut_migrates_and_persists() {
-        let mut keymap: KeymapConfig = serde_json::from_str(r#"{"newSession":"mod-alt-n"}"#).unwrap();
+        let mut keymap: KeymapConfig =
+            serde_json::from_str(r#"{"newSession":"mod-alt-n"}"#).unwrap();
         assert_eq!(keymap.get(ShortcutId::NewProject), "mod-shift-n");
         assert_eq!(keymap.get(ShortcutId::NewSession), "mod-alt-n");
         keymap.set(ShortcutId::NewProject, "mod-alt-p".into());

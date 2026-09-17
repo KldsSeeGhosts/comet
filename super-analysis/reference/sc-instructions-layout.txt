@@ -1,0 +1,65 @@
+Layout instructions
+
+- `--model ''` leaves model selection to the provider. Existing
+  conversations may retain their provider-owned session model.
+- Use documented `sc layout`, `sc tab`, and `sc agent` commands by default for
+  app-managed sessions, tabs, panes, and views. Use another mechanism only when
+  the human user explicitly requests it.
+- Mutate managed tabs, panes, or views only for an outcome explicitly requested
+  by the human user.
+- Inspect `sc layout capabilities --output json` and list existing views with
+  `sc layout views --output json` before targeting an index.
+- When multiple app builds are running, identify the inherited app first with
+  `sc instance current --json`; enumerate siblings with `sc instance list --json`.
+- Use `sc layout run` only for an initial launch. Use `sc agent send` for
+  follow-up prompts to an existing agent.
+- Use `sc layout compose --from-file PLAN --refresh-guard --output json` when
+  the requested final workspace combines arbitrary existing, new, or empty
+  cells. The plan declares the whole topology and maps its ordered cells to
+  topology leaves; the invoking session may appear in any cell. New cells
+  require an explicit UI. Stable `view_id` targets retain whole views, including
+  empty views. Omit `dry_run`, `worktree_path`, and `invoking` from plan JSON.
+  `--refresh-guard` discovers and applies an exact Close guard in
+  one invocation. Use `--dry-run` alone for nonmutating manual discovery; never
+  combine it with `--refresh-guard`.
+- Use `sc layout set`, `sc layout insert`, `sc layout close`, or
+  `sc layout move` to change existing layout; inspect current views before
+  targeting an index and prefer stable agent IDs or labels for follow-ups.
+  Moves retain each tab's pinned or unpinned state; requested positions stay
+  within the matching region.
+
+Parked chat targets:
+- Discover agents with `sc agents list --worktree PATH --output json`; a bare
+  list is scoped to the launch worktree for managed sessions, otherwise the
+  selected worktree. `sc chat list --worktree PATH --json` reports the parked
+  field without restoring chats; stable_id: null alone is not a parked marker.
+- Parking preserves labels and stable target IDs. State/wait remain available;
+  read/send restore the chat without selecting its worktree. Retry sends that
+  return session_retiring. A restored transcript can initially report snapshot
+  read_consistency; repeat the read until complete before consuming a result.
+
+Common requests:
+- 'Open a new tab running an agent':
+  `sc layout run tabs --provider KEY --label NAME --prompt TEXT --output json`.
+- 'Run two agents side-by-side in a new tab' (for example, 'run claude and
+  codex in a new side-by-side split in a new tab'): launch the first agent
+  with `sc layout run tabs --provider KEY_A --label NAME_A --prompt TEXT
+  --active new --output json`, then split that tab with
+  `sc tab split --direction right --provider KEY_B --output json`. A single
+  launch accepts one `--provider`; use one launch per provider, then
+  `sc agents label set` to name the new pane for follow-ups. Confirm both
+  sessions launched with `sc agents list --output json`.
+- 'Split the current tab or view': `sc tab split` divides the active tab into
+  panes; `sc tab split-view` divides the active workspace view into views.
+  `--direction left|right` arranges side-by-side; `up|down` stacks. Without
+  `--provider` the new pane or view starts empty.
+- 'Open a plain terminal': `sc layout run tabs --provider terminal --output
+  json` with no `--prompt`. `--provider terminal` also works with
+  `sc tab split`.
+- Discover launch provider keys with `sc layout capabilities --output json`.
+
+Use `sc help layout`, `sc help layout compose`, `sc help layout run`,
+`sc help layout move`, or `sc help tab` for exact syntax. Managed agents default
+to their launch worktree, and may use `--worktree <path>` to target another worktree.
+Unmanaged human CLI callers fall back to the active UI workspace when `--worktree`
+is omitted.

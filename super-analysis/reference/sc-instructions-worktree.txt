@@ -1,0 +1,86 @@
+Worktree instructions
+
+Control surface and authorization:
+- For an explicit human request to create an app-managed worktree or branch,
+  use `sc worktree create` by default. Do not use `git worktree`, manual
+  worktree directories, provider worktree features, or a generic worktree skill
+  unless the human explicitly requests that specific mechanism.
+- Never infer authorization from the task, isolation needs, subagents,
+  delegation, agents, parallel work, separate sessions, or missing capabilities.
+- The exact blank controller mode is
+  `sc worktree create --workspace WORKSPACE_ID --project PROJECT_ID`. It creates
+  an idle worktree with app-configured setup and no task, inherited context, or
+  launch overrides. Use it only when the human explicitly requests a blank
+  worktree; never use it to bypass task-bearing creation policy or hand a task
+  to another session.
+- `--worktree-name` and `--branch` independently override exact blank creation
+  names. Omitted values remain generated; neither value is derived from the
+  other. These flags are rejected in task-bearing mode.
+- New-branch creation rejects used worktree names and branches.
+  A worktree that already exists is never a reason to invent a different name.
+  When the worktree exists on disk — including one created outside the app with
+  plain `git worktree add` — register and select it with
+  `sc worktree open [PATH]`; with no PATH it opens the caller's own worktree.
+  When the branch exists but has no worktree, use exact blank creation with
+  `--existing-branch BRANCH`. Open works for worktrees the app manages and ones
+  it does not, and reports the ITEM_ID the other worktree commands take.
+- For a requested PR checkout, use exact blank creation with `--pr NUMBER`.
+  It resolves the open PR/MR in the project's repository, uses its head branch,
+  and seeds normal PR status/check tracking. It cannot be combined with --branch
+  or --existing-branch. A matching checkout can be reused; fork PRs/MRs are
+  unsupported. To associate a checkout that already exists, use
+  `sc worktree open [PATH] --pr NUMBER`. The PR must match that checkout's branch
+  and repository; this does not switch branches or modify Git files.
+- `--background` preserves the current app selection while the new worktree and
+  any requested task start in the background. `--skip-setup-scripts` suppresses
+  configured setup scripts for that creation only and does not skip submodule
+  initialization. Both flags work in blank and task-bearing modes.
+- Task-bearing creation is every create without the complete exact blank target,
+  including `--project` alone or any prompt/provider/model/reasoning form. It
+  requires a verified app-launched agent session.
+  External or unverified shells are rejected for task-bearing creation.
+- From a Shared Context group or child, task-bearing creation stays in that
+  Shared Context workspace and launches the session at the new group root.
+  `--project` selects a member repository by name, path, registered project id,
+  or display name to materialize; omit it for normal group setup. Do not create
+  separate individual workspaces for those repos.
+- A session launched by `sc worktree create` must work its launched task in its
+  current worktree and must not run `sc worktree create` for that task, even if
+  the task mentions agents, isolation, branches, or worktrees. The app rejects
+  task-bearing creation until the human submits UI-originated input in the
+  session. Terminal or composer submissions and question-card answers unlock
+  it; app-injected prompts do not. Report any need for another task worktree to
+  the human instead.
+
+State and operation:
+- Read target/base branch and managed identity with `sc worktree status --json`;
+  do not infer them from git defaults, branch names, or directory names.
+- Change the target branch only for an explicitly requested outcome:
+  `sc worktree set-target-branch <branch>`.
+- `sc watch`, `sc git-summary`, `sc git-request`, and
+  `sc opencode-config-compose` are private managed transport commands, not agent
+  control surfaces. SSH teardown cancels active watch, summary, or request work
+  and its Git subprocesses. Never invoke these commands directly.
+  The managed watcher shares the app's cached Git ignore policy: nested
+  `.gitignore`, repository/global excludes, and tracked-file exceptions.
+  Linux prunes ignored directory watches; macOS filters native FSEvents.
+  Directory and ignore-rule changes update the watch set automatically.
+  Native coverage is bounded; large indexes, directory limits, or unreadable
+  folders use periodic reconciliation for incomplete coverage (15 seconds by
+  default, configurable with `--reconcile-secs`). Event overflow refreshes in place.
+- One `sc worktree create` invocation creates and activates one managed
+  worktree. Exact blank mode stops after ordinary setup scheduling. For a
+  task-bearing handoff, give `--prompt`, `--stdin`, or `--from-file` the actual
+  task and relevant context, never a meta-task asking the new session to create
+  another worktree.
+- For multi-line or complex task context, write the complete task to a temporary
+  file and pass `--from-file PATH`; it avoids shell-quoting mangling that
+  `--prompt` invites.
+- A task-bearing child receives trusted, read-only origin metadata for the
+  invoking worktree, best-available parent conversation references, and a
+  bounded recent user/assistant excerpt when structured history is available.
+  The supplied task remains authoritative and drives naming. This handoff does
+  not change the new worktree's Git base or copy source changes.
+- Use `sc worktree create --help` for exact targeting, inputs,
+  provider/model overrides, completion, and recovery behavior.
+- `--model ''` leaves model selection to the provider.

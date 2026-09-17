@@ -42,6 +42,7 @@ mod new_thread_background_image;
 mod new_thread_background_mask;
 mod notice;
 pub mod notify;
+pub mod pane;
 pub mod pickers;
 pub mod popover;
 pub mod queue;
@@ -59,6 +60,7 @@ pub mod theme_library;
 pub mod transcript;
 pub mod typography;
 mod workspace_links;
+pub mod workspace_layout_store;
 
 use std::path::PathBuf;
 
@@ -219,6 +221,13 @@ pub fn run_app(config: UiConfig) {
         let quit_state = state.clone();
         cx.on_app_quit(move |cx| {
             settings::flush(cx);
+            // WS5: flush per-space workspace layouts past their debounce
+            // window (each Shell owns its store; windows are the only path in).
+            for window in cx.windows() {
+                if let Some(handle) = window.downcast::<shell::Shell>() {
+                    let _ = handle.update(cx, |shell, _, cx| shell.flush_workspace_layout(cx));
+                }
+            }
             let shutdown =
                 quit_state.read(cx).engine().cloned().map(|handle| {
                     gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
