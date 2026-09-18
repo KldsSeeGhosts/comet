@@ -461,6 +461,7 @@ impl EngineHandle {
             engine_info: EngineInfo {
                 device_id: "local".into(),
                 workspace_scope: WorkspaceScope::Local,
+                cursor_sdk_version: None,
                 capabilities: Vec::new(),
             },
             deferred_state: None,
@@ -508,6 +509,7 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
             Ok(EngineInfo {
                 device_id: legacy.device_id,
                 workspace_scope: WorkspaceScope::Synced,
+                cursor_sdk_version: None,
                 capabilities: Vec::new(),
             })
         }
@@ -2895,6 +2897,7 @@ mod tests {
                 engine_info: EngineInfo {
                     device_id: "owner-device".into(),
                     workspace_scope: WorkspaceScope::Local,
+                    cursor_sdk_version: None,
                     capabilities: zeron_proto::capabilities::current(),
                 },
                 state: state_rx,
@@ -3338,6 +3341,7 @@ mod tests {
             last_seen_at: None,
             created_at: None,
             version: None,
+            cursor_sdk_version: None,
             capabilities: Vec::new(),
         }
     }
@@ -4284,6 +4288,7 @@ mod tests {
             last_seen_at: None,
             created_at: None,
             version: Some("0.2.12".into()),
+            cursor_sdk_version: None,
             capabilities: Vec::new(),
         }];
         assert!(s.device_version_at_least("d1", (0, 2, 12)));
@@ -4306,6 +4311,7 @@ mod tests {
                 last_seen_at: None,
                 created_at: None,
                 version: Some("0.2.31".into()),
+                cursor_sdk_version: None,
                 capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
             },
             Device {
@@ -4315,6 +4321,7 @@ mod tests {
                 last_seen_at: None,
                 created_at: None,
                 version: Some("0.2.31".into()),
+                cursor_sdk_version: None,
                 capabilities: Vec::new(),
             },
         ];
@@ -4341,6 +4348,7 @@ mod tests {
             last_seen_at: Some(now),
             created_at: None,
             version: None,
+            cursor_sdk_version: None,
             capabilities: Vec::new(),
         }];
         s.connectivity.state = ConnectivityState::Connected;
