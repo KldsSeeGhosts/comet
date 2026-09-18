@@ -1,0 +1,10 @@
+{
+  "source_type": "native-gpui",
+  "sources": [
+    "crates/ui/src/pane/chrome.rs",
+    "crates/ui/src/pane/render.rs",
+    "crates/ui/src/theme.rs",
+    "super-analysis/10-design-system.md",
+    "super-analysis/13-interaction-truth.md"
+  ]
+}

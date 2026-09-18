@@ -1,0 +1,28 @@
+{
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "breakpoints": [],
+  "framework": {
+    "super": {
+      "native": true,
+      "ui": "GPUI",
+      "bundle_id": "com.zarifpour.superconductor"
+    },
+    "noches": {
+      "native": true,
+      "ui": "GPUI",
+      "bundle_id": "app.noches.desktop"
+    }
+  },
+  "reference_constraints": {
+    "pane_edge_zone_ratio": 0.2,
+    "divider_hit_width_px": 8,
+    "pane_corner_radius_px": 8,
+    "single_pane_header": false,
+    "multi_pane_header": true,
+    "center_drop_preview": false,
+    "close_view_shortcut": "alt-cmd-w"
+  }
+}

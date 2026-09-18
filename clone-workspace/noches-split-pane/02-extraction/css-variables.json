@@ -1,0 +1,21 @@
+{
+  "source_type": "native-gpui",
+  "themes": {
+    "dark": {
+      "bg": "#060606",
+      "surface": "#0d0d0d",
+      "text_muted_lightness": 0.708,
+      "text_faint_lightness": 0.556,
+      "border_strong_alpha": 0.14,
+      "input_bg_alpha": 0.03
+    },
+    "light": {
+      "surface_lightness": 0.968,
+      "text_muted_lightness": 0.439,
+      "text_faint_lightness": 0.535,
+      "border_strong_alpha": 0.17,
+      "input_bg": "#ffffff"
+    }
+  },
+  "evidence_method": "crates/ui/src/theme.rs authored tokens"
+}

@@ -1,0 +1,6 @@
+{
+  "page": "native-workspace",
+  "source_type": "native-gpui",
+  "pseudo_archetypes": [],
+  "reason": "GPUI does not expose DOM pseudo-elements."
+}

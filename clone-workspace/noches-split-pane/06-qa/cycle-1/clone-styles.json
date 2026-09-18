@@ -1,0 +1,26 @@
+{
+  "page": "native-workspace",
+  "viewport": "1152x768 native window",
+  "source_type": "native-gpui",
+  "styles": {
+    "chrome::tab_strip": {
+      "width": "full-view",
+      "height": "30px"
+    },
+    "view_node pane-field": {
+      "padding": "6px"
+    },
+    "pane_container": {
+      "background": "theme.bg",
+      "borderRadius": "8px"
+    },
+    "pane_container unfocused": {
+      "borderColor": "theme.border_strong"
+    },
+    "chrome::ghost_composer": {
+      "color": "theme.text_muted",
+      "borderColor": "theme.border_strong"
+    }
+  },
+  "evidence_method": "authored GPUI properties plus native CUA screenshot"
+}

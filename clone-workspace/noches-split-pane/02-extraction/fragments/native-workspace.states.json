@@ -1,0 +1,39 @@
+{
+  "page": "native-workspace",
+  "states": [
+    {
+      "selector": "pane",
+      "state": "focused",
+      "delta": {
+        "border": "theme.accent"
+      },
+      "evidence_method": "Super interaction-truth section 6"
+    },
+    {
+      "selector": "pane",
+      "state": "unfocused",
+      "delta": {
+        "border": "theme.border",
+        "background": "theme.bg"
+      },
+      "evidence_method": "Super split screenshot"
+    },
+    {
+      "selector": "pane-header-control",
+      "state": "rest",
+      "delta": {
+        "color": "theme.text_muted"
+      },
+      "evidence_method": "user-supplied Image 3 contrast defect"
+    },
+    {
+      "selector": "pane-header-control",
+      "state": "hover",
+      "delta": {
+        "background": "theme.wash(0.12)",
+        "color": "theme.text"
+      },
+      "evidence_method": "Noches authored hover rule and Super visible controls"
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "page": "native-workspace",
+  "source_type": "native-gpui",
+  "archetypes": [
+    {
+      "name": "view-strip",
+      "styles": {
+        "height_px": 30,
+        "width": "full-view",
+        "display": "flex-row",
+        "padding_inline_px": 8,
+        "gap_px": 4,
+        "border_bottom_px": 1
+      },
+      "evidence_method": "Noches authored GPUI rules plus Super screenshot geometry"
+    },
+    {
+      "name": "pane-field",
+      "styles": {
+        "inset_px": 6,
+        "divider_hit_width_px": 8,
+        "pane_radius_px": 8,
+        "pane_border_px": 1,
+        "background": "theme.bg"
+      },
+      "evidence_method": "Super screenshot geometry and interaction-truth sections 1, 3, and 6"
+    },
+    {
+      "name": "pane-header",
+      "styles": {
+        "height_px": 28,
+        "padding_left_px": 10,
+        "padding_right_px": 6,
+        "gap_px": 6,
+        "font_size_px": 11,
+        "font_weight": 500,
+        "text_role": "text_muted"
+      },
+      "evidence_method": "Noches authored GPUI rules, adjusted to Super visible dormant chrome"
+    },
+    {
+      "name": "ghost-composer",
+      "styles": {
+        "radius_px": 12,
+        "padding_px": 10,
+        "gap_px": 8,
+        "font_size_px": 12,
+        "text_role": "text_muted",
+        "border_role": "border_strong",
+        "background": "input_bg"
+      },
+      "evidence_method": "Super interaction-truth section 7 and user-supplied Image 3"
+    }
+  ]
+}

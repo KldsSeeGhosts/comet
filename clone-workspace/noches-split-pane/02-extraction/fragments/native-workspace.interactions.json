@@ -1,0 +1,17 @@
+{
+  "page": "native-workspace",
+  "interactions": [
+    {
+      "action_slug": "split-pane-visual-delta",
+      "required_result": "The strip spans the view and the pane field reads as separate inset cards."
+    },
+    {
+      "action_slug": "close-pane",
+      "required_result": "The close control remains readable at rest and the adjacent pane expands after activation."
+    },
+    {
+      "action_slug": "drag-sidebar-session-to-pane-edge",
+      "required_result": "The preview follows the inset pane bounds rather than the outer workspace frame."
+    }
+  ]
+}

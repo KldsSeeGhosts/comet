@@ -1,0 +1,9 @@
+{
+  "source_type": "native-gpui",
+  "families": {
+    "ui": "theme.font_sans",
+    "mono": "theme.font_mono",
+    "terminal": "theme.font_terminal"
+  },
+  "downloaded_assets": []
+}

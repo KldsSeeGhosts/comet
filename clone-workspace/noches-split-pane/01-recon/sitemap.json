@@ -1,0 +1,9 @@
+{
+  "routes": [
+    "single-pane",
+    "pane-split",
+    "view-split",
+    "pane-context-menu",
+    "tab-layout-submenu"
+  ]
+}

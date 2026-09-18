@@ -1,0 +1,15 @@
+{
+  "cycle": 1,
+  "style_assertions": {
+    "total": 7,
+    "passed": 7,
+    "failed": 0,
+    "failures": []
+  },
+  "build_ok": true,
+  "focused_tests": {
+    "pane_tests": "31 passed",
+    "hit_test": "14 passed"
+  },
+  "native_visual_check": "passed"
+}

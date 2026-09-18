@@ -1,0 +1,28 @@
+{
+  "page": "native-workspace",
+  "source_type": "native-gpui",
+  "hierarchy": [
+    "workspace outlet",
+    "full-width view tab strip",
+    "inset pane field",
+    "split tree",
+    "independent rounded pane cards"
+  ],
+  "measurements": {
+    "titlebar_height_px": 38,
+    "view_strip_height_px": 30,
+    "pane_field_inset_px": 6,
+    "divider_hit_width_px": 8,
+    "divider_visual_width_px": 1,
+    "pane_corner_radius_px": 8,
+    "pane_border_px": 1
+  },
+  "rules": {
+    "view_strip_stretches": true,
+    "pane_field_clips": false,
+    "pane_cards_own_background": true,
+    "single_pane_header": false,
+    "multi_pane_header": true
+  },
+  "evidence_method": "authored GPUI layout and saved Super split screenshot"
+}

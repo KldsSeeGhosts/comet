@@ -1,0 +1,21 @@
+{
+  "target": "installed native super.engineering app",
+  "target_bundle_id": "com.zarifpour.superconductor",
+  "clone": "installed native Noches app",
+  "clone_bundle_id": "app.noches.desktop",
+  "scope": "functional",
+  "platform": "macOS",
+  "views": [
+    "single pane",
+    "pane split",
+    "view split",
+    "pane context menu",
+    "tab layout submenu",
+    "sidebar session drag"
+  ],
+  "gate": {
+    "cargo_check": true,
+    "focused_tests": true,
+    "native_interaction_qa": true
+  }
+}

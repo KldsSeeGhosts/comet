@@ -1,0 +1,10 @@
+{
+  "source_type": "native-gpui",
+  "assets": [
+    {
+      "name": "close",
+      "path": "crates/ui/assets/icons/close.svg",
+      "role": "pane, tab, and view close control"
+    }
+  ]
+}

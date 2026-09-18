@@ -1,0 +1,40 @@
+{
+  "source_type": "native-gpui",
+  "assertions": [
+    {
+      "selector": "chrome::tab_strip",
+      "property": "width",
+      "expected": "full-view"
+    },
+    {
+      "selector": "view_node pane-field",
+      "property": "padding",
+      "expected": "6px"
+    },
+    {
+      "selector": "pane_container",
+      "property": "background",
+      "expected": "theme.bg"
+    },
+    {
+      "selector": "pane_container",
+      "property": "borderRadius",
+      "expected": "8px"
+    },
+    {
+      "selector": "pane_container unfocused",
+      "property": "borderColor",
+      "expected": "theme.border_strong"
+    },
+    {
+      "selector": "chrome::ghost_composer",
+      "property": "color",
+      "expected": "theme.text_muted"
+    },
+    {
+      "selector": "chrome::ghost_composer",
+      "property": "borderColor",
+      "expected": "theme.border_strong"
+    }
+  ]
+}

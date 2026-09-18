@@ -1,0 +1,112 @@
+{
+  "route": "native-workspace",
+  "interactions": [
+    {
+      "action_slug": "drag-sidebar-session-to-pane-center",
+      "trigger": "Noches sidebar session row",
+      "kind": "drag",
+      "reveals": [
+        "Super contract: no preview, center drop moves or joins the target pane group",
+        "Noches observation: no session or layout change"
+      ],
+      "screenshot": null,
+      "captured": true
+    },
+    {
+      "action_slug": "drag-sidebar-session-to-pane-edge",
+      "trigger": "Noches sidebar session row",
+      "kind": "drag",
+      "reveals": [
+        "Super contract: half-pane wash for pane split or outer region wash for view split",
+        "Noches observation: no session or layout change"
+      ],
+      "screenshot": null,
+      "captured": true
+    },
+    {
+      "action_slug": "split-pane-right",
+      "trigger": "pane header context menu or cmd-d",
+      "kind": "click",
+      "reveals": [
+        "Tool picker before layout mutation",
+        "Escape cancels without changing layout"
+      ],
+      "screenshot": "super-analysis/screenshots/07-pane-context-menu.png",
+      "captured": true
+    },
+    {
+      "action_slug": "open-pane-context-menu",
+      "trigger": "right-click pane header",
+      "kind": "click",
+      "reveals": [
+        "Split pane right",
+        "Split pane down",
+        "Split view right",
+        "Split view down",
+        "Tab layout submenu"
+      ],
+      "screenshot": "super-analysis/screenshots/07-pane-context-menu.png",
+      "captured": true
+    },
+    {
+      "action_slug": "open-tab-layout-submenu",
+      "trigger": "Tab layout submenu",
+      "kind": "hover",
+      "reveals": [
+        "layout preset submenu"
+      ],
+      "screenshot": "super-analysis/screenshots/08-tab-layout-submenu.png",
+      "captured": true
+    },
+    {
+      "action_slug": "close-pane",
+      "trigger": "pane header close button",
+      "kind": "click",
+      "reveals": [
+        "sibling expands",
+        "split tree collapses",
+        "focus moves to an adjacent surviving pane"
+      ],
+      "screenshot": "super-analysis/screenshots/06-terminal-split-right.png",
+      "captured": true
+    },
+    {
+      "action_slug": "close-view",
+      "trigger": "empty-view strip close button or alt-cmd-w",
+      "kind": "click",
+      "reveals": [
+        "remaining view expands to the full content region",
+        "split ratios normalize"
+      ],
+      "screenshot": null,
+      "captured": true
+    },
+    {
+      "action_slug": "split-pane-visual-delta",
+      "trigger": "restored Noches two-pane workspace",
+      "kind": "visual",
+      "reveals": [
+        "Noches tab strip shrink-wraps its contents instead of spanning the view",
+        "Noches pane tree begins flush against the strip and frame, so panes do not read as separate inset islands",
+        "Noches inactive pane header, ghost composer, and status controls have insufficient dark-theme contrast",
+        "Super keeps one full-width view strip above an inset pane field with independent rounded pane cards and readable dormant chrome"
+      ],
+      "screenshot": null,
+      "captured": true
+    }
+  ],
+  "unreached": [
+    {
+      "action_slug": "live-super-drag-preview",
+      "trigger": "Super tab chip drag",
+      "kind": "drag",
+      "reason": "The installed Super app has no project configured. Prior live findings and screenshots were used."
+    },
+    {
+      "action_slug": "live-super-close-collapse",
+      "trigger": "Super pane and view close controls",
+      "kind": "click",
+      "reason": "The installed Super app has no project configured. Prior live findings and screenshots were used."
+    }
+  ]
+}
