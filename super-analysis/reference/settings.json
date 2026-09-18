@@ -1,0 +1,442 @@
+{
+  "default_tool": "codex",
+  "default_add_action": "superconductor",
+  "tools": {
+    "codex": {
+      "name": "Codex",
+      "command": "codex",
+      "args": [],
+      "env": {}
+    },
+    "cursor": {
+      "name": "Cursor",
+      "command": "cursor-agent",
+      "args": [],
+      "env": {}
+    },
+    "factory": {
+      "name": "Factory Droid",
+      "command": "droid",
+      "args": [],
+      "env": {}
+    },
+    "prime-agent": {
+      "name": "Prime Agent",
+      "command": "prime-agent",
+      "args": [],
+      "env": {}
+    },
+    "opencode": {
+      "name": "OpenCode",
+      "command": "opencode",
+      "args": [],
+      "env": {}
+    },
+    "pi": {
+      "name": "Pi",
+      "command": "pi",
+      "args": [],
+      "env": {}
+    },
+    "gemini": {
+      "name": "Gemini Legacy",
+      "command": "gemini",
+      "args": [],
+      "env": {}
+    },
+    "kiro": {
+      "name": "Kiro",
+      "command": "kiro-cli",
+      "args": [
+        "chat"
+      ],
+      "env": {}
+    },
+    "claude": {
+      "name": "Claude Code",
+      "command": "claude",
+      "args": [],
+      "env": {}
+    },
+    "qwen": {
+      "name": "Qwen Code",
+      "command": "qwen",
+      "args": [],
+      "env": {}
+    },
+    "copilot": {
+      "name": "Copilot",
+      "command": "copilot",
+      "args": [],
+      "env": {}
+    },
+    "terminal": {
+      "name": "Terminal",
+      "command": "",
+      "args": [],
+      "env": {}
+    },
+    "fx": {
+      "name": "fx (Vercel)",
+      "command": "fx",
+      "args": [],
+      "env": {}
+    },
+    "grok": {
+      "name": "Grok",
+      "command": "grok",
+      "args": [],
+      "env": {}
+    },
+    "hermes": {
+      "name": "Hermes",
+      "command": "hermes",
+      "args": [
+        "--tui"
+      ],
+      "env": {}
+    },
+    "antigravity": {
+      "name": "Antigravity",
+      "command": "agy",
+      "args": [],
+      "env": {}
+    },
+    "omp": {
+      "name": "Oh My Pi",
+      "command": "omp",
+      "args": [],
+      "env": {}
+    },
+    "kimi": {
+      "name": "Kimi Code",
+      "command": "kimi",
+      "args": [],
+      "env": {}
+    }
+  },
+  "ai_routing": {
+    "version": 2,
+    "defaults": {
+      "session_default": {
+        "provider": "openai_codex",
+        "model_id": "devin/swe-2"
+      },
+      "inline_commit": {
+        "provider": "openai_codex",
+        "model_id": "\u0000cli-default"
+      },
+      "prompt_improve": {
+        "provider": "openai_codex",
+        "model_id": "\u0000cli-default"
+      },
+      "create_pr": {
+        "provider": "openai_codex",
+        "model_id": "gpt-5.6-sol"
+      },
+      "commit_push": {
+        "provider": "openai_codex",
+        "model_id": "gpt-5.6-sol"
+      },
+      "commit": {
+        "provider": "openai_codex",
+        "model_id": "gpt-5.6-sol"
+      },
+      "resolve_conflicts": {
+        "provider": "openai_codex",
+        "model_id": "gpt-5.6-sol"
+      },
+      "review": {
+        "provider": "openai_codex",
+        "model_id": "gpt-5.6-sol"
+      },
+      "fix_ci": {
+        "provider": "openai_codex",
+        "model_id": "gpt-5.6-sol"
+      },
+      "fix_merge_blocked": {
+        "provider": "openai_codex",
+        "model_id": "gpt-5.6-sol"
+      },
+      "fix_comments": {
+        "provider": "openai_codex",
+        "model_id": "gpt-5.6-sol"
+      },
+      "fix_changes": {
+        "provider": "openai_codex",
+        "model_id": "gpt-5.6-sol"
+      },
+      "session_default_provider": "openai_codex",
+      "fast_provider": "openai_codex",
+      "thorough_provider": "openai_codex",
+      "per_provider_models": {
+        "openai_codex": {
+          "session_default": "devin/swe-2"
+        }
+      }
+    },
+    "overrides": []
+  },
+  "ai_execution": {
+    "bypass_claude_permissions": true,
+    "claude_permission_mode": "bypass",
+    "bypass_codex_permissions": true,
+    "bypass_opencode_permissions": true,
+    "bypass_antigravity_permissions": true,
+    "bypass_grok_permissions": true,
+    "bypass_kimi_permissions": true,
+    "codex_permission_bypass_mode": "dangerous_bypass"
+  },
+  "action_prompt_dispatch": {
+    "create_pr": "inject_current_or_new_tab",
+    "create_pr_cmd": "always_new_tab",
+    "commit_push": "inject_current_or_new_tab",
+    "commit_push_cmd": "always_new_tab",
+    "commit": "inject_current_or_new_tab",
+    "commit_cmd": "always_new_tab",
+    "resolve_conflicts": "inject_current_or_new_tab",
+    "resolve_conflicts_cmd": "always_new_tab",
+    "fix_ci": "inject_current_or_new_tab",
+    "fix_ci_cmd": "always_new_tab",
+    "fix_merge_blocked": "inject_current_or_new_tab",
+    "fix_merge_blocked_cmd": "always_new_tab",
+    "fix_comments": "inject_current_or_new_tab",
+    "fix_comments_cmd": "always_new_tab",
+    "fix_changes": "inject_current_or_new_tab",
+    "fix_changes_cmd": "always_new_tab"
+  },
+  "experimental": {
+    "review": false,
+    "chat_editor": false,
+    "chat_text_choice_fallback": false,
+    "shared_context_workspaces": false,
+    "remote_workspaces": false,
+    "non_git_projects": false,
+    "hapi_mobile_resume": false,
+    "agent_orchestration": false,
+    "automations": false,
+    "browser_automation": false,
+    "claude_auto_compact": false,
+    "interactive_claude_chat_view": false,
+    "enabled_providers": [],
+    "experimental_providers": []
+  },
+  "ui_language": "system",
+  "font_family": "",
+  "mono_font_family": "Lilex",
+  "terminal_font_family": "Lilex Nerd Font",
+  "terminal_color_scheme": "vscode",
+  "font_size": 12.0,
+  "line_height": 16.0,
+  "projects": [
+    {
+      "id": "f921d64e-d6ea-4688-8656-4bc93bc94650",
+      "name": "open-design-project",
+      "main_repo_path": "/Users/kidsseemac/superconductor/projects/open-design-project",
+      "ui_state": {
+        "collapsed": false,
+        "worktree_limit_expanded": false,
+        "color": "210",
+        "show_external_worktrees": true,
+        "show_main_worktree": true,
+        "show_shared_context_branches": false,
+        "section_member_ids_migrated": true,
+        "worktree_usage": {
+          "sc-coupled-fermion-707b": {
+            "created_at": "2026-09-17T07:09:01.459965+00:00",
+            "last_interaction_at": "2026-09-17T07:09:01.459964+00:00",
+            "usage_score": 1.0,
+            "score_updated_at": "2026-09-17T07:09:01.459964+00:00"
+          },
+          "main": {
+            "created_at": "2026-09-16T06:02:37.244322544+00:00",
+            "last_interaction_at": "2026-09-17T06:34:32.226888+00:00",
+            "usage_score": 24.408093526819897,
+            "score_updated_at": "2026-09-17T06:34:32.226888+00:00",
+            "last_user_message_at": "2026-09-17T06:34:32.226888+00:00"
+          },
+          "sc-entangled-phonon-391b": {
+            "created_at": "2026-09-17T06:33:52.039556+00:00",
+            "last_interaction_at": "2026-09-17T06:33:52.039555+00:00",
+            "usage_score": 1.0,
+            "score_updated_at": "2026-09-17T06:33:52.039555+00:00"
+          }
+        }
+      },
+      "settings": {
+        "default_branch": null,
+        "default_target_branch": null,
+        "branch_prefix": null,
+        "default_tool": null,
+        "worktree_root": null,
+        "setup_scripts": null,
+        "run_scripts": null,
+        "run_script_entries": null,
+        "pre_cleanup_scripts": null,
+        "teardown_scripts": null,
+        "post_cleanup_scripts": null,
+        "auto_run_setup_scripts": true,
+        "auto_init_submodules": false,
+        "setup_scripts_run_in_background": false,
+        "auto_clear_setup_script_output": false,
+        "auto_clear_run_script_output": false,
+        "ai_tier": {}
+      }
+    }
+  ],
+  "active_project_id": "f921d64e-d6ea-4688-8656-4bc93bc94650",
+  "update_channel": "nightly",
+  "telemetry": {
+    "enabled": true
+  },
+  "palette": {
+    "show_files": true,
+    "show_worktrees": true,
+    "show_tabs": true,
+    "show_commands": true,
+    "show_conversations": true,
+    "show_breadcrumbs": true
+  },
+  "show_workspace_numbers_on_cmd_hold": true,
+  "theme_mode": "system",
+  "migrated_accent_style_optional": true,
+  "workspace_tab_placement": "top",
+  "pinned_tab_style": "compact",
+  "workspace_vertical_tab_rail_width": 196.0,
+  "loading_indicator_style": "spinner",
+  "app_icon": "light",
+  "last_open_app": null,
+  "open_in_apps": {},
+  "right_panel_tab": "changes",
+  "default_right_panel_layout_mode": "stacked",
+  "notification_sounds": {
+    "task_complete": "default",
+    "approval_needed": "default",
+    "delivery_mode": "only_when_not_focused",
+    "break_through_focus": false,
+    "timeline_limit": 50
+  },
+  "migrated_system_notifications": true,
+  "chat_editor_perf_v2": true,
+  "chat_editor_completion_v2": false,
+  "chat_editor_mentions_v1": false,
+  "chat_editor_tx_undo_v1": false,
+  "window_bounds": {
+    "x": 0.0,
+    "y": 30.0,
+    "width": 1920.0,
+    "height": 1050.0,
+    "state": "Windowed",
+    "display_id": "d4ab3ee1-5be6-40e9-86dd-d14dd4c217bb"
+  },
+  "workspaces": [
+    {
+      "id": "4d62cf01-c49e-48dc-848b-0879f756ccf5",
+      "name": "Default",
+      "project_ids": [
+        "f921d64e-d6ea-4688-8656-4bc93bc94650"
+      ],
+      "worktree_sections": [
+        {
+          "id": "pinned",
+          "name": "Pinned",
+          "kind": {
+            "type": "manual"
+          },
+          "collapsed": false
+        }
+      ],
+      "workspace_type": {
+        "type": "Individual"
+      },
+      "right_panel_layout_mode": "stacked",
+      "stacked_shell_weight": 0.4,
+      "ai_tier": {},
+      "bottom_terminal_weight": 0.35,
+      "browser_automation_granted": false
+    },
+    {
+      "id": "0468d607-cf71-444f-aff4-59e69f66b8fc",
+      "name": "Noches",
+      "icon": {
+        "icon": "terminal"
+      },
+      "project_ids": [],
+      "worktree_sections": [
+        {
+          "id": "pinned",
+          "name": "Pinned",
+          "kind": {
+            "type": "manual"
+          },
+          "collapsed": false
+        }
+      ],
+      "workspace_type": {
+        "type": "Individual"
+      },
+      "right_panel_layout_mode": "stacked",
+      "stacked_shell_weight": 0.4,
+      "ai_tier": {},
+      "bottom_terminal_weight": 0.35,
+      "browser_automation_granted": false
+    }
+  ],
+  "active_workspace_id": "4d62cf01-c49e-48dc-848b-0879f756ccf5",
+  "delete_local_branch_on_cleanup": true,
+  "delete_remote_tracking_branches_on_cleanup": false,
+  "auto_fast_forward": true,
+  "auto_fast_forward_default_branch": true,
+  "automatic_branch_naming": true,
+  "ui_scale": 1.0,
+  "chat_text_multiplier": 1.0,
+  "migrated_chat_text_multiplier_v1": true,
+  "worktree_sort_mode": "activity",
+  "pinned_worktree_sort_mode": "activity",
+  "left_sidebar_layout": "detailed",
+  "compact_sidebar_label_style": "description",
+  "detailed_sidebar_label_style": "branch",
+  "sidebar_show_commit_status": true,
+  "last_installed_version": "faa1fb9f8cfccd4d7d17f69e8862c5493785c6c1",
+  "last_seen_version": "faa1fb9f8cfccd4d7d17f69e8862c5493785c6c1",
+  "provider_update_checks": true,
+  "previous_installed_version": "b739b94eab330907ba148a2b7f32833691c85763",
+  "auto_hide_sidebars": true,
+  "left_sidebar_width_design": 260.0,
+  "left_sidebar_hidden": false,
+  "right_panel_width_design": 260.0,
+  "right_panel_hidden": true,
+  "bottom_terminal_weight": 0.35,
+  "center_bottom_bar_visible": true,
+  "usage_meter_extended": false,
+  "usage_meter_window": "smart",
+  "show_conversation_cost": true,
+  "conversation_cost_scope": "worktree",
+  "migrated_sidebar_layout_to_global": true,
+  "migrated_panel_widths_to_design_v1": true,
+  "migrated_bottom_terminal_weight_to_global": true,
+  "pip_pinned": true,
+  "dismissed_project_welcome": false,
+  "migrated_compact_label_style_collapse": true,
+  "diff_word_wrap": false,
+  "diff_view_mode": "stacked",
+  "markdown_file_open_mode": "rich",
+  "plan_card_expanded": null,
+  "review_submit": {
+    "default_destination": "agent",
+    "last_new_chat_provider": null,
+    "last_agent_provider": null
+  },
+  "preferred_commit_action": "commit_and_push",
+  "show_file_edits_inline": true,
+  "show_files_changed_summary": true,
+  "show_live_edits_in_chat": false,
+  "chat_full_width": false,
+  "expand_streaming_file_edits_by_default": false,
+  "expand_thinking_by_default": false,
+  "expand_tool_calls_by_default": false,
+  "expand_completed_tool_summaries_by_default": false,
+  "migrated_live_edits_visibility": true,
+  "migrated_live_edits_default_off": true,
+  "ai_tier": {}
+}

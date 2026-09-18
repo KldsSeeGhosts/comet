@@ -26,6 +26,7 @@ use gpui_tokio::Tokio;
 use zeron_engine::InstanceLock;
 use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
+use zeron_workspace::Direction;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
@@ -60,6 +61,7 @@ use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workspace_links::resolve_workspace_file_link;
 
 mod command_palette;
+mod panes;
 mod spaces;
 mod tabs;
 
@@ -78,6 +80,20 @@ actions!(
         NextSession,
         PrevSession,
         ArchiveSession
+    ]
+);
+
+// The split-pane workspace actions (namespace parity with the plan — these
+// exact names are the contract). Handlers live in shell/panes.rs; combos are
+// rebindable via `KeymapConfig` (apply_keymap below).
+actions!(
+    workspace,
+    [
+        SplitPaneRight,
+        SplitPaneDown,
+        SplitViewRight,
+        SplitViewDown,
+        CloseSplitView
     ]
 );
 
@@ -365,6 +381,48 @@ pub fn apply_keymap(
         KeyBinding::new(
             &valid_or_default(&keymap.archive_session, "mod-shift-a"),
             ArchiveSession,
+            None,
+        ),
+        // Split-pane workspace chords (⌘D family + ⌥⌘W close; ⌘W itself stays
+        // CloseWindow — analysis §3.3.3).
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.split_pane_right,
+                ShortcutId::SplitPaneRight.default_combo(),
+            ),
+            SplitPaneRight,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.split_pane_down,
+                ShortcutId::SplitPaneDown.default_combo(),
+            ),
+            SplitPaneDown,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.split_view_right,
+                ShortcutId::SplitViewRight.default_combo(),
+            ),
+            SplitViewRight,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.split_view_down,
+                ShortcutId::SplitViewDown.default_combo(),
+            ),
+            SplitViewDown,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.close_split_view,
+                ShortcutId::CloseSplitView.default_combo(),
+            ),
+            CloseSplitView,
             None,
         ),
         KeyBinding::new(
@@ -1293,6 +1351,40 @@ pub struct Shell {
     sidebar_pane: Entity<SidebarPane>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    /// Split-pane workspace host (crate::pane): the layout tree plus the
+    /// per-pane dormant transcript cache. `transcript`/`composer` above stay
+    /// the FOCUSED pane's live views — they remain bound to
+    /// `AppState::selected_chat`, which the focus/selection sync keeps equal
+    /// to the focused pane's session (shell/panes.rs).
+    workspace: crate::pane::PaneHost,
+    /// WS3: open tool picker (⌘D/⇧⌘D/tab-strip "+"). `None` = no layout
+    /// impact; a picked row commits the split/tab, Esc closes with zero
+    /// layout change. State + flow in `shell/panes.rs` + `pane/mod.rs`.
+    tool_picker: Option<crate::pane::ToolPickerState>,
+    /// WS3: pane-header right-click context menu (split/close).
+    pane_menu: popover::Popup<crate::pane::PaneMenuState>,
+    /// WS3: a divider drag is live — hover fades pause for its duration.
+    divider_dragging: bool,
+    /// WS4: live tab/pane drag state (source + last pure DropPlan
+    /// resolution). The outlet's drop preview paints from it; per-sample
+    /// resolution is `pane/hit_test.rs`, commit/cancel `shell/panes.rs`.
+    split_drag: Option<crate::pane::DragSplitState>,
+    /// WS5: per-space layout persistence — `{data_dir}/workspace-layout.json`
+    /// (`workspace_layout_store`), the debounced write task, and the space
+    /// whose tree the host currently holds (`None` = the projectless canvas).
+    workspace_layouts: crate::workspace_layout_store::WorkspaceLayoutStore,
+    workspace_save_task: Option<Task<()>>,
+    active_workspace_space: Option<String>,
+    workspace_space_loaded: bool,
+    /// Explicit user navigation target that must survive a workspace layout
+    /// restore. `Some(Some(chat_id))` = sidebar click / deep link;
+    /// `Some(None)` = new-session request. `None` = no pending navigation
+    /// (boot / passive restore). Consumed once by the restore path. Both
+    /// arming sites (`open_chat` / `open_new_session`) follow up with a
+    /// `select_chat`, which notifies even when the selection is unchanged —
+    /// so the intent is always consumed by the next observation, never left
+    /// armed for an unrelated future frame.
+    pending_explicit_nav: Option<Option<String>>,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under. Paint-time
     /// measurement schedules another frame whenever this value changes.
@@ -1700,6 +1792,16 @@ impl Shell {
             sidebar_pane,
             transcript,
             composer,
+            workspace: crate::pane::PaneHost::new(),
+            tool_picker: None,
+            pane_menu: popover::Popup::default(),
+            divider_dragging: false,
+            split_drag: None,
+            workspace_layouts: crate::workspace_layout_store::WorkspaceLayoutStore::load(&data_dir),
+            workspace_save_task: None,
+            active_workspace_space: None,
+            workspace_space_loaded: false,
+            pending_explicit_nav: None,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
@@ -2131,6 +2233,27 @@ impl Shell {
         // Boot landing: the most recent session once the first chats frame
         // syncs (manual selection wins).
         self.boot_select_chat(cx);
+        // WS5: once chats are known, clear pane bindings whose session no
+        // longer exists (a chat deleted here or on another device) — the pane
+        // stays and degrades to the new-thread body. Frequent no-op.
+        if state.read(cx).chats_synced {
+            self.prune_dead_workspace_sessions(cx);
+        }
+        // Restore a project's layout before applying explicit navigation. The
+        // intent must also be consumed within the same project: otherwise a
+        // sidebar click can replace the focused pane instead of focusing the
+        // pane that already owns the requested session.
+        let selected_space = state.read(cx).selected_space.clone();
+        if state.read(cx).spaces_synced {
+            let explicit_nav = self.pending_explicit_nav.take();
+            if !self.workspace_space_loaded || self.active_workspace_space != selected_space {
+                self.workspace_space_loaded = true;
+                self.restore_workspace_layout(selected_space, cx);
+            }
+            if let Some(nav_target) = explicit_nav {
+                self.apply_explicit_workspace_navigation(nav_target, cx);
+            }
+        }
         // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
         // fall back to "All" rather than filtering everything out.
         if state.read(cx).spaces_synced
@@ -2149,6 +2272,12 @@ impl Shell {
         if selected != self.active_chat {
             self.suspend_file_images(cx);
             self.active_chat = selected;
+            // Workspace panes: bind the FOCUSED pane's session to the newly
+            // selected chat. Every selection path converges here (sidebar
+            // click, jump shortcut, notification, and the composer's
+            // mint-on-send — which selects the new chat id it created), so a
+            // split pane picks up the session created from the canvas.
+            self.sync_workspace_selection(cx);
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
             // zeron's `/` route redirected into the last-used chat, leaving no
@@ -4001,6 +4130,7 @@ impl Shell {
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
         self.command_palette.is_some()
             || self.add_space.is_some()
+            || self.tool_picker.is_some()
             || self.composer.read(cx).pickers().read(cx).is_open()
     }
 
@@ -5751,6 +5881,31 @@ impl Shell {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_chat(select_id.clone(), cx);
             }))
+            // WS4: sidebar session drag - dropping a chat row onto the
+            // content area creates a split pane bound to this session.
+            .on_drag(
+                {
+                    let drag_id = id.clone();
+                    let (mark_icon, mark_tint) = harness
+                        .map(crate::pickers::harness_brand_icon)
+                        .unwrap_or((crate::icons::ZERON_LOGO, None));
+                    crate::pane::TabSplitDrag {
+                        source: crate::pane::hit_test::DragSource::SidebarSession,
+                        mark: crate::pane::chrome::TabMark {
+                            icon: mark_icon,
+                            tint: mark_tint,
+                        },
+                        title: title.clone(),
+                        session_id: Some(drag_id),
+                    }
+                },
+                |payload, _point, _, cx| {
+                    cx.new(|_| crate::pane::SplitDragGhost {
+                        mark: payload.mark,
+                        title: payload.title.clone(),
+                    })
+                },
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -7032,6 +7187,13 @@ impl Shell {
     /// Resolve shell-owned Escape surfaces in capture phase, before focused
     /// descendants such as an integrated terminal can consume the key.
     fn capture_escape_surface(&mut self, cx: &mut Context<Self>) -> bool {
+        // The WS3 tool picker is the strictest Esc contract (⌘D verified:
+        // cancel = zero layout change — the split only ever commits on a
+        // picked row). Close it first, before any blocker can swallow the key.
+        if self.tool_picker.take().is_some() {
+            cx.notify();
+            return true;
+        }
         // Modals and context menus sit above the rest of the shell. Preserve
         // their existing behavior: only surfaces that already have a Cancel
         // path close here; the others remain explicit blockers.
@@ -7072,6 +7234,13 @@ impl Shell {
             return true;
         }
         if self.right_plus.get().is_some() {
+            return true;
+        }
+        if self.pane_menu.is_open() {
+            self.close_workspace_pane_menu(cx);
+            return true;
+        }
+        if self.pane_menu.get().is_some() {
             return true;
         }
         self.active_changes(cx)
@@ -7369,6 +7538,7 @@ impl Shell {
         }
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));
+        overlays.extend(self.render_workspace_overlays(cx));
         if let Some(overlay) = self.render_command_palette(viewport, window, cx) {
             overlays.push(overlay);
         }
@@ -7617,12 +7787,21 @@ impl Shell {
         // Content outlet: selected chat → transcript; nothing selected → the
         // centered new-thread composition; no spaces at all → the onboarding
         // card. New-chat mode mints the chat id on first send.
+        //
+        // Workspace mode (any split/extra tab/pane — shell/panes.rs) renders
+        // the pane tree instead: the focused pane hosts `self.transcript`,
+        // the shared dock composer below stays its live composer, and dormant
+        // panes carry ghost strips. The single-pane parity gate keeps the
+        // untouched default layout on the exact historical path below.
         let departing_transcript = !has_selection && dock_frame.transcript() > 0.0;
         if !has_selection && !departing_transcript {
             self.transcript
                 .update(cx, |transcript, cx| transcript.finish_route_exit(cx));
         }
-        let outlet: AnyElement = if has_selection || departing_transcript {
+        let workspace_mode = self.workspace_mode();
+        let outlet: AnyElement = if workspace_mode {
+            self.render_workspace_outlet(cx)
+        } else if has_selection || departing_transcript {
             div()
                 .relative()
                 .size_full()
@@ -7737,6 +7916,17 @@ impl Shell {
                 }
                 cx.notify();
             }))
+            // Sidebar session drag-to-split: dropping a sidebar chat row onto
+            // the single-pane content area creates a split. When workspace
+            // mode is already active the workspace_outlet handles this; this
+            // receiver covers the default single-pane screen.
+            .on_drop::<crate::pane::TabSplitDrag>(cx.listener(
+                |this, payload: &crate::pane::TabSplitDrag, _, cx| {
+                    if payload.source == crate::pane::hit_test::DragSource::SidebarSession {
+                        this.accept_sidebar_session_drop(payload, cx);
+                    }
+                },
+            ))
             // The hero is deliberately outside the transcript EdgeFade below:
             // it must paint under the overlaid titlebar instead of becoming
             // fully transparent across the titlebar's inset band.
@@ -7793,7 +7983,11 @@ impl Shell {
             .child({
                 let measured = self.bottom_stack.clone();
                 let measured_has_composer = self.bottom_stack_has_composer.clone();
-                let contains_composer = (has_spaces || no_project || has_appshots) && has_selection;
+                // WS3: in workspace mode the composer lives inside the
+                // focused pane, so the measured bottom stack holds only the
+                // status strip (+ terminal dock).
+                let contains_composer =
+                    !workspace_mode && (has_spaces || no_project || has_appshots) && has_selection;
                 let composer = self.composer.clone();
                 div()
                     .flex_none()
@@ -7821,25 +8015,38 @@ impl Shell {
                     )
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
-                        let composer_opacity = self.composer_dock.borrow().opacity();
-                        el.child(crate::composer_dock::docked_composer(
-                            div()
-                                .id("persistent-composer")
-                                .relative()
-                                .w(px(composer_width))
-                                .opacity(composer_opacity)
-                                .mx_auto()
-                                .child(self.composer.clone())
-                                .children(if has_selection {
-                                    self.render_jump_to_bottom(cx)
-                                } else {
-                                    None
-                                }),
-                            self.composer_dock.clone(),
-                            self.viewport_height,
-                            self.reduced_motion,
-                            frame_time,
-                        ))
+                        // WS3 composer re-homing: in workspace mode the live
+                        // composer is hosted INSIDE the focused chat pane
+                        // (pane/render.rs), so the shared outer dock is
+                        // suppressed. Tradeoffs (documented in
+                        // shell/panes.rs): the dock clock keeps ticking for
+                        // the trivial route, so re-entering single-chat mode
+                        // re-docks normally, but the hero↔dock glide and the
+                        // composer's measured available width (still fed from
+                        // the full main column) do not track pane geometry.
+                        if workspace_mode {
+                            el
+                        } else {
+                            let composer_opacity = self.composer_dock.borrow().opacity();
+                            el.child(crate::composer_dock::docked_composer(
+                                div()
+                                    .id("persistent-composer")
+                                    .relative()
+                                    .w(px(composer_width))
+                                    .opacity(composer_opacity)
+                                    .mx_auto()
+                                    .child(self.composer.clone())
+                                    .children(if has_selection {
+                                        self.render_jump_to_bottom(cx)
+                                    } else {
+                                        None
+                                    }),
+                                self.composer_dock.clone(),
+                                self.viewport_height,
+                                self.reduced_motion,
+                                frame_time,
+                            ))
+                        }
                     })
                     .child(self.render_terminal_container(window, cx))
             })
@@ -9972,6 +10179,23 @@ impl Render for Shell {
                 } else {
                     this.open_add_space(cx);
                 }
+            }))
+            // Split-pane workspace actions (shell/panes.rs holds the
+            // semantics; each is chat-scoped and no-ops under an overlay).
+            .on_action(cx.listener(|this, _: &SplitPaneRight, _, cx| {
+                this.split_workspace_pane(Direction::Right, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SplitPaneDown, _, cx| {
+                this.split_workspace_pane(Direction::Down, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SplitViewRight, _, cx| {
+                this.split_workspace_view(Direction::Right, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SplitViewDown, _, cx| {
+                this.split_workspace_view(Direction::Down, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseSplitView, _, cx| {
+                this.close_workspace_view(cx)
             }));
 
         let render_gate = if restart_required {
@@ -12690,5 +12914,218 @@ impl Shell {
     pub fn fixture_appshots_transcript_start(&self, cx: &mut Context<Self>) {
         self.transcript
             .update(cx, |t, cx| t.fixture_appshots_start(cx));
+    }
+}
+
+#[cfg(test)]
+mod workspace_persistence {
+    include!("shell/workspace_regressions.rs");
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    fn init_app(dir: &std::path::Path, cx: &mut gpui::App) {
+        settings::init(settings::UiSettings::default(), dir, cx);
+        crate::history::init(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            cx,
+        );
+        gpui_base::init(cx);
+        cx.set_global(Theme::default());
+        crate::app_menus::init(cx);
+    }
+
+    /// Seed `{dir}/workspace-layout.json` with one space's layout, built
+    /// through the public PaneHost ops: pane 3 holds `chat-b`, a second view
+    /// is split off to the right, focus lands back on pane 3 (view 1).
+    fn seed_space_layout(dir: &std::path::Path, session: &'static str) {
+        let mut host = crate::pane::PaneHost::new();
+        host.sync_focused_session(Some(session.into()));
+        host.split_focused_view(Direction::Right).unwrap();
+        host.focus_pane(zeron_workspace::PaneId(3)).unwrap();
+        let mut store = crate::workspace_layout_store::WorkspaceLayoutStore::load(dir);
+        store.set_layout(Some("b"), host.layout.clone());
+        store.flush().unwrap();
+    }
+
+    fn chat(id: &str, space: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "deviceId": "local", "spaceId": space,
+            "archived": false, "createdAt": Utc::now(),
+        })
+    }
+
+    fn space(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "deviceId": "local", "path": "/tmp", "gitDetected": false,
+            "createdAt": Utc::now(),
+        })
+    }
+
+    fn new_shell(dir: &std::path::Path, cx: &mut Context<Shell>) -> Shell {
+        Shell::new(
+            cx.new(|_| AppState::new()),
+            EngineBootConfig {
+                data_dir: dir.into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock,
+            },
+            cx,
+        )
+    }
+
+    #[gpui::test]
+    fn boot_restores_the_active_space_layout_and_selects_its_focused_session(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        seed_space_layout(dir.path(), "chat-b");
+        cx.update(|cx| init_app(dir.path(), cx));
+        let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.spaces = vec![serde_json::from_value(space("b")).unwrap()];
+                    state.chats = vec![serde_json::from_value(chat("chat-b", "b")).unwrap()];
+                    state.chats_synced = true;
+                    state.spaces_synced = true;
+                });
+                // One observation drives the whole boot path: the last chat
+                // implies its space, and the space's remembered tree restores.
+                shell.on_state_changed(&shell.state.clone(), cx);
+                assert!(shell.workspace_mode(), "the split tree restored");
+                assert_eq!(shell.workspace.layout.views.len(), 2);
+                assert_eq!(
+                    shell.active_workspace_space.as_deref(),
+                    Some("b"),
+                    "the shell tracks the space the tree belongs to"
+                );
+                assert_eq!(
+                    shell.state.read(cx).selected_chat.as_deref(),
+                    Some("chat-b"),
+                    "the restored focused pane's session re-selects in AppState"
+                );
+                // The tree is the store's content, not a change: nothing arms.
+                assert!(!shell.workspace.is_dirty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_deleted_session_degrades_to_the_new_thread_body(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        seed_space_layout(dir.path(), "gone");
+        cx.update(|cx| init_app(dir.path(), cx));
+        let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                // chat "gone" does NOT exist — it was deleted elsewhere.
+                shell.state.update(cx, |state, cx| {
+                    state.spaces = vec![serde_json::from_value(space("b")).unwrap()];
+                    state.chats = vec![serde_json::from_value(chat("chat-b", "b")).unwrap()];
+                    state.chats_synced = true;
+                    state.spaces_synced = true;
+                });
+                shell.on_state_changed(&shell.state.clone(), cx);
+                // First pass: the tree restores, unknown sessions are kept
+                // optimistically (chats could still be syncing elsewhere).
+                assert!(shell.workspace.layout.pane(zeron_workspace::PaneId(3)).is_some());
+                // Next frame: chats are synced, the dead binding clears.
+                shell.on_state_changed(&shell.state.clone(), cx);
+                let pane = shell
+                    .workspace
+                    .layout
+                    .pane(zeron_workspace::PaneId(3))
+                    .expect("the pane STAYS when its session died");
+                assert_eq!(pane.session_id, None, "the binding cleared");
+                assert_eq!(
+                    shell.state.read(cx).selected_chat,
+                    None,
+                    "selection followed the focused pane off the dead session"
+                );
+                assert!(shell.workspace.is_dirty(), "the clearing persists");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn mutations_persist_and_reload_per_space(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| init_app(dir.path(), cx));
+        let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.spaces_synced = true;
+                    state.chats_synced = true;
+                });
+                shell.on_state_changed(&shell.state.clone(), cx);
+                // A real mutation path: split the focused view.
+                assert!(shell.workspace.split_focused_view(Direction::Right).is_ok());
+                shell.flush_workspace_layout(cx);
+                assert!(
+                    crate::workspace_layout_store::WorkspaceLayoutStore::path(dir.path()).exists(),
+                    "the flush wrote the store file"
+                );
+                let reloaded =
+                    crate::workspace_layout_store::WorkspaceLayoutStore::load(dir.path());
+                let restored = reloaded.layout_for(None).expect("projectless tree saved");
+                assert_eq!(restored.views.len(), 2);
+                assert!(!reloaded.needs_save());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn gestures_never_arm_a_save_and_the_drag_end_does(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| init_app(dir.path(), cx));
+        let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, window, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.spaces_synced = true;
+                    state.chats_synced = true;
+                });
+                shell.on_state_changed(&shell.state.clone(), cx);
+                // A real split node for the divider to resize.
+                assert!(shell.workspace.split_focused_view(Direction::Right).is_ok());
+                shell.workspace.take_dirty();
+                // Divider drag mid-flight: ratios commit, saves must not arm.
+                shell.divider_dragging = true;
+                shell.equalize_divider(&crate::pane::DividerTarget::View { path: vec![] }, cx);
+                assert!(shell.workspace.is_dirty());
+                assert!(
+                    shell.workspace_save_task.is_none(),
+                    "mid-gesture saves are forbidden"
+                );
+                assert!(!crate::workspace_layout_store::WorkspaceLayoutStore::path(dir.path()).exists());
+                // The drag commits: end_divider_drag clears the latch and
+                // arms the save (still debounced, so the file only appears
+                // once the flush runs).
+                shell.end_divider_drag(cx);
+                assert!(shell.workspace_save_task.is_some());
+                shell.flush_workspace_layout(cx);
+                let reloaded =
+                    crate::workspace_layout_store::WorkspaceLayoutStore::load(dir.path());
+                let restored = reloaded.layout_for(None).unwrap();
+                restored.validate().unwrap();
+                match &restored.root {
+                    zeron_workspace::SplitNode::Split { ratio, .. } => {
+                        assert!((ratio - crate::pane::EQUALIZE_RATIO).abs() < 1e-9);
+                    }
+                    zeron_workspace::SplitNode::Leaf { .. } => {
+                        panic!("the equalized split did not persist")
+                    }
+                }
+                let _ = window;
+            })
+            .unwrap();
     }
 }

@@ -11994,6 +11994,7 @@ dependencies = [
  "zeron-syntax",
  "zeron-theme",
  "zeron-update",
+ "zeron-workspace",
 ]
 
 [[package]]
@@ -12010,6 +12011,16 @@ dependencies = [
  "tokio",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "zeron-workspace"
+version = "0.2.72"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

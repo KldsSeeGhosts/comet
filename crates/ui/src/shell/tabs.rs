@@ -97,6 +97,8 @@ impl Shell {
         self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
+        // Track the explicit navigation so workspace restore preserves it.
+        self.pending_explicit_nav = Some(Some(chat_id.clone()));
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         cx.notify();
@@ -109,6 +111,9 @@ impl Shell {
         self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
+        // Track the explicit new-session intent so workspace restore
+        // does not overwrite it with a saved layout's focused chat.
+        self.pending_explicit_nav = Some(None);
         let target = {
             let state = self.state.read(cx);
             self.settings
