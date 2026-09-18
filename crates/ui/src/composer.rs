@@ -6640,6 +6640,7 @@ impl Composer {
                                 run_worktree = Some(zeron_proto::WorktreeSpec {
                                     repo_path: repo_path.clone(),
                                     base: base.clone(),
+                                    space_id: space_id.clone(),
                                 });
                             }
                         }

@@ -262,6 +262,7 @@ impl EngineCore {
         )
         .map_err(|e| EngineError::Other(e.to_string()))?;
         let project_actions = ProjectActionsStore::open(profile.store_root())?;
+        doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),

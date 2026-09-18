@@ -140,6 +140,10 @@ pub struct WorktreeSpec {
     pub repo_path: String,
     /// Base ref the fresh `zeron/<name>` branch is created off.
     pub base: String,
+    /// Owning project used to resolve host-local setup Actions. Optional for
+    /// wire compatibility with clients that only request worktree creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
 }
 
 /// The session-scoped singleton id for the live plan/todo chip. ACP plan
@@ -556,6 +560,7 @@ mod tests {
             worktree: Some(WorktreeSpec {
                 repo_path: "/repos/comet".into(),
                 base: "main".into(),
+                space_id: None,
             }),
             ..req
         };
