@@ -500,3 +500,308 @@ fn a_parked_queue_edit_salvages_the_displaced_draft_and_older_maps(
         assert_eq!(draft_text(&restored, cx), "older a2 words");
     }).unwrap();
 }
+
+// ---- mixed-space sidebar drops ----
+
+fn sidebar_payload(session: &'static str) -> crate::pane::TabSplitDrag {
+    crate::pane::TabSplitDrag {
+        source: crate::pane::hit_test::DragSource::SidebarSession,
+        mark: crate::pane::chrome::TabMark {
+            icon: crate::icons::ZERON_LOGO,
+            tint: None,
+        },
+        title: session.into(),
+        session_id: Some(session.into()),
+    }
+}
+
+fn sidebar_drop(session: &str, plan: crate::pane::hit_test::DropPlan) -> crate::pane::DragSplitState {
+    crate::pane::DragSplitState {
+        source: crate::pane::hit_test::DragSource::SidebarSession,
+        session_id: Some(session.into()),
+        root_bounds: gpui::Bounds {
+            origin: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+            size: gpui::size(gpui::px(960.0), gpui::px(640.0)),
+        },
+        resolution: crate::pane::hit_test::DropResolution {
+            plan,
+            preview: None,
+            anchor: None,
+        },
+    }
+}
+
+fn layout_counts(shell: &Shell) -> (usize, usize, usize) {
+    (
+        shell.workspace.layout.views.len(),
+        shell
+            .workspace
+            .layout
+            .views
+            .values()
+            .map(|view| view.ordered_tabs().len())
+            .sum(),
+        shell
+            .workspace
+            .layout
+            .views
+            .values()
+            .flat_map(|view| view.tabs.values())
+            .map(|tab| tab.panes.len())
+            .sum(),
+    )
+}
+
+/// Layout owner `a`, panes bound to `chat-a1` (space a) and `chat-b1`
+/// (space b). Returns the two pane ids.
+fn seed_mixed_layout(
+    shell: &mut Shell,
+    cx: &mut Context<Shell>,
+) -> (zeron_workspace::PaneId, zeron_workspace::PaneId) {
+    seed_two_spaces(shell, cx);
+    shell.on_state_changed(&shell.state.clone(), cx);
+    let pane_a = shell.workspace.focused_pane().unwrap();
+    shell.split_drag = Some(sidebar_drop(
+        "chat-b1",
+        crate::pane::hit_test::DropPlan::SplitPane {
+            pane: pane_a,
+            direction: Direction::Right,
+        },
+    ));
+    shell.commit_split_drop(&sidebar_payload("chat-b1"), cx);
+    shell.on_state_changed(&shell.state.clone(), cx);
+    let pane_b = shell.find_pane_with_session("chat-b1").unwrap();
+    (pane_a, pane_b)
+}
+
+#[gpui::test]
+fn a_foreign_space_sidebar_drop_docks_under_the_owning_space(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window
+        .update(cx, |shell, _, cx| {
+            let (pane_a, pane_b) = seed_mixed_layout(shell, cx);
+            assert_ne!(pane_a, pane_b);
+            assert_eq!(shell.active_workspace_space.as_deref(), Some("a"));
+            assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("a"));
+            assert_eq!(
+                shell.state.read(cx).selected_chat.as_deref(),
+                Some("chat-b1")
+            );
+            assert_eq!(
+                shell.workspace.layout.pane(pane_a).unwrap().session_id.as_deref(),
+                Some("chat-a1")
+            );
+            assert_eq!(
+                shell.workspace.layout.pane(pane_b).unwrap().session_id.as_deref(),
+                Some("chat-b1")
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn focusing_between_mixed_space_panes_keeps_the_layout_owner(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window
+        .update(cx, |shell, _, cx| {
+            let (pane_a, pane_b) = seed_mixed_layout(shell, cx);
+            shell.focus_workspace_pane(pane_a, cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+            assert_eq!(
+                shell.state.read(cx).selected_chat.as_deref(),
+                Some("chat-a1")
+            );
+            assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("a"));
+            assert_eq!(shell.active_workspace_space.as_deref(), Some("a"));
+
+            shell.focus_workspace_pane(pane_b, cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+            assert_eq!(
+                shell.state.read(cx).selected_chat.as_deref(),
+                Some("chat-b1")
+            );
+            assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("a"));
+            assert_eq!(shell.active_workspace_space.as_deref(), Some("a"));
+            assert_eq!(shell.find_pane_with_session("chat-a1"), Some(pane_a));
+            assert_eq!(shell.find_pane_with_session("chat-b1"), Some(pane_b));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_mixed_space_layout_round_trips_through_the_store(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window
+        .update(cx, |shell, _, cx| {
+            let (pane_a, pane_b) = seed_mixed_layout(shell, cx);
+            shell.flush_workspace_layout(cx);
+            select_space(shell, "b", cx);
+            select_space(shell, "a", cx);
+            // The restored tree kept BOTH bindings — including the
+            // foreign-space one — instead of clearing it on load.
+            assert_eq!(shell.find_pane_with_session("chat-a1"), Some(pane_a));
+            assert_eq!(shell.find_pane_with_session("chat-b1"), Some(pane_b));
+            assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("a"));
+            assert_eq!(shell.active_workspace_space.as_deref(), Some("a"));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn an_already_open_session_drop_only_focuses(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window
+        .update(cx, |shell, _, cx| {
+            seed_two_spaces(shell, cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+            let pane_a = shell.workspace.focused_pane().unwrap();
+            let before = layout_counts(shell);
+            let revision = shell.workspace.layout.revision;
+            shell.split_drag = Some(sidebar_drop(
+                "chat-a1",
+                crate::pane::hit_test::DropPlan::SplitPane {
+                    pane: pane_a,
+                    direction: Direction::Right,
+                },
+            ));
+            shell.commit_split_drop(&sidebar_payload("chat-a1"), cx);
+            assert_eq!(layout_counts(shell), before);
+            assert_eq!(shell.workspace.layout.revision, revision);
+            assert_eq!(shell.workspace.focused_pane(), Some(pane_a));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_stale_drag_payload_never_mutates_the_layout(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window
+        .update(cx, |shell, _, cx| {
+            seed_two_spaces(shell, cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+            let pane_a = shell.workspace.focused_pane().unwrap();
+            let before = layout_counts(shell);
+            let revision = shell.workspace.layout.revision;
+
+            // Workspace commit entry: state for chat-a1, payload chat-b1.
+            shell.split_drag = Some(sidebar_drop(
+                "chat-a1",
+                crate::pane::hit_test::DropPlan::SplitPane {
+                    pane: pane_a,
+                    direction: Direction::Right,
+                },
+            ));
+            shell.commit_split_drop(&sidebar_payload("chat-b1"), cx);
+            assert!(shell.split_drag.is_none());
+            assert_eq!(layout_counts(shell), before);
+            assert_eq!(shell.workspace.layout.revision, revision);
+            assert!(shell.find_pane_with_session("chat-b1").is_none());
+
+            // Sidebar (legacy single-pane) commit entry, same mismatch.
+            shell.split_drag = Some(sidebar_drop(
+                "chat-a1",
+                crate::pane::hit_test::DropPlan::SplitPane {
+                    pane: pane_a,
+                    direction: Direction::Right,
+                },
+            ));
+            shell.accept_sidebar_session_drop(&sidebar_payload("chat-b1"), cx);
+            assert!(shell.split_drag.is_none());
+            assert_eq!(layout_counts(shell), before);
+            assert_eq!(shell.workspace.layout.revision, revision);
+            assert!(shell.find_pane_with_session("chat-b1").is_none());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn an_open_session_resolves_to_focus_only_inside_the_content(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window
+        .update(cx, |shell, _, cx| {
+            seed_two_spaces(shell, cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+            let pane = shell.workspace.focused_pane().unwrap();
+            let (view, tab) = shell.workspace.layout.pane_location(pane).unwrap();
+            let outlet = crate::pane::hit_test::Rect::new(0.0, 0.0, 800.0, 600.0);
+            let geometry = crate::pane::hit_test::single_pane_geometry(&outlet, pane, view, tab);
+
+            // Captured sample left of the content (over the sidebar): the
+            // existing-session path must decline just like `resolve_drop`.
+            assert!(shell
+                .existing_sidebar_session_resolution(
+                    Some("chat-a1"),
+                    &geometry,
+                    geometry.content.x - 1.0,
+                    geometry.content.y + geometry.content.h / 2.0,
+                )
+                .is_none());
+
+            // Inside the content: focus the existing pane, full-pane preview.
+            let (cx_mid, cy_mid) = geometry.panes[0].rect.center();
+            let resolution = shell
+                .existing_sidebar_session_resolution(Some("chat-a1"), &geometry, cx_mid, cy_mid)
+                .unwrap();
+            assert_eq!(
+                resolution.plan,
+                crate::pane::hit_test::DropPlan::FocusPane { pane }
+            );
+            assert_eq!(
+                resolution.preview,
+                Some(crate::pane::hit_test::DropPreview {
+                    rect: geometry.panes[0].rect,
+                    kind: crate::pane::hit_test::PreviewKind::FullTarget,
+                })
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_sidebar_strip_drop_inserts_at_the_requested_position(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window
+        .update(cx, |shell, _, cx| {
+            seed_two_spaces(shell, cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+            let view = zeron_workspace::ViewId(1);
+            let t1 = shell.workspace.layout.views[&view].ordered_tabs()[0];
+            let t2 = shell.workspace.add_tab_to_view(view).unwrap();
+            assert_eq!(
+                shell.workspace.layout.views[&view].ordered_tabs(),
+                vec![t1, t2]
+            );
+            shell.split_drag = Some(sidebar_drop(
+                "chat-b1",
+                crate::pane::hit_test::DropPlan::MoveIntoPane {
+                    view,
+                    tab_before: Some(t1),
+                },
+            ));
+            shell.commit_split_drop(&sidebar_payload("chat-b1"), cx);
+            let ordered = shell.workspace.layout.views[&view].ordered_tabs();
+            assert_eq!(ordered.len(), 3);
+            assert_eq!(&ordered[1..], &[t1, t2]);
+            let pane_b = shell.find_pane_with_session("chat-b1").unwrap();
+            assert_eq!(
+                shell.workspace.layout.pane_location(pane_b),
+                Some((view, ordered[0]))
+            );
+            assert_eq!(shell.workspace.focused_pane(), Some(pane_b));
+        })
+        .unwrap();
+}

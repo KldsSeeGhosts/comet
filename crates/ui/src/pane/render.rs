@@ -11,8 +11,7 @@
 //!   `theme.border_strong` 1px border;
 //! - pane focus is internal state only (keyboard/selection routing), still
 //!   driven by click-to-focus on the pane container;
-//! - a tab with ≥2 panes gives each pane a header; single-pane tabs have no
-//!   header (§4/§6);
+//! - every pane renders its header — the pane's chat identity row;
 //! - a sole top-level view hides its tab strip when it has a single tab;
 //!   the strip survives for multi-tab views and any view whose close
 //!   control it carries.
@@ -53,15 +52,16 @@ use crate::transcript::Transcript;
 
 use super::chrome::{self, TabChip};
 use super::flex_weights;
+use super::hit_test::PreviewKind;
 use super::{DIVIDER_HIT_PX, DividerDrag, DividerGhost, DividerTarget};
-/// The workspace outlet's outer padding: 3px on the sides and bottom, and
-/// the unified titlebar band plus the same 3px on top. Shared with
+/// The workspace outlet's outer padding: 3px on every side — the window-wide
+/// chat header is gone, so the top reserves no titlebar band. Shared with
 /// `shell/panes.rs`'s drag geometry so the hit-test `content` region is
 /// derived from the SAME constants the outlet lays out with — the preview
 /// overlay, the pane/view rects and the boundary math must all reference one
 /// coordinate space, not two.
 pub(crate) const OUTLET_PAD_PX: f32 = 3.0;
-pub(crate) const OUTLET_TOP_PAD_PX: f32 = Theme::TITLEBAR_HEIGHT + OUTLET_PAD_PX;
+pub(crate) const OUTLET_TOP_PAD_PX: f32 = OUTLET_PAD_PX;
 
 /// The pane tree's inner gutter: each view's active tab pane tree pads this
 /// much inside its view region, so the outermost pane edges sit this far
@@ -103,12 +103,10 @@ pub(crate) struct PaneSnap {
     /// The pane's provider mark (header dot-side identity + drag ghost).
     pub mark: chrome::TabMark,
     /// Kept in the snapshot contract for the shell's pane bookkeeping; the
-    /// renderer keys off `transcript`/`composer` presence instead.
-    #[allow(dead_code)]
+    /// header's changes-toggle gate also reads it (focused + bound only).
     pub has_session: bool,
-    /// The one globally focused pane — internal routing state only; it no
-    /// longer changes what the pane renders.
-    #[allow(dead_code)]
+    /// The one globally focused pane — internal routing state plus the
+    /// changes-toggle gate; it no longer changes what the pane body renders.
     pub focused: bool,
     /// The pane's own interactive transcript (`None` on the new-chat canvas
     /// or for a pane with no surface).
@@ -123,8 +121,8 @@ pub(crate) struct PaneSnap {
 ///
 /// WS4: the outlet is the drag surface. `drag_preview` — the active drag's
 /// resolved preview rect in outlet-relative coordinates — paints ABOVE the
-/// tree as an occluding accent wash + 1px ring (§3: half-pane for splits,
-/// full top-level region for view splits, nothing at center). The offsets
+/// tree (§3: half-pane for splits, full region for view splits and center
+/// moves, a 2px insertion marker for strip drops). The offsets
 /// feed an `.absolute()` child, which Taffy measures from this div's
 /// border-box origin (its padding does NOT shift absolute children), and the
 /// conversion subtracts exactly that origin — `DragMoveEvent::bounds`, this
@@ -137,7 +135,7 @@ pub(crate) fn workspace_outlet(
     cx: &Context<'_, Shell>,
     theme: &Theme,
     snap: &WorkspaceSnap,
-    drag_preview: Option<Bounds<Pixels>>,
+    drag_preview: Option<(Bounds<Pixels>, PreviewKind)>,
 ) -> AnyElement {
     div()
         .relative()
@@ -146,25 +144,10 @@ pub(crate) fn workspace_outlet(
         .flex_col()
         .overflow_hidden()
         .p(px(OUTLET_PAD_PX))
-        // The unified window titlebar is an overlay. Workspace chrome must
-        // begin below it so tab chips and their close controls remain visible
-        // and clickable instead of painting underneath the titlebar.
-        .pt(px(OUTLET_TOP_PAD_PX))
         .child(view_node(cx, theme, &snap.root, &[], snap))
-        // The live drop preview: accent wash (~0.12 alpha) + 1px accent ring,
-        // rounded ~8px (§3), painted above everything it covers.
-        .children(drag_preview.map(|b| {
-            div()
-                .absolute()
-                .left(b.origin.x)
-                .top(b.origin.y)
-                .w(b.size.width)
-                .h(b.size.height)
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(theme.accent)
-                .bg(theme.accent.opacity(0.12))
-        }))
+        // The live drop preview (§3): every resolved plan paints one, above
+        // everything it covers.
+        .children(drag_preview.map(|(b, kind)| split_drop_preview(b, kind, theme)))
         .on_drag_move(cx.listener(
             move |this, event: &gpui::DragMoveEvent<super::TabSplitDrag>, _, cx| {
                 this.apply_split_drag_move(event, cx);
@@ -182,6 +165,59 @@ pub(crate) fn workspace_outlet(
             cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.cancel_split_drag(cx)),
         )
         .into_any_element()
+}
+
+/// The one drop preview for every resolved plan — shared by the workspace
+/// outlet and the legacy single-pane content area so drag feedback reads
+/// identically on both surfaces. The [`PreviewKind`] the resolver produced
+/// chooses the paint: a solid accent line for strip insertions, a half-pane
+/// wash for pane splits, a fainter full-pane wash for tab joins and
+/// existing-pane focuses, and a contained accent ring for view splits — the
+/// ring insets 1px on every side so it never clips into the native window
+/// edge. No listeners, no animation — direct manipulation stays
+/// synchronized with the resolved drop plan.
+pub(crate) fn split_drop_preview(
+    bounds: Bounds<Pixels>,
+    kind: PreviewKind,
+    theme: &Theme,
+) -> AnyElement {
+    let bounds = match kind {
+        PreviewKind::ViewRing => {
+            let origin = gpui::point(bounds.origin.x + px(1.0), bounds.origin.y + px(1.0));
+            let size = gpui::size(
+                gpui::px((f32::from(bounds.size.width) - 2.0).max(0.0)),
+                gpui::px((f32::from(bounds.size.height) - 2.0).max(0.0)),
+            );
+            Bounds { origin, size }
+        }
+        _ => bounds,
+    };
+    let el = div()
+        .absolute()
+        .left(bounds.origin.x)
+        .top(bounds.origin.y)
+        .w(bounds.size.width)
+        .h(bounds.size.height);
+    match kind {
+        PreviewKind::Insertion => el.rounded(px(1.0)).bg(theme.accent).into_any_element(),
+        PreviewKind::PaneHalf => el
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.accent)
+            .bg(theme.accent.opacity(0.14))
+            .into_any_element(),
+        PreviewKind::FullTarget => el
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.accent)
+            .bg(theme.accent.opacity(0.08))
+            .into_any_element(),
+        PreviewKind::ViewRing => el
+            .rounded(px(8.0))
+            .border_2()
+            .border_color(theme.accent)
+            .into_any_element(),
+    }
 }
 
 /// Whether a view renders its tab strip: hidden on the common sole-view /
@@ -486,20 +522,21 @@ fn split_child(weight: f32, child: AnyElement) -> AnyElement {
         .into_any_element()
 }
 
-/// One pane: click-to-focus container, conditional header, and the pane's
-/// own transcript + composer body. Focus is internal routing state only —
-/// every pane carries the same border and the same element tree. A
-/// paint-time canvas records the pane's bounds for the tool-picker anchor.
+/// One pane: click-to-focus container, its header (the chat identity row —
+/// `closable` only gates the ×), and the pane's own transcript + composer
+/// body. Focus is internal routing state only — every pane carries the same
+/// border and the same element tree. A paint-time canvas records the pane's
+/// bounds for the tool-picker anchor.
 fn pane_container(
     cx: &Context<'_, Shell>,
     theme: &Theme,
     pane: &PaneSnap,
-    multi_pane: bool,
+    closable: bool,
     snap: &WorkspaceSnap,
 ) -> AnyElement {
     let pane_id = pane.pane;
     let bounds_cell = snap.pane_bounds.clone();
-    let mut container = div()
+    let container = div()
         .flex_1()
         .min_w_0()
         .min_h_0()
@@ -531,20 +568,22 @@ fn pane_container(
             .absolute()
             .inset_0(),
         );
-    // Single-pane tabs render NO header — header chrome is conditional
-    // (§4/§6); it first appears the moment a tab splits.
-    if multi_pane {
-        container = container.child(chrome::pane_header(
+    // Every pane renders its header — the chat identity row now that the
+    // window-wide chat header is gone.
+    container
+        .child(chrome::pane_header(
             pane.pane,
             pane.title.clone(),
             pane.mark,
             theme.text_muted.opacity(0.55),
+            closable,
+            pane.focused && pane.has_session,
             true,
             theme,
             cx,
-        ));
-    }
-    container.child(pane_body(theme, pane)).into_any_element()
+        ))
+        .child(pane_body(theme, pane))
+        .into_any_element()
 }
 
 fn pane_body(theme: &Theme, pane: &PaneSnap) -> AnyElement {

@@ -12,7 +12,7 @@
 
 use super::*;
 
-use crate::pane::chrome::{TabChip, tab_mark};
+use crate::pane::chrome::{self, TabChip, tab_mark};
 use crate::pane::hit_test::{self, DragSource, DropPlan};
 use crate::pane::render::{
     OUTLET_PAD_PX, OUTLET_TOP_PAD_PX, PaneSnap, ViewSnap, WorkspaceSnap, workspace_outlet,
@@ -45,6 +45,40 @@ impl Shell {
         // WS4: the active drag's preview, converted to outlet-relative space.
         let drag_preview = self.split_drag_preview();
         workspace_outlet(cx, &theme, &snap, drag_preview)
+    }
+
+    /// The legacy single-pane route's chat identity row: the same pane
+    /// header the workspace tree renders per pane, mounted above the
+    /// transcript when `workspace_mode()` is off (the workspace outlet then
+    /// supplies its own headers). Not closable and not a drag source — the
+    /// trivial layout has no splits to re-dock.
+    pub(super) fn render_primary_pane_header(
+        &self,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let Some(pane) = self.workspace.focused_pane() else {
+            return Empty.into_any_element();
+        };
+        let (title, has_selection) = {
+            let row = self.state.read(cx).selected_chat_row();
+            let title = row
+                .and_then(|chat| chat.title.clone())
+                .map(|title| SharedString::from(transcript::single_line(&title)))
+                .unwrap_or_else(|| SharedString::from("New session"));
+            (title, row.is_some())
+        };
+        chrome::pane_header(
+            pane,
+            title,
+            tab_mark(PaneMode::Chat, None),
+            theme.text_muted.opacity(0.55),
+            false,
+            has_selection,
+            false,
+            theme,
+            cx,
+        )
     }
 
     /// Keep a pane's composer entity alive through navigation and first-send
@@ -728,20 +762,26 @@ impl Shell {
         event: &gpui::DragMoveEvent<crate::pane::TabSplitDrag>,
         cx: &mut Context<Self>,
     ) {
-        let drag = event.drag(cx);
-        let (source, pointer) = (drag.source, event.event.position);
+        let (source, session_id, pointer) = {
+            let drag = event.drag(cx);
+            (
+                drag.source,
+                drag.session_id.clone(),
+                event.event.position,
+            )
+        };
         let anchor = self.split_drag.as_ref().and_then(|s| s.resolution.anchor);
         let geom = self.workspace_geometry(event.bounds);
-        let resolution = hit_test::resolve_drop(
-            &geom,
-            f32::from(pointer.x),
-            f32::from(pointer.y),
-            source,
-            anchor,
-        );
+        let x = f32::from(pointer.x);
+        let y = f32::from(pointer.y);
+        // A sidebar session already open anywhere in the layout always
+        // resolves to focusing its existing pane — never a duplicate.
+        let resolution = self
+            .existing_sidebar_session_resolution(session_id.as_deref(), &geom, x, y)
+            .unwrap_or_else(|| hit_test::resolve_drop(&geom, x, y, source, anchor));
         let next = DragSplitState {
             source,
-            pointer,
+            session_id,
             root_bounds: event.bounds,
             resolution,
         };
@@ -751,13 +791,45 @@ impl Shell {
         }
     }
 
+    /// The drag resolution for a sidebar session that is already bound to a
+    /// pane somewhere in the layout: focus that pane (`DropPlan::FocusPane`)
+    /// rather than minting a second binding. Previews the pane's painted
+    /// rect as a `FullTarget` wash when the geometry knows it (a pane in an
+    /// inactive tab has no painted rect — the commit activates it).
+    pub(crate) fn existing_sidebar_session_resolution(
+        &self,
+        session_id: Option<&str>,
+        geometry: &hit_test::WorkspaceGeometry,
+        x: f32,
+        y: f32,
+    ) -> Option<hit_test::DropResolution> {
+        if !x.is_finite() || !y.is_finite() || !geometry.content.contains(x, y) {
+            return None;
+        }
+        let pane = self.find_pane_with_session(session_id?)?;
+        let preview = geometry
+            .panes
+            .iter()
+            .find(|p| p.pane == pane)
+            .map(|p| hit_test::DropPreview {
+                rect: p.rect,
+                kind: hit_test::PreviewKind::FullTarget,
+            });
+        Some(hit_test::DropResolution {
+            plan: DropPlan::FocusPane { pane },
+            preview,
+            anchor: Some(pane),
+        })
+    }
+
     /// `on_drag_move` on the SINGLE-PANE content area (the workspace outlet
     /// is not rendered there, so the legacy container is the only drag
     /// surface): the whole area is the focused pane, so the sample resolves
-    /// through [`hit_test::single_pane_split`] — the same outer-20% edge rule
-    /// as the workspace matrix — and stores the same [`DragSplitState`] the
-    /// workspace path uses, so the preview overlay paints and
-    /// [`Self::accept_sidebar_session_drop`] can honor the hovered half.
+    /// through [`hit_test::resolve_single_pane_drop`] — the same outer-20%
+    /// edge rule as the workspace matrix, with the center resolving to a
+    /// tab-joining `MoveIntoPane` — and stores the same [`DragSplitState`]
+    /// the workspace path uses, so the preview overlay paints and
+    /// [`Self::accept_sidebar_session_drop`] commits the resolved plan.
     /// Workspace mode must win when both surfaces are live (the outlet owns
     /// the geometry); only sidebar sessions drag here (chips and headers
     /// exist only inside the outlet).
@@ -766,30 +838,41 @@ impl Shell {
         event: &gpui::DragMoveEvent<crate::pane::TabSplitDrag>,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace_mode() || event.drag(cx).source != DragSource::SidebarSession {
+        let (source, session_id, pointer) = {
+            let drag = event.drag(cx);
+            (
+                drag.source,
+                drag.session_id.clone(),
+                event.event.position,
+            )
+        };
+        if self.workspace_mode() || source != DragSource::SidebarSession {
             return;
         }
-        let source = event.drag(cx).source;
-        let pointer = event.event.position;
-        let content = hit_test::Rect::from_bounds(event.bounds);
-        let resolution = match (
-            self.workspace.focused_pane(),
-            hit_test::single_pane_split(&content, f32::from(pointer.x), f32::from(pointer.y)),
-        ) {
-            (Some(pane), Some((direction, half))) => hit_test::DropResolution {
-                plan: DropPlan::SplitPane { pane, direction },
-                preview: Some(half),
-                anchor: None,
-            },
-            _ => hit_test::DropResolution {
-                plan: DropPlan::None,
-                preview: None,
-                anchor: None,
-            },
+        let outlet = hit_test::Rect::from_bounds(event.bounds);
+        let anchor = self.split_drag.as_ref().and_then(|s| s.resolution.anchor);
+        let x = f32::from(pointer.x);
+        let y = f32::from(pointer.y);
+        let located = self
+            .workspace
+            .focused_pane()
+            .and_then(|pane| self.workspace.layout.pane_location(pane).map(|l| (pane, l)));
+        let resolution = match located {
+            Some((pane, (view, tab))) => self
+                .existing_sidebar_session_resolution(
+                    session_id.as_deref(),
+                    &hit_test::single_pane_geometry(&outlet, pane, view, tab),
+                    x,
+                    y,
+                )
+                .unwrap_or_else(|| {
+                    hit_test::resolve_single_pane_drop(&outlet, pane, view, tab, x, y, anchor)
+                }),
+            None => hit_test::DropResolution::none(),
         };
         let next = DragSplitState {
             source,
-            pointer,
+            session_id,
             root_bounds: event.bounds,
             resolution,
         };
@@ -799,10 +882,12 @@ impl Shell {
         }
     }
 
-    /// The active drag's preview rect in its paint surface's local
+    /// The active drag's preview rect and kind in its paint surface's local
     /// coordinates — the workspace outlet in workspace mode, the single-pane
     /// content area otherwise. Both render the same accent overlay from this.
-    pub(crate) fn split_drag_preview(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
+    pub(crate) fn split_drag_preview(
+        &self,
+    ) -> Option<(gpui::Bounds<gpui::Pixels>, hit_test::PreviewKind)> {
         self.split_drag.as_ref().and_then(preview_bounds)
     }
 
@@ -818,6 +903,12 @@ impl Shell {
         let Some(state) = self.split_drag.take() else {
             return;
         };
+        // The stored resolution belongs to the payload that produced it — a
+        // mismatched drop commits nothing.
+        if !split_drag_matches_payload(&state, payload) {
+            cx.notify();
+            return;
+        }
         // Sidebar session drags create a new pane bound to the dragged
         // session rather than moving an existing workspace tab/pane.
         if payload.source == DragSource::SidebarSession {
@@ -831,38 +922,34 @@ impl Shell {
         }
     }
 
-    /// Whether a sidebar session belongs to the current workspace's space.
-    /// A drop that would cross a project boundary is rejected before the
-    /// tree is mutated - accepting it would immediately trigger a space
-    /// restore that dismantles the split.
-    fn sidebar_session_compatible(
-        &self,
-        session_id: &Option<String>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(sid) = session_id.as_deref() else {
-            return true; // no session to validate
-        };
-        let state = self.state.read(cx);
-        match state.chats.iter().find(|c| c.id == sid) {
-            Some(chat) => chat.space_id == self.active_workspace_space,
-            // Unknown chat (not synced yet): allow optimistically.
-            None => true,
-        }
-    }
-
     /// Commit a sidebar-session drag using the full resolved drop plan.
     /// Each plan variant targets the pane/view/tab the resolver identified,
-    /// not the focused pane.
+    /// not the focused pane. A session already open in the tree focuses its
+    /// pane instead of minting a second binding for the same chat; sessions
+    /// from ANY space dock here — the layout stays owned by the space it was
+    /// opened from, and pane focus no longer mutates the selected space.
     fn commit_sidebar_split(
         &mut self,
         plan: DropPlan,
         payload: &crate::pane::TabSplitDrag,
         cx: &mut Context<Self>,
     ) {
-        if !self.sidebar_session_compatible(&payload.session_id, cx) {
-            self.split_drag = None;
-            cx.notify();
+        if let Some(session_id) = payload.session_id.as_deref()
+            && let Some(pane) = self.find_pane_with_session(session_id)
+        {
+            // Two panes bound to one chat would double its transcript and
+            // split the single-projection selection model; Super reopens the
+            // existing home for the session, so focus (and retarget) it.
+            let _ = self.workspace.focus_pane(pane);
+            self.retarget_to_focused_pane(cx);
+            return;
+        }
+        // The resolver's synthesized already-open plan focuses/retargets
+        // without creating anything (the guard above already covers a bound
+        // payload session; this arm also reaches tests and defensive paths).
+        if let DropPlan::FocusPane { pane } = plan {
+            let _ = self.workspace.focus_pane(pane);
+            self.retarget_to_focused_pane(cx);
             return;
         }
         let session_id = payload.session_id.clone();
@@ -870,56 +957,89 @@ impl Shell {
             let new_pane = crate::pane::chat_pane_state();
             match plan {
                 DropPlan::None => return false,
-                DropPlan::SplitPane { pane, direction } => {
-                    self.workspace
-                        .layout
-                        .split_pane(pane, direction, new_pane)
-                        .is_ok_and(|pane_id| {
-                            let _ = self.workspace.set_pane_session(pane_id, session_id);
-                            self.workspace.layout.focus_pane(pane_id).ok();
-                            true
-                        })
+                DropPlan::SplitPane { pane, direction } => self
+                    .workspace
+                    .layout
+                    .split_pane(pane, direction, new_pane)
+                    .is_ok_and(|pane_id| self.bind_sidebar_session(pane_id, session_id)),
+                DropPlan::SplitView { view, direction } => self
+                    .workspace
+                    .layout
+                    .split_view(view, direction, new_pane)
+                    .is_ok_and(|new_view| {
+                        let pane_id = self
+                            .workspace
+                            .layout
+                            .views
+                            .get(&new_view)
+                            .and_then(|v| v.tabs.values().next())
+                            .and_then(|tab| tab.panes.keys().next())
+                            .copied();
+                        match pane_id {
+                            Some(pane_id) => self.bind_sidebar_session(pane_id, session_id),
+                            None => false,
+                        }
+                    }),
+                // Strip/center drop: the session becomes a new tab, at the
+                // hovered insertion point when the strip named one.
+                DropPlan::MoveIntoPane { view, tab_before } => {
+                    self.add_sidebar_session_tab(view, tab_before, session_id)
                 }
-                DropPlan::SplitView { view, direction } => {
-                    self.workspace
-                        .layout
-                        .split_view(view, direction, new_pane)
-                        .is_ok_and(|new_view| {
-                            if let Some(tab) = self.workspace.layout.views
-                                .get(&new_view)
-                                .and_then(|v| v.tabs.values().next())
-                            {
-                                if let Some(pane_id) = tab.panes.keys().next().copied() {
-                                    let _ = self.workspace.set_pane_session(pane_id, session_id);
-                                    self.workspace.layout.focus_pane(pane_id).ok();
-                                }
-                            }
-                            true
-                        })
+                // A ReorderStrip plan from a sidebar source only reaches here
+                // defensively — append is the honest fallback.
+                DropPlan::ReorderStrip { view, .. } => {
+                    self.add_sidebar_session_tab(view, None, session_id)
                 }
-                DropPlan::MoveIntoPane { view, .. } | DropPlan::ReorderStrip { view, .. } => {
-                    self.workspace
-                        .layout
-                        .add_tab(view, new_pane)
-                        .is_ok_and(|tab_id| {
-                            if let Some(pane_id) = self.workspace.layout.views
-                                .get(&view)
-                                .and_then(|v| v.tabs.get(&tab_id))
-                                .and_then(|t| t.panes.keys().next())
-                                .copied()
-                            {
-                                let _ = self.workspace.set_pane_session(pane_id, session_id);
-                                self.workspace.layout.focus_pane(pane_id).ok();
-                            }
-                            true
-                        })
-                }
+                DropPlan::FocusPane { .. } => return false,
             }
         })();
         if succeeded {
             self.retarget_to_focused_pane(cx);
         } else {
             cx.notify();
+        }
+    }
+
+    /// Bind the dragged session to a pane the commit just created and focus
+    /// it (the engine split ops focus their new pane; this mirrors that for
+    /// the raw `layout` calls the resolver targets).
+    fn bind_sidebar_session(&mut self, pane_id: PaneId, session_id: Option<String>) -> bool {
+        let _ = self.workspace.set_pane_session(pane_id, session_id);
+        let _ = self.workspace.focus_pane(pane_id);
+        true
+    }
+
+    /// Sidebar-session commit on a tab strip (or a pane center): mint a tab
+    /// in `view` — at `tab_before` when the strip drop resolved a position —
+    /// bind the session to its pane, and focus it.
+    fn add_sidebar_session_tab(
+        &mut self,
+        view: ViewId,
+        tab_before: Option<TabId>,
+        session_id: Option<String>,
+    ) -> bool {
+        let Ok(tab_id) = self
+            .workspace
+            .add_tab_with(view, crate::pane::chat_pane_state())
+        else {
+            return false;
+        };
+        if let Some(before) = tab_before {
+            let _ = self
+                .workspace
+                .reorder_tab_in_view(tab_id, view, Some(before));
+        }
+        let pane_id = self
+            .workspace
+            .layout
+            .views
+            .get(&view)
+            .and_then(|v| v.tabs.get(&tab_id))
+            .and_then(|tab| tab.panes.keys().next())
+            .copied();
+        match pane_id {
+            Some(pane_id) => self.bind_sidebar_session(pane_id, session_id),
+            None => false,
         }
     }
 
@@ -934,41 +1054,25 @@ impl Shell {
 
     /// Accept a sidebar session drop on the single-pane content area (the
     /// workspace outlet is not rendered, so this is the entry point for
-    /// drag-to-split from the default screen). Splits the focused pane toward
-    /// the half the preview tracked via `apply_single_pane_drag_move`. A drop
-    /// with no tracked zone — dead center (§3: no indicator) or a mouse-up
-    /// that never sampled the content — keeps the legacy right split.
-    /// Validates the dragged session's space before mutating.
+    /// drag-to-split from the default screen). Commits the plan the preview
+    /// tracked via `apply_single_pane_drag_move` — a view/pane split, a new
+    /// tab for a center drop, or a focus for an already-open session. A
+    /// missing state, a mismatched payload, or `DropPlan::None` is an honest
+    /// no-op.
     pub(crate) fn accept_sidebar_session_drop(
         &mut self,
         payload: &crate::pane::TabSplitDrag,
         cx: &mut Context<Self>,
     ) {
-        let direction = self
-            .split_drag
-            .take()
-            .and_then(|state| match state.resolution.plan {
-                DropPlan::SplitPane { direction, .. } => Some(direction),
-                _ => None,
-            })
-            .unwrap_or(Direction::Right);
-        if !self.sidebar_session_compatible(&payload.session_id, cx) {
-            cx.notify();
-            return;
-        }
-        let session_id = payload.session_id.clone();
-        let Some(target) = self.workspace.focused_pane() else {
+        let Some(state) = self.split_drag.take() else {
             cx.notify();
             return;
         };
-        let new_pane = crate::pane::chat_pane_state();
-        if let Ok(pane_id) = self.workspace.layout.split_pane(target, direction, new_pane) {
-            let _ = self.workspace.set_pane_session(pane_id, session_id);
-            self.workspace.layout.focus_pane(pane_id).ok();
-            self.retarget_to_focused_pane(cx);
-        } else {
+        if !split_drag_matches_payload(&state, payload) {
             cx.notify();
+            return;
         }
+        self.commit_sidebar_split(state.resolution.plan, payload, cx);
     }
 
     /// The plan → engine-op mapping. Returns whether anything changed.
@@ -978,8 +1082,9 @@ impl Shell {
         let result = match (source, plan) {
             (_, DropPlan::None) => return false,
             // Sidebar session drags are handled in commit_sidebar_split_drop,
-            // not here - they need the session_id from the payload.
-            (DragSource::SidebarSession, _) => return false,
+            // not here - they need the session_id from the payload. FocusPane
+            // is only ever synthesized for that same path.
+            (DragSource::SidebarSession, _) | (_, DropPlan::FocusPane { .. }) => return false,
             // Center drop. Same view + append = the no-op restore (activate
             // the tab); anything else moves the tab (append when
             // `tab_before` is `None`).
@@ -1371,8 +1476,12 @@ impl Shell {
             .and_then(|state| state.session_id.clone());
         let selected = self.state.read(cx).selected_chat.clone();
         if selected != session {
+            // Pane focus selects the pane's chat but does NOT follow it into
+            // its space: the layout stays owned by the space it was opened
+            // from, so focusing a pane bound to another space's session must
+            // not trigger a layout restore that swaps the tree out.
             self.state
-                .update(cx, |state, cx| state.select_chat(session, cx));
+                .update(cx, |state, cx| state.select_workspace_pane_chat(session, cx));
         }
     }
 
@@ -1505,21 +1614,6 @@ impl Shell {
             None
         };
         let layout = saved_layout.unwrap_or_default();
-        // Restore alignment: a pane bound to a chat of a DIFFERENT space
-        // drops its binding before anything re-selects, so a space switch can
-        // never yank the app back to another space's session. Chats that have
-        // not synced yet keep their binding optimistically — the dead-session
-        // prune picks them up once the first chats frame lands.
-        let foreign = {
-            let state = self.state.read(cx);
-            crate::pane::stale_session_panes(&layout.views, |session| {
-                state
-                    .chats
-                    .iter()
-                    .find(|chat| chat.id == *session)
-                    .map_or(true, |chat| chat.space_id.as_deref() == space.as_deref())
-            })
-        };
         self.composer.update(cx, |composer, cx| {
             composer.set_target(ChatTarget::Selected, cx);
         });
@@ -1527,11 +1621,10 @@ impl Shell {
         if let Some(session) = initial_session {
             self.workspace.sync_focused_session(Some(&session));
         }
-        for pane in foreign {
-            let _ = self.workspace.set_pane_session(pane, None);
-        }
-        // The clearings above are real changes: persist them (and pick up any
-        // space deletions) without waiting for the next mutation.
+        // Pane bindings of ANY space survive the install: a mixed-space
+        // layout is legal (sidebar drops dock any session into the owning
+        // space's tree), and dead sessions are still degraded by
+        // `prune_dead_workspace_sessions` once chats sync.
         self.schedule_workspace_layout_save(cx);
         self.retarget_to_focused_pane(cx);
     }
@@ -1562,8 +1655,16 @@ impl Shell {
     }
 }
 
-/// The active drag's preview rect ([`hit_test::DropResolution::preview`] is
-/// window-space) converted into the coordinate space of the surface that
+/// Whether the stored drag state still belongs to the payload being
+/// committed — the source plus the session identity the resolver stored. A
+/// mismatch means the state predates this drop: clear and no-op rather than
+/// committing a plan resolved against a different session.
+fn split_drag_matches_payload(state: &DragSplitState, payload: &crate::pane::TabSplitDrag) -> bool {
+    state.source == payload.source && state.session_id == payload.session_id
+}
+
+/// The active drag's preview rect and kind ([`hit_test::DropResolution::preview`]
+/// is window-space) converted into the coordinate space of the surface that
 /// paints it (the workspace outlet, or the single-pane content area), where
 /// the overlay div is absolutely positioned. GPUI/Taffy measure an
 /// `.absolute()` child's `.left()/.top()` insets from the containing block's
@@ -1571,19 +1672,24 @@ impl Shell {
 /// are borderless, so subtracting `root_bounds.origin` (the surface's
 /// paint-time hitbox origin, `DragMoveEvent::bounds`) is exact; the
 /// container's padding is deliberately NOT subtracted (it does not shift
-/// absolute children). `None` when the resolution has no preview (center
-/// moves, strip drops, invalid drops — the verified §3 rule that the center
-/// shows NO indicator).
-fn preview_bounds(state: &DragSplitState) -> Option<gpui::Bounds<gpui::Pixels>> {
-    let rect = state.resolution.preview?;
+/// absolute children). `None` when the resolution has no preview (invalid
+/// drops and guarded self-hits).
+fn preview_bounds(
+    state: &DragSplitState,
+) -> Option<(gpui::Bounds<gpui::Pixels>, hit_test::PreviewKind)> {
+    let preview = state.resolution.preview?;
+    let rect = preview.rect;
     let origin = state.root_bounds.origin;
-    Some(gpui::Bounds {
-        origin: gpui::point(
-            gpui::px(rect.x) - origin.x,
-            gpui::px(rect.y) - origin.y,
-        ),
-        size: gpui::size(gpui::px(rect.w), gpui::px(rect.h)),
-    })
+    Some((
+        gpui::Bounds {
+            origin: gpui::point(
+                gpui::px(rect.x) - origin.x,
+                gpui::px(rect.y) - origin.y,
+            ),
+            size: gpui::size(gpui::px(rect.w), gpui::px(rect.h)),
+        },
+        preview.kind,
+    ))
 }
 
 #[cfg(test)]
@@ -1608,31 +1714,35 @@ mod preview_tests {
         // double-count it.
         let state = DragSplitState {
             source: DragSource::SidebarSession,
-            pointer: gpui::point(gpui::px(600.0), gpui::px(300.0)),
+            session_id: Some("chat-a".into()),
             root_bounds: root_bounds(),
             resolution: hit_test::DropResolution {
                 plan: DropPlan::SplitPane {
                     pane: PaneId(3),
                     direction: Direction::Right,
                 },
-                preview: Some(hit_test::Rect::new(500.0, 200.0, 250.0, 192.5)),
+                preview: Some(hit_test::DropPreview {
+                    rect: hit_test::Rect::new(500.0, 200.0, 250.0, 192.5),
+                    kind: hit_test::PreviewKind::PaneHalf,
+                }),
                 anchor: Some(PaneId(3)),
             },
         };
-        let bounds = preview_bounds(&state).unwrap();
+        let (bounds, kind) = preview_bounds(&state).unwrap();
         assert_eq!(bounds.origin, gpui::point(gpui::px(180.0), gpui::px(130.0)));
         assert_eq!(
             bounds.size,
             gpui::size(gpui::px(250.0), gpui::px(192.5))
         );
+        assert_eq!(kind, hit_test::PreviewKind::PaneHalf);
     }
 
     #[test]
     fn preview_bounds_is_none_without_a_preview() {
-        // Center move: the §3 rule — no indicator, nothing to convert.
+        // Invalid drops and self-hits carry no preview — nothing to convert.
         let state = DragSplitState {
             source: DragSource::PaneHeader(PaneId(1)),
-            pointer: gpui::point(gpui::px(600.0), gpui::px(300.0)),
+            session_id: None,
             root_bounds: root_bounds(),
             resolution: hit_test::DropResolution {
                 plan: DropPlan::MoveIntoPane {

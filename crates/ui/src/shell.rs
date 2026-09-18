@@ -2433,7 +2433,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
         // Reverse from the visible width when toggled during an animation.
         let from = self.eval_tween(self.right_tween, self.right_target(cx));
         self.right_edge_bounce = None;
@@ -4941,12 +4941,24 @@ impl Shell {
         cluster + CLUSTER_BUTTONS_WIDTH + TITLEBAR_IDENTITY_GAP
     }
 
-    /// The unified window titlebar: chat → the session tab strip; settings →
+    /// The unified window titlebar: chat → nothing (the window-wide chat
+    /// header is gone — pane headers own the chat identity); settings →
     /// the section label. Full-width on the glass shell; the traffic lights
     /// and control cluster overlay its left end.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
-            Route::Chat => self.render_session_title_bar(cx),
+            Route::Chat => {
+                // Transparent window-drag strip behind the control cluster
+                // and the sidebar's native-chrome band — hit-only, no
+                // visuals; the pane header owns the chat identity below.
+                let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+                let width = self
+                    .sidebar_now()
+                    .max(self.title_bar_content_start() + plus_inset);
+                let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).w(px(width)).flex_none();
+                self.titlebar_drag_region("chat-window-drag-region", bar, cx)
+                    .into_any_element()
+            }
             Route::Settings(_) => {
                 let inner = div()
                     .size_full()
@@ -5939,10 +5951,11 @@ impl Shell {
                         session_id: Some(drag_id),
                     }
                 },
-                |payload, _point, _, cx| {
+                |payload, point, _, cx| {
                     cx.new(|_| crate::pane::SplitDragGhost {
                         mark: payload.mark,
                         title: payload.title.clone(),
+                        cursor_offset: point,
                     })
                 },
             )
@@ -8024,15 +8037,21 @@ impl Shell {
                             true,
                             div().size_full().child(outlet),
                         )
-                        // Fully faded BY the titlebar's bottom edge (the
+                        // Fully faded BY the pane header's bottom edge (the
                         // title text is opaque — overlap read as collision),
                         // ramping in the band just below it.
-                        .inset_top(Theme::TITLEBAR_HEIGHT)
+                        .inset_top(crate::pane::chrome::PANE_HEADER_HEIGHT)
                         .band_top(Theme::TRANSCRIPT_FADE_BAND)
                         .band_bottom(bottom_band),
                     )
                 },
             )
+            // The pane header is the chat identity row on the legacy route —
+            // mounted after the transcript underlay so it paints above it and
+            // consumes the top row; workspace mode's outlet supplies its own.
+            .when(!workspace_mode, |el| {
+                el.child(self.render_primary_pane_header(theme, cx))
+            })
             // The glass chrome stack, floating over the transcript's bottom:
             // reserved status strip (h-6, the WorkingIndicator — the composer
             // below never shifts), composer, terminal dock. A paint-time
@@ -8134,22 +8153,15 @@ impl Shell {
                     })
                     .child("Drop to attach"),
             )
-            // WS4 single-pane split preview: the same accent wash + ring the
-            // workspace outlet paints, over the half of the content area the
-            // dropped session's pane would take. Painted last so it sits
-            // above the transcript underlay; dead-center drags resolve to no
-            // preview (§3) and the drop keeps the legacy right split.
-            .children(self.split_drag_preview().map(|bounds| {
-                div()
-                    .absolute()
-                    .left(bounds.origin.x)
-                    .top(bounds.origin.y)
-                    .w(bounds.size.width)
-                    .h(bounds.size.height)
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(theme.accent)
-                    .bg(theme.accent.opacity(0.12))
+            // WS4 single-pane split preview: the shared drop renderer the
+            // workspace outlet also uses, painted last so it sits above the
+            // transcript underlay. Its own absolute clip layer keeps a
+            // view-level ring inside the content area without clipping the
+            // whole dropzone.
+            .children(self.split_drag_preview().map(|(bounds, kind)| {
+                div().absolute().inset_0().overflow_hidden().child(
+                    crate::pane::render::split_drop_preview(bounds, kind, theme),
+                )
             }))
             .into_any_element()
     }
@@ -8460,8 +8472,8 @@ impl Shell {
     fn render_right_pane(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
-        let content: AnyElement = if self.right_pane_open(cx) || self.tween_active(self.right_tween)
-        {
+        let pane_live = self.right_pane_open(cx) || self.tween_active(self.right_tween);
+        let content: AnyElement = if pane_live {
             match self.resolved_right_active(cx) {
                 // Rendering a Files surface activates its image. Keep it unmounted
                 // throughout the closing animation after suspending its resources.
@@ -8590,9 +8602,42 @@ impl Shell {
             })
             .bg(panel_bg)
             .overflow_hidden()
-            // The titlebar is a glass overlay over the full-height content
-            // row; the panel's own chrome starts below it.
-            .pt(px(Theme::TITLEBAR_HEIGHT))
+            // The pane's own chrome row: the surface tab strip integrated
+            // under the expand/close controls — the window-wide chat header
+            // that used to carry them is gone. Right padding clears the
+            // platform caption controls (Windows/Linux).
+            .when(pane_live, |el| {
+                el.child(
+                    div()
+                        .h(px(Theme::TITLEBAR_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .pl(px(8.0))
+                        .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
+                        .border_b_1()
+                        .border_color(theme.hairline(0.06))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .child(self.render_right_tab_strip(cx)),
+                        )
+                        .child(header_icon_button(
+                            "expand-changes",
+                            tabs::right_pane_expand_icon(self.right_pane_expanded),
+                            &theme,
+                            cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
+                        ))
+                        .child(header_icon_button(
+                            "toggle-changes",
+                            icons::CLOSE,
+                            &theme,
+                            cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+                        )),
+                )
+            })
             .child(content);
         let target = self.right_target(cx);
         let edge_offset = self.eval_resize_edge_bounce(

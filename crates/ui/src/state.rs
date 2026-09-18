@@ -1881,6 +1881,29 @@ impl AppState {
     /// watch server-side. Selecting a chat also lands in its space and marks it
     /// seen (a global-list click must switch the tab strip too).
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
+        self.select_chat_with_space_follow(chat_id, true, cx);
+    }
+
+    /// Workspace-pane selection: identical to [`Self::select_chat`] except the
+    /// chat's project is NOT followed. A workspace layout stays owned by the
+    /// space it was opened from — a pane bound to another space's session
+    /// (a sidebar drop can dock any chat) selects that session's transcript
+    /// and watches without repointing `selected_space`, so the state observer
+    /// never restores a different layout over the mixed tree.
+    pub(crate) fn select_workspace_pane_chat(
+        &mut self,
+        chat_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_chat_with_space_follow(chat_id, false, cx);
+    }
+
+    fn select_chat_with_space_follow(
+        &mut self,
+        chat_id: Option<String>,
+        follow_space: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.selected_chat == chat_id {
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
@@ -1905,9 +1928,11 @@ impl AppState {
         self.queue.clear();
         self.queue_task = None;
         if let Some(id) = chat_id.as_deref() {
-            // A chat implies its project (or the lack of one); `select_chat(None)`
-            // (the new-session canvas) keeps the current project pick.
-            if let Some(chat) = self.chats.iter().find(|c| c.id == id) {
+            // A chat implies its project (or the lack of one) — but only for
+            // direct selection; a workspace pane's chat leaves the layout
+            // owner's project alone. `select_chat(None)` (the new-session
+            // canvas) keeps the current project pick either way.
+            if follow_space && let Some(chat) = self.chats.iter().find(|c| c.id == id) {
                 match chat.space_id.clone() {
                     Some(space_id) => {
                         self.selected_space = Some(space_id);

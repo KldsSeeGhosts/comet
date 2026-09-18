@@ -126,16 +126,32 @@ pub(crate) struct TabSplitDrag {
 /// mark + title on a raised surface with a hairline border. GPUI renders the
 /// active drag's view AT the cursor, so this is the whole story — the
 /// `SurfaceTabGhost` precedent (shell.rs), no manual window-space overlay.
+/// `cursor_offset` is where inside the source row/header the press began:
+/// GPUI anchors the drag root at `pointer - cursor_offset`, and the chip
+/// renders that offset PLUS 12px inside the root, so the visible chip always
+/// sits 12px down/right of the pointer regardless of grab point.
 pub(crate) struct SplitDragGhost {
     pub mark: chrome::TabMark,
     pub title: SharedString,
+    pub cursor_offset: gpui::Point<Pixels>,
+}
+
+/// The chip's offset inside the drag root: the grab point plus a fixed
+/// 12px down/right nudge, cancelling GPUI's `pointer - cursor_offset` root
+/// placement so the chip trails the pointer at a constant displacement.
+pub(crate) fn ghost_render_offset(cursor_offset: gpui::Point<Pixels>) -> gpui::Point<Pixels> {
+    gpui::point(cursor_offset.x + px(12.0), cursor_offset.y + px(12.0))
 }
 
 impl gpui::Render for SplitDragGhost {
     fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         let tint = self.mark.tint.unwrap_or(theme.text_muted.opacity(0.8));
+        let offset = ghost_render_offset(self.cursor_offset);
         div()
+            .relative()
+            .left(offset.x)
+            .top(offset.y)
             .h(px(22.0))
             .max_w(px(220.0))
             .px(px(9.0))
@@ -159,13 +175,18 @@ impl gpui::Render for SplitDragGhost {
     }
 }
 
-/// One in-flight workspace drag's live state: the source, the last pointer
-/// sample, the workspace outlet's root bounds (the preview overlay is painted
-/// relative to it), and the current pure [`hit_test::DropResolution`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// One in-flight workspace drag's live state: the source, the payload's
+/// session identity (sidebar drags carry the session to bind; the commit
+/// rejects a stale state whose payload no longer matches), the workspace
+/// outlet's root bounds (the preview overlay is painted relative to it), and
+/// the current pure [`hit_test::DropResolution`]. The raw pointer sample is
+/// deliberately NOT stored — it changes every pixel, so holding it would
+/// re-render the shell per sample; the resolved plan IS the state that
+/// matters.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DragSplitState {
     pub source: hit_test::DragSource,
-    pub pointer: gpui::Point<Pixels>,
+    pub session_id: Option<String>,
     pub root_bounds: Bounds<Pixels>,
     pub resolution: hit_test::DropResolution,
 }
@@ -743,13 +764,9 @@ pub fn stale_cache_keys(
 }
 
 /// WS5: panes whose bound session fails `keep` — the pure half of the
-/// stale-session degradation. Two consumers:
-/// - dead sessions (chat deleted while a pane still binds it): the pane stays
-///   and degrades to the new-thread body, binding cleared on the next prune;
-/// - cross-space bindings (restore alignment): a pane bound to a chat of a
-///   DIFFERENT space drops its binding before the restored tree retargets
-///   selection, so a space switch can never yank the app back to another
-///   space's session.
+/// stale-session degradation, consumed by the dead-session prune (a chat
+/// deleted while a pane still binds it): the pane stays and degrades to the
+/// new-thread body, binding cleared on the next prune.
 /// Deterministic order; sessions that `keep` accepts (including unknown ones
 /// — e.g. chats not synced yet) are preserved.
 pub fn stale_session_panes(
@@ -1021,6 +1038,23 @@ mod tests {
         host.split_focused_pane(Direction::Down).unwrap();
         let live = live_pane_ids(&host.layout.views);
         assert_eq!(live.len(), 3);
+    }
+
+    // ---- WS4: drag ghost ----
+
+    #[test]
+    fn ghost_trails_the_pointer_at_a_constant_offset() {
+        // GPUI anchors the drag root at `pointer - cursor_offset`; the chip
+        // renders `ghost_render_offset` inside it. The visible chip's
+        // displacement from the pointer is therefore
+        // `render_offset - cursor_offset` — a constant (12, 12) wherever the
+        // press began inside the source row/header.
+        for grab in [(0.0, 0.0), (180.0, 34.0)] {
+            let cursor_offset = gpui::point(px(grab.0), px(grab.1));
+            let rendered = ghost_render_offset(cursor_offset);
+            assert_eq!(rendered.x - cursor_offset.x, px(12.0));
+            assert_eq!(rendered.y - cursor_offset.y, px(12.0));
+        }
     }
 
     // ---- WS3: divider math ----
@@ -1423,7 +1457,7 @@ mod tests {
         let dead_pane = host.focused_pane().unwrap();
         let dead = stale_session_panes(&host.layout.views, |s| s != "dead");
         assert_eq!(dead, vec![dead_pane]);
-        // Cross-space alignment: keep sessions whose chat belongs to "s1".
+        // The predicate defines staleness: keep sessions starting "s1".
         let mut host2 = PaneHost::new();
         host2.sync_focused_session(Some("s1-chat"));
         host2.split_focused_pane(Direction::Right).unwrap();
