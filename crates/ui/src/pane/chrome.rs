@@ -3,8 +3,8 @@
 //!
 //! Rules carried over from the live Super capture
 //! (`super-analysis/13-interaction-truth.md`):
-//! - a tab with ONE pane renders **no header** (§4/§6) — the header is
-//!   conditional chrome for split tabs only;
+//! - every pane renders a header — it is the pane's chat identity row
+//!   (the window-wide chat header is gone);
 //! - unfocused chat panes render a static composer-shaped strip reading
 //!   "Click to focus chat" with a muted, NON-interactive pill row (§7);
 //! - tab chips carry a provider mark + title; the ACTIVE chip gets a raised
@@ -105,18 +105,25 @@ pub(crate) struct TabChip {
     pub mark: TabMark,
 }
 
+/// The pane header's fixed height — also the chat identity row on the
+/// legacy single-pane route and the transcript's top fade inset.
+pub(crate) const PANE_HEADER_HEIGHT: f32 = 28.0;
+
 /// The pane header: status dot + truncated title left; pop-out/maximize/close
 /// right — revealed on hover (Super §6). The close is functional; pop-out and
 /// maximize are decorative until WS6 wires their flows. Right-click opens the
-/// split/close context menu (and focuses the pane, §6). Rendered ONLY when
-/// the owning tab has ≥2 panes. WS4: the header is a drag source — dragging
-/// it moves/re-docks the pane (drop targets resolve in `pane/hit_test.rs`).
+/// split/close context menu (and focuses the pane, §6). Every workspace pane
+/// renders one — it is the chat identity row. WS4: a `draggable` header is a
+/// drag source — dragging it moves/re-docks the pane (drop targets resolve
+/// in `pane/hit_test.rs`).
 pub(crate) fn pane_header(
     pane: PaneId,
     title: SharedString,
     mark: TabMark,
     dot: Hsla,
     closable: bool,
+    show_changes: bool,
+    draggable: bool,
     theme: &Theme,
     cx: &Context<'_, Shell>,
 ) -> AnyElement {
@@ -140,7 +147,7 @@ pub(crate) fn pane_header(
     };
     div()
         .id(SharedString::from(format!("pane-header-{}", pane.0)))
-        .h(px(28.0))
+        .h(px(PANE_HEADER_HEIGHT))
         .flex_none()
         .flex()
         .flex_row()
@@ -159,21 +166,25 @@ pub(crate) fn pane_header(
             }),
         )
         // WS4: header drag → re-dock/split/move resolution (§3's ghost chip
-        // trails the cursor; the pane's title rides along).
-        .on_drag(
-            TabSplitDrag {
-                source: DragSource::PaneHeader(pane),
-                mark,
-                title: title.clone(),
-                session_id: None,
-            },
-            |payload, _point, _, cx| {
-                cx.new(|_| SplitDragGhost {
-                    mark: payload.mark,
-                    title: payload.title.clone(),
-                })
-            },
-        )
+        // trails the cursor; the pane's title rides along). Non-draggable
+        // headers (the legacy single-pane identity row) skip the source.
+        .when(draggable, |el| {
+            el.on_drag(
+                TabSplitDrag {
+                    source: DragSource::PaneHeader(pane),
+                    mark,
+                    title: title.clone(),
+                    session_id: None,
+                },
+                |payload, point, _, cx| {
+                    cx.new(|_| SplitDragGhost {
+                        mark: payload.mark,
+                        title: payload.title.clone(),
+                        cursor_offset: point,
+                    })
+                },
+            )
+        })
         .child(div().size(px(6.0)).flex_none().rounded_full().bg(dot))
         .child(
             div()
@@ -185,6 +196,24 @@ pub(crate) fn pane_header(
                 .text_color(theme.text_muted)
                 .child(title),
         )
+        // The right-pane toggle lives on the pane header — the window-wide
+        // chat header that used to carry it is gone. Shown only on the
+        // focused session-bound pane so idle panes stay quiet.
+        .when(show_changes, |el| {
+            el.child(
+                control(
+                    format!("pane-changes-{}", pane.0),
+                    icon(icons::SIDEBAR_MINIMALISTIC)
+                        .size(px(11.0))
+                        .into_any_element(),
+                )
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_right_pane(cx);
+                })),
+            )
+        })
         // TODO(WS6): pop-out (detach this tab into its own view) — decorative
         // until the detach flow exists.
         .child(control(
@@ -291,10 +320,11 @@ pub(crate) fn tab_strip(
                         title: chip.label.clone(),
                         session_id: None,
                     },
-                    |payload, _point, _, cx| {
+                    |payload, point, _, cx| {
                         cx.new(|_| SplitDragGhost {
                             mark: payload.mark,
                             title: payload.title.clone(),
+                            cursor_offset: point,
                         })
                     },
                 )
@@ -391,7 +421,9 @@ pub(crate) fn tab_strip(
 /// composer-shaped strip with muted "Click to focus chat" text and a
 /// non-interactive pill row mirroring the live composer's footer layout.
 /// Purely decorative — the pane container's click-to-focus handler owns the
-/// pointer.
+/// pointer. Unused since every pane renders its own live composer; kept
+/// pending the final workspace chrome cleanup.
+#[allow(dead_code)]
 pub(crate) fn ghost_composer(theme: &Theme) -> AnyElement {
     let pill = |label: &'static str| {
         div()

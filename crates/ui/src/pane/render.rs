@@ -4,18 +4,17 @@
 //! ratio drag + double-click equalize), each view renders a tab strip plus its
 //! active tab's pane tree, and each pane renders optional header + body.
 //!
-//! Hosting rules (see `super-analysis/13-interaction-truth.md`):
-//! - exactly ONE pane is focused at a time; it renders the shell's LIVE
-//!   transcript (passed in) and the LIVE composer (WS3 re-homing: the
-//!   composer is overlaid at the focused pane's bottom instead of the shared
-//!   outer dock), and carries the 1px `theme.accent` ring;
-//! - unfocused panes carry a `hairline()` border and render the dormant
-//!   composition (cached read-only transcript under an identity card, ghost
-//!   composer strip at the bottom);
-//! - a tab with ≥2 panes gives each pane a header; single-pane tabs have no
-//!   header (§4/§6);
-//! - the focused pane with no session renders nothing above the composer —
-//!   the new-thread hero layer behind the tree IS its body.
+//! Hosting rules:
+//! - every Chat-mode pane renders its OWN transcript (or an empty canvas
+//!   area for an unbound pane) over its OWN composer footer — focus changes
+//!   nothing in the element tree; every pane carries the same
+//!   `theme.border_strong` 1px border;
+//! - pane focus is internal state only (keyboard/selection routing), still
+//!   driven by click-to-focus on the pane container;
+//! - every pane renders its header — the pane's chat identity row;
+//! - a sole top-level view hides its tab strip when it has a single tab;
+//!   the strip survives for multi-tab views and any view whose close
+//!   control it carries.
 //!
 //! Sizing: every split child gets `flex_basis(0)` + `flex_grow(weight)` with
 //! weights from [`super::flex_weights`] (the markdown table trick), so nested
@@ -40,19 +39,36 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    canvas, div, px, AnyElement, AppContext as _, Bounds, Context, Empty, Entity,
-    InteractiveElement, IntoElement, MouseButton, ParentElement as _, Pixels, SharedString,
-    StatefulInteractiveElement, Styled as _,
+    AnyElement, AppContext as _, Bounds, Context, Empty, Entity, InteractiveElement, IntoElement,
+    MouseButton, ParentElement as _, Pixels, SharedString, StatefulInteractiveElement, Styled as _,
+    canvas, div, px,
 };
 use zeron_workspace::{Branch, PaneId, PaneMode, SplitNode, TabId, ViewId};
 
+use crate::composer::Composer;
 use crate::shell::Shell;
 use crate::theme::Theme;
 use crate::transcript::Transcript;
 
 use super::chrome::{self, TabChip};
 use super::flex_weights;
-use super::{DividerDrag, DividerGhost, DividerTarget, DIVIDER_HIT_PX};
+use super::hit_test::PreviewKind;
+use super::{DIVIDER_HIT_PX, DividerDrag, DividerGhost, DividerTarget};
+/// The workspace outlet's outer padding: 3px on every side — the window-wide
+/// chat header is gone, so the top reserves no titlebar band. Shared with
+/// `shell/panes.rs`'s drag geometry so the hit-test `content` region is
+/// derived from the SAME constants the outlet lays out with — the preview
+/// overlay, the pane/view rects and the boundary math must all reference one
+/// coordinate space, not two.
+pub(crate) const OUTLET_PAD_PX: f32 = 3.0;
+pub(crate) const OUTLET_TOP_PAD_PX: f32 = OUTLET_PAD_PX;
+
+/// The pane tree's inner gutter: each view's active tab pane tree pads this
+/// much inside its view region, so the outermost pane edges sit this far
+/// inside the workspace content edge. `hit_test::BOUNDARY_EPSILON_PX` is
+/// sized from it.
+pub(crate) const PANE_TREE_PAD_PX: f32 = 6.0;
+
 /// Immutable render-time snapshot of the workspace tree. Built per frame
 /// (cheap: small trees, cloned ids/titles only).
 pub(crate) struct WorkspaceSnap {
@@ -64,12 +80,13 @@ pub(crate) struct WorkspaceSnap {
     /// WS4: the top-level view regions (SplitView preview washes one).
     pub view_bounds: Rc<RefCell<std::collections::BTreeMap<ViewId, Bounds<Pixels>>>>,
     /// WS4: the tab chips' rects (strip drop/reorder targets).
-    pub chip_bounds:
-        Rc<RefCell<std::collections::BTreeMap<(ViewId, TabId), Bounds<Pixels>>>>,
+    pub chip_bounds: Rc<RefCell<std::collections::BTreeMap<(ViewId, TabId), Bounds<Pixels>>>>,
 }
 
 pub(crate) struct ViewSnap {
     pub view_id: ViewId,
+    /// A view is directly closable only while another top-level view remains.
+    pub closable: bool,
     /// The view's active tab (pane-level divider targets need it; only the
     /// active tab renders).
     pub active_tab_id: TabId,
@@ -85,67 +102,52 @@ pub(crate) struct PaneSnap {
     pub title: SharedString,
     /// The pane's provider mark (header dot-side identity + drag ghost).
     pub mark: chrome::TabMark,
+    /// Kept in the snapshot contract for the shell's pane bookkeeping; the
+    /// header's changes-toggle gate also reads it (focused + bound only).
     pub has_session: bool,
-    /// The one globally focused pane (ring + live transcript + composer).
+    /// The one globally focused pane — internal routing state plus the
+    /// changes-toggle gate; it no longer changes what the pane body renders.
     pub focused: bool,
-    /// The pane's cached dormant transcript, if it has a session.
-    pub dormant_transcript: Option<Entity<Transcript>>,
+    /// The pane's own interactive transcript (`None` on the new-chat canvas
+    /// or for a pane with no surface).
+    pub transcript: Option<Entity<Transcript>>,
+    /// The pane's own composer.
+    pub composer: Option<Entity<Composer>>,
 }
 
-/// The content-area outlet for workspace mode: the whole view tree.
-/// `composer_block` is the prebuilt live-composer strip (built by
-/// `shell/panes.rs`, which can read the shell's dock state) overlaid inside
-/// the FOCUSED chat pane — the WS3 composer re-homing. It is threaded down
-/// the recursion as a single-use slot (AnyElement is not Clone): exactly one
-/// leaf is focused, and that leaf takes the block.
+/// The content-area outlet for workspace mode: the whole view tree. Every
+/// pane renders the entities it owns ([`PaneSnap::transcript`] /
+/// [`PaneSnap::composer`]) — nothing is threaded through the recursion.
 ///
 /// WS4: the outlet is the drag surface. `drag_preview` — the active drag's
 /// resolved preview rect in outlet-relative coordinates — paints ABOVE the
-/// tree as an occluding accent wash + 1px ring (§3: half-pane for splits,
-/// full top-level region for view splits, nothing at center). The root's
-/// `on_drag_move` receives every pointer sample while a [`TabSplitDrag`] is
-/// live (GPUI capture dispatch, inside or outside the outlet), `on_drop`
-/// commits on mouse-up inside, and the mouse-up/out listeners clear the
-/// state when a drag ends without a commit (drop over the sidebar etc.).
+/// tree (§3: half-pane for splits, full region for view splits and center
+/// moves, a 2px insertion marker for strip drops). The offsets
+/// feed an `.absolute()` child, which Taffy measures from this div's
+/// border-box origin (its padding does NOT shift absolute children), and the
+/// conversion subtracts exactly that origin — `DragMoveEvent::bounds`, this
+/// div's paint-time hitbox. The root's `on_drag_move` receives every pointer
+/// sample while a [`TabSplitDrag`] is live (GPUI capture dispatch, inside or
+/// outside the outlet), `on_drop` commits on mouse-up inside, and the
+/// mouse-up/out listeners clear the state when a drag ends without a commit
+/// (drop over the sidebar etc.).
 pub(crate) fn workspace_outlet(
     cx: &Context<'_, Shell>,
     theme: &Theme,
     snap: &WorkspaceSnap,
-    live_transcript: &Entity<Transcript>,
-    composer_block: Option<AnyElement>,
-    drag_preview: Option<Bounds<Pixels>>,
+    drag_preview: Option<(Bounds<Pixels>, PreviewKind)>,
 ) -> AnyElement {
-    let mut chrome_slot = composer_block;
     div()
         .relative()
         .size_full()
         .flex()
         .flex_col()
         .overflow_hidden()
-        .p(px(3.0))
-        .child(view_node(
-            cx,
-            theme,
-            &snap.root,
-            &[],
-            snap,
-            live_transcript,
-            &mut chrome_slot,
-        ))
-        // The live drop preview: accent wash (~0.12 alpha) + 1px accent ring,
-        // rounded ~8px (§3), painted above everything it covers.
-        .children(drag_preview.map(|b| {
-            div()
-                .absolute()
-                .left(b.origin.x)
-                .top(b.origin.y)
-                .w(b.size.width)
-                .h(b.size.height)
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(theme.accent)
-                .bg(theme.accent.opacity(0.12))
-        }))
+        .p(px(OUTLET_PAD_PX))
+        .child(view_node(cx, theme, &snap.root, &[], snap))
+        // The live drop preview (§3): every resolved plan paints one, above
+        // everything it covers.
+        .children(drag_preview.map(|(b, kind)| split_drop_preview(b, kind, theme)))
         .on_drag_move(cx.listener(
             move |this, event: &gpui::DragMoveEvent<super::TabSplitDrag>, _, cx| {
                 this.apply_split_drag_move(event, cx);
@@ -165,14 +167,73 @@ pub(crate) fn workspace_outlet(
         .into_any_element()
 }
 
+/// The one drop preview for every resolved plan — shared by the workspace
+/// outlet and the legacy single-pane content area so drag feedback reads
+/// identically on both surfaces. The [`PreviewKind`] the resolver produced
+/// chooses the paint: a solid accent line for strip insertions, a half-pane
+/// wash for pane splits, a fainter full-pane wash for tab joins and
+/// existing-pane focuses, and a contained accent ring for view splits — the
+/// ring insets 1px on every side so it never clips into the native window
+/// edge. No listeners, no animation — direct manipulation stays
+/// synchronized with the resolved drop plan.
+pub(crate) fn split_drop_preview(
+    bounds: Bounds<Pixels>,
+    kind: PreviewKind,
+    theme: &Theme,
+) -> AnyElement {
+    let bounds = match kind {
+        PreviewKind::ViewRing => {
+            let origin = gpui::point(bounds.origin.x + px(1.0), bounds.origin.y + px(1.0));
+            let size = gpui::size(
+                gpui::px((f32::from(bounds.size.width) - 2.0).max(0.0)),
+                gpui::px((f32::from(bounds.size.height) - 2.0).max(0.0)),
+            );
+            Bounds { origin, size }
+        }
+        _ => bounds,
+    };
+    let el = div()
+        .absolute()
+        .left(bounds.origin.x)
+        .top(bounds.origin.y)
+        .w(bounds.size.width)
+        .h(bounds.size.height);
+    match kind {
+        PreviewKind::Insertion => el.rounded(px(1.0)).bg(theme.accent).into_any_element(),
+        PreviewKind::PaneHalf => el
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.accent)
+            .bg(theme.accent.opacity(0.14))
+            .into_any_element(),
+        PreviewKind::FullTarget => el
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.accent)
+            .bg(theme.accent.opacity(0.08))
+            .into_any_element(),
+        PreviewKind::ViewRing => el
+            .rounded(px(8.0))
+            .border_2()
+            .border_color(theme.accent)
+            .into_any_element(),
+    }
+}
+
+/// Whether a view renders its tab strip: hidden on the common sole-view /
+/// single-tab case (a lone chip is redundant chrome), preserved whenever a
+/// second tab exists OR the strip must carry the view's × — the multi-view
+/// strip owns the visible close-view control.
+pub(crate) fn show_tab_strip(view: &ViewSnap) -> bool {
+    view.chips.len() > 1 || view.closable
+}
+
 fn view_node(
     cx: &Context<'_, Shell>,
     theme: &Theme,
     node: &SplitNode<ViewId>,
     path: &[Branch],
     snap: &WorkspaceSnap,
-    live: &Entity<Transcript>,
-    chrome_slot: &mut Option<AnyElement>,
 ) -> AnyElement {
     match node {
         SplitNode::Split {
@@ -191,33 +252,17 @@ fn view_node(
                 *ratio,
                 target,
                 &divider_id_of(path),
-                view_node(
-                    cx,
-                    theme,
-                    first,
-                    &joined(path, Branch::First),
-                    snap,
-                    live,
-                    chrome_slot,
-                ),
-                view_node(
-                    cx,
-                    theme,
-                    second,
-                    &joined(path, Branch::Second),
-                    snap,
-                    live,
-                    chrome_slot,
-                ),
+                view_node(cx, theme, first, &joined(path, Branch::First), snap),
+                view_node(cx, theme, second, &joined(path, Branch::Second), snap),
             )
         }
         SplitNode::Leaf { content } => {
             let Some(view) = snap.views.iter().find(|v| v.view_id == *content) else {
                 return Empty.into_any_element();
             };
-            // View = tab strip + the ACTIVE tab's pane tree. Inactive tabs
-            // unmount (their viewports restore from the per-chat cache when
-            // they come back). A paint-time canvas records the view region's
+            // View = optional tab strip + the ACTIVE tab's pane tree. Inactive
+            // tabs keep their surfaces (each pane owns its entities — only the
+            // ELEMENTS unmount). A paint-time canvas records the view region's
             // bounds (WS4: the SplitView preview washes this whole region).
             let view_bounds_cell = snap.view_bounds.clone();
             let view_id = view.view_id;
@@ -237,23 +282,26 @@ fn view_node(
                     .absolute()
                     .inset_0(),
                 )
-                .child(chrome::tab_strip(
-                    view.view_id,
-                    &view.chips,
-                    theme,
-                    &snap.chip_bounds,
-                    cx,
-                ));
-            col = col.child(pane_node(
-                cx,
-                theme,
-                &view.active_tab_root,
-                &[],
-                view,
-                live,
-                chrome_slot,
-                snap,
-            ));
+                .when(show_tab_strip(view), |el| {
+                    el.child(chrome::tab_strip(
+                        view.view_id,
+                        &view.chips,
+                        theme,
+                        &snap.chip_bounds,
+                        cx,
+                    ))
+                });
+            let pane_tree = pane_node(cx, theme, &view.active_tab_root, &[], view, snap);
+            col = col.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .p(px(PANE_TREE_PAD_PX))
+                    .child(pane_tree),
+            );
             col.into_any_element()
         }
     }
@@ -284,8 +332,6 @@ fn pane_node(
     node: &SplitNode<PaneId>,
     path: &[Branch],
     view: &ViewSnap,
-    live: &Entity<Transcript>,
-    chrome_slot: &mut Option<AnyElement>,
     snap: &WorkspaceSnap,
 ) -> AnyElement {
     match node {
@@ -307,33 +353,15 @@ fn pane_node(
                 *ratio,
                 target,
                 &divider_id_of(path),
-                pane_node(
-                    cx,
-                    theme,
-                    first,
-                    &joined(path, Branch::First),
-                    view,
-                    live,
-                    chrome_slot,
-                    snap,
-                ),
-                pane_node(
-                    cx,
-                    theme,
-                    second,
-                    &joined(path, Branch::Second),
-                    view,
-                    live,
-                    chrome_slot,
-                    snap,
-                ),
+                pane_node(cx, theme, first, &joined(path, Branch::First), view, snap),
+                pane_node(cx, theme, second, &joined(path, Branch::Second), view, snap),
             )
         }
         SplitNode::Leaf { content } => {
             let Some(pane) = view.panes.iter().find(|p| p.pane == *content) else {
                 return Empty.into_any_element();
             };
-            pane_container(cx, theme, pane, view.panes.len() > 1, live, chrome_slot, snap)
+            pane_container(cx, theme, pane, view.panes.len() > 1, snap)
         }
     }
 }
@@ -440,8 +468,12 @@ fn divider(
         .flex_none()
         .relative()
         .occlude()
-        .when(horizontal, |el| el.w(px(DIVIDER_HIT_PX)).cursor_col_resize())
-        .when(!horizontal, |el| el.h(px(DIVIDER_HIT_PX)).cursor_row_resize())
+        .when(horizontal, |el| {
+            el.w(px(DIVIDER_HIT_PX)).cursor_col_resize()
+        })
+        .when(!horizontal, |el| {
+            el.h(px(DIVIDER_HIT_PX)).cursor_row_resize()
+        })
         // Hover feedback pauses while any divider drag is live so the strip
         // never re-fades mid-drag (hover churn reads as flicker). The shell
         // method owns the drag latch (Shell fields stay private to the shell
@@ -490,27 +522,24 @@ fn split_child(weight: f32, child: AnyElement) -> AnyElement {
         .into_any_element()
 }
 
-/// One pane: click-to-focus container, conditional header, content body,
-/// and (focused chat only) the live composer block overlaid at the bottom. A
-/// paint-time canvas records the pane's bounds for the tool-picker anchor.
+/// One pane: click-to-focus container, its header (the chat identity row —
+/// `closable` only gates the ×), and the pane's own transcript + composer
+/// body. Focus is internal routing state only. The container is deliberately
+/// CHROMELESS — no rounding, border, or fill (product decision, Super parity):
+/// every pane sits flush on the same frost glass the single-chat route uses,
+/// so a split reads as one surface that grew, not white cards laid on gray.
+/// Separation is the dividers' 1px hairlines alone. A paint-time canvas
+/// records the pane's bounds for the tool-picker anchor.
 fn pane_container(
     cx: &Context<'_, Shell>,
     theme: &Theme,
     pane: &PaneSnap,
-    multi_pane: bool,
-    live: &Entity<Transcript>,
-    chrome_slot: &mut Option<AnyElement>,
+    closable: bool,
     snap: &WorkspaceSnap,
 ) -> AnyElement {
-    // Focused: 1px accent ring; unfocused: plain hairline (§6).
-    let border = if pane.focused {
-        theme.accent
-    } else {
-        theme.hairline(0.10)
-    };
     let pane_id = pane.pane;
     let bounds_cell = snap.pane_bounds.clone();
-    let mut container = div()
+    let container = div()
         .flex_1()
         .min_w_0()
         .min_h_0()
@@ -518,16 +547,13 @@ fn pane_container(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(border)
         // Click anywhere in the pane focuses it (§7); the listener no-ops
-        // when the pane is already focused, so scrolling the live transcript
-        // never yanks keyboard focus. Dividers sit OUTSIDE every pane
-        // container, so a divider press never lands here.
+        // when the pane is already focused, so scrolling a transcript never
+        // yanks keyboard focus. Dividers sit OUTSIDE every pane container,
+        // so a divider press never lands here.
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, _, cx| this.focus_workspace_pane(pane_id, cx)),
+            cx.listener(move |this, _, _, cx| this.pointer_focus_workspace_pane(pane_id, cx)),
         )
         // Paint-time bounds registry (the picker anchors at the focused
         // pane's top-left, §2; WS4's drag previews read the same map).
@@ -541,42 +567,25 @@ fn pane_container(
             .absolute()
             .inset_0(),
         );
-    // Single-pane tabs render NO header — header chrome is conditional
-    // (§4/§6); it first appears the moment a tab splits.
-    if multi_pane {
-        container = container.child(chrome::pane_header(
+    // Every pane renders its header — the chat identity row now that the
+    // window-wide chat header is gone.
+    container
+        .child(chrome::pane_header(
             pane.pane,
             pane.title.clone(),
             pane.mark,
             theme.text_muted.opacity(0.55),
+            closable,
+            pane.focused && pane.has_session,
             true,
             theme,
             cx,
-        ));
-    }
-    container = container.child(pane_body(theme, pane, live));
-    // WS3 composer re-homing: the LIVE composer is overlaid at the focused
-    // chat pane's bottom (floating over the transcript's tail, like the old
-    // outer dock floated over it). Unfocused panes keep the ghost strip in
-    // `pane_body`.
-    if pane.focused && pane.mode == PaneMode::Chat {
-        // The single-use live-composer strip lands in exactly one pane — the
-        // focused one (AnyElement is not Clone, hence the take).
-        if let Some(block) = chrome_slot.take() {
-            container = container.child(
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .child(block),
-            );
-        }
-    }
-    container.into_any_element()
+        ))
+        .child(pane_body(theme, pane))
+        .into_any_element()
 }
 
-fn pane_body(theme: &Theme, pane: &PaneSnap, live: &Entity<Transcript>) -> AnyElement {
+fn pane_body(theme: &Theme, pane: &PaneSnap) -> AnyElement {
     match pane.mode {
         PaneMode::Terminal => div()
             .flex_1()
@@ -592,64 +601,99 @@ fn pane_body(theme: &Theme, pane: &PaneSnap, live: &Entity<Transcript>) -> AnyEl
                     .child(SharedString::from("Terminal panes are not yet available")),
             )
             .into_any_element(),
-        PaneMode::Chat if pane.focused => {
-            if pane.has_session {
-                // The focused pane's live view: the shell's single transcript,
-                // still bound to AppState::selected_chat exactly as before.
-                div()
+        PaneMode::Chat => {
+            // The pane's own transcript (or, on the new-chat canvas, an empty
+            // flexible area that keeps the composer footer pinned to the
+            // pane's bottom edge under the header). The wrapper MUST clip:
+            // the transcript's virtualized list lays out inside this box, and
+            // any overflow would otherwise escape the pane (the tail painted
+            // under the composer or past the pane's rounded bottom border).
+            let transcript: AnyElement = match &pane.transcript {
+                Some(transcript) => div()
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .child(live.clone())
-                    .into_any_element()
-            } else {
-                // New-thread pane: the hero layer behind the tree is the
-                // body; the re-homed live composer at the pane's bottom
-                // mints the chat on first send.
-                Empty.into_any_element()
-            }
-        }
-        PaneMode::Chat => {
-            // Dormant: the cached read-only transcript (blank until per-chat
-            // projections land in WS5) under an identity card, ghost composer
-            // strip at the bottom. Clicks bubble to the pane container, which
-            // swaps this whole composition for the live one.
+                    .overflow_hidden()
+                    .child(transcript.clone())
+                    .into_any_element(),
+                None => div().flex_1().min_w_0().min_h_0().into_any_element(),
+            };
+            // The pane's own composer as its FLEX FOOTER — it consumes its
+            // own height out of the pane's column so the transcript above
+            // ends at the footer's top edge. A paint-time canvas feeds the
+            // pane's actual width into the composer's responsive mode (each
+            // composer measures against its own pane, not the dock column).
+            let composer = pane.composer.clone().map(|composer| {
+                div().relative().w_full().px(px(10.0)).pb(px(10.0)).child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .max_w(px(crate::composer::COMPOSER_MAX_WIDTH))
+                        .mx_auto()
+                        .child(
+                            canvas(
+                                {
+                                    let composer = composer.clone();
+                                    move |bounds, _, cx| {
+                                        composer.update(cx, |composer, cx| {
+                                            composer.set_available_width(
+                                                f32::from(bounds.size.width),
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0(),
+                        )
+                        .child(composer.clone()),
+                )
+            });
             div()
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .relative()
-                        .children(
-                            pane.dormant_transcript
-                                .clone()
-                                .map(|t| div().absolute().inset_0().child(t)),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .px(px(12.0))
-                                        .text_center()
-                                        .truncate()
-                                        .text_size(crate::typography::ui_rems(12.0))
-                                        .text_color(theme.text_muted.opacity(0.7))
-                                        .child(pane.title.clone()),
-                                ),
-                        ),
-                )
-                .child(chrome::ghost_composer(theme))
+                .child(transcript)
+                .children(composer)
                 .into_any_element()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pane::chrome::tab_mark;
+
+    fn view(chip_count: usize, closable: bool) -> ViewSnap {
+        ViewSnap {
+            view_id: ViewId(1),
+            closable,
+            active_tab_id: TabId(2),
+            chips: (0..chip_count)
+                .map(|i| TabChip {
+                    tab_id: TabId(2 + i as u64),
+                    label: SharedString::from("Tab"),
+                    active: i == 0,
+                    mark: tab_mark(PaneMode::Chat, None),
+                })
+                .collect(),
+            active_tab_root: SplitNode::leaf(PaneId(3)),
+            panes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn tab_strip_hides_for_a_lone_chip_and_shows_for_tabs_or_close() {
+        // Sole view with one chip: the strip is redundant chrome.
+        assert!(!show_tab_strip(&view(1, false)));
+        // A second tab needs the strip to switch.
+        assert!(show_tab_strip(&view(2, false)));
+        // A closable view keeps the strip — it carries the ×.
+        assert!(show_tab_strip(&view(1, true)));
     }
 }

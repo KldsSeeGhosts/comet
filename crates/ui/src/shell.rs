@@ -1376,6 +1376,17 @@ pub struct Shell {
     workspace_save_task: Option<Task<()>>,
     active_workspace_space: Option<String>,
     workspace_space_loaded: bool,
+    /// Unsent pane composer content parked while a project switch tears the
+    /// pane surfaces down (`restore_workspace_layout`), keyed
+    /// `(space, pane)` — PaneId numerals are only unique WITHIN one space's
+    /// persisted tree, so the space qualifies the key. In-memory session
+    /// nicety, never persisted; entries are consumed one-for-one by the
+    /// surface recreation that rehydrates them, so the map stays bounded by
+    /// spaces × panes.
+    parked_pane_drafts: std::collections::HashMap<
+        (Option<String>, zeron_workspace::PaneId),
+        crate::composer::ComposerDraftState,
+    >,
     /// Explicit user navigation target that must survive a workspace layout
     /// restore. `Some(Some(chat_id))` = sidebar click / deep link;
     /// `Some(None)` = new-session request. `None` = no pending navigation
@@ -1666,7 +1677,11 @@ impl Shell {
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
-            move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+            move |_this: &mut Shell, composer, event: &ComposerEvent, cx| {
+                if matches!(composer.read(cx).target, crate::state::ChatTarget::Fixed(_)) {
+                    return;
+                }
+                match event {
                 ComposerEvent::NewThreadTransitionStarted => {
                     // Route observation drives the dock once selection commits.
                     cx.notify();
@@ -1686,6 +1701,7 @@ impl Shell {
                     transcript.update(cx, |t, cx| {
                         t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
                     });
+                }
                 }
             }
         });
@@ -1801,6 +1817,7 @@ impl Shell {
             workspace_save_task: None,
             active_workspace_space: None,
             workspace_space_loaded: false,
+            parked_pane_drafts: std::collections::HashMap::new(),
             pending_explicit_nav: None,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
@@ -1970,11 +1987,19 @@ impl Shell {
         } else {
             self.route = Route::Chat;
         }
+        // Workspace mode: the navigation's pane rebind lands in a deferred
+        // observer — force it now so the staged shot belongs to the composer
+        // that survives (the focused pane's post-rebind surface), not the
+        // entity the rebind is about to replace.
+        if self.workspace_mode() {
+            self.apply_explicit_workspace_navigation(target.clone(), cx);
+        }
         let key = target.unwrap_or_default();
-        self.composer.update(cx, |composer, cx| {
+        let composer = self.active_composer();
+        composer.update(cx, |composer, cx| {
             composer.stage_appshot_for(key, appshot, cx)
         });
-        window.focus(&self.composer.focus_handle(cx), cx);
+        window.focus(&composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -1985,9 +2010,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.route = Route::Chat;
-        self.composer
-            .update(cx, |composer, cx| composer.show_appshot_error(message, cx));
-        window.focus(&self.composer.focus_handle(cx), cx);
+        let composer = self.active_composer();
+        composer.update(cx, |composer, cx| composer.show_appshot_error(message, cx));
+        window.focus(&composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -2408,7 +2433,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
         // Reverse from the visible width when toggled during an animation.
         let from = self.eval_tween(self.right_tween, self.right_target(cx));
         self.right_edge_bounce = None;
@@ -2626,7 +2651,7 @@ impl Shell {
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
-                self.composer
+                self.active_composer()
                     .update(cx, |composer, _| composer.focus_pending = false);
                 panel.update(cx, |panel, cx| {
                     panel.select_tab_by_key(tab, cx);
@@ -3268,7 +3293,8 @@ impl Shell {
                 }
                 self.browser_subs.remove(&id);
                 if was_active {
-                    window.focus(&self.composer.focus_handle(cx), cx);
+                    let composer = self.active_composer();
+                    window.focus(&composer.focus_handle(cx), cx);
                 }
             }
             RightSurface::Diff(id) => {
@@ -3478,7 +3504,7 @@ impl Shell {
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
         if open {
-            self.composer
+            self.active_composer()
                 .update(cx, |composer, _| composer.focus_pending = false);
             panel.update(cx, |panel, cx| panel.request_focus(cx));
             // Opening lands keyboard focus IN the shell — typing goes straight
@@ -3493,7 +3519,8 @@ impl Shell {
             // hand focus to the composer. (Cmd+J is a pure toggle — a second
             // press closes even while the terminal is focused, as in zeron's
             // `useHotkey(toggleShortcut, ... setOpenScoped(!open))`.)
-            window.focus(&self.composer.focus_handle(cx), cx);
+            let composer = self.active_composer();
+            window.focus(&composer.focus_handle(cx), cx);
         }
         self.terminal_tween_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -4131,7 +4158,7 @@ impl Shell {
         self.command_palette.is_some()
             || self.add_space.is_some()
             || self.tool_picker.is_some()
-            || self.composer.read(cx).pickers().read(cx).is_open()
+            || self.active_composer().read(cx).pickers().read(cx).is_open()
     }
 
     /// Track held modifiers for sidebar jump hints and the queue's submit hint.
@@ -4155,7 +4182,7 @@ impl Shell {
         let queue_shortcut_revealed = matches!(self.route, Route::Chat)
             && !self.overlay_owns_keyboard(cx)
             && modifier_send_hint_visible(primary, mods.alt, mods.shift);
-        self.composer.update(cx, |composer, cx| {
+        self.active_composer().update(cx, |composer, cx| {
             composer.set_queue_shortcut_revealed(queue_shortcut_revealed, cx)
         });
     }
@@ -4182,8 +4209,21 @@ impl Shell {
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
-        self.composer
-            .update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
+        // Every composer holding state for the deleted chat purges — the
+        // shared dock entity AND each pane's fixed composer (a pane bound to
+        // the deleted chat drops back to its canvas draft).
+        let mut composers = vec![self.composer.clone()];
+        for surface in self.workspace.chat_surfaces.values() {
+            if !composers
+                .iter()
+                .any(|composer| composer.entity_id() == surface.composer.entity_id())
+            {
+                composers.push(surface.composer.clone());
+            }
+        }
+        for composer in composers {
+            composer.update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
+        }
         self.mutate(
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
             cx,
@@ -4901,12 +4941,24 @@ impl Shell {
         cluster + CLUSTER_BUTTONS_WIDTH + TITLEBAR_IDENTITY_GAP
     }
 
-    /// The unified window titlebar: chat → the session tab strip; settings →
+    /// The unified window titlebar: chat → nothing (the window-wide chat
+    /// header is gone — pane headers own the chat identity); settings →
     /// the section label. Full-width on the glass shell; the traffic lights
     /// and control cluster overlay its left end.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
-            Route::Chat => self.render_session_title_bar(cx),
+            Route::Chat => {
+                // Transparent window-drag strip behind the control cluster
+                // and the sidebar's native-chrome band — hit-only, no
+                // visuals; the pane header owns the chat identity below.
+                let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+                let width = self
+                    .sidebar_now()
+                    .max(self.title_bar_content_start() + plus_inset);
+                let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).w(px(width)).flex_none();
+                self.titlebar_drag_region("chat-window-drag-region", bar, cx)
+                    .into_any_element()
+            }
             Route::Settings(_) => {
                 let inner = div()
                     .size_full()
@@ -5899,10 +5951,11 @@ impl Shell {
                         session_id: Some(drag_id),
                     }
                 },
-                |payload, _point, _, cx| {
+                |payload, point, _, cx| {
                     cx.new(|_| crate::pane::SplitDragGhost {
                         mark: payload.mark,
                         title: payload.title.clone(),
+                        cursor_offset: point,
                     })
                 },
             )
@@ -7292,7 +7345,7 @@ impl Shell {
             .unwrap_or(Indicator::None);
         let interrupting = selected_chat
             .as_deref()
-            .is_some_and(|chat_id| self.composer.read(cx).is_interrupting(chat_id));
+            .is_some_and(|chat_id| self.active_composer().read(cx).is_interrupting(chat_id));
         let escape_stops_active_agent = self.settings.escape_stops_active_agent;
 
         match resolve_shell_escape(
@@ -7307,7 +7360,7 @@ impl Shell {
             ShellEscapeOutcome::Blocked => cx.stop_propagation(),
             ShellEscapeOutcome::InterruptChat(chat_id) => {
                 cx.stop_propagation();
-                self.composer
+                self.active_composer()
                     .update(cx, |composer, cx| composer.interrupt_chat(chat_id, cx));
             }
             ShellEscapeOutcome::OtherKey | ShellEscapeOutcome::Ignored => {}
@@ -7789,10 +7842,10 @@ impl Shell {
         // card. New-chat mode mints the chat id on first send.
         //
         // Workspace mode (any split/extra tab/pane — shell/panes.rs) renders
-        // the pane tree instead: the focused pane hosts `self.transcript`,
-        // the shared dock composer below stays its live composer, and dormant
-        // panes carry ghost strips. The single-pane parity gate keeps the
-        // untouched default layout on the exact historical path below.
+        // the pane tree instead: every Chat pane hosts its own transcript and
+        // composer (pane-owned surfaces), and the shared dock composer below
+        // stays suppressed. The single-pane parity gate keeps the untouched
+        // default layout on the exact historical path below.
         let departing_transcript = !has_selection && dock_frame.transcript() > 0.0;
         if !has_selection && !departing_transcript {
             self.transcript
@@ -7896,13 +7949,14 @@ impl Shell {
             .flex_col()
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 let paths = paths.paths().to_vec();
-                this.composer
-                    .update(cx, |composer, cx| composer.add_paths(paths, cx));
+                let composer = this.active_composer();
+                composer.update(cx, |composer, cx| composer.add_paths(paths, cx));
                 cx.notify();
             }))
             .on_drop::<WorkspacePathDrag>(cx.listener(
                 |this, payload: &WorkspacePathDrag, window, cx| {
-                    this.composer.update(cx, |composer, cx| {
+                    let composer = this.active_composer();
+                    composer.update(cx, |composer, cx| {
                         composer.add_workspace_path(&payload.path, payload.is_directory, window, cx)
                     });
                     cx.notify();
@@ -7910,7 +7964,8 @@ impl Shell {
             ))
             .on_drop::<RightTabDrag>(cx.listener(|this, payload: &RightTabDrag, window, cx| {
                 if let Some(path) = &payload.workspace_path {
-                    this.composer.update(cx, |composer, cx| {
+                    let composer = this.active_composer();
+                    composer.update(cx, |composer, cx| {
                         composer.add_workspace_path(&path.path, path.is_directory, window, cx)
                     });
                 }
@@ -7927,6 +7982,24 @@ impl Shell {
                     }
                 },
             ))
+            // WS4 single-pane drag surface: per-sample resolution feeds the
+            // preview overlay below and the drop's split direction (the
+            // workspace outlet owns the samples in workspace mode; the
+            // handler guards on that). Mouse-up without a matching drop
+            // clears the state so no stale preview lingers.
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<crate::pane::TabSplitDrag>, _, cx| {
+                    this.apply_single_pane_drag_move(event, cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.cancel_split_drag(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.cancel_split_drag(cx)),
+            )
             // The hero is deliberately outside the transcript EdgeFade below:
             // it must paint under the overlaid titlebar instead of becoming
             // fully transparent across the titlebar's inset band.
@@ -7957,22 +8030,34 @@ impl Shell {
                     // status strip above it is empty air), zero at the
                     // underlay's bottom edge.
                     let bottom_band = (stack_h - Theme::STATUS_STRIP_HEIGHT).max(1.0);
-                    div().absolute().inset_0().bottom(px(term_h)).child(
-                        crate::edge_fade::edge_faded(
+                    div().absolute().inset_0().bottom(px(term_h)).child({
+                        // The top ramp is gated by
+                        // [`Shell::transcript_underlay_fades_top`] — legacy
+                        // route only (see that method for why the workspace
+                        // route must never take it). The inset/band_top stay
+                        // inert while the top edge is off.
+                        let fade = crate::edge_fade::edge_faded(
                             Theme::TRANSCRIPT_FADE_BAND,
-                            true,
+                            self.transcript_underlay_fades_top(),
                             true,
                             div().size_full().child(outlet),
-                        )
-                        // Fully faded BY the titlebar's bottom edge (the
-                        // title text is opaque — overlap read as collision),
-                        // ramping in the band just below it.
-                        .inset_top(Theme::TITLEBAR_HEIGHT)
-                        .band_top(Theme::TRANSCRIPT_FADE_BAND)
-                        .band_bottom(bottom_band),
-                    )
+                        );
+                        if self.transcript_underlay_fades_top() {
+                            fade.inset_top(crate::pane::chrome::PANE_HEADER_HEIGHT)
+                                .band_top(Theme::TRANSCRIPT_FADE_BAND)
+                                .band_bottom(bottom_band)
+                        } else {
+                            fade.band_bottom(bottom_band)
+                        }
+                    })
                 },
             )
+            // The pane header is the chat identity row on the legacy route —
+            // mounted after the transcript underlay so it paints above it and
+            // consumes the top row; workspace mode's outlet supplies its own.
+            .when(!workspace_mode, |el| {
+                el.child(self.render_primary_pane_header(theme, cx))
+            })
             // The glass chrome stack, floating over the transcript's bottom:
             // reserved status strip (h-6, the WorkingIndicator — the composer
             // below never shifts), composer, terminal dock. A paint-time
@@ -8015,15 +8100,12 @@ impl Shell {
                     )
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
-                        // WS3 composer re-homing: in workspace mode the live
-                        // composer is hosted INSIDE the focused chat pane
+                        // WS3 composer re-homing: in workspace mode each Chat
+                        // pane renders its OWN composer as its footer
                         // (pane/render.rs), so the shared outer dock is
-                        // suppressed. Tradeoffs (documented in
-                        // shell/panes.rs): the dock clock keeps ticking for
-                        // the trivial route, so re-entering single-chat mode
-                        // re-docks normally, but the hero↔dock glide and the
-                        // composer's measured available width (still fed from
-                        // the full main column) do not track pane geometry.
+                        // suppressed. The dock clock keeps ticking for the
+                        // trivial route, so re-entering single-chat mode
+                        // re-docks normally.
                         if workspace_mode {
                             el
                         } else {
@@ -8077,6 +8159,16 @@ impl Shell {
                     })
                     .child("Drop to attach"),
             )
+            // WS4 single-pane split preview: the shared drop renderer the
+            // workspace outlet also uses, painted last so it sits above the
+            // transcript underlay. Its own absolute clip layer keeps a
+            // view-level ring inside the content area without clipping the
+            // whole dropzone.
+            .children(self.split_drag_preview().map(|(bounds, kind)| {
+                div().absolute().inset_0().overflow_hidden().child(
+                    crate::pane::render::split_drop_preview(bounds, kind, theme),
+                )
+            }))
             .into_any_element()
     }
 
@@ -8343,7 +8435,7 @@ impl Shell {
         let elapsed_secs = started
             .map(|t| now.signed_duration_since(t).num_seconds().max(0))
             .unwrap_or(0);
-        let sending = self.composer.read(cx).is_sending();
+        let sending = self.active_composer().read(cx).is_sending();
 
         // Unused here since the Working loader moved into the transcript
         // (its trailer computes its own elapsed).
@@ -8386,8 +8478,8 @@ impl Shell {
     fn render_right_pane(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
-        let content: AnyElement = if self.right_pane_open(cx) || self.tween_active(self.right_tween)
-        {
+        let pane_live = self.right_pane_open(cx) || self.tween_active(self.right_tween);
+        let content: AnyElement = if pane_live {
             match self.resolved_right_active(cx) {
                 // Rendering a Files surface activates its image. Keep it unmounted
                 // throughout the closing animation after suspending its resources.
@@ -8516,9 +8608,42 @@ impl Shell {
             })
             .bg(panel_bg)
             .overflow_hidden()
-            // The titlebar is a glass overlay over the full-height content
-            // row; the panel's own chrome starts below it.
-            .pt(px(Theme::TITLEBAR_HEIGHT))
+            // The pane's own chrome row: the surface tab strip integrated
+            // under the expand/close controls — the window-wide chat header
+            // that used to carry them is gone. Right padding clears the
+            // platform caption controls (Windows/Linux).
+            .when(pane_live, |el| {
+                el.child(
+                    div()
+                        .h(px(Theme::TITLEBAR_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .pl(px(8.0))
+                        .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
+                        .border_b_1()
+                        .border_color(theme.hairline(0.06))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .child(self.render_right_tab_strip(cx)),
+                        )
+                        .child(header_icon_button(
+                            "expand-changes",
+                            tabs::right_pane_expand_icon(self.right_pane_expanded),
+                            &theme,
+                            cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
+                        ))
+                        .child(header_icon_button(
+                            "toggle-changes",
+                            icons::CLOSE,
+                            &theme,
+                            cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+                        )),
+                )
+            })
             .child(content);
         let target = self.right_target(cx);
         let edge_offset = self.eval_resize_edge_bounce(
@@ -10038,7 +10163,7 @@ impl Render for Shell {
                 |this: &mut Shell, window, cx| {
                     if !window.is_window_active() {
                         this.set_jump_hints(false, cx);
-                        this.composer.update(cx, |composer, cx| {
+                        this.active_composer().update(cx, |composer, cx| {
                             composer.set_queue_shortcut_revealed(false, cx)
                         });
                     }
@@ -10052,7 +10177,7 @@ impl Render for Shell {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
                 let root = this.shortcut_focus.clone();
                 let unfocused = this.unfocused.clone();
-                let preferred = this.composer.focus_handle(cx);
+                let preferred = this.active_composer().focus_handle(cx);
                 window.on_next_frame(move |window, cx| {
                     restore_mounted_focus(&root, &preferred, &unfocused, window, cx);
                 });
@@ -10061,7 +10186,7 @@ impl Render for Shell {
         }
         let shortcut_focus = self.shortcut_focus.clone();
         let unfocused = self.unfocused.clone();
-        let preferred_focus = self.composer.focus_handle(cx);
+        let preferred_focus = self.active_composer().focus_handle(cx);
         window.defer(cx, move |window, cx| {
             restore_mounted_focus(&shortcut_focus, &preferred_focus, &unfocused, window, cx);
         });
@@ -10141,7 +10266,8 @@ impl Render for Shell {
                     if !this.right_pane_open(cx) {
                         // The hidden editor can retain a focus handle after unmounting.
                         // Restore a mounted target so the next shortcut can reopen it.
-                        window.focus(&this.composer.focus_handle(cx), cx);
+                        let composer = this.active_composer();
+                        window.focus(&composer.focus_handle(cx), cx);
                     }
                 }
             }))
@@ -10160,7 +10286,7 @@ impl Render for Shell {
             // this matched binding beats its key handler to the dispatch —
             // forward the slot instead of eating it.
             .on_action(cx.listener(|this, jump: &JumpSession, _, cx| {
-                let pickers = this.composer.read(cx).pickers().clone();
+                let pickers = this.active_composer().read(cx).pickers().clone();
                 let handled = pickers.update(cx, |pickers, cx| pickers.jump_model_slot(jump.0, cx));
                 if !handled && !this.overlay_owns_keyboard(cx) {
                     this.jump_to_session(jump.0, cx)
@@ -10237,7 +10363,7 @@ impl Render for Shell {
                 // than in `on_state_changed`).
                 if self.debug_dialog.as_deref() == Some("model") {
                     self.debug_dialog = None;
-                    self.composer
+                    self.active_composer()
                         .update(cx, |c, cx| c.debug_open_model_menu(window, cx));
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.
@@ -10429,29 +10555,46 @@ impl Render for Shell {
                 // under the header and fade out at its edge. Columns that
                 // must NOT underlap (sidebar content, the changes panel,
                 // settings) pad themselves down by the titlebar height.
-                let page = div()
-                    .size_full()
-                    .relative()
-                    .child(
+                let page = {
+                    let content_row = div()
+                        .size_full()
+                        .flex()
+                        .flex_row()
+                        .child(sidebar)
+                        .child(sidebar_seam)
+                        .child(card)
+                        .child(
+                            div()
+                                .h_full()
+                                .flex_none()
+                                .relative()
+                                .child(right)
+                                .child(right_seam),
+                        );
+                    let title_bar_overlay =
+                        div().absolute().top_0().left_0().right_0().child(title_bar);
+                    // Paint order is hit-test order: on a split workspace the
+                    // chat drag strip mounts UNDER the content row (see
+                    // [`Shell::pane_chrome_wins_titlebar_band`]); the legacy
+                    // route keeps the strip on top — its transcript scrolls
+                    // under the band.
+                    let chrome_wins_band = self.pane_chrome_wins_titlebar_band();
+                    if chrome_wins_band {
                         div()
                             .size_full()
-                            .flex()
-                            .flex_row()
-                            .child(sidebar)
-                            .child(sidebar_seam)
-                            .child(card)
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex_none()
-                                    .relative()
-                                    .child(right)
-                                    .child(right_seam),
-                            ),
-                    )
-                    .child(div().absolute().top_0().left_0().right_0().child(title_bar))
-                    .child(self.render_titlebar_cluster(cx))
-                    .children(overlays);
+                            .relative()
+                            .child(title_bar_overlay)
+                            .child(content_row)
+                    } else {
+                        div()
+                            .size_full()
+                            .relative()
+                            .child(content_row)
+                            .child(title_bar_overlay)
+                    }
+                }
+                .child(self.render_titlebar_cluster(cx))
+                .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
             }
@@ -12920,6 +13063,7 @@ impl Shell {
 #[cfg(test)]
 mod workspace_persistence {
     include!("shell/workspace_regressions.rs");
+    include!("shell/pane_surface_regressions.rs");
     use super::*;
     use gpui::{AppContext, TestAppContext};
 
