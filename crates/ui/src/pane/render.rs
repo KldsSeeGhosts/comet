@@ -498,7 +498,7 @@ fn pane_container(
         // so a divider press never lands here.
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, _, cx| this.focus_workspace_pane(pane_id, cx)),
+            cx.listener(move |this, _, _, cx| this.pointer_focus_workspace_pane(pane_id, cx)),
         )
         // Paint-time bounds registry (the picker anchors at the focused
         // pane's top-left, §2; WS4's drag previews read the same map).

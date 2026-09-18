@@ -420,6 +420,23 @@ impl Shell {
         self.retarget_to_focused_pane(cx);
     }
 
+    /// Pointer activation changes routing, not the control's keyboard focus.
+    /// Text selection, queue editors and pickers retain the focus they chose.
+    pub(crate) fn pointer_focus_workspace_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.workspace.focused_pane() != Some(pane) {
+            if self.workspace.focus_pane(pane).is_err() {
+                return;
+            }
+            self.sync_selection_to_focused_pane(cx);
+            self.note_workspace_mutation(cx);
+        }
+        // A pointer action wins over an earlier, not-yet-painted focus request.
+        for surface in self.workspace.chat_surfaces.values() {
+            surface.composer.update(cx, |composer, _| composer.focus_pending = false);
+        }
+        cx.notify();
+    }
+
     /// Apply one user-requested navigation after any required workspace
     /// restore. Existing sessions keep their pane bindings and only move
     /// focus; a target not yet open replaces the focused pane.

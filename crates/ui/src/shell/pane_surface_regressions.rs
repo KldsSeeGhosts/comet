@@ -261,3 +261,35 @@ fn a_late_existing_send_failure_restores_only_its_own_draft(cx: &mut TestAppCont
         assert_eq!(draft_text(&composer, cx), "recover existing prompt");
     }).unwrap();
 }
+
+#[gpui::test]
+fn pointer_activation_changes_routing_without_requesting_composer_focus(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        prepare_selected_composer(shell, cx);
+        let first = shell.workspace.focused_pane().unwrap();
+        shell.split_workspace_view(Direction::Right, cx);
+        shell.pointer_focus_workspace_pane(first, cx);
+        assert_eq!(shell.workspace.focused_pane(), Some(first));
+        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("chat-a"));
+        assert!(shell.workspace.chat_surfaces.values().all(|surface| !surface.composer.read(cx).focus_pending));
+    }).unwrap();
+}
+
+#[gpui::test]
+fn clicking_the_active_pane_does_not_refocus_the_composer(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        prepare_selected_composer(shell, cx);
+        shell.split_workspace_view(Direction::Right, cx);
+        let pane = shell.workspace.focused_pane().unwrap();
+        let revision = shell.workspace.layout.revision;
+        shell.pointer_focus_workspace_pane(pane, cx);
+        assert_eq!(shell.workspace.layout.revision, revision);
+        assert!(!shell.active_composer().read(cx).focus_pending);
+    }).unwrap();
+}
