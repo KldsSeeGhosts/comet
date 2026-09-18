@@ -488,43 +488,87 @@ impl Shell {
         }
     }
 
-    /// Commit a sidebar-session drag: split the target pane and bind the
-    /// new half to the dragged session. The session_id on the payload
-    /// identifies which chat to bind.
+    /// Whether a sidebar session belongs to the current workspace's space.
+    /// A drop that would cross a project boundary is rejected before the
+    /// tree is mutated - accepting it would immediately trigger a space
+    /// restore that dismantles the split.
+    fn sidebar_session_compatible(&self, session_id: &Option<String>, cx: &mut Context<Self>) -> bool {
+        let Some(sid) = session_id.as_deref() else {
+            return true; // no session to validate
+        };
+        let state = self.state.read(cx);
+        match state.chats.iter().find(|c| c.id == sid) {
+            Some(chat) => chat.space_id == self.active_workspace_space,
+            // Unknown chat (not synced yet): allow optimistically.
+            None => true,
+        }
+    }
+
+    /// Commit a sidebar-session drag using the full resolved drop plan.
+    /// Each plan variant targets the pane/view/tab the resolver identified,
+    /// not the focused pane.
     fn commit_sidebar_split(
         &mut self,
         plan: DropPlan,
         payload: &crate::pane::TabSplitDrag,
         cx: &mut Context<Self>,
     ) {
+        if !self.sidebar_session_compatible(&payload.session_id, cx) {
+            self.split_drag = None;
+            cx.notify();
+            return;
+        }
         let session_id = payload.session_id.clone();
-        let direction = match plan {
-            DropPlan::SplitPane { direction, .. } => direction,
-            DropPlan::SplitView { direction, .. } => direction,
-            // Center or reorder with no existing split target: split right
-            // from the focused pane as the default entry.
-            DropPlan::MoveIntoPane { .. } | DropPlan::ReorderStrip { .. } => {
-                zeron_workspace::Direction::Right
-            }
-            DropPlan::None => {
-                cx.notify();
-                return;
-            }
-        };
-        let target = match plan {
-            DropPlan::SplitPane { pane, .. } => pane,
-            _ => match self.workspace.focused_pane() {
-                Some(p) => p,
-                None => {
-                    cx.notify();
-                    return;
+        let succeeded = (|| -> bool {
+            let new_pane = crate::pane::chat_pane_state();
+            match plan {
+                DropPlan::None => return false,
+                DropPlan::SplitPane { pane, direction } => {
+                    self.workspace
+                        .layout
+                        .split_pane(pane, direction, new_pane)
+                        .is_ok_and(|pane_id| {
+                            let _ = self.workspace.set_pane_session(pane_id, session_id);
+                            self.workspace.layout.focus_pane(pane_id).ok();
+                            true
+                        })
                 }
-            },
-        };
-        let new_pane = crate::pane::chat_pane_state();
-        if let Ok(pane_id) = self.workspace.layout.split_pane(target, direction, new_pane) {
-            let _ = self.workspace.set_pane_session(pane_id, session_id);
-            self.workspace.layout.focus_pane(pane_id).ok();
+                DropPlan::SplitView { view, direction } => {
+                    self.workspace
+                        .layout
+                        .split_view(view, direction, new_pane)
+                        .is_ok_and(|new_view| {
+                            if let Some(tab) = self.workspace.layout.views
+                                .get(&new_view)
+                                .and_then(|v| v.tabs.values().next())
+                            {
+                                if let Some(pane_id) = tab.panes.keys().next() {
+                                    let _ = self.workspace.set_pane_session(*pane_id, session_id);
+                                    self.workspace.layout.focus_pane(*pane_id).ok();
+                                }
+                            }
+                            true
+                        })
+                }
+                DropPlan::MoveIntoPane { view, .. } | DropPlan::ReorderStrip { view, .. } => {
+                    self.workspace
+                        .layout
+                        .add_tab(view, new_pane)
+                        .is_ok_and(|tab_id| {
+                            if let Some(pane_id) = self.workspace.layout.views
+                                .get(&view)
+                                .and_then(|v| v.tabs.get(&tab_id))
+                                .and_then(|t| t.panes.keys().next())
+                            {
+                                let _ = self.workspace.set_pane_session(*pane_id, session_id);
+                                self.workspace.layout.focus_pane(*pane_id).ok();
+                            }
+                            true
+                        })
+                }
+            }
+        })();
+        if succeeded {
             self.retarget_to_focused_pane(cx);
         } else {
             cx.notify();
@@ -543,13 +587,17 @@ impl Shell {
     /// Accept a sidebar session drop on the single-pane content area (the
     /// workspace outlet is not rendered, so this is the entry point for
     /// drag-to-split from the default screen). Splits right from the
-    /// focused pane.
+    /// focused pane. Validates the dragged session's space before mutating.
     pub(crate) fn accept_sidebar_session_drop(
         &mut self,
         payload: &crate::pane::TabSplitDrag,
         cx: &mut Context<Self>,
     ) {
         self.split_drag = None;
+        if !self.sidebar_session_compatible(&payload.session_id, cx) {
+            cx.notify();
+            return;
+        }
         let session_id = payload.session_id.clone();
         let Some(target) = self.workspace.focused_pane() else {
             cx.notify();
@@ -919,6 +967,23 @@ impl Shell {
         self.focus_composer(cx);
         cx.notify();
         self.note_workspace_mutation(cx);
+    }
+
+    /// Search the current workspace layout for a pane already bound to
+    /// `session_id`. Returns the first match. Used by the explicit-nav
+    /// restore path to focus an existing pane rather than duplicating a
+    /// session binding.
+    pub(crate) fn find_pane_with_session(&self, session_id: &str) -> Option<PaneId> {
+        for view in self.workspace.layout.views.values() {
+            for tab in view.tabs.values() {
+                for (pane_id, pane_state) in &tab.panes {
+                    if pane_state.session_id.as_deref() == Some(session_id) {
+                        return Some(*pane_id);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// The selection half of [`Self::retarget_to_focused_pane`], without the

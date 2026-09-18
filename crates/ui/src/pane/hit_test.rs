@@ -281,10 +281,12 @@ pub(crate) fn resolve_drop(
                 }
             }
             // Another view's chip, or a pane header: join this strip.
-            DragSource::TabChip(..) | DragSource::PaneHeader(..) => DropPlan::MoveIntoPane {
-                view: *view,
-                tab_before: before,
-            },
+            DragSource::TabChip(..) | DragSource::PaneHeader(..) | DragSource::SidebarSession => {
+                DropPlan::MoveIntoPane {
+                    view: *view,
+                    tab_before: before,
+                }
+            }
         };
         if extraction_doomed(geom, source, &plan) {
             return DropResolution::none();
