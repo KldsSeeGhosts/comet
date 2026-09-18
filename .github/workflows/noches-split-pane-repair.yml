@@ -1,0 +1,105 @@
+name: Noches split-pane repair
+on:
+  push:
+    branches: [fix/pane-owned-chat-surfaces]
+    paths: [.github/workflows/noches-split-pane-repair.yml]
+permissions:
+  contents: read
+jobs:
+  repair:
+    if: github.repository == 'KldsSeeGhosts/comet' && github.ref == 'refs/heads/fix/pane-owned-chat-surfaces'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+      - name: Apply reviewed pointer activation fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = d369695c673bc611696a5ff4dc90aa1355ae6633
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          p = Path('crates/ui/src/shell/panes.rs')
+          s = p.read_text()
+          anchor = '    /// Apply one user-requested navigation after any required workspace'
+          assert s.count(anchor) == 1
+          helper = '''    /// Pointer activation changes routing, not the control's keyboard focus.
+              /// Text selection, queue editors and pickers retain the focus they chose.
+              pub(crate) fn pointer_focus_workspace_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+                  if self.workspace.focused_pane() != Some(pane) {
+                      if self.workspace.focus_pane(pane).is_err() {
+                          return;
+                      }
+                      self.sync_selection_to_focused_pane(cx);
+                      self.note_workspace_mutation(cx);
+                  }
+                  // A pointer action wins over an earlier, not-yet-painted focus request.
+                  for surface in self.workspace.chat_surfaces.values() {
+                      surface.composer.update(cx, |composer, _| composer.focus_pending = false);
+                  }
+                  cx.notify();
+              }
+
+          '''
+          p.write_text(s.replace(anchor, helper + anchor))
+          p = Path('crates/ui/src/pane/render.rs')
+          s = p.read_text()
+          anchor = 'cx.listener(move |this, _, _, cx| this.focus_workspace_pane(pane_id, cx))'
+          assert s.count(anchor) == 1
+          p.write_text(s.replace(anchor, 'cx.listener(move |this, _, _, cx| this.pointer_focus_workspace_pane(pane_id, cx))'))
+          p = Path('crates/ui/src/shell/pane_surface_regressions.rs')
+          p.write_text(p.read_text() + '''
+          #[gpui::test]
+          fn pointer_activation_changes_routing_without_requesting_composer_focus(cx: &mut TestAppContext) {
+              let dir = tempfile::tempdir().unwrap();
+              cx.update(|cx| init_app(dir.path(), cx));
+              let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+              window.update(cx, |shell, _, cx| {
+                  prepare_selected_composer(shell, cx);
+                  let first = shell.workspace.focused_pane().unwrap();
+                  shell.split_workspace_view(Direction::Right, cx);
+                  shell.pointer_focus_workspace_pane(first, cx);
+                  assert_eq!(shell.workspace.focused_pane(), Some(first));
+                  assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("chat-a"));
+                  assert!(shell.workspace.chat_surfaces.values().all(|surface| !surface.composer.read(cx).focus_pending));
+              }).unwrap();
+          }
+
+          #[gpui::test]
+          fn clicking_the_active_pane_does_not_refocus_the_composer(cx: &mut TestAppContext) {
+              let dir = tempfile::tempdir().unwrap();
+              cx.update(|cx| init_app(dir.path(), cx));
+              let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+              window.update(cx, |shell, _, cx| {
+                  prepare_selected_composer(shell, cx);
+                  shell.split_workspace_view(Direction::Right, cx);
+                  let pane = shell.workspace.focused_pane().unwrap();
+                  let revision = shell.workspace.layout.revision;
+                  shell.pointer_focus_workspace_pane(pane, cx);
+                  assert_eq!(shell.workspace.layout.revision, revision);
+                  assert!(!shell.active_composer().read(cx).focus_pending);
+              }).unwrap();
+          }
+          ''')
+          expected = {
+              'crates/ui/src/shell/panes.rs': 'f1ffaca87234b010fe7773b83a962aacf8e5fb58f1ccb9d53e74f9f2940d3f26',
+              'crates/ui/src/pane/render.rs': 'e4981dc4e41ef4c5f78d9c9f6819d07acbacba61aafcd069defde5a2934ada6c',
+              'crates/ui/src/shell/pane_surface_regressions.rs': '6fb3a11d9cdd54b35f3b53f3c4f6575a0dd1dbf04823d75d5a84751ff26df26b',
+          }
+          for path, digest in expected.items():
+              assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest, path
+          PY
+          git diff --check
+          rustfmt --edition 2024 --emit stdout crates/ui/src/shell.rs crates/ui/src/pane/render.rs > /dev/null
+          git config user.name 'Noches review'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/ui/src/shell/panes.rs crates/ui/src/pane/render.rs crates/ui/src/shell/pane_surface_regressions.rs
+          git commit -m 'fix: preserve control focus when activating chat panes with the pointer'
+          git push origin HEAD:refs/heads/fix/pane-owned-chat-surfaces
+          git rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
