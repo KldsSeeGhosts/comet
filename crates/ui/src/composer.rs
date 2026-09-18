@@ -4437,6 +4437,25 @@ impl Composer {
         }
     }
 
+    /// Recover a failed prompt without changing a newer pane navigation.
+    pub(crate) fn restore_failed_send_input(
+        &mut self,
+        failed_chat_id: &str,
+        is_new: bool,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let restore_key = if is_new { "" } else { failed_chat_id };
+        if is_new && self.target.chat_id(self.state.read(cx)) == Some(failed_chat_id) {
+            self.reset_fixed_target(cx);
+        }
+        if self.current_key == restore_key {
+            self.input.update(cx, |input, cx| input.set_text(text, cx));
+        } else {
+            self.drafts.insert(restore_key.to_string(), text);
+        }
+    }
+
     /// The space the target's canvas/git decisions resolve against: a bound
     /// pane chat's own project, else the globally picked one (a `Fixed(None)`
     /// pane's launch target, and the fallback while a fresh chat row syncs).
@@ -6677,15 +6696,9 @@ impl Composer {
                     };
                     composer.failure = Some(message.into());
                     composer.failure_key = Some(restore_key.clone());
-                    // A pane-fixed composer returns to its own new-chat
-                    // canvas — its target, not the global selection, keys it.
-                    // Reset BEFORE the deselect below: a pane surface observes
-                    // the canvas target before `set_pane_session(None)` can
-                    // invalidate (and drop) this composer — its restored draft
-                    // survives.
-                    if is_new {
-                        composer.reset_fixed_target(cx);
-                    }
+                    composer.restore_failed_send_input(
+                        &err_chat_id, is_new, restore_text, cx,
+                    );
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
                         s.end_pending_send(&err_chat_id, &err_message_id);
@@ -6699,19 +6712,6 @@ impl Composer {
                         }
                         cx.notify();
                     });
-                    if is_new && composer.current_key != restore_key {
-                        // A re-key swap to the canvas is pending (the
-                        // select_chat(None) above); it loads this draft into
-                        // the input on flush — setting the input directly
-                        // here would be clobbered by that same swap.
-                        composer.drafts.insert(restore_key.clone(), restore_text.clone());
-                    } else {
-                        // Already keyed to the restore target (either an
-                        // existing chat, or the deleted row's watch event
-                        // re-keyed to the canvas before this handler ran —
-                        // no further swap will fire). Set the input directly.
-                        composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
-                    }
                     if !ordinary_staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
                         // while the send was in flight survive the hand-back —

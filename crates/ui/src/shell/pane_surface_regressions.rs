@@ -207,3 +207,57 @@ fn only_the_latest_focus_request_survives_before_paint(cx: &mut TestAppContext) 
         assert!(!shell.workspace.chat_surfaces[&second].composer.read(cx).focus_pending);
     }).unwrap();
 }
+
+#[gpui::test]
+fn a_late_first_send_failure_preserves_the_new_session_and_draft(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        prepare_selected_composer(shell, cx);
+        shell.split_workspace_view(Direction::Right, cx);
+        let pane = shell.workspace.focused_pane().unwrap();
+        let composer = shell.active_composer();
+        composer.update(cx, |composer, cx| composer.bind_chat("failed-mint".into(), cx));
+        shell.ensure_pane_chat_surfaces(cx);
+        shell.open_chat("chat-b".into(), cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        draft(&composer, "newer session draft", cx);
+        composer.update(cx, |composer, cx| {
+            composer.restore_failed_send_input("failed-mint", true, "recover first prompt".into(), cx);
+        });
+        shell.ensure_pane_chat_surfaces(cx);
+        assert_eq!(shell.workspace.layout.pane(pane).unwrap().session_id.as_deref(), Some("chat-b"));
+        assert_eq!(composer.read(cx).current_key, "chat-b");
+        assert_eq!(draft_text(&composer, cx), "newer session draft");
+        shell.open_new_session(cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        assert_eq!(draft_text(&composer, cx), "recover first prompt");
+    }).unwrap();
+}
+
+#[gpui::test]
+fn a_late_existing_send_failure_restores_only_its_own_draft(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        prepare_selected_composer(shell, cx);
+        shell.split_workspace_view(Direction::Right, cx);
+        let composer = shell.active_composer();
+        shell.open_chat("chat-b".into(), cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        shell.open_new_session(cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        draft(&composer, "newer canvas draft", cx);
+        composer.update(cx, |composer, cx| {
+            composer.restore_failed_send_input("chat-b", false, "recover existing prompt".into(), cx);
+        });
+        shell.ensure_pane_chat_surfaces(cx);
+        assert_eq!(composer.read(cx).current_key, "");
+        assert_eq!(draft_text(&composer, cx), "newer canvas draft");
+        shell.open_chat("chat-b".into(), cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        assert_eq!(draft_text(&composer, cx), "recover existing prompt");
+    }).unwrap();
+}
