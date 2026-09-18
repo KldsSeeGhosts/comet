@@ -1,0 +1,41 @@
+name: Workspace layout tests
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/workspace/**'
+      - 'crates/ui/src/pane/**'
+      - 'crates/ui/src/shell.rs'
+      - 'crates/ui/src/shell/**'
+      - '.github/workflows/workspace-layout-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/workspace/**'
+      - '.github/workflows/workspace-layout-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workspace-layout-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  layout-engine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Workspace layout engine regressions
+        run: cargo test --release --locked -p zeron-workspace --lib
