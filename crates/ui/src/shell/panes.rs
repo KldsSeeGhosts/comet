@@ -32,6 +32,28 @@ impl Shell {
         !self.workspace.is_trivial() || !self.workspace.chat_surfaces.is_empty()
     }
 
+    /// Whether the shell's transcript-underlay fade may take a TOP ramp.
+    /// Legacy single-pane route only: there the primary transcript slides
+    /// under the mounted pane header, so content must be fully faded by the
+    /// header's bottom edge. The workspace route must NOT take it — its panes
+    /// carry their own chrome (header row, tab strip) inside the outlet, and
+    /// a zero band across the outlet's top erased those glyphs (the "faded
+    /// top bar, no title" split-view bug) while every pane transcript is an
+    /// override instance that paints its own scroll-gated fade scope,
+    /// replacing the shell's.
+    pub(super) fn transcript_underlay_fades_top(&self) -> bool {
+        !self.workspace_mode()
+    }
+
+    /// Whether pane chrome wins the titlebar band's hit-tests: on a split
+    /// workspace the chat drag strip paints UNDER the content row so header
+    /// rows and tab strips stay clickable, draggable and hoverable inside the
+    /// band; the strip still catches the chrome-free outlet padding and
+    /// gutters, so the band keeps dragging the window.
+    pub(super) fn pane_chrome_wins_titlebar_band(&self) -> bool {
+        matches!(self.route, Route::Chat) && self.workspace_mode()
+    }
+
     /// The workspace tree as the chat outlet. Every Chat-mode pane in the
     /// layout owns a live transcript+composer pair bound to its session —
     /// created lazily here (render pass, like the lazy terminal panel) for

@@ -8030,20 +8030,26 @@ impl Shell {
                     // status strip above it is empty air), zero at the
                     // underlay's bottom edge.
                     let bottom_band = (stack_h - Theme::STATUS_STRIP_HEIGHT).max(1.0);
-                    div().absolute().inset_0().bottom(px(term_h)).child(
-                        crate::edge_fade::edge_faded(
+                    div().absolute().inset_0().bottom(px(term_h)).child({
+                        // The top ramp is gated by
+                        // [`Shell::transcript_underlay_fades_top`] — legacy
+                        // route only (see that method for why the workspace
+                        // route must never take it). The inset/band_top stay
+                        // inert while the top edge is off.
+                        let fade = crate::edge_fade::edge_faded(
                             Theme::TRANSCRIPT_FADE_BAND,
-                            true,
+                            self.transcript_underlay_fades_top(),
                             true,
                             div().size_full().child(outlet),
-                        )
-                        // Fully faded BY the pane header's bottom edge (the
-                        // title text is opaque — overlap read as collision),
-                        // ramping in the band just below it.
-                        .inset_top(crate::pane::chrome::PANE_HEADER_HEIGHT)
-                        .band_top(Theme::TRANSCRIPT_FADE_BAND)
-                        .band_bottom(bottom_band),
-                    )
+                        );
+                        if self.transcript_underlay_fades_top() {
+                            fade.inset_top(crate::pane::chrome::PANE_HEADER_HEIGHT)
+                                .band_top(Theme::TRANSCRIPT_FADE_BAND)
+                                .band_bottom(bottom_band)
+                        } else {
+                            fade.band_bottom(bottom_band)
+                        }
+                    })
                 },
             )
             // The pane header is the chat identity row on the legacy route —
@@ -10549,29 +10555,46 @@ impl Render for Shell {
                 // under the header and fade out at its edge. Columns that
                 // must NOT underlap (sidebar content, the changes panel,
                 // settings) pad themselves down by the titlebar height.
-                let page = div()
-                    .size_full()
-                    .relative()
-                    .child(
+                let page = {
+                    let content_row = div()
+                        .size_full()
+                        .flex()
+                        .flex_row()
+                        .child(sidebar)
+                        .child(sidebar_seam)
+                        .child(card)
+                        .child(
+                            div()
+                                .h_full()
+                                .flex_none()
+                                .relative()
+                                .child(right)
+                                .child(right_seam),
+                        );
+                    let title_bar_overlay =
+                        div().absolute().top_0().left_0().right_0().child(title_bar);
+                    // Paint order is hit-test order: on a split workspace the
+                    // chat drag strip mounts UNDER the content row (see
+                    // [`Shell::pane_chrome_wins_titlebar_band`]); the legacy
+                    // route keeps the strip on top — its transcript scrolls
+                    // under the band.
+                    let chrome_wins_band = self.pane_chrome_wins_titlebar_band();
+                    if chrome_wins_band {
                         div()
                             .size_full()
-                            .flex()
-                            .flex_row()
-                            .child(sidebar)
-                            .child(sidebar_seam)
-                            .child(card)
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex_none()
-                                    .relative()
-                                    .child(right)
-                                    .child(right_seam),
-                            ),
-                    )
-                    .child(div().absolute().top_0().left_0().right_0().child(title_bar))
-                    .child(self.render_titlebar_cluster(cx))
-                    .children(overlays);
+                            .relative()
+                            .child(title_bar_overlay)
+                            .child(content_row)
+                    } else {
+                        div()
+                            .size_full()
+                            .relative()
+                            .child(content_row)
+                            .child(title_bar_overlay)
+                    }
+                }
+                .child(self.render_titlebar_cluster(cx))
+                .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
             }

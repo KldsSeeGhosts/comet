@@ -805,3 +805,46 @@ fn a_sidebar_strip_drop_inserts_at_the_requested_position(cx: &mut TestAppContex
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn split_panes_drop_the_underlay_top_ramp_and_win_the_titlebar_band(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window
+        .update(cx, |shell, _, cx| {
+            seed_selected_project(shell, cx);
+            shell.on_state_changed(&shell.state.clone(), cx);
+            // Legacy single-session route: the primary transcript slides
+            // under the mounted pane header, so the shell underlay keeps its
+            // top ramp and the window-drag strip stays the band's topmost
+            // hitbox.
+            assert_eq!(shell.active_chat, "chat-a");
+            assert!(!shell.workspace_mode());
+            assert!(shell.transcript_underlay_fades_top());
+            assert!(!shell.pane_chrome_wins_titlebar_band());
+
+            // A split flips both: pane chrome (header rows, tab strips) now
+            // lives inside the outlet top — it must not sit in a zero-alpha
+            // fade band (the "faded top bar, no title" bug) — and it must
+            // win the titlebar band's clicks over the drag strip.
+            shell.split_workspace_view(Direction::Right, cx);
+            assert!(shell.workspace_mode());
+            assert!(!shell.transcript_underlay_fades_top());
+            assert!(shell.pane_chrome_wins_titlebar_band());
+
+            // Collapsing back to one pane keeps the workspace route (its
+            // chat surfaces persist — see the draft-preservation suites), so
+            // the pane-owned chrome ordering stays with it.
+            let second = shell.workspace.focused_pane().unwrap();
+            shell.close_workspace_pane(second, cx);
+            shell.ensure_pane_chat_surfaces(cx);
+            assert!(shell.workspace.is_trivial());
+            assert!(shell.workspace_mode());
+            assert!(!shell.transcript_underlay_fades_top());
+            assert!(shell.pane_chrome_wins_titlebar_band());
+        })
+        .unwrap();
+}
