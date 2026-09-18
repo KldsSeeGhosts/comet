@@ -2236,8 +2236,20 @@ impl Shell {
         if state.read(cx).spaces_synced
             && (!self.workspace_space_loaded || self.active_workspace_space != selected_space)
         {
+            // P1 fix: capture the explicit navigation target (e.g. sidebar
+            // click) BEFORE the restore clobbers it via retarget_to_focused_pane.
+            let explicit_target = state.read(cx).selected_chat.clone();
             self.workspace_space_loaded = true;
             self.restore_workspace_layout(selected_space, cx);
+            // Re-apply the explicit target so the user's click wins over
+            // whatever the restored layout's focused pane had (or lacked).
+            if let Some(target) = explicit_target {
+                self.workspace.sync_focused_session(Some(&target));
+                let current = self.state.read(cx).selected_chat.clone();
+                if current.as_deref() != Some(target.as_str()) {
+                    self.state.update(cx, |state, cx| state.select_chat(Some(target), cx));
+                }
+            }
         }
         // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
         // fall back to "All" rather than filtering everything out.
@@ -5866,6 +5878,31 @@ impl Shell {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_chat(select_id.clone(), cx);
             }))
+            // WS4: sidebar session drag - dropping a chat row onto the
+            // content area creates a split pane bound to this session.
+            .on_drag(
+                {
+                    let drag_id = id.clone();
+                    let (mark_icon, mark_tint) = harness
+                        .map(crate::pickers::harness_brand_icon)
+                        .unwrap_or((crate::icons::ZERON_LOGO, None));
+                    crate::pane::TabSplitDrag {
+                        source: crate::pane::hit_test::DragSource::SidebarSession,
+                        mark: crate::pane::chrome::TabMark {
+                            icon: mark_icon,
+                            tint: mark_tint,
+                        },
+                        title: title.clone(),
+                        session_id: Some(drag_id),
+                    }
+                },
+                |payload, _point, _, cx| {
+                    cx.new(|_| crate::pane::SplitDragGhost {
+                        mark: payload.mark,
+                        title: payload.title.clone(),
+                    })
+                },
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -7876,6 +7913,17 @@ impl Shell {
                 }
                 cx.notify();
             }))
+            // Sidebar session drag-to-split: dropping a sidebar chat row onto
+            // the single-pane content area creates a split. When workspace
+            // mode is already active the workspace_outlet handles this; this
+            // receiver covers the default single-pane screen.
+            .on_drop::<crate::pane::TabSplitDrag>(cx.listener(
+                |this, payload: &crate::pane::TabSplitDrag, _, cx| {
+                    if payload.source == crate::pane::hit_test::DragSource::SidebarSession {
+                        this.accept_sidebar_session_drop(payload, cx);
+                    }
+                },
+            ))
             // The hero is deliberately outside the transcript EdgeFade below:
             // it must paint under the overlaid titlebar instead of becoming
             // fully transparent across the titlebar's inset band.

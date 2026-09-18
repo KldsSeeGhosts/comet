@@ -589,7 +589,7 @@ fn pane_body(theme: &Theme, pane: &PaneSnap, live: &Entity<Transcript>) -> AnyEl
                 div()
                     .text_size(crate::typography::ui_rems(12.0))
                     .text_color(theme.text_faint)
-                    .child(SharedString::from("Terminal panes land in a later pass")),
+                    .child(SharedString::from("Terminal panes are not yet available")),
             )
             .into_any_element(),
         PaneMode::Chat if pane.focused => {

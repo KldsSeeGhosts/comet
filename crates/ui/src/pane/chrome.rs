@@ -165,6 +165,7 @@ pub(crate) fn pane_header(
                 source: DragSource::PaneHeader(pane),
                 mark,
                 title: title.clone(),
+                session_id: None,
             },
             |payload, _point, _, cx| {
                 cx.new(|_| SplitDragGhost {
@@ -189,13 +190,13 @@ pub(crate) fn pane_header(
         .child(control(
             format!("pane-popout-{}", pane.0),
             icon(icons::EXPAND_ARROWS).size(px(11.0)).into_any_element(),
-        ))
+        ).opacity(0.35).cursor_default())
         // TODO(WS6): maximize (collapse the sibling panes of this split) —
         // decorative until the layout preset presets land.
         .child(control(
             format!("pane-maximize-{}", pane.0),
             icon(icons::WINDOW_MAXIMIZE).size(px(11.0)).into_any_element(),
-        ))
+        ).opacity(0.35).cursor_default())
         .when(closable, |el| {
             el.child(
                 control(
@@ -288,6 +289,7 @@ pub(crate) fn tab_strip(
                         source: DragSource::TabChip(tab, view),
                         mark: chip.mark,
                         title: chip.label.clone(),
+                        session_id: None,
                     },
                     |payload, _point, _, cx| {
                         cx.new(|_| SplitDragGhost {

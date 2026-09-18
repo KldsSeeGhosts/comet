@@ -154,6 +154,10 @@ pub(crate) fn touches_boundary(rect: &Rect, content: &Rect, dir: Direction) -> b
 pub(crate) enum DragSource {
     TabChip(TabId, ViewId),
     PaneHeader(PaneId),
+    /// A sidebar chat row dragged onto the content area. No workspace IDs
+    /// exist yet - the commit path creates the split and binds the session.
+    /// Never a self-hit.
+    SidebarSession,
 }
 
 /// One pane's resolved registry entry. `view`/`tab` come from the engine (the
@@ -381,6 +385,7 @@ fn self_hit(source: DragSource, hit: &PaneRect) -> bool {
     match source {
         DragSource::PaneHeader(pane) => pane == hit.pane,
         DragSource::TabChip(tab, _) => tab == hit.tab,
+        DragSource::SidebarSession => false,
     }
 }
 

@@ -118,6 +118,9 @@ pub(crate) struct TabSplitDrag {
     pub source: hit_test::DragSource,
     pub mark: chrome::TabMark,
     pub title: SharedString,
+    /// For sidebar-originated drags: the session to bind into the new pane.
+    /// `None` for workspace-internal drags (tab chips, pane headers).
+    pub session_id: Option<String>,
 }
 
 /// The floating chip trailing the cursor during a workspace drag: provider
@@ -569,6 +572,9 @@ impl PaneHost {
             }
             Ok(())
         });
+        // Invalidate the cached transcript so the next render creates one
+        // bound to the new session (or drops it for an unbound pane).
+        self.pane_transcripts.remove(&pane);
         self.touched(result)
     }
 
@@ -608,6 +614,9 @@ impl PaneHost {
             .layout
             .pane(pane)
             .and_then(|state| state.session_id.clone())?;
+        // Start a document feed for this session so the dormant transcript
+        // actually receives messages. `watch_subagent_doc` is single-flight.
+        state.update(cx, |s, cx| s.watch_subagent_doc(session.clone(), cx));
         Some(
             self.pane_transcripts
                 .entry(pane)

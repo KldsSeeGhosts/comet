@@ -374,6 +374,11 @@ impl Shell {
             .iter()
             .filter_map(|(pane, bounds)| {
                 let (view, tab) = layout.pane_location(*pane)?;
+                // Only include panes from the view's active tab - stale
+                // bounds from inactive tabs must not participate in hit-testing.
+                if !layout.views.get(&view).is_some_and(|v| v.active_tab_id == tab) {
+                    return None;
+                }
                 Some(hit_test::PaneRect {
                     pane: *pane,
                     view,
@@ -470,7 +475,56 @@ impl Shell {
         let Some(state) = self.split_drag.take() else {
             return;
         };
+        // Sidebar session drags create a new pane bound to the dragged
+        // session rather than moving an existing workspace tab/pane.
+        if payload.source == DragSource::SidebarSession {
+            self.commit_sidebar_split(state.resolution.plan, payload, cx);
+            return;
+        }
         if self.apply_drop_plan(state.resolution.plan, payload.source) {
+            self.retarget_to_focused_pane(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Commit a sidebar-session drag: split the target pane and bind the
+    /// new half to the dragged session. The session_id on the payload
+    /// identifies which chat to bind.
+    fn commit_sidebar_split(
+        &mut self,
+        plan: DropPlan,
+        payload: &crate::pane::TabSplitDrag,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = payload.session_id.clone();
+        let direction = match plan {
+            DropPlan::SplitPane { direction, .. } => direction,
+            DropPlan::SplitView { direction, .. } => direction,
+            // Center or reorder with no existing split target: split right
+            // from the focused pane as the default entry.
+            DropPlan::MoveIntoPane { .. } | DropPlan::ReorderStrip { .. } => {
+                zeron_workspace::Direction::Right
+            }
+            DropPlan::None => {
+                cx.notify();
+                return;
+            }
+        };
+        let target = match plan {
+            DropPlan::SplitPane { pane, .. } => pane,
+            _ => match self.workspace.focused_pane() {
+                Some(p) => p,
+                None => {
+                    cx.notify();
+                    return;
+                }
+            },
+        };
+        let new_pane = crate::pane::chat_pane_state();
+        if let Ok(pane_id) = self.workspace.layout.split_pane(target, direction, new_pane) {
+            let _ = self.workspace.set_pane_session(pane_id, session_id);
+            self.workspace.layout.focus_pane(pane_id).ok();
             self.retarget_to_focused_pane(cx);
         } else {
             cx.notify();
@@ -486,12 +540,44 @@ impl Shell {
         }
     }
 
+    /// Accept a sidebar session drop on the single-pane content area (the
+    /// workspace outlet is not rendered, so this is the entry point for
+    /// drag-to-split from the default screen). Splits right from the
+    /// focused pane.
+    pub(crate) fn accept_sidebar_session_drop(
+        &mut self,
+        payload: &crate::pane::TabSplitDrag,
+        cx: &mut Context<Self>,
+    ) {
+        self.split_drag = None;
+        let session_id = payload.session_id.clone();
+        let Some(target) = self.workspace.focused_pane() else {
+            cx.notify();
+            return;
+        };
+        let new_pane = crate::pane::chat_pane_state();
+        if let Ok(pane_id) = self
+            .workspace
+            .layout
+            .split_pane(target, zeron_workspace::Direction::Right, new_pane)
+        {
+            let _ = self.workspace.set_pane_session(pane_id, session_id);
+            self.workspace.layout.focus_pane(pane_id).ok();
+            self.retarget_to_focused_pane(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
     /// The plan → engine-op mapping. Returns whether anything changed.
     /// Every engine error is a silent no-op: the engine commits atomically,
     /// so a rejected drop leaves `validate()` passing and the tree intact.
     fn apply_drop_plan(&mut self, plan: DropPlan, source: DragSource) -> bool {
         let result = match (source, plan) {
             (_, DropPlan::None) => return false,
+            // Sidebar session drags are handled in commit_sidebar_split_drop,
+            // not here - they need the session_id from the payload.
+            (DragSource::SidebarSession, _) => return false,
             // Center drop. Same view + append = the no-op restore (activate
             // the tab); anything else moves the tab (append when
             // `tab_before` is `None`).
