@@ -1379,7 +1379,11 @@ pub struct Shell {
     /// Explicit user navigation target that must survive a workspace layout
     /// restore. `Some(Some(chat_id))` = sidebar click / deep link;
     /// `Some(None)` = new-session request. `None` = no pending navigation
-    /// (boot / passive restore). Consumed once by the restore path.
+    /// (boot / passive restore). Consumed once by the restore path. Both
+    /// arming sites (`open_chat` / `open_new_session`) follow up with a
+    /// `select_chat`, which notifies even when the selection is unchanged —
+    /// so the intent is always consumed by the next observation, never left
+    /// armed for an unrelated future frame.
     pending_explicit_nav: Option<Option<String>>,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under. Paint-time

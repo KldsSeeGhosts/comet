@@ -1861,6 +1861,13 @@ impl AppState {
             if let Some(id) = chat_id {
                 self.mark_chat_seen(&id, cx);
             }
+            // No-op selects still notify (same contract as `select_space`):
+            // the Shell arms its pending explicit-navigation intent right
+            // before calling this, and that intent is consumed only by the
+            // state observer. A silent no-op would leave it armed for an
+            // unrelated later frame, which would then rebind focus or clear
+            // a pane long after the user's click.
+            cx.notify();
             return;
         }
         self.selected_chat = chat_id.clone();
