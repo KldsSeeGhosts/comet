@@ -12,9 +12,8 @@
 //!   closes the tab (engine semantics: last tab of the only view = no-op);
 //! - the strip ends in a "+" that opens the TOOL PICKER (§2) committed as an
 //!   `add_tab` to that view;
-//! - the pane header reveals its close × on hover (functional →
-//!   `close_pane`); pop-out/maximize render as decorative chrome pending WS6;
-//!   right-click opens the split/close context menu AND focuses the pane (§6).
+//! - the pane header exposes a functional close ×; right-click opens the
+//!   split/close context menu AND focuses the pane (§6);
 //!
 //! WS4 makes both drag SOURCES: a chip drags as [`DragSource::TabChip`], a
 //! header as [`DragSource::PaneHeader`] (payload [`TabSplitDrag`], ghost
@@ -32,9 +31,9 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, AnyElement, AppContext as _, Bounds, Context, FontWeight, Hsla, InteractiveElement,
-    IntoElement, MouseButton, ParentElement as _, Pixels, SharedString,
-    StatefulInteractiveElement, Styled as _,
+    AnyElement, AppContext as _, Bounds, Context, FontWeight, Hsla, InteractiveElement,
+    IntoElement, MouseButton, ParentElement as _, Pixels, SharedString, StatefulInteractiveElement,
+    Styled as _, div, px,
 };
 use zeron_workspace::{PaneId, PaneMode, TabId, ViewId};
 
@@ -106,11 +105,11 @@ pub(crate) struct TabChip {
 }
 
 /// The pane header: status dot + truncated title left; pop-out/maximize/close
-/// right — revealed on hover (Super §6). The close is functional; pop-out and
-/// maximize are decorative until WS6 wires their flows. Right-click opens the
-/// split/close context menu (and focuses the pane, §6). Rendered ONLY when
-/// the owning tab has ≥2 panes. WS4: the header is a drag source — dragging
-/// it moves/re-docks the pane (drop targets resolve in `pane/hit_test.rs`).
+/// right. The close is functional and remains visible at rest so split panes
+/// always have an obvious escape hatch. Right-click opens the split/close
+/// context menu (and focuses the pane, §6). Rendered ONLY when the owning tab
+/// has ≥2 panes. WS4: the header is a drag source — dragging it moves/re-docks
+/// the pane (drop targets resolve in `pane/hit_test.rs`).
 pub(crate) fn pane_header(
     pane: PaneId,
     title: SharedString,
@@ -121,9 +120,6 @@ pub(crate) fn pane_header(
     cx: &Context<'_, Shell>,
 ) -> AnyElement {
     let header_key = format!("pane-header-hover-{}", pane.0);
-    // Controls hide until the header hovers; the × additionally gets its own
-    // hover wash (hitboxes nest, so hovering the × keeps the header "on").
-    let reveal = || motion::hover_blend(&header_key, gpui::transparent_black(), theme.text_muted);
     let control = |key: String, child_icon: AnyElement| {
         div()
             .id(SharedString::from(key.clone()))
@@ -133,8 +129,12 @@ pub(crate) fn pane_header(
             .items_center()
             .justify_center()
             .rounded(px(5.0))
-            .text_color(reveal())
-            .bg(motion::hover_blend(&key, gpui::transparent_black(), theme.wash(0.12)))
+            .text_color(motion::hover_blend(&key, theme.text_muted, theme.text))
+            .bg(motion::hover_blend(
+                &key,
+                gpui::transparent_black(),
+                theme.wash(0.12),
+            ))
             .on_hover(motion::hover_listener(key))
             .child(child_icon)
     };
@@ -185,18 +185,6 @@ pub(crate) fn pane_header(
                 .text_color(theme.text_muted)
                 .child(title),
         )
-        // TODO(WS6): pop-out (detach this tab into its own view) — decorative
-        // until the detach flow exists.
-        .child(control(
-            format!("pane-popout-{}", pane.0),
-            icon(icons::EXPAND_ARROWS).size(px(11.0)).into_any_element(),
-        ).opacity(0.35).cursor_default())
-        // TODO(WS6): maximize (collapse the sibling panes of this split) —
-        // decorative until the layout preset presets land.
-        .child(control(
-            format!("pane-maximize-{}", pane.0),
-            icon(icons::WINDOW_MAXIMIZE).size(px(11.0)).into_any_element(),
-        ).opacity(0.35).cursor_default())
         .when(closable, |el| {
             el.child(
                 control(
@@ -226,12 +214,15 @@ pub(crate) fn pane_header(
 pub(crate) fn tab_strip(
     view: ViewId,
     tabs: &[TabChip],
+    view_closable: bool,
     theme: &Theme,
     chip_bounds: &Rc<RefCell<BTreeMap<(ViewId, TabId), Bounds<Pixels>>>>,
     cx: &Context<'_, Shell>,
 ) -> AnyElement {
     let mut strip = div()
         .h(px(30.0))
+        .w_full()
+        .min_w_0()
         .flex_none()
         .flex()
         .flex_row()
@@ -272,7 +263,11 @@ pub(crate) fn tab_strip(
                 .bg(if chip.active {
                     theme.wash(0.09)
                 } else {
-                    motion::hover_blend(&chip_hover_key, gpui::transparent_black(), theme.wash(0.07))
+                    motion::hover_blend(
+                        &chip_hover_key,
+                        gpui::transparent_black(),
+                        theme.wash(0.07),
+                    )
                 })
                 .when(chip.active, |el| {
                     el.border_1().border_color(theme.hairline(0.09))
@@ -322,13 +317,21 @@ pub(crate) fn tab_strip(
                             .bg(theme.accent),
                     )
                 })
-                .child(icon(chip.mark.icon).size(px(11.0)).flex_none().text_color(mark_tint))
+                .child(
+                    icon(chip.mark.icon)
+                        .size(px(11.0))
+                        .flex_none()
+                        .text_color(mark_tint),
+                )
                 .child(div().min_w_0().truncate().child(chip.label.clone()))
                 // Close ×, revealed on chip hover; closes the tab (last tab
                 // of the only view is an engine-guarded no-op).
                 .child(
                     div()
-                        .id(SharedString::from(format!("ws-tab-close-{}-{}", view.0, tab.0)))
+                        .id(SharedString::from(format!(
+                            "ws-tab-close-{}-{}",
+                            view.0, tab.0
+                        )))
                         .size(px(14.0))
                         .flex_none()
                         .flex()
@@ -373,7 +376,11 @@ pub(crate) fn tab_strip(
             .rounded(px(6.0))
             .cursor_pointer()
             .text_color(theme.text_muted.opacity(0.8))
-            .bg(motion::hover_blend(&plus_key, gpui::transparent_black(), theme.wash(0.09)))
+            .bg(motion::hover_blend(
+                &plus_key,
+                gpui::transparent_black(),
+                theme.wash(0.09),
+            ))
             .on_hover(motion::hover_listener(plus_key))
             .on_mouse_down(
                 MouseButton::Left,
@@ -384,6 +391,32 @@ pub(crate) fn tab_strip(
             )
             .child(icon(icons::PLUS).size(px(11.0))),
     );
+    if view_closable {
+        let close_key = format!("ws-view-close-{}", view.0);
+        strip = strip.child(div().flex_1()).child(
+            div()
+                .id(SharedString::from(close_key.clone()))
+                .size(px(20.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .text_color(theme.text_muted.opacity(0.72))
+                .bg(motion::hover_blend(
+                    &close_key,
+                    gpui::transparent_black(),
+                    theme.danger.opacity(0.14),
+                ))
+                .on_hover(motion::hover_listener(close_key))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.close_workspace_view_at(view, cx);
+                }))
+                .child(icon(icons::CLOSE).size(px(11.0))),
+        );
+    }
     strip.into_any_element()
 }
 
@@ -391,7 +424,9 @@ pub(crate) fn tab_strip(
 /// composer-shaped strip with muted "Click to focus chat" text and a
 /// non-interactive pill row mirroring the live composer's footer layout.
 /// Purely decorative — the pane container's click-to-focus handler owns the
-/// pointer.
+/// pointer. Unused since every pane renders its own live composer; kept
+/// pending the final workspace chrome cleanup.
+#[allow(dead_code)]
 pub(crate) fn ghost_composer(theme: &Theme) -> AnyElement {
     let pill = |label: &'static str| {
         div()
@@ -402,9 +437,9 @@ pub(crate) fn ghost_composer(theme: &Theme) -> AnyElement {
             .items_center()
             .rounded_full()
             .border_1()
-            .border_color(theme.hairline(0.08))
+            .border_color(theme.border_strong)
             .text_size(crate::typography::ui_rems(10.0))
-            .text_color(theme.text_faint)
+            .text_color(theme.text_muted.opacity(0.82))
             .child(SharedString::from(label))
     };
     let round_btn = |label: &'static str| {
@@ -416,9 +451,9 @@ pub(crate) fn ghost_composer(theme: &Theme) -> AnyElement {
             .justify_center()
             .rounded_full()
             .border_1()
-            .border_color(theme.hairline(0.08))
+            .border_color(theme.border_strong)
             .text_size(crate::typography::ui_rems(11.0))
-            .text_color(theme.text_faint)
+            .text_color(theme.text_muted.opacity(0.82))
             .child(SharedString::from(label))
     };
     div()
@@ -432,8 +467,8 @@ pub(crate) fn ghost_composer(theme: &Theme) -> AnyElement {
             div()
                 .rounded(px(12.0))
                 .border_1()
-                .border_color(theme.hairline(0.09))
-                .bg(theme.input_bg.opacity(0.6))
+                .border_color(theme.border_strong)
+                .bg(theme.input_glass_bg())
                 .p(px(10.0))
                 .flex()
                 .flex_col()
@@ -441,7 +476,7 @@ pub(crate) fn ghost_composer(theme: &Theme) -> AnyElement {
                 .child(
                     div()
                         .text_size(crate::typography::ui_rems(12.0))
-                        .text_color(theme.text_faint)
+                        .text_color(theme.text_muted)
                         .child(SharedString::from("Click to focus chat")),
                 )
                 .child(
@@ -476,14 +511,23 @@ mod tests {
             tab_mark(PaneMode::Chat, Some("claude")).tint,
             Some(icons::claude_brand())
         );
-        assert_eq!(tab_mark(PaneMode::Chat, Some("codex")).icon, icons::OPENAI_MARK);
-        assert_eq!(tab_mark(PaneMode::Chat, Some("devin")).icon, icons::DEVIN_MARK);
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("codex")).icon,
+            icons::OPENAI_MARK
+        );
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("devin")).icon,
+            icons::DEVIN_MARK
+        );
         assert_eq!(tab_mark(PaneMode::Chat, Some("pi")).icon, icons::PI_MARK);
         assert_eq!(
             tab_mark(PaneMode::Chat, Some("opencode")).icon,
             icons::OPENCODE_MARK
         );
-        assert_eq!(tab_mark(PaneMode::Chat, Some("cursor")).icon, icons::CURSOR_MARK);
+        assert_eq!(
+            tab_mark(PaneMode::Chat, Some("cursor")).icon,
+            icons::CURSOR_MARK
+        );
     }
 
     #[test]
@@ -504,7 +548,10 @@ mod tests {
     fn tool_picker_rows_advertise_the_real_entry_points() {
         use crate::pane::TOOL_PICKER_ROWS;
         let kinds: Vec<_> = TOOL_PICKER_ROWS.iter().map(|row| row.kind).collect();
-        assert_eq!(kinds, vec![crate::pane::ToolKind::Chat, crate::pane::ToolKind::Terminal]);
+        assert_eq!(
+            kinds,
+            vec![crate::pane::ToolKind::Chat, crate::pane::ToolKind::Terminal]
+        );
         assert!(TOOL_PICKER_ROWS.iter().all(|row| !row.label.is_empty()));
     }
 }

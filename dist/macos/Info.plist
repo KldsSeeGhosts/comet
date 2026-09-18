@@ -1,23 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Template for Zeron.app/Contents/Info.plist — see dist/README.md for the
+<!-- Template for Noches.app/Contents/Info.plist - see dist/README.md for the
      bundling steps. Replace __VERSION__ before packaging. -->
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>Zeron</string>
+    <string>Noches</string>
     <key>CFBundleExecutable</key>
     <string>zeron</string>
     <key>CFBundleIconFile</key>
-    <string>zeron.icns</string>
+    <string>noches.icns</string>
     <key>CFBundleIdentifier</key>
-    <string>sh.zeron.app</string>
+    <string>app.noches.desktop</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Zeron</string>
+    <string>Noches</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -28,9 +28,11 @@
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>sh.zeron.app.conversation</string>
+            <string>app.noches.desktop.conversation</string>
             <key>CFBundleURLSchemes</key>
             <array>
+                <string>noches</string>
+                <!-- Keep opening links copied by earlier builds. -->
                 <string>zeron</string>
             </array>
         </dict>

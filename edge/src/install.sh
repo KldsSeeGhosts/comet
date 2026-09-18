@@ -22,7 +22,7 @@ case "$os" in
   Linux) plat=linux ;;
   Darwin)
     echo "zeron install: on macOS, download the desktop app instead:" >&2
-    echo "  $BASE/releases/latest.txt → $BASE/releases/zeron-<version>-macos-arm64.dmg" >&2
+    echo "  $BASE/releases/latest.txt -> $BASE/releases/noches-<version>-macos-arm64.dmg" >&2
     exit 1
     ;;
   *)

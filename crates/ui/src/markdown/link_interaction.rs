@@ -329,7 +329,7 @@ impl Element for LinkRanges {
                         window.refresh();
                     });
                 for (action_ix, (action, label, icon)) in [
-                    (LinkAction::Internal, "Open in Zeron", icons::GLOBE),
+                    (LinkAction::Internal, "Open in Noches", icons::GLOBE),
                     (
                         LinkAction::External,
                         "Open in external browser",
@@ -375,7 +375,7 @@ impl Element for LinkRanges {
                         false,
                         format!("{}-link-{index}-default-destination", self.id),
                     )
-                    .id("Open links in Zeron")
+                    .id("Open links in Noches")
                     .child(div().w(px(16.)).flex_none().when(open_in_zeron, |el| {
                         el.child(
                             icons::icon(icons::CHECK)
@@ -383,13 +383,13 @@ impl Element for LinkRanges {
                                 .text_color(theme.text_muted),
                         )
                     }))
-                    .child("Open links in Zeron")
+                    .child("Open links in Noches")
                     .track_focus(&state.menu_focus[3])
                     .role(Role::Button)
                     .aria_label(if open_in_zeron {
-                        "Open links in Zeron, checked"
+                        "Open links in Noches, checked"
                     } else {
-                        "Open links in Zeron, unchecked"
+                        "Open links in Noches, unchecked"
                     })
                     .focus_visible(|s| s.bg(crate::theme::card_selected_bg()))
                     .on_click(move |_, window, cx| {

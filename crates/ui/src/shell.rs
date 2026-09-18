@@ -1966,11 +1966,19 @@ impl Shell {
         } else {
             self.route = Route::Chat;
         }
+        // Workspace mode: the navigation's pane rebind lands in a deferred
+        // observer — force it now so the staged shot belongs to the composer
+        // that survives (the focused pane's post-rebind surface), not the
+        // entity the rebind is about to replace.
+        if self.workspace_mode() {
+            self.apply_explicit_workspace_navigation(target.clone(), cx);
+        }
         let key = target.unwrap_or_default();
-        self.composer.update(cx, |composer, cx| {
+        let composer = self.active_composer();
+        composer.update(cx, |composer, cx| {
             composer.stage_appshot_for(key, appshot, cx)
         });
-        window.focus(&self.composer.focus_handle(cx), cx);
+        window.focus(&composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -1981,9 +1989,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.route = Route::Chat;
-        self.composer
-            .update(cx, |composer, cx| composer.show_appshot_error(message, cx));
-        window.focus(&self.composer.focus_handle(cx), cx);
+        let composer = self.active_composer();
+        composer.update(cx, |composer, cx| composer.show_appshot_error(message, cx));
+        window.focus(&composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -2179,7 +2187,7 @@ impl Shell {
                 {
                     let body = match connectivity {
                         zeron_proto::ConnectivityState::Offline => "Your device is offline",
-                        _ => "Zeron is trying to reconnect",
+                        _ => "Noches is trying to reconnect",
                     };
                     crate::notify::post("Connection unavailable", body, None);
                 }
@@ -2235,59 +2243,27 @@ impl Shell {
         if state.read(cx).chats_synced {
             self.prune_dead_workspace_sessions(cx);
         }
+        // Consume explicit navigation on every state change, not only a
+        // project switch. Same-project sidebar navigation must focus an
+        // already-open pane instead of rebinding the currently focused one.
+        // Deep links originate in AppState, so collect their resolved target
+        // here and feed it through the same path.
+        let deep_link_nav = state
+            .update(cx, |state, _| state.take_workspace_navigation())
+            .map(Some);
+        let explicit_nav = self.pending_explicit_nav.take().or(deep_link_nav);
+
         // WS5: the content area holds the ACTIVE SPACE's workspace tree.
-        // Restore it on boot (first synced frame) and on every space switch;
-        // the remembered focused pane re-selects its chat in AppState.
+        // Restore it on boot (first synced frame) and on every space switch.
         let selected_space = state.read(cx).selected_space.clone();
         if state.read(cx).spaces_synced
             && (!self.workspace_space_loaded || self.active_workspace_space != selected_space)
         {
-            // Consume pending explicit navigation intent (set by open_chat /
-            // open_new_session). `None` = passive restore (boot or background
-            // space sync) where the saved layout's focus should win.
-            let explicit_nav = self.pending_explicit_nav.take();
             self.workspace_space_loaded = true;
             self.restore_workspace_layout(selected_space, cx);
-            // Re-apply the explicit target so the user's intent wins over
-            // whatever the restored layout's focused pane had (or lacked).
-            // For Some(chat_id): if the chat already exists in a pane, focus
-            // that pane instead of overwriting another pane's binding.
-            // For None (new-session): clear the focused pane's binding.
-            if let Some(nav_target) = explicit_nav {
-                match nav_target {
-                    Some(ref chat_id) => {
-                        // Search the restored layout for a pane already
-                        // bound to this session; focus it rather than
-                        // duplicating the binding.
-                        let existing = self.find_pane_with_session(chat_id);
-                        if let Some(pane) = existing {
-                            self.workspace.layout.focus_pane(pane).ok();
-                            self.retarget_to_focused_pane(cx);
-                        } else {
-                            self.workspace.sync_focused_session(Some(chat_id));
-                            let current = self.state.read(cx).selected_chat.clone();
-                            if current.as_deref() != Some(chat_id.as_str()) {
-                                let target = chat_id.clone();
-                                self.state.update(cx, |state, cx| {
-                                    state.select_chat(Some(target), cx)
-                                });
-                            }
-                        }
-                    }
-                    None => {
-                        // New-session intent: clear the focused pane so the
-                        // user lands on the fresh composer canvas.
-                        self.workspace
-                            .sync_focused_session(None);
-                        let current = self.state.read(cx).selected_chat.clone();
-                        if current.is_some() {
-                            self.state.update(cx, |state, cx| {
-                                state.select_chat(None, cx)
-                            });
-                        }
-                    }
-                }
-            }
+        }
+        if let Some(nav_target) = explicit_nav {
+            self.apply_explicit_workspace_navigation(nav_target, cx);
         }
         // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
         // fall back to "All" rather than filtering everything out.
@@ -2661,7 +2637,7 @@ impl Shell {
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
-                self.composer
+                self.active_composer()
                     .update(cx, |composer, _| composer.focus_pending = false);
                 panel.update(cx, |panel, cx| {
                     panel.select_tab_by_key(tab, cx);
@@ -3303,7 +3279,8 @@ impl Shell {
                 }
                 self.browser_subs.remove(&id);
                 if was_active {
-                    window.focus(&self.composer.focus_handle(cx), cx);
+                    let composer = self.active_composer();
+                    window.focus(&composer.focus_handle(cx), cx);
                 }
             }
             RightSurface::Diff(id) => {
@@ -3513,7 +3490,7 @@ impl Shell {
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
         if open {
-            self.composer
+            self.active_composer()
                 .update(cx, |composer, _| composer.focus_pending = false);
             panel.update(cx, |panel, cx| panel.request_focus(cx));
             // Opening lands keyboard focus IN the shell — typing goes straight
@@ -3528,7 +3505,8 @@ impl Shell {
             // hand focus to the composer. (Cmd+J is a pure toggle — a second
             // press closes even while the terminal is focused, as in zeron's
             // `useHotkey(toggleShortcut, ... setOpenScoped(!open))`.)
-            window.focus(&self.composer.focus_handle(cx), cx);
+            let composer = self.active_composer();
+            window.focus(&composer.focus_handle(cx), cx);
         }
         self.terminal_tween_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -3718,7 +3696,7 @@ impl Shell {
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.sidebar_notice = Some("Zeron conversation link copied".into());
+            self.sidebar_notice = Some("Noches conversation link copied".into());
         } else {
             self.sidebar_notice = Some("Conversation link is not ready yet".into());
         }
@@ -4166,7 +4144,7 @@ impl Shell {
         self.command_palette.is_some()
             || self.add_space.is_some()
             || self.tool_picker.is_some()
-            || self.composer.read(cx).pickers().read(cx).is_open()
+            || self.active_composer().read(cx).pickers().read(cx).is_open()
     }
 
     /// Track held modifiers for sidebar jump hints and the queue's submit hint.
@@ -4190,7 +4168,7 @@ impl Shell {
         let queue_shortcut_revealed = matches!(self.route, Route::Chat)
             && !self.overlay_owns_keyboard(cx)
             && modifier_send_hint_visible(primary, mods.alt, mods.shift);
-        self.composer.update(cx, |composer, cx| {
+        self.active_composer().update(cx, |composer, cx| {
             composer.set_queue_shortcut_revealed(queue_shortcut_revealed, cx)
         });
     }
@@ -4217,8 +4195,21 @@ impl Shell {
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
-        self.composer
-            .update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
+        // Every composer holding state for the deleted chat purges — the
+        // shared dock entity AND each pane's fixed composer (a pane bound to
+        // the deleted chat drops back to its canvas draft).
+        let mut composers = vec![self.composer.clone()];
+        for surface in self.workspace.chat_surfaces.values() {
+            if !composers
+                .iter()
+                .any(|composer| composer.entity_id() == surface.composer.entity_id())
+            {
+                composers.push(surface.composer.clone());
+            }
+        }
+        for composer in composers {
+            composer.update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
+        }
         self.mutate(
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
             cx,
@@ -4620,7 +4611,7 @@ impl Shell {
                     },
                     Err(err) => {
                         shell.runtime_change_error = Some(format!(
-                            "Could not stop the remote engine: {err}. Run `zeron daemon stop`, then quit and reopen Zeron."
+                            "Could not stop the remote engine: {err}. Run `zeron daemon stop`, then quit and reopen Noches."
                         ).into());
                         cx.notify();
                     }
@@ -6509,7 +6500,7 @@ impl Shell {
         }
     }
 
-    /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
+    /// Fetch the manifest and stage the new Noches desktop bundle under the data dir
     /// (tokio — reqwest); the strip flips to "restart to apply" when done.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
         let edge_url = self.boot.edge_url.clone();
@@ -6851,7 +6842,7 @@ impl Shell {
         } else if remote_engine {
             "Stop daemon and quit"
         } else {
-            "Quit Zeron"
+            "Quit Noches"
         };
 
         if self.sync_flow == SyncFlow::Enabling && needs_org {
@@ -6876,7 +6867,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Finish signing in in your browser. Zeron will keep using this local workspace until you quit and reopen.",
+                        "Finish signing in in your browser. Noches will keep using this local workspace until you quit and reopen.",
                     )),
                 )
                 .child(
@@ -6920,14 +6911,14 @@ impl Shell {
                     )
                     .into(),
                     (Some(email), None) => format!(
-                        "You're signed in as {email}. Zeron can switch to your synced workspace now."
+                        "You're signed in as {email}. Noches can switch to your synced workspace now."
                     )
                     .into(),
                     (None, Some(phrase)) => format!(
                         "Bring {phrase} from this device into your synced workspace, or start it fresh."
                     )
                     .into(),
-                    (None, None) => "Zeron can switch to your synced workspace now.".into(),
+                    (None, None) => "Noches can switch to your synced workspace now.".into(),
                 };
                 let mut actions = div()
                     .mt(px(16.0))
@@ -7116,9 +7107,9 @@ impl Shell {
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
                         if remote_engine {
-                            "Zeron is using a background daemon. Stop it and quit Zeron, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Noches is using a background daemon. Stop it and quit Noches, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
                         } else {
-                            "Quit and reopen Zeron to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            "Quit and reopen Noches to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
                         },
                     )),
                 )
@@ -7163,7 +7154,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Zeron will remove your credentials, close the synced workspace, and continue in local mode.",
+                        "Noches will remove your credentials, close the synced workspace, and continue in local mode.",
                     )),
                 )
                 .child(
@@ -7327,7 +7318,7 @@ impl Shell {
             .unwrap_or(Indicator::None);
         let interrupting = selected_chat
             .as_deref()
-            .is_some_and(|chat_id| self.composer.read(cx).is_interrupting(chat_id));
+            .is_some_and(|chat_id| self.active_composer().read(cx).is_interrupting(chat_id));
         let escape_stops_active_agent = self.settings.escape_stops_active_agent;
 
         match resolve_shell_escape(
@@ -7342,7 +7333,7 @@ impl Shell {
             ShellEscapeOutcome::Blocked => cx.stop_propagation(),
             ShellEscapeOutcome::InterruptChat(chat_id) => {
                 cx.stop_propagation();
-                self.composer
+                self.active_composer()
                     .update(cx, |composer, cx| composer.interrupt_chat(chat_id, cx));
             }
             ShellEscapeOutcome::OtherKey | ShellEscapeOutcome::Ignored => {}
@@ -7475,7 +7466,7 @@ impl Shell {
                                     .size(px(16.0))
                                     .text_color(theme.text_muted),
                             )
-                            .child(SharedString::from("Zeron conversation link")),
+                            .child(SharedString::from("Noches conversation link")),
                     )
                     .when_some(harness_link, |menu, link| {
                         menu.child(
@@ -7824,10 +7815,10 @@ impl Shell {
         // card. New-chat mode mints the chat id on first send.
         //
         // Workspace mode (any split/extra tab/pane — shell/panes.rs) renders
-        // the pane tree instead: the focused pane hosts `self.transcript`,
-        // the shared dock composer below stays its live composer, and dormant
-        // panes carry ghost strips. The single-pane parity gate keeps the
-        // untouched default layout on the exact historical path below.
+        // the pane tree instead: every Chat pane hosts its own transcript and
+        // composer (pane-owned surfaces), and the shared dock composer below
+        // stays suppressed. The single-pane parity gate keeps the untouched
+        // default layout on the exact historical path below.
         let departing_transcript = !has_selection && dock_frame.transcript() > 0.0;
         if !has_selection && !departing_transcript {
             self.transcript
@@ -7912,6 +7903,9 @@ impl Shell {
         };
 
         let status = self.render_status_strip(cx);
+        let single_pane_drag_preview = (!workspace_mode)
+            .then(|| self.split_drag.as_ref().and_then(panes::preview_visual))
+            .flatten();
         // Attachment dropzone over the ENTIRE conversation column (transcript
         // + composer, not just the pill). OS images keep using the upload
         // pipeline; workspace files/directories and file tabs become the same
@@ -7931,13 +7925,14 @@ impl Shell {
             .flex_col()
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 let paths = paths.paths().to_vec();
-                this.composer
-                    .update(cx, |composer, cx| composer.add_paths(paths, cx));
+                let composer = this.active_composer();
+                composer.update(cx, |composer, cx| composer.add_paths(paths, cx));
                 cx.notify();
             }))
             .on_drop::<WorkspacePathDrag>(cx.listener(
                 |this, payload: &WorkspacePathDrag, window, cx| {
-                    this.composer.update(cx, |composer, cx| {
+                    let composer = this.active_composer();
+                    composer.update(cx, |composer, cx| {
                         composer.add_workspace_path(&payload.path, payload.is_directory, window, cx)
                     });
                     cx.notify();
@@ -7945,23 +7940,42 @@ impl Shell {
             ))
             .on_drop::<RightTabDrag>(cx.listener(|this, payload: &RightTabDrag, window, cx| {
                 if let Some(path) = &payload.workspace_path {
-                    this.composer.update(cx, |composer, cx| {
+                    let composer = this.active_composer();
+                    composer.update(cx, |composer, cx| {
                         composer.add_workspace_path(&path.path, path.is_directory, window, cx)
                     });
                 }
                 cx.notify();
             }))
             // Sidebar session drag-to-split: dropping a sidebar chat row onto
-            // the single-pane content area creates a split. When workspace
-            // mode is already active the workspace_outlet handles this; this
-            // receiver covers the default single-pane screen.
-            .on_drop::<crate::pane::TabSplitDrag>(cx.listener(
-                |this, payload: &crate::pane::TabSplitDrag, _, cx| {
-                    if payload.source == crate::pane::hit_test::DragSource::SidebarSession {
-                        this.accept_sidebar_session_drop(payload, cx);
-                    }
-                },
-            ))
+            // the single-pane content area creates a split. These listeners
+            // live on the dropzone only on the default single-pane screen:
+            // in workspace mode the workspace_outlet owns the TabSplitDrag
+            // family outright (one writer for `split_drag` — a second
+            // capture-phase `on_drag_move` here would clobber the outlet's
+            // resolution and its flip-smoothing anchor between samples).
+            .when(!workspace_mode, |zone| {
+                zone.on_drop::<crate::pane::TabSplitDrag>(cx.listener(
+                    |this, payload: &crate::pane::TabSplitDrag, _, cx| {
+                        if payload.source == crate::pane::hit_test::DragSource::SidebarSession {
+                            this.commit_split_drop(payload, cx);
+                        }
+                    },
+                ))
+                .on_drag_move::<crate::pane::TabSplitDrag>(cx.listener(
+                    |this, event: &gpui::DragMoveEvent<crate::pane::TabSplitDrag>, _, cx| {
+                        this.apply_single_pane_drag_move(event, cx);
+                    },
+                ))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| this.cancel_split_drag(cx)),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| this.cancel_split_drag(cx)),
+                )
+            })
             // The hero is deliberately outside the transcript EdgeFade below:
             // it must paint under the overlaid titlebar instead of becoming
             // fully transparent across the titlebar's inset band.
@@ -8050,15 +8064,12 @@ impl Shell {
                     )
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
-                        // WS3 composer re-homing: in workspace mode the live
-                        // composer is hosted INSIDE the focused chat pane
+                        // WS3 composer re-homing: in workspace mode each Chat
+                        // pane renders its OWN composer as its footer
                         // (pane/render.rs), so the shared outer dock is
-                        // suppressed. Tradeoffs (documented in
-                        // shell/panes.rs): the dock clock keeps ticking for
-                        // the trivial route, so re-entering single-chat mode
-                        // re-docks normally, but the hero↔dock glide and the
-                        // composer's measured available width (still fed from
-                        // the full main column) do not track pane geometry.
+                        // suppressed. The dock clock keeps ticking for the
+                        // trivial route, so re-entering single-chat mode
+                        // re-docks normally.
                         if workspace_mode {
                             el
                         } else {
@@ -8112,6 +8123,37 @@ impl Shell {
                     })
                     .child("Drop to attach"),
             )
+            .children(single_pane_drag_preview.map(|preview| {
+                let bounds = preview.bounds;
+                match preview.kind {
+                    // Workspace-outer drop: the outer ring — a heavier ring
+                    // hugging the region's own edge with a lighter wash, so
+                    // it reads as the workspace-level gesture rather than a
+                    // pane half (§3 full-region highlight, doc 06 "outer
+                    // drop ring").
+                    crate::pane::hit_test::PreviewKind::ViewRing => div()
+                        .absolute()
+                        .left(bounds.origin.x + px(2.0))
+                        .top(bounds.origin.y + px(2.0))
+                        .w(bounds.size.width - px(4.0))
+                        .h(bounds.size.height - px(4.0))
+                        .rounded(px(8.0))
+                        .border_2()
+                        .border_color(theme.accent)
+                        .bg(theme.accent.opacity(0.06)),
+                    // Interior pane edge: the half-pane band.
+                    crate::pane::hit_test::PreviewKind::PaneHalf => div()
+                        .absolute()
+                        .left(bounds.origin.x)
+                        .top(bounds.origin.y)
+                        .w(bounds.size.width)
+                        .h(bounds.size.height)
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.accent)
+                        .bg(theme.accent.opacity(0.12)),
+                }
+            }))
             .into_any_element()
     }
 
@@ -8378,7 +8420,7 @@ impl Shell {
         let elapsed_secs = started
             .map(|t| now.signed_duration_since(t).num_seconds().max(0))
             .unwrap_or(0);
-        let sending = self.composer.read(cx).is_sending();
+        let sending = self.active_composer().read(cx).is_sending();
 
         // Unused here since the Working loader moved into the transcript
         // (its trailer computes its own elapsed).
@@ -8696,7 +8738,7 @@ impl Shell {
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(
-                        "Zeron removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
+                        "Noches removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
                     )),
             )
             .when_some(self.runtime_change_error.clone(), |card, error| {
@@ -9343,7 +9385,7 @@ impl Shell {
                         .text_size(crate::typography::ui_rems(18.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(SharedString::from("Log in to Zeron")),
+                        .child(SharedString::from("Log in to Noches")),
                 )
                 .child(
                     div()
@@ -9498,11 +9540,11 @@ impl Shell {
         // then existing memberships and the account escape hatch.
         let blurb: SharedString = match email {
             Some(email) => format!(
-                "Zeron is organized around workspaces — create one for yourself or your team. Signed in as {email}."
+                "Noches is organized around workspaces - create one for yourself or your team. Signed in as {email}."
             )
             .into(),
             None => {
-                "Zeron is organized around workspaces — create one for yourself or your team."
+                "Noches is organized around workspaces - create one for yourself or your team."
                     .into()
             }
         };
@@ -10073,7 +10115,7 @@ impl Render for Shell {
                 |this: &mut Shell, window, cx| {
                     if !window.is_window_active() {
                         this.set_jump_hints(false, cx);
-                        this.composer.update(cx, |composer, cx| {
+                        this.active_composer().update(cx, |composer, cx| {
                             composer.set_queue_shortcut_revealed(false, cx)
                         });
                     }
@@ -10087,7 +10129,7 @@ impl Render for Shell {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
                 let root = this.shortcut_focus.clone();
                 let unfocused = this.unfocused.clone();
-                let preferred = this.composer.focus_handle(cx);
+                let preferred = this.active_composer().focus_handle(cx);
                 window.on_next_frame(move |window, cx| {
                     restore_mounted_focus(&root, &preferred, &unfocused, window, cx);
                 });
@@ -10096,7 +10138,7 @@ impl Render for Shell {
         }
         let shortcut_focus = self.shortcut_focus.clone();
         let unfocused = self.unfocused.clone();
-        let preferred_focus = self.composer.focus_handle(cx);
+        let preferred_focus = self.active_composer().focus_handle(cx);
         window.defer(cx, move |window, cx| {
             restore_mounted_focus(&shortcut_focus, &preferred_focus, &unfocused, window, cx);
         });
@@ -10176,7 +10218,8 @@ impl Render for Shell {
                     if !this.right_pane_open(cx) {
                         // The hidden editor can retain a focus handle after unmounting.
                         // Restore a mounted target so the next shortcut can reopen it.
-                        window.focus(&this.composer.focus_handle(cx), cx);
+                        let composer = this.active_composer();
+                        window.focus(&composer.focus_handle(cx), cx);
                     }
                 }
             }))
@@ -10195,7 +10238,7 @@ impl Render for Shell {
             // this matched binding beats its key handler to the dispatch —
             // forward the slot instead of eating it.
             .on_action(cx.listener(|this, jump: &JumpSession, _, cx| {
-                let pickers = this.composer.read(cx).pickers().clone();
+                let pickers = this.active_composer().read(cx).pickers().clone();
                 let handled = pickers.update(cx, |pickers, cx| pickers.jump_model_slot(jump.0, cx));
                 if !handled && !this.overlay_owns_keyboard(cx) {
                     this.jump_to_session(jump.0, cx)
@@ -10229,9 +10272,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &SplitViewDown, _, cx| {
                 this.split_workspace_view(Direction::Down, cx)
             }))
-            .on_action(cx.listener(|this, _: &CloseSplitView, _, cx| {
-                this.close_workspace_view(cx)
-            }));
+            .on_action(
+                cx.listener(|this, _: &CloseSplitView, _, cx| this.close_workspace_view(cx)),
+            );
 
         let render_gate = if restart_required {
             GatePhase::Loading
@@ -10272,7 +10315,7 @@ impl Render for Shell {
                 // than in `on_state_changed`).
                 if self.debug_dialog.as_deref() == Some("model") {
                     self.debug_dialog = None;
-                    self.composer
+                    self.active_composer()
                         .update(cx, |c, cx| c.debug_open_model_menu(window, cx));
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.
@@ -10316,9 +10359,17 @@ impl Render for Shell {
                     self.bottom_stack_has_composer.get(),
                     expected_has_composer,
                 );
+                let workspace_mode = self.workspace_mode();
                 self.transcript.update(cx, |t, cx| {
                     t.set_rail_enabled(rail::rail_visible(main_width), cx);
-                    if bottom_stack_ready && expected_has_composer {
+                    // Workspace panes lay the composer out as a flex footer.
+                    // It consumes pane height instead of floating over the
+                    // transcript, so carrying the single-pane dock clearance
+                    // into this mode creates a second, stale composer-sized
+                    // gap whenever focus changes.
+                    if workspace_mode {
+                        t.set_bottom_clearance(0.0, cx);
+                    } else if bottom_stack_ready && expected_has_composer {
                         t.set_bottom_clearance(stack_h, cx);
                     }
                 });
@@ -13069,7 +13120,13 @@ mod workspace_persistence {
                 shell.on_state_changed(&shell.state.clone(), cx);
                 // First pass: the tree restores, unknown sessions are kept
                 // optimistically (chats could still be syncing elsewhere).
-                assert!(shell.workspace.layout.pane(zeron_workspace::PaneId(3)).is_some());
+                assert!(
+                    shell
+                        .workspace
+                        .layout
+                        .pane(zeron_workspace::PaneId(3))
+                        .is_some()
+                );
                 // Next frame: chats are synced, the dead binding clears.
                 shell.on_state_changed(&shell.state.clone(), cx);
                 let pane = shell
@@ -13117,6 +13174,130 @@ mod workspace_persistence {
     }
 
     #[gpui::test]
+    fn same_project_navigation_focuses_an_existing_pane_without_rebinding(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| init_app(dir.path(), cx));
+        let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.spaces = vec![serde_json::from_value(space("p")).unwrap()];
+                    state.chats = vec![
+                        serde_json::from_value(chat("a", "p")).unwrap(),
+                        serde_json::from_value(chat("b", "p")).unwrap(),
+                    ];
+                    state.selected_space = Some("p".into());
+                    state.selected_chat = Some("a".into());
+                    state.chats_synced = true;
+                    state.spaces_synced = true;
+                });
+                shell.on_state_changed(&shell.state.clone(), cx);
+
+                let pane_a = shell.workspace.focused_pane().unwrap();
+                shell.workspace.sync_focused_session(Some("a"));
+                let pane_b = shell
+                    .workspace
+                    .split_focused_pane(Direction::Right)
+                    .unwrap();
+                shell
+                    .workspace
+                    .set_pane_session(pane_b, Some("b".into()))
+                    .unwrap();
+                shell.workspace.focus_pane(pane_a).unwrap();
+
+                shell.open_chat("b".into(), cx);
+                shell.on_state_changed(&shell.state.clone(), cx);
+
+                assert_eq!(shell.workspace.focused_pane(), Some(pane_b));
+                assert_eq!(
+                    shell
+                        .workspace
+                        .layout
+                        .pane(pane_a)
+                        .unwrap()
+                        .session_id
+                        .as_deref(),
+                    Some("a")
+                );
+                assert_eq!(
+                    shell
+                        .workspace
+                        .layout
+                        .pane(pane_b)
+                        .unwrap()
+                        .session_id
+                        .as_deref(),
+                    Some("b")
+                );
+                assert_eq!(shell.pending_explicit_nav, None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn deep_link_target_wins_over_the_restored_workspace_focus(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| init_app(dir.path(), cx));
+        let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+                    state.local_device_id = Some("local".into());
+                    state.spaces = vec![
+                        serde_json::from_value(space("a")).unwrap(),
+                        serde_json::from_value(space("b")).unwrap(),
+                    ];
+                    state.chats = vec![
+                        serde_json::from_value(chat("chat-a", "a")).unwrap(),
+                        serde_json::from_value(chat("chat-b", "b")).unwrap(),
+                        serde_json::from_value(chat("chat-c", "b")).unwrap(),
+                    ];
+                    state.selected_space = Some("a".into());
+                    state.selected_chat = Some("chat-a".into());
+                    state.chats_synced = true;
+                    state.spaces_synced = true;
+                });
+                shell.on_state_changed(&shell.state.clone(), cx);
+
+                let mut saved_b = crate::pane::PaneHost::new();
+                saved_b.sync_focused_session(Some("chat-c"));
+                shell
+                    .workspace_layouts
+                    .set_layout(Some("b"), saved_b.layout.clone());
+
+                let locator = crate::links::workspace_locator(
+                    Some(zeron_proto::WorkspaceScope::Local),
+                    None,
+                    Some("local"),
+                )
+                .unwrap();
+                let link = crate::links::zeron_conversation_link("chat-b", &locator);
+                shell
+                    .state
+                    .update(cx, |state, cx| state.open_deep_link(&link, cx));
+                shell.on_state_changed(&shell.state.clone(), cx);
+
+                assert_eq!(
+                    shell.state.read(cx).selected_chat.as_deref(),
+                    Some("chat-b")
+                );
+                let focused = shell.workspace.focused_pane().unwrap();
+                assert_eq!(
+                    shell
+                        .workspace
+                        .layout
+                        .pane(focused)
+                        .unwrap()
+                        .session_id
+                        .as_deref(),
+                    Some("chat-b")
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn gestures_never_arm_a_save_and_the_drag_end_does(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| init_app(dir.path(), cx));
@@ -13139,7 +13320,9 @@ mod workspace_persistence {
                     shell.workspace_save_task.is_none(),
                     "mid-gesture saves are forbidden"
                 );
-                assert!(!crate::workspace_layout_store::WorkspaceLayoutStore::path(dir.path()).exists());
+                assert!(
+                    !crate::workspace_layout_store::WorkspaceLayoutStore::path(dir.path()).exists()
+                );
                 // The drag commits: end_divider_drag clears the latch and
                 // arms the save (still debounced, so the file only appears
                 // once the flush runs).

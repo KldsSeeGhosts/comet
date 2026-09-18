@@ -404,3 +404,88 @@ fn generic_tree_schema_and_edge_detection() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn closing_active_pane_focuses_the_nearest_sibling() -> Result<()> {
+    // Nested on the right: A | (B / C). Closing the active C must focus B
+    // (the seam leaf), not the tree's global first leaf A.
+    let mut layout = WorkspaceLayout::new();
+    let a = layout.active_pane_id().unwrap();
+    let b = layout.split_pane(a, Direction::Right, state("b"))?;
+    let c = layout.split_pane(b, Direction::Down, state("c"))?;
+    assert_eq!(layout.active_pane_id(), Some(c));
+    layout.close_pane(c)?;
+    assert_eq!(
+        layout.active_pane_id(),
+        Some(b),
+        "closing C focuses the seam sibling B, not the first leaf {a:?}"
+    );
+
+    // Nested on the left: (A / B) | C. Closing the active C must focus B
+    // (the sibling subtree's last leaf hugging the seam), not A.
+    let mut layout = WorkspaceLayout::new();
+    let a = layout.active_pane_id().unwrap();
+    let b = layout.split_pane(a, Direction::Down, state("b"))?;
+    let c = layout.split_pane(b, Direction::Right, state("c"))?;
+    assert_eq!(layout.active_pane_id(), Some(c));
+    layout.close_pane(c)?;
+    assert_eq!(
+        layout.active_pane_id(),
+        Some(b),
+        "closing C focuses the seam sibling B, not the first leaf {a:?}"
+    );
+    layout.validate()
+}
+
+#[test]
+fn closing_a_background_pane_keeps_focus() -> Result<()> {
+    let mut layout = WorkspaceLayout::new();
+    let a = layout.active_pane_id().unwrap();
+    let b = layout.split_pane(a, Direction::Right, state("b"))?;
+    let c = layout.split_pane(b, Direction::Down, state("c"))?;
+    layout.focus_pane(c)?;
+    layout.close_pane(a)?;
+    assert_eq!(layout.active_pane_id(), Some(c));
+    layout.validate()
+}
+
+#[test]
+fn closing_active_tab_focuses_the_adjacent_tab() -> Result<()> {
+    let mut layout = WorkspaceLayout::new();
+    let view = layout.active_view_id;
+    let t1 = layout.views[&view].active_tab_id;
+    let t2 = layout.add_tab(view, state("t2"))?;
+    let t3 = layout.add_tab(view, state("t3"))?;
+    assert_eq!(layout.views[&view].active_tab_id, t3);
+    layout.focus_tab(view, t2)?;
+    layout.close_tab(view, t2)?;
+    assert_eq!(
+        layout.views[&view].active_tab_id, t3,
+        "the tab after the closed one, not the first tab {t1:?}"
+    );
+    layout.focus_tab(view, t3)?;
+    layout.close_tab(view, t3)?;
+    assert_eq!(
+        layout.views[&view].active_tab_id, t1,
+        "the tab before when there is no tab after"
+    );
+    layout.validate()
+}
+
+#[test]
+fn closing_active_view_focuses_the_adjacent_view() -> Result<()> {
+    let mut layout = WorkspaceLayout::new();
+    let v1 = layout.active_view_id;
+    let v2 = layout.split_view(v1, Direction::Right, state("v2"))?;
+    let v3 = layout.split_view(v2, Direction::Right, state("v3"))?;
+    assert_eq!(layout.active_view_id, v3);
+    layout.close_view(v3)?;
+    assert_eq!(
+        layout.active_view_id, v2,
+        "the view before the closed one, not the first view {v1:?}"
+    );
+    layout.focus_view(v1)?;
+    layout.close_view(v1)?;
+    assert_eq!(layout.active_view_id, v2, "the view after the closed one");
+    layout.validate()
+}

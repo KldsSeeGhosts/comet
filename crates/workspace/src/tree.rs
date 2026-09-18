@@ -95,6 +95,14 @@ impl<T> SplitNode<T> {
         }
     }
 
+    /// The last leaf of this subtree (the mirror of [`Self::first_leaf`]).
+    pub fn last_leaf(&self) -> &T {
+        match self {
+            Self::Leaf { content } => content,
+            Self::Split { second, .. } => second.last_leaf(),
+        }
+    }
+
     pub(crate) fn collect<'a>(&'a self, depth: usize, leaves: &mut Vec<&'a T>) -> Result<()> {
         if depth > MAX_DEPTH {
             return Err(LayoutError::Limit("tree depth"));
@@ -198,24 +206,71 @@ impl<T: Copy + Eq> SplitNode<T> {
         }
     }
 
-    /// Remove a leaf and promote its sibling. None means the entire tree was removed.
-    pub(crate) fn remove(self, target: T) -> Option<Self> {
+    /// Remove a leaf and promote its sibling.
+    ///
+    /// Returns `(surviving tree, nearest surviving leaf)`:
+    /// - the tree is `None` when the removed leaf was the entire tree;
+    /// - the nearest leaf is the promoted sibling subtree's leaf that hugs
+    ///   the seam the removed leaf left behind: its first leaf when the
+    ///   removed leaf sat in the first child, its last leaf when it sat in
+    ///   the second. `None` when the target was not present (the tree comes
+    ///   back unchanged).
+    ///
+    /// Callers use the nearest leaf as the focus fallback after a close, so
+    /// focus lands beside the closed leaf instead of on the tree's global
+    /// first leaf.
+    pub(crate) fn remove(self, target: T) -> (Option<Self>, Option<T>) {
         match self {
-            Self::Leaf { content } => (content != target).then_some(Self::Leaf { content }),
+            Self::Leaf { content } => {
+                if content == target {
+                    (None, None)
+                } else {
+                    (Some(Self::Leaf { content }), None)
+                }
+            }
             Self::Split {
                 horizontal,
                 ratio,
                 first,
                 second,
-            } => match (first.remove(target), second.remove(target)) {
-                (Some(first), Some(second)) => Some(Self::Split {
-                    horizontal,
-                    ratio,
-                    first: Box::new(first),
-                    second: Box::new(second),
-                }),
-                (first, second) => first.or(second),
-            },
+            } => {
+                let (new_first, first_nearest) = first.remove(target);
+                let Some(new_first) = new_first else {
+                    // The first child WAS the removed leaf: the second child
+                    // is promoted whole, and its first leaf hugs the seam.
+                    let nearest = *second.first_leaf();
+                    return (Some(*second), Some(nearest));
+                };
+                if let Some(nearest) = first_nearest {
+                    // Removed deeper inside the surviving first child.
+                    return (
+                        Some(Self::Split {
+                            horizontal,
+                            ratio,
+                            first: Box::new(new_first),
+                            second,
+                        }),
+                        Some(nearest),
+                    );
+                }
+                // Not in the first child: try the second.
+                let (new_second, second_nearest) = second.remove(target);
+                let Some(new_second) = new_second else {
+                    // The second child WAS the removed leaf: the first child
+                    // is promoted whole, and its last leaf hugs the seam.
+                    let nearest = *new_first.last_leaf();
+                    return (Some(new_first), Some(nearest));
+                };
+                (
+                    Some(Self::Split {
+                        horizontal,
+                        ratio,
+                        first: Box::new(new_first),
+                        second: Box::new(new_second),
+                    }),
+                    second_nearest,
+                )
+            }
         }
     }
 }

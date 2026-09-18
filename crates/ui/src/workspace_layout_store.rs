@@ -175,7 +175,9 @@ impl WorkspaceLayoutStore {
 fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    std::fs::File::open(path)?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -193,8 +195,12 @@ mod tests {
     /// A non-trivial layout built through the engine's public ops.
     fn sample_layout() -> WorkspaceLayout {
         let mut layout = WorkspaceLayout::new();
-        layout.split_view(ViewId(1), Direction::Right, Default::default()).unwrap();
-        layout.split_pane(PaneId(3), Direction::Down, Default::default()).unwrap();
+        layout
+            .split_view(ViewId(1), Direction::Right, Default::default())
+            .unwrap();
+        layout
+            .split_pane(PaneId(3), Direction::Down, Default::default())
+            .unwrap();
         layout.set_view_ratio(&[], 0.72).unwrap();
         layout.validate().unwrap();
         layout
@@ -206,7 +212,8 @@ mod tests {
         let mut store = WorkspaceLayoutStore::load(dir.path());
         let a = sample_layout();
         let mut b = WorkspaceLayout::new();
-        b.split_pane(PaneId(3), Direction::Right, Default::default()).unwrap();
+        b.split_pane(PaneId(3), Direction::Right, Default::default())
+            .unwrap();
         let none = WorkspaceLayout::new();
         store.set_layout(Some("space-a"), a.clone());
         store.set_layout(Some("space-b"), b.clone());
@@ -253,7 +260,10 @@ mod tests {
         .unwrap();
         let store = WorkspaceLayoutStore::load(dir.path());
         assert_eq!(store.layout_for(Some("a")), None);
-        assert!(!store.needs_save(), "a corrupt load must not look like a change");
+        assert!(
+            !store.needs_save(),
+            "a corrupt load must not look like a change"
+        );
         // The damaged file survives until a real change rewrites it.
         assert!(WorkspaceLayoutStore::path(dir.path()).exists());
     }

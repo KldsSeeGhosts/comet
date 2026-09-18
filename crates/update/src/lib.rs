@@ -107,10 +107,11 @@ pub fn headless_artifact(version: &str) -> String {
     format!("zeron-{version}-{os}-{arch}.tar.gz")
 }
 
-/// `zeron-<ver>-macos-<arch>-app.tar.gz` — the macOS app update payload.
+/// `noches-<ver>-macos-<arch>-app.tar.gz` - the macOS app update payload, named
+/// after the `Noches.app` bundle it carries (see `scripts/package-macos.sh`).
 pub fn mac_app_artifact(version: &str) -> String {
     let (_, arch) = platform_key();
-    format!("zeron-{version}-macos-{arch}-app.tar.gz")
+    format!("noches-{version}-macos-{arch}-app.tar.gz")
 }
 
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
@@ -479,6 +480,9 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
 pub fn restart_service() -> anyhow::Result<()> {
     require_managed_update_platform()?;
     if cfg!(target_os = "macos") {
+        // The LaunchAgent label `zeron daemon` installs - deliberately not the
+        // `app.noches.desktop` bundle id: renaming it would orphan the daemon
+        // on every machine whose service was installed under the old name.
         let output = std::process::Command::new("id").arg("-u").output()?;
         let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
         run(
@@ -494,7 +498,21 @@ pub fn restart_service() -> anyhow::Result<()> {
 // macOS app-bundle installs — the desktop path
 // ---------------------------------------------------------------------------
 
-/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Zeron.app`
+/// The bundle the packaging script tars at the archive root. Only the bundle
+/// moved with the Noches rename; the executable inside the app stays `zeron`.
+const MAC_APP_BUNDLE: &str = "Noches.app";
+/// Bundle-relative executable, present only once the tarball fully unpacked.
+const MAC_APP_EXECUTABLE: &str = "Contents/MacOS/zeron";
+
+/// The app bundle unpacked under `dir`, or `None` when the tarball did not
+/// carry one - a pre-rename `Zeron.app` payload (or a half-finished unpack)
+/// must never be swapped over the installed app.
+fn unpacked_app_bundle(dir: &Path) -> Option<PathBuf> {
+    let bundle = dir.join(MAC_APP_BUNDLE);
+    bundle.join(MAC_APP_EXECUTABLE).is_file().then_some(bundle)
+}
+
+/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Noches.app`
 /// (idempotent). Returns the staged bundle path.
 pub async fn stage_mac_app(
     edge_url: &str,
@@ -505,8 +523,7 @@ pub async fn stage_mac_app(
     require_mac_app_update_platform()?;
     let version = &manifest.version;
     let dir = data_dir.join("updates").join(version);
-    let staged = dir.join("Zeron.app");
-    if staged.join("Contents/MacOS/zeron").exists() {
+    if let Some(staged) = unpacked_app_bundle(&dir) {
         return Ok(staged);
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -524,10 +541,8 @@ pub async fn stage_mac_app(
         ],
     )?;
     std::fs::remove_file(&tarball).ok();
-    if !staged.join("Contents/MacOS/zeron").exists() {
-        bail!("app tarball {file} did not contain Zeron.app");
-    }
-    Ok(staged)
+    unpacked_app_bundle(&dir)
+        .with_context(|| format!("app tarball {file} did not contain {MAC_APP_BUNDLE}"))
 }
 
 /// Swap the installed bundle for the staged one: `ditto` the staged copy next to
@@ -878,6 +893,18 @@ mod tests {
         );
         assert_eq!(
             detect_install_from_for_os(
+                Path::new("/Applications/Noches.app/Contents/MacOS/zeron"),
+                Some(Path::new("/Users/u")),
+                "macos",
+            ),
+            InstallKind::MacApp {
+                bundle: PathBuf::from("/Applications/Noches.app")
+            }
+        );
+        // Pre-rename bundles are still app installs: they must keep updating in
+        // place (the updater swaps the running bundle, whatever its name).
+        assert_eq!(
+            detect_install_from_for_os(
                 Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
                 Some(Path::new("/Users/u")),
                 "macos",
@@ -909,7 +936,28 @@ mod tests {
             headless_artifact("0.2.0"),
             format!("zeron-0.2.0-{os}-{arch}.tar.gz")
         );
-        assert!(mac_app_artifact("0.2.0").ends_with("-app.tar.gz"));
+        let (_, arch) = platform_key();
+        assert_eq!(
+            mac_app_artifact("0.2.0"),
+            format!("noches-0.2.0-macos-{arch}-app.tar.gz")
+        );
+    }
+
+    #[test]
+    fn staged_app_bundle_must_be_the_packaged_noches_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A pre-rename payload left in the staging dir does not satisfy the
+        // check: staging re-downloads instead of swapping a stale bundle in.
+        let legacy = tmp.path().join("Zeron.app");
+        std::fs::create_dir_all(legacy.join("Contents/MacOS")).unwrap();
+        std::fs::write(legacy.join("Contents/MacOS/zeron"), "").unwrap();
+        assert_eq!(unpacked_app_bundle(tmp.path()), None);
+
+        let bundle = tmp.path().join("Noches.app");
+        std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        assert_eq!(unpacked_app_bundle(tmp.path()), None, "no executable yet");
+        std::fs::write(bundle.join("Contents/MacOS/zeron"), "").unwrap();
+        assert_eq!(unpacked_app_bundle(tmp.path()), Some(bundle));
     }
 
     #[cfg(windows)]
@@ -960,10 +1008,13 @@ mod tests {
                 .contains("not supported on windows")
         );
         assert!(
-            apply_mac_app(&data_dir.join("Zeron.app"), &data_dir.join("Installed.app"))
-                .unwrap_err()
-                .to_string()
-                .contains("not supported on windows")
+            apply_mac_app(
+                &data_dir.join("Noches.app"),
+                &data_dir.join("Installed.app")
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not supported on windows")
         );
         assert!(
             restart_service()

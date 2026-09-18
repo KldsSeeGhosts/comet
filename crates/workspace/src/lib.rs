@@ -159,16 +159,17 @@ impl SplitTabLayout {
             .panes
             .remove(&pane)
             .ok_or(LayoutError::NotFound("pane"))?;
-        self.root = self
-            .root
-            .clone()
-            .remove(pane)
-            .ok_or(LayoutError::Last("pane in tab"))?;
+        let (root, nearest) = self.root.clone().remove(pane);
+        self.root = root.ok_or(LayoutError::Last("pane in tab"))?;
+        // Focus falls back to the surviving leaf nearest the closed pane
+        // (the promoted sibling subtree's seam leaf), never the tree's
+        // global first leaf.
+        let fallback = || nearest.unwrap_or_else(|| *self.root.first_leaf());
         if self.active_pane_id == pane {
-            self.active_pane_id = *self.root.first_leaf();
+            self.active_pane_id = fallback();
         }
         if self.primary_pane_id == pane {
-            self.primary_pane_id = *self.root.first_leaf();
+            self.primary_pane_id = fallback();
         }
         Ok(state)
     }
@@ -372,13 +373,13 @@ impl WorkspaceLayout {
             return Err(LayoutError::Last("view"));
         }
         self.views.remove(&view);
-        self.root = self
-            .root
-            .clone()
-            .remove(view)
-            .ok_or(LayoutError::Last("view"))?;
+        let (root, nearest) = self.root.clone().remove(view);
+        self.root = root.ok_or(LayoutError::Last("view"))?;
         if self.active_view_id == view {
-            self.active_view_id = *self.root.first_leaf();
+            // Focus the surviving view adjacent to the closed one (the
+            // promoted sibling region's seam leaf), not the global first
+            // leaf.
+            self.active_view_id = nearest.unwrap_or_else(|| *self.root.first_leaf());
         }
         Ok(())
     }
@@ -395,10 +396,15 @@ impl WorkspaceLayout {
             return self.close_view_inner(view);
         }
         state.tab_order = state.ordered_tabs();
+        // Focus falls back to the NEAREST surviving tab: the one that follows
+        // the closed tab in strip order, else the one before it.
+        let neighbour = nearest_in_order(&state.tab_order, tab);
         state.tab_order.retain(|id| *id != tab);
         state.tabs.remove(&tab);
         if state.active_tab_id == tab {
-            state.active_tab_id = state.tab_order[0];
+            state.active_tab_id = neighbour
+                .or_else(|| state.tab_order.first().copied())
+                .unwrap_or(tab);
         }
         Ok(())
     }
@@ -613,6 +619,17 @@ fn unique_id(ids: &mut BTreeSet<u64>, id: u64) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The nearest surviving neighbour of `closed` in an ordered strip: the id
+/// that follows it, else the one before it. `None` when the list holds only
+/// `closed` (or not the closed id at all).
+fn nearest_in_order<T: Copy + Eq>(order: &[T], closed: T) -> Option<T> {
+    let index = order.iter().position(|id| *id == closed)?;
+    order
+        .get(index + 1)
+        .copied()
+        .or_else(|| index.checked_sub(1).and_then(|i| order.get(i)).copied())
 }
 
 fn reachable<T: Ord, V>(root: &SplitNode<T>, map: &BTreeMap<T, V>) -> Result<()> {

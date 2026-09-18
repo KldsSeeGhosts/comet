@@ -149,6 +149,7 @@ mod tests {
             "javascript:alert(1)",
             "file:///tmp/a",
             "data:text/html,hi",
+            "noches://open/chat/a",
             "zeron://open/chat/a",
             "https://user:pass@example.com",
             "https://",

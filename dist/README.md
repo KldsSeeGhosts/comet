@@ -20,15 +20,20 @@ The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 ## macOS
 
 ```sh
-scripts/package-macos.sh    # → target/package/zeron-<version>-macos-<arch>.dmg
+scripts/package-macos.sh    # → target/package/noches-<version>-macos-<arch>.dmg
 ```
 
-Builds the release binary, assembles `Zeron.app` (Info.plist + icns), ad-hoc
+Builds the release binary, assembles `Noches.app` (Info.plist + icns), ad-hoc
 signs it (set `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a
-dmg. The auto-update tarball retains an internal `Zeron.app` path so older
-installed builds can update into Zeron. CI runs this on tags
+dmg. Bundle identity: `app.noches.desktop`, internal executable `zeron`, icon
+`noches.icns`, and the `noches://` deep-link scheme. The legacy `zeron://`
+scheme stays declared so links copied by earlier builds keep opening. The
+auto-update tarball (`noches-<version>-macos-<arch>-app.tar.gz`) contains
+`Noches.app` at the archive root, which is the path the updater swaps in;
+`scripts/run-macos-dev.sh` builds the isolated `Noches Dev.app` under
+`app.noches.desktop.dev`. CI runs this on tags
 (`.github/workflows/release.yml`). The manual steps it automates, for reference
-(run on a macOS host — gpui needs Metal; no cross-build from Linux):
+(run on a macOS host - gpui needs Metal; no cross-build from Linux):
 
 1. Build the universal (or per-arch) binary:
    ```sh
@@ -40,23 +45,23 @@ installed builds can update into Zeron. CI runs this on tags
    ```
 2. Assemble the bundle:
    ```sh
-   mkdir -p Zeron.app/Contents/{MacOS,Resources}
-   cp zeron Zeron.app/Contents/MacOS/zeron
+   mkdir -p Noches.app/Contents/{MacOS,Resources}
+   cp zeron Noches.app/Contents/MacOS/zeron
    sed "s/__VERSION__/$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')/" \
-     dist/macos/Info.plist > Zeron.app/Contents/Info.plist
+     dist/macos/Info.plist > Noches.app/Contents/Info.plist
    ```
-3. Icon: generate `zeron.icns` from `dist/macos/icon-1024.png` (the macOS-shaped
-   variant of the artwork — squircle mask, margins, and shadow pre-baked, since
+3. Icon: generate `noches.icns` from `dist/macos/icon-1024.png` (the macOS-shaped
+   variant of the artwork - squircle mask, margins, and shadow pre-baked, since
    `sips` can't apply an alpha mask) and place it at
-   `Zeron.app/Contents/Resources/zeron.icns`:
+   `Noches.app/Contents/Resources/noches.icns`:
    ```sh
-   mkdir zeron.iconset && sips -z 256 256 dist/macos/icon-1024.png --out zeron.iconset/icon_256x256.png
-   iconutil -c icns zeron.iconset -o Zeron.app/Contents/Resources/zeron.icns
+   mkdir noches.iconset && sips -z 256 256 dist/macos/icon-1024.png --out noches.iconset/icon_256x256.png
+   iconutil -c icns noches.iconset -o Noches.app/Contents/Resources/noches.icns
    ```
 4. Sign + notarize (required for distribution):
    ```sh
-   codesign --deep --force --options runtime --sign "Developer ID Application: …" Zeron.app
-   xcrun notarytool submit Zeron.zip --keychain-profile … --wait
-   xcrun stapler staple Zeron.app
+   codesign --deep --force --options runtime --sign "Developer ID Application: …" Noches.app
+   xcrun notarytool submit Noches.zip --keychain-profile … --wait
+   xcrun stapler staple Noches.app
    ```
-5. Ship as a `.dmg` (`hdiutil create -volname Zeron -srcfolder Zeron.app -ov -format UDZO Zeron.dmg`).
+5. Ship as a `.dmg` (`hdiutil create -volname Noches -srcfolder Noches.app -ov -format UDZO Noches.dmg`).

@@ -1,16 +1,15 @@
 //! Pane-host foundation (WS2 of the split-pane workspace feature).
 //!
 //! [`PaneHost`] owns the [`WorkspaceLayout`] tree (the `zeron-workspace`
-//! engine: view → tab → pane hierarchy) plus the per-pane dormant transcript
-//! cache, and drives the content area's split panes. See
+//! engine: view → tab → pane hierarchy) plus the per-pane chat surfaces
+//! ([`PaneChatSurface`]), and drives the content area's split panes. See
 //! `docs/plans/2026-09-17-split-pane-workspace-analysis.md` §WS2.
 //!
-//! Hosting model (analysis §3.2): only the FOCUSED pane hosts the shell's
-//! live [`Transcript`] + [`Composer`] pair, which stay bound to
-//! `AppState::selected_chat` exactly as before. Every other chat pane renders
-//! as a dormant composition (pane/ chrome.rs ghost strip + a cached read-only
-//! transcript entity); clicking it re-focuses the pane, which re-selects its
-//! chat in `AppState` and thereby retargets the live views. Split actions:
+//! Hosting model: every Chat-mode pane owns a persistent
+//! [`Transcript`] + [`Composer`] pair bound to the pane's session (or the
+//! new-chat canvas for an unbound pane) — nothing moves with focus. Pane
+//! focus still re-selects the pane's chat in `AppState` so the sidebar and
+//! global actions keep their single-selection model. Split actions:
 //! `workspace::{SplitPaneRight, SplitPaneDown, SplitViewRight, SplitViewDown,
 //! CloseSplitView}` (shell.rs).
 //!
@@ -35,21 +34,21 @@ pub mod chrome;
 pub mod hit_test;
 pub mod render;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
-use std::cell::RefCell;
 
 use gpui::{
-    AppContext as _, Bounds, Entity, IntoElement, ParentElement as _, Pixels, SharedString,
-    Styled as _, div, px,
+    Bounds, Entity, IntoElement, ParentElement as _, Pixels, SharedString, Styled as _,
+    Subscription, div, px,
 };
 use zeron_workspace::{
-    Branch, Direction, LayoutError, PaneId, PaneMode, PaneState, Result, SplitNode, TabId, ViewId,
-    WorkspaceLayout, MAX_RATIO,
+    Branch, Direction, LayoutError, MAX_RATIO, PaneId, PaneMode, PaneState, Result, SplitNode,
+    TabId, ViewId, WorkspaceLayout,
 };
 
+use crate::composer::Composer;
 use crate::icons::{self, icon};
-use crate::state::AppState;
 use crate::theme::Theme;
 use crate::transcript::Transcript;
 
@@ -150,7 +149,12 @@ impl gpui::Render for SplitDragGhost {
             .text_size(crate::typography::ui_rems(11.0))
             .text_color(theme.text)
             .opacity(0.9)
-            .child(icon(self.mark.icon).size(px(11.0)).flex_none().text_color(tint))
+            .child(
+                icon(self.mark.icon)
+                    .size(px(11.0))
+                    .flex_none()
+                    .text_color(tint),
+            )
             .child(div().min_w_0().truncate().child(self.title.clone()))
     }
 }
@@ -190,7 +194,8 @@ pub fn ratio_from_pointer(
     if usable <= 0.0 {
         return None;
     }
-    let at = f64::from(pointer_along_axis) - f64::from(container_origin) - f64::from(divider_px) / 2.0;
+    let at =
+        f64::from(pointer_along_axis) - f64::from(container_origin) - f64::from(divider_px) / 2.0;
     Some((at / usable).clamp(MIN_RATIO, MAX_RATIO))
 }
 
@@ -238,19 +243,15 @@ pub(crate) fn tool_pane_state(kind: ToolKind) -> PaneState {
     }
 }
 
-/// What a picked tool row commits (no layout happens until a row is picked —
-/// ⌘D/⇧⌘D only OPEN the picker; Esc cancels with zero layout change, §2).
+/// What a picked tool row commits. Pane splits create the standard
+/// session-less Chat pane directly, so the picker is only a tab launcher.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PickerCommit {
-    /// Split the focused pane (⌘D / ⇧⌘D semantics).
-    SplitPane(Direction),
     /// Add a tab to one view ("+" in a tab strip — no split).
     AddTab { view: ViewId },
 }
 
-/// Open tool-picker state: the commit contract plus the window-space anchor
-/// (the focused pane's top-left for ⌘D/⇧⌘D per §2; the "+" trigger's position
-/// for tab strips).
+/// Open tool-picker state: the add-tab target plus its window-space anchor.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ToolPickerState {
     pub commit: PickerCommit,
@@ -258,21 +259,45 @@ pub(crate) struct ToolPickerState {
 }
 
 /// Pane-header context-menu state (right-click, §6 — the menu also focuses
-/// the pane, which returns its composer from the ghost state).
+/// the pane, which routes keyboard focus to its own composer).
 #[derive(Clone)]
 pub(crate) struct PaneMenuState {
     pub pane: PaneId,
     pub position: gpui::Point<Pixels>,
 }
 
-/// Shell-side workspace state: the layout tree plus per-pane dormant views.
+/// The transcript + composer a Chat-mode pane owns. Created by the shell
+/// (entity construction needs a `Context`), keyed by pane so the layout can
+/// rebind sessions without moving entities between panes. `chat_id` mirrors
+/// the layout's `PaneState.session_id` — the validity key the shell's
+/// ensure pass compares against — and the pane composer's own target watch
+/// keeps it current when the composer binds or resets itself (mint /
+/// failed first send) ahead of the layout commit.
+pub(crate) struct PaneChatSurface {
+    pub chat_id: Option<String>,
+    /// `None` on the new-chat canvas: the transcript is minted by the first
+    /// send (the composer event handler creates it), not at surface creation.
+    pub transcript: Option<Entity<Transcript>>,
+    pub composer: Entity<Composer>,
+    /// Held for RAII: dropping the surface unsubscribes the event stream.
+    #[allow(dead_code)]
+    pub composer_events: Subscription,
+    /// Mirrors the composer's `ChatTarget` into `chat_id` on bind/reset —
+    /// queued ahead of the `select_chat` observers that rebind the layout.
+    /// Held for RAII like `composer_events`.
+    #[allow(dead_code)]
+    pub composer_observation: Subscription,
+    pub transcript_events: Option<Subscription>,
+}
+
+/// Shell-side workspace state: the layout tree plus per-pane chat surfaces.
 pub struct PaneHost {
     pub layout: WorkspaceLayout,
-    /// Dormant transcript views keyed by pane. Only created for panes with a
-    /// bound session; the FOCUSED pane never renders from this cache (it
-    /// renders the shell's live transcript instead). Entries for dead panes
-    /// are dropped by [`PaneHost::prune_caches`].
-    pub pane_transcripts: HashMap<PaneId, Entity<Transcript>>,
+    /// Per-pane transcript+composer pairs for every Chat-mode pane, keyed by
+    /// pane. Created lazily by the shell's render pass for every pane in the
+    /// tree (focus no longer moves views); dead-pane entries are dropped by
+    /// [`PaneHost::prune_caches`].
+    pub(crate) chat_surfaces: HashMap<PaneId, PaneChatSurface>,
     /// Last painted pane bounds, recorded by a paint-time canvas in
     /// [`render`](crate::pane::render). Consumed as the tool-picker's anchor
     /// (the focused pane's top-left) and by WS4's drag resolution.
@@ -300,7 +325,7 @@ impl PaneHost {
     pub fn new() -> Self {
         Self {
             layout: WorkspaceLayout::new(),
-            pane_transcripts: HashMap::new(),
+            chat_surfaces: HashMap::new(),
             pane_bounds: Rc::new(RefCell::new(BTreeMap::new())),
             view_bounds: Rc::new(RefCell::new(BTreeMap::new())),
             chip_bounds: Rc::new(RefCell::new(BTreeMap::new())),
@@ -328,12 +353,12 @@ impl PaneHost {
     }
 
     /// WS5 restore: replace the whole tree with a (validated) stored layout.
-    /// Every cache resets so dormant views and paint registries rebuild
+    /// Every cache resets so pane surfaces and paint registries rebuild
     /// against the restored pane ids. Not a mutation — the dirty latch
     /// CLEARS, because the restored tree is the store's own content.
     pub fn install_layout(&mut self, layout: WorkspaceLayout) {
         self.layout = layout;
-        self.pane_transcripts.clear();
+        self.chat_surfaces.clear();
         self.pane_bounds.borrow_mut().clear();
         self.view_bounds.borrow_mut().clear();
         self.chip_bounds.borrow_mut().clear();
@@ -341,16 +366,12 @@ impl PaneHost {
     }
 
     /// The registry handle the renderer's paint-time canvas writes into.
-    pub(crate) fn pane_bounds_handle(
-        &self,
-    ) -> Rc<RefCell<BTreeMap<PaneId, Bounds<Pixels>>>> {
+    pub(crate) fn pane_bounds_handle(&self) -> Rc<RefCell<BTreeMap<PaneId, Bounds<Pixels>>>> {
         self.pane_bounds.clone()
     }
 
     /// WS4: the view-region registry handle (see [`Self::pane_bounds`]).
-    pub(crate) fn view_bounds_handle(
-        &self,
-    ) -> Rc<RefCell<BTreeMap<ViewId, Bounds<Pixels>>>> {
+    pub(crate) fn view_bounds_handle(&self) -> Rc<RefCell<BTreeMap<ViewId, Bounds<Pixels>>>> {
         self.view_bounds.clone()
     }
 
@@ -359,11 +380,6 @@ impl PaneHost {
         &self,
     ) -> Rc<RefCell<BTreeMap<(ViewId, TabId), Bounds<Pixels>>>> {
         self.chip_bounds.clone()
-    }
-
-    /// The focused pane's last painted window bounds.
-    pub(crate) fn focused_pane_bounds(&self) -> Option<Bounds<Pixels>> {
-        self.pane_bounds.borrow().get(&self.focused_pane()?).copied()
     }
 
     // ---- focus / structure queries ----
@@ -375,7 +391,9 @@ impl PaneHost {
     }
 
     pub fn focused_view(&self) -> Option<ViewId> {
-        self.layout.views.contains_key(&self.layout.active_view_id)
+        self.layout
+            .views
+            .contains_key(&self.layout.active_view_id)
             .then_some(self.layout.active_view_id)
     }
 
@@ -427,6 +445,12 @@ impl PaneHost {
         let result = self.layout.close_view(target);
         self.touched(result)?;
         Ok(target)
+    }
+
+    /// Close a specific top-level view from its visible strip control.
+    pub fn close_view(&mut self, view: ViewId) -> Result<()> {
+        let result = self.layout.close_view(view);
+        self.touched(result)
     }
 
     /// Close one pane (tab/view follow via the engine when they empty out).
@@ -506,7 +530,12 @@ impl PaneHost {
     /// Tab chip dropped on a strip: move/reorder to sit before `before`
     /// (`None` = append). Handles both same-strip reorder and cross-view
     /// moves; a same-position drop early-Ok's (the no-op restore).
-    pub fn reorder_tab_in_view(&mut self, tab: TabId, view: ViewId, before: Option<TabId>) -> Result<()> {
+    pub fn reorder_tab_in_view(
+        &mut self,
+        tab: TabId,
+        view: ViewId,
+        before: Option<TabId>,
+    ) -> Result<()> {
         let result = self.layout.reorder_tab(tab, view, before);
         self.touched(result)
     }
@@ -522,7 +551,12 @@ impl PaneHost {
     /// pane subtree becomes the half-pane beside `pane` toward `direction`
     /// (`merge_tab`; the emptied source tab/view close automatically, and the
     /// moved subtree's active pane takes focus).
-    pub fn merge_tab_into_pane(&mut self, tab: TabId, pane: PaneId, direction: Direction) -> Result<()> {
+    pub fn merge_tab_into_pane(
+        &mut self,
+        tab: TabId,
+        pane: PaneId,
+        direction: Direction,
+    ) -> Result<()> {
         let result = self.layout.merge_tab(tab, pane, direction);
         self.touched(result)
     }
@@ -530,7 +564,12 @@ impl PaneHost {
     /// Pane header dropped on a pane's INTERIOR edge: the pane moves beside
     /// the target toward `direction` (`move_pane`; already-sibling panes
     /// swap, emptied tabs/views close, the moved pane takes focus).
-    pub fn move_pane_beside(&mut self, source: PaneId, target: PaneId, direction: Direction) -> Result<()> {
+    pub fn move_pane_beside(
+        &mut self,
+        source: PaneId,
+        target: PaneId,
+        direction: Direction,
+    ) -> Result<()> {
         let result = self.layout.move_pane(source, target, direction);
         self.touched(result)
     }
@@ -564,6 +603,10 @@ impl PaneHost {
 
     /// Bind a session to a pane (`None` = new-thread pane). Committed through
     /// `compose` so the revision advances exactly once per real change.
+    /// Surface lifecycle is NOT decided here: the shell's ensure pass is the
+    /// sole authority that compares `PaneChatSurface.chat_id` to the layout
+    /// binding and recreates stale surfaces, so a just-bound pane composer
+    /// can never be dropped by an observation-order race.
     pub fn set_pane_session(&mut self, pane: PaneId, session_id: Option<String>) -> Result<()> {
         let revision = self.layout.revision;
         let result = self.layout.compose(revision, |draft| {
@@ -572,10 +615,14 @@ impl PaneHost {
             }
             Ok(())
         });
-        // Invalidate the cached transcript so the next render creates one
-        // bound to the new session (or drops it for an unbound pane).
-        self.pane_transcripts.remove(&pane);
         self.touched(result)
+    }
+
+    /// Latch the persistence flag without a structural mutation — the pane
+    /// composer's mint commits its session through the selection-sync path,
+    /// which may have landed the identical binding already.
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     /// Selection sync (the sidebar ↔ pane bridge): bind the FOCUSED pane's
@@ -598,33 +645,21 @@ impl PaneHost {
             .is_ok()
     }
 
-    // ---- per-pane views ----
+    // ---- per-pane surfaces ----
 
-    /// The dormant transcript view for a pane, creating it on first request.
-    /// Built read-only over the pane's chat doc (like a subagent tab); it
-    /// lights up once per-chat projections land (WS5) — today the dormant
-    /// chrome above it carries the pane's identity.
-    pub fn transcript_for_pane(
-        &mut self,
-        pane: PaneId,
-        state: Entity<AppState>,
-        cx: &mut gpui::App,
-    ) -> Option<Entity<Transcript>> {
-        let session = self
-            .layout
-            .pane(pane)
-            .and_then(|state| state.session_id.clone())?;
-        // Start a document feed for this session so the dormant transcript
-        // actually receives messages. `watch_subagent_doc` is single-flight.
-        state.update(cx, |s, cx| s.watch_subagent_doc(session.clone(), cx));
-        Some(
-            self.pane_transcripts
-                .entry(pane)
-                .or_insert_with(|| {
-                    cx.new(|cx| Transcript::for_doc(state, session.clone(), true, cx))
-                })
-                .clone(),
-        )
+    /// Every Chat-mode pane's `(id, session binding)` across ALL views and
+    /// tabs — the inventory [`PaneHost::chat_surfaces`] must hold live
+    /// entities for. The shell's render pass creates or recreates a surface
+    /// for each entry whose `chat_id` doesn't match.
+    pub(crate) fn chat_pane_sessions(&self) -> Vec<(PaneId, Option<String>)> {
+        self.layout
+            .views
+            .values()
+            .flat_map(|view| view.tabs.values())
+            .flat_map(|tab| tab.panes.iter())
+            .filter(|(_, state)| state.mode == PaneMode::Chat)
+            .map(|(id, state)| (*id, state.session_id.clone()))
+            .collect()
     }
 
     /// Drop cache entries whose pane left the tree, and reset to the default
@@ -635,12 +670,19 @@ impl PaneHost {
             self.layout = WorkspaceLayout::new();
             self.dirty = true;
         }
-        let live = live_pane_ids(&self.layout.views);
-        let stale = stale_cache_keys(&live, self.pane_transcripts.keys().copied());
-        for pane in stale {
-            self.pane_transcripts.remove(&pane);
+        if is_trivial_layout(&self.layout) {
+            // The single-pane parity path renders the shell's global
+            // entities; pane surfaces exist only for workspace mode.
+            self.chat_surfaces.clear();
         }
-        self.pane_bounds.borrow_mut().retain(|pane, _| live.contains(pane));
+        let live = live_pane_ids(&self.layout.views);
+        let stale = stale_cache_keys(&live, self.chat_surfaces.keys().copied());
+        for pane in stale {
+            self.chat_surfaces.remove(&pane);
+        }
+        self.pane_bounds
+            .borrow_mut()
+            .retain(|pane, _| live.contains(pane));
         let live_views: BTreeSet<ViewId> = self.layout.views.keys().copied().collect();
         self.view_bounds
             .borrow_mut()
@@ -669,9 +711,10 @@ pub fn is_trivial_layout(layout: &WorkspaceLayout) -> bool {
     if layout.views.len() != 1 {
         return false;
     }
-    layout.views.values().all(|view| {
-        view.tabs.len() == 1 && view.tabs.values().all(|tab| tab.panes.len() == 1)
-    })
+    layout
+        .views
+        .values()
+        .all(|view| view.tabs.len() == 1 && view.tabs.values().all(|tab| tab.panes.len() == 1))
 }
 
 /// Every pane id reachable from a workspace (leaves of every tab's pane
@@ -687,7 +730,10 @@ pub fn live_pane_ids(
 
 /// Cache keys not in `live`, in deterministic order — the pure half of
 /// [`PaneHost::prune_caches`].
-pub fn stale_cache_keys(live: &BTreeSet<PaneId>, cached: impl Iterator<Item = PaneId>) -> Vec<PaneId> {
+pub fn stale_cache_keys(
+    live: &BTreeSet<PaneId>,
+    cached: impl Iterator<Item = PaneId>,
+) -> Vec<PaneId> {
     let mut stale: Vec<PaneId> = cached.filter(|pane| !live.contains(pane)).collect();
     stale.sort_unstable();
     stale
@@ -1000,16 +1046,23 @@ mod tests {
         let ratio = ratio_from_pointer(4.0, 0.0, 1000.0, hit).unwrap();
         assert_eq!(ratio, MIN_RATIO);
         // Origin offsets (nested containers) subtract cleanly.
-        let ratio =
-            ratio_from_pointer(1000.0 + 0.3 * (1000.0 - hit) + hit / 2.0, 1000.0, 1000.0, hit)
-                .unwrap();
+        let ratio = ratio_from_pointer(
+            1000.0 + 0.3 * (1000.0 - hit) + hit / 2.0,
+            1000.0,
+            1000.0,
+            hit,
+        )
+        .unwrap();
         assert!((ratio - 0.3).abs() < 1e-4);
     }
 
     #[test]
     fn ratio_from_pointer_clamps_and_degenerates() {
         // Way outside the children span clamps to the engine band.
-        assert_eq!(ratio_from_pointer(-500.0, 0.0, 1000.0, DIVIDER_HIT_PX), Some(MIN_RATIO));
+        assert_eq!(
+            ratio_from_pointer(-500.0, 0.0, 1000.0, DIVIDER_HIT_PX),
+            Some(MIN_RATIO)
+        );
         assert_eq!(
             ratio_from_pointer(5000.0, 0.0, 1000.0, DIVIDER_HIT_PX),
             Some(zeron_workspace::MAX_RATIO)
@@ -1018,8 +1071,14 @@ mod tests {
         assert_eq!(ratio_from_pointer(4.0, 0.0, 8.0, DIVIDER_HIT_PX), None);
         assert_eq!(ratio_from_pointer(4.0, 0.0, 7.0, DIVIDER_HIT_PX), None);
         // Non-finite input is rejected, never panes.
-        assert_eq!(ratio_from_pointer(f32::NAN, 0.0, 1000.0, DIVIDER_HIT_PX), None);
-        assert_eq!(ratio_from_pointer(4.0, 0.0, f32::INFINITY, DIVIDER_HIT_PX), None);
+        assert_eq!(
+            ratio_from_pointer(f32::NAN, 0.0, 1000.0, DIVIDER_HIT_PX),
+            None
+        );
+        assert_eq!(
+            ratio_from_pointer(4.0, 0.0, f32::INFINITY, DIVIDER_HIT_PX),
+            None
+        );
     }
 
     #[test]
@@ -1056,7 +1115,8 @@ mod tests {
         // → the inner split lives at path [First].
         host.focus_pane(original).unwrap();
         host.split_focused_pane(Direction::Right).unwrap();
-        host.set_pane_ratio(view, tab, &[Branch::First], 0.8).unwrap();
+        host.set_pane_ratio(view, tab, &[Branch::First], 0.8)
+            .unwrap();
         let root = &host.layout.views[&view].tabs[&tab].root;
         match root {
             SplitNode::Split { ratio, first, .. } => {
@@ -1090,7 +1150,10 @@ mod tests {
         let added = host.add_tab_to_view(view).unwrap();
         assert_eq!(host.layout.views[&view].tabs.len(), 2);
         assert_eq!(host.layout.views[&view].active_tab_id, added);
-        assert_eq!(host.layout.active_pane_id(), Some(host.layout.views[&view].tabs[&added].active_pane_id));
+        assert_eq!(
+            host.layout.active_pane_id(),
+            Some(host.layout.views[&view].tabs[&added].active_pane_id)
+        );
         // Closing the added tab restores the single-tab view.
         host.close_tab(view, added).unwrap();
         assert_eq!(host.layout.views[&view].tabs.len(), 1);
@@ -1171,7 +1234,10 @@ mod tests {
         assert_eq!(host.focused_pane(), Some(PaneId(6)));
         host.layout.validate().unwrap();
         // Merging a tab beside its OWN pane is refused and rolls back.
-        assert!(host.merge_tab_into_pane(tab, PaneId(3), Direction::Right).is_err());
+        assert!(
+            host.merge_tab_into_pane(tab, PaneId(3), Direction::Right)
+                .is_err()
+        );
         assert!(host.layout.validate().is_ok());
         assert_eq!(host.layout.views[&ViewId(1)].tabs[&tab].panes.len(), 3);
     }
@@ -1196,13 +1262,17 @@ mod tests {
     #[test]
     fn move_pane_beside_refuses_self_and_keeps_the_tree_valid() {
         let mut host = PaneHost::new();
-        assert!(host.move_pane_beside(PaneId(3), PaneId(3), Direction::Right).is_err());
+        assert!(
+            host.move_pane_beside(PaneId(3), PaneId(3), Direction::Right)
+                .is_err()
+        );
         assert!(host.is_trivial());
         host.layout.validate().unwrap();
         let new_pane = host.split_focused_pane(Direction::Right).unwrap();
         // pane4 sits RIGHT of pane3; dropping it on pane3's right edge is the
         // sibling-in-direction case → the panes SWAP, no new split nests.
-        host.move_pane_beside(new_pane, PaneId(3), Direction::Right).unwrap();
+        host.move_pane_beside(new_pane, PaneId(3), Direction::Right)
+            .unwrap();
         assert_eq!(host.focused_pane(), Some(new_pane));
         let tab = host.layout.views[&ViewId(1)].active_tab_id;
         assert_eq!(
@@ -1220,7 +1290,8 @@ mod tests {
         let second = host.add_tab_to_view(view).unwrap();
         // Same position: the engine's in-place early-return — the tree is
         // unchanged (the restore no-op; the revision counter alone ticks).
-        host.reorder_tab_in_view(second, view, Some(second)).unwrap();
+        host.reorder_tab_in_view(second, view, Some(second))
+            .unwrap();
         assert_eq!(host.layout.views[&view].ordered_tabs(), vec![first, second]);
         // Reorder before the first chip.
         host.reorder_tab_in_view(second, view, Some(first)).unwrap();
@@ -1230,10 +1301,7 @@ mod tests {
         let split_pane = host.split_focused_pane(Direction::Right).unwrap();
         let popped = host.pane_header_to_tab(split_pane, view).unwrap();
         assert_eq!(host.layout.views[&view].tabs.len(), 3);
-        assert_eq!(
-            host.layout.pane_location(split_pane),
-            Some((view, popped))
-        );
+        assert_eq!(host.layout.pane_location(split_pane), Some((view, popped)));
         host.layout.validate().unwrap();
     }
 
@@ -1247,7 +1315,10 @@ mod tests {
         assert!(host.is_dirty(), "session binding is a persisted change");
         host.take_dirty();
         host.focus_pane(PaneId(3)).unwrap();
-        assert!(!host.is_dirty(), "refocusing the already-focused pane is not a change");
+        assert!(
+            !host.is_dirty(),
+            "refocusing the already-focused pane is not a change"
+        );
         host.split_focused_pane(Direction::Right).unwrap();
         assert!(host.is_dirty());
         host.take_dirty();
@@ -1260,8 +1331,14 @@ mod tests {
         host.close_pane(PaneId(3)).unwrap();
         assert!(host.is_dirty());
         host.take_dirty();
-        assert!(host.close_pane(PaneId(4)).is_err(), "the last pane cannot close");
-        assert!(host.close_focused_view().is_err(), "the last view cannot close");
+        assert!(
+            host.close_pane(PaneId(4)).is_err(),
+            "the last pane cannot close"
+        );
+        assert!(
+            host.close_focused_view().is_err(),
+            "the last view cannot close"
+        );
         assert!(!host.is_dirty(), "engine rejections must not arm a save");
         assert!(host.layout.validate().is_ok());
         // install_layout is a LOAD, not a mutation: it clears the latch.
@@ -1270,7 +1347,7 @@ mod tests {
         host.install_layout(zeron_workspace::WorkspaceLayout::new());
         assert!(!host.is_dirty());
         assert!(host.is_trivial());
-        assert!(host.pane_transcripts.is_empty(), "caches reset with the tree");
+        assert!(host.chat_surfaces.is_empty(), "caches reset with the tree");
     }
 
     #[test]
@@ -1285,7 +1362,8 @@ mod tests {
         host.set_view_ratio(&[], 0.68).unwrap();
         let first_tab = host.layout.views[&ViewId(1)].active_tab_id;
         let added_tab = host.add_tab_to_view(ViewId(1)).unwrap();
-        host.add_tab_with(second_view, tool_pane_state(ToolKind::Terminal)).unwrap();
+        host.add_tab_with(second_view, tool_pane_state(ToolKind::Terminal))
+            .unwrap();
         // Land focus on the original session's pane and ITS tab.
         host.focus_tab(ViewId(1), first_tab).unwrap();
         host.focus_pane(PaneId(3)).unwrap();
@@ -1307,7 +1385,8 @@ mod tests {
             "focused pane persists (Super's active_pane_id)"
         );
         assert_eq!(
-            restored.views[&ViewId(1)].active_tab_id, first_tab,
+            restored.views[&ViewId(1)].active_tab_id,
+            first_tab,
             "per-view active tab persists"
         );
         assert!(restored.views[&ViewId(1)].tabs.contains_key(&added_tab));
@@ -1321,13 +1400,13 @@ mod tests {
         host.install_layout(restored);
         assert_eq!(host.focused_pane(), Some(PaneId(3)));
         assert_eq!(host.layout.views[&second_view].tabs.len(), 2);
-        assert!(host
-            .layout
-            .views[&second_view]
-            .tabs
-            .values()
-            .any(|tab| tab.panes.values().any(|p| p.mode == PaneMode::Terminal)),
-            "terminal tabs restore as tabs (never as PTYs)");
+        assert!(
+            host.layout.views[&second_view]
+                .tabs
+                .values()
+                .any(|tab| tab.panes.values().any(|p| p.mode == PaneMode::Terminal)),
+            "terminal tabs restore as tabs (never as PTYs)"
+        );
         assert!(!host.is_dirty());
     }
 

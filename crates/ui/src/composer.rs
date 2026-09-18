@@ -26,7 +26,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
+    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, Space, UserInputAnswer,
     UserInputQuestion, capabilities,
 };
 use zeron_rpc::{RpcError, methods};
@@ -37,7 +37,7 @@ use crate::motion;
 use crate::notice::{NoticeChipIcon, notice_chip};
 use crate::pickers::Pickers;
 use crate::settings::{ComposerSendBehavior, platform_combo};
-use crate::state::{AppState, Indicator};
+use crate::state::{AppState, ChatTarget, Indicator};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -3999,6 +3999,8 @@ fn slash_error_message(err: &RpcError) -> SharedString {
 
 pub struct Composer {
     pub(crate) state: Entity<AppState>,
+    /// The chat this instance serves (see [`ChatTarget`]).
+    pub(crate) target: ChatTarget,
     pub(crate) input: Entity<ComposerInput>,
     /// Draft displaced while a queued message occupies the composer.
     pub(crate) queue_edit_draft: Option<(String, Vec<StagedAttachment>, Vec<CapturedAppshot>)>,
@@ -4203,6 +4205,18 @@ impl Composer {
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        Self::with_target(state, ChatTarget::Selected, cx)
+    }
+
+    pub(crate) fn for_pane(
+        state: Entity<AppState>,
+        chat_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_target(state, ChatTarget::Fixed(chat_id), cx)
+    }
+
+    fn with_target(state: Entity<AppState>, target: ChatTarget, cx: &mut Context<Self>) -> Self {
         cx.on_release(|this, cx| this.release_queue_previews(cx))
             .detach();
         let input = cx.new(|cx| {
@@ -4211,7 +4225,13 @@ impl Composer {
             input.enable_mentions();
             input
         });
-        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        let pickers = match &target {
+            ChatTarget::Selected => cx.new(|cx| Pickers::new(state.clone(), cx)),
+            ChatTarget::Fixed(chat_id) => {
+                let chat_id = chat_id.clone();
+                cx.new(|cx| Pickers::for_pane(state.clone(), chat_id, cx))
+            }
+        };
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
@@ -4264,9 +4284,10 @@ impl Composer {
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
-        let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
+        let current_key = target.key(state.read(cx));
         let mut composer = Self {
             state,
+            target,
             input,
             queue_edit_draft: None,
             pickers,
@@ -4378,6 +4399,57 @@ impl Composer {
             }
         }
         composer
+    }
+
+    /// Bind a pane-fixed composer (and its pickers) to a chat — `send` calls
+    /// this with the just-minted id before the selection observer can run.
+    /// The input text is untouched; `ChatTarget::bind` is a no-op for the
+    /// global Selected composer.
+    pub(crate) fn bind_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.target.bind(chat_id.clone());
+        self.pickers
+            .update(cx, |pickers, cx| pickers.bind_chat(chat_id, cx));
+        self.current_key = self.target.key(self.state.read(cx));
+        cx.notify();
+    }
+
+    /// Back to the pane's new-chat canvas after the minted chat was deleted
+    /// on a failed first send (`bind_chat`'s inverse; no-op for Selected).
+    /// Notifies so a pane surface observing the target sees the reset
+    /// before the deselect's `set_pane_session` can invalidate it.
+    fn reset_fixed_target(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.target, ChatTarget::Fixed(_)) {
+            self.target = ChatTarget::Fixed(None);
+            self.current_key = String::new();
+            self.pickers
+                .update(cx, |pickers, cx| pickers.unbind_chat(cx));
+            cx.notify();
+        }
+    }
+
+    /// The space the target's canvas/git decisions resolve against: a bound
+    /// pane chat's own project, else the globally picked one (a `Fixed(None)`
+    /// pane's launch target, and the fallback while a fresh chat row syncs).
+    fn target_space<'a>(target: &'a ChatTarget, state: &'a AppState) -> Option<&'a Space> {
+        match target {
+            ChatTarget::Fixed(Some(_)) if target.chat(state).is_some() => target
+                .chat(state)
+                .and_then(|chat| chat.space_id.as_deref())
+                .and_then(|id| state.space_row(id)),
+            _ => state.selected_space_row(),
+        }
+    }
+
+    /// The device the target runs on: a bound pane chat's host, else the
+    /// canvas's effective pick.
+    fn target_device_id(target: &ChatTarget, state: &AppState) -> Option<String> {
+        match target {
+            ChatTarget::Fixed(Some(_)) => target
+                .chat(state)
+                .map(|chat| chat.device_id.clone())
+                .or_else(|| state.effective_device_id()),
+            _ => state.effective_device_id(),
+        }
     }
 
     /// Capture-knob passthrough (`ZERON_OPEN_DIALOG=model`): open the
@@ -5090,10 +5162,10 @@ impl Composer {
             let state = self.state.read(cx);
             let mut params = serde_json::Map::new();
             params.insert("query".into(), token.query.clone().into());
-            let target = if let Some(chat) = state.selected_chat_row() {
+            let target = if let Some(chat) = self.target.chat(state) {
                 params.insert("chatId".into(), chat.id.clone().into());
                 Some(chat.device_id.clone())
-            } else if let Some(space) = state.selected_space_row() {
+            } else if let Some(space) = Self::target_space(&self.target, state) {
                 params.insert("spaceId".into(), space.id.clone().into());
                 if let Some(path) = selected_worktree {
                     params.insert("path".into(), path.into());
@@ -5404,10 +5476,10 @@ impl Composer {
         };
         let target = {
             let state = self.state.read(cx);
-            state
-                .selected_chat_row()
+            self.target
+                .chat(state)
                 .map(|chat| chat.device_id.clone())
-                .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
+                .or_else(|| Self::target_space(&self.target, state).map(|s| s.device_id.clone()))
         };
         let request = self.slash.request;
         self.slash_task = Some(cx.spawn(async move |this, cx| {
@@ -5700,8 +5772,12 @@ impl Composer {
                     Indicator::Working | Indicator::AwaitingInput
                 )
             });
+            // `target_queue` is this composer's own projection — selected or
+            // pane-fixed — so removal markers verify against its rows without
+            // involving the selection.
+            let queue = Self::target_queue(&self.target, state);
             self.queue_removing
-                .retain(|id| state.queue.iter().any(|item| item.id == *id));
+                .retain(|id| queue.iter().any(|item| item.id == *id));
         }
         self.interrupt_tasks
             .retain(|chat_id, _| self.interrupting.contains(chat_id));
@@ -5709,12 +5785,17 @@ impl Composer {
         let editing_id = self.editing_queued.clone();
         let (key, pending, edited_row_exists) = {
             let s = self.state.read(cx);
+            // The edited row verifies against this composer's own queue
+            // projection — a pane composer checks its chat's rows even while
+            // another chat is selected.
             (
-                s.selected_chat.clone().unwrap_or_default(),
-                pending_input_request(&s.transcript),
-                editing_id
-                    .as_ref()
-                    .is_none_or(|id| s.queue.iter().any(|item| item.id == *id)),
+                self.target.key(s),
+                pending_input_request(self.target.transcript(s)),
+                editing_id.as_ref().is_none_or(|id| {
+                    Self::target_queue(&self.target, s)
+                        .iter()
+                        .any(|item| item.id == *id)
+                }),
             )
         };
 
@@ -5835,7 +5916,7 @@ impl Composer {
                     // assistant entry took over). Never on run death: the
                     // question stays answerable until answered — the engine
                     // delivers a dead run's answer as a resumed turn.
-                    let transcript = self.state.read(cx).transcript.clone();
+                    let transcript = self.target.transcript(self.state.read(cx)).to_vec();
                     let released = input_request_resolved(&transcript, &wizard.request_id)
                         || (!transcript.is_empty()
                             && !self.answered_requests.contains(&wizard.request_id));
@@ -5856,7 +5937,7 @@ impl Composer {
 
     pub(crate) fn run_live(&self, cx: &App) -> bool {
         let s = self.state.read(cx);
-        let Some(chat_id) = s.selected_chat.as_deref() else {
+        let Some(chat_id) = self.target.chat_id(s) else {
             return false;
         };
         matches!(
@@ -5875,7 +5956,7 @@ impl Composer {
         if state.review_comment_flush_pending(&self.current_key) {
             return true;
         }
-        if state.selected_chat.is_some() {
+        if self.target.chat_id(state).is_some() {
             return false;
         }
         // New-chat canvas: needs a runnable agent. The
@@ -5958,7 +6039,7 @@ impl Composer {
         };
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
-        let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
+        let (chat_id, is_new) = match self.target.chat_id(self.state.read(cx)).map(str::to_owned) {
             Some(id) => (id, false),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
@@ -5970,25 +6051,23 @@ impl Composer {
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
         let existing_cwd = self
-            .state
-            .read(cx)
-            .selected_chat_row()
+            .target
+            .chat(self.state.read(cx))
             .and_then(|c| c.cwd.clone());
         // The PROJECT fixes the new chat's device + base folder — sessions are
         // minted onto the project's device, not necessarily this one. With no
         // project ("Don't work in a project") the composer's device pick is
         // the host and the session runs from `~` there.
-        let space = self.state.read(cx).selected_space_row().cloned();
+        let space = Self::target_space(&self.target, self.state.read(cx)).cloned();
         let local_device_id = self.state.read(cx).local_device_id.clone();
-        let target_device_id = self.state.read(cx).effective_device_id();
+        let target_device_id = Self::target_device_id(&self.target, self.state.read(cx));
         let device_id = if is_new {
             target_device_id
                 .clone()
                 .unwrap_or_else(|| "local".to_string())
         } else {
-            self.state
-                .read(cx)
-                .selected_chat_row()
+            self.target
+                .chat(self.state.read(cx))
                 .map(|c| c.device_id.clone())
                 .or_else(|| local_device_id.clone())
                 .unwrap_or_else(|| "local".to_string())
@@ -6000,9 +6079,8 @@ impl Composer {
                 .clone()
                 .filter(|id| local_device_id.as_deref() != Some(id.as_str()))
         } else {
-            self.state
-                .read(cx)
-                .selected_chat_row()
+            self.target
+                .chat(self.state.read(cx))
                 .map(|c| c.device_id.clone())
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
@@ -6175,6 +6253,12 @@ impl Composer {
             status: None,
             continuation_of: None,
         };
+        // A pane-fixed composer locks onto the chat it just minted BEFORE the
+        // event and the selection observer run — by the time `select_chat`
+        // notifies, its key must already be the new chat's (no draft swap).
+        if is_new && matches!(self.target, ChatTarget::Fixed(None)) {
+            self.bind_chat(chat_id.clone(), cx);
+        }
         self.launching_new_chat = is_new;
         if is_new {
             cx.emit(ComposerEvent::NewThreadTransitionStarted);
@@ -6583,6 +6667,15 @@ impl Composer {
                     };
                     composer.failure = Some(message.into());
                     composer.failure_key = Some(restore_key.clone());
+                    // A pane-fixed composer returns to its own new-chat
+                    // canvas — its target, not the global selection, keys it.
+                    // Reset BEFORE the deselect below: a pane surface observes
+                    // the canvas target before `set_pane_session(None)` can
+                    // invalidate (and drop) this composer — its restored draft
+                    // survives.
+                    if is_new {
+                        composer.reset_fixed_target(cx);
+                    }
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
                         s.end_pending_send(&err_chat_id, &err_message_id);
@@ -6635,7 +6728,7 @@ impl Composer {
     }
 
     pub(crate) fn interrupt_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+        let Some(chat_id) = self.target.chat_id(self.state.read(cx)).map(str::to_owned) else {
             return;
         };
         self.interrupt_chat(chat_id, cx);
@@ -6743,7 +6836,7 @@ impl Composer {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+        let Some(chat_id) = self.target.chat_id(self.state.read(cx)).map(str::to_owned) else {
             return;
         };
         let request_id = wizard.request_id.clone();
@@ -6778,7 +6871,7 @@ impl Composer {
             // un-hide the panel instead of leaving the question unanswerable.
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |composer, cx| {
-                let transcript = composer.state.read(cx).transcript.clone();
+                let transcript = composer.target.transcript(composer.state.read(cx)).to_vec();
                 let still_pending = pending_input_request(&transcript)
                     .is_some_and(|(pending_id, _)| pending_id == request_id);
                 if still_pending && composer.answered_requests.remove(&request_id) {
@@ -7226,7 +7319,7 @@ impl Render for Composer {
         }
         // New chats render expanded regardless of `expanded_mode` (see below),
         // so a mode flip there changes nothing visible — never morph it.
-        let new_chat = self.state.read(cx).selected_chat.is_none();
+        let new_chat = self.target.chat_id(self.state.read(cx)).is_none();
         // Morph clock in ms; dividing by the measurement knob stretches the
         // timeline exactly like shell.rs eval_tween's scaled duration.
         let now_ms = self.morph_clock.elapsed().as_secs_f32() * 1000.0 / motion::speed_scale();
@@ -7262,18 +7355,19 @@ impl Render for Composer {
         let queue_notice: Option<(SharedString, bool)> = {
             use zeron_proto::ConnectivityState as S;
             let state = self.state.read(cx);
-            let degraded = match state.selected_chat.as_deref() {
+            let degraded = match self.target.chat_id(state) {
                 Some(id) => state.chat_delivery_degraded(id),
                 None => {
                     // New-chat canvas: judge by the picked target device.
-                    let remote_target = state
-                        .effective_device_id()
-                        .is_some_and(|id| state.local_device_id.as_deref() != Some(id.as_str()));
+                    let target_device = Self::target_device_id(&self.target, state);
+                    let remote_target = target_device
+                        .as_deref()
+                        .is_some_and(|id| state.local_device_id.as_deref() != Some(id));
                     remote_target
                         && (matches!(state.connectivity.state, S::Offline | S::Reconnecting)
-                            || state
-                                .effective_device_id()
-                                .is_some_and(|id| !state.device_online(&id, chrono::Utc::now())))
+                            || target_device
+                                .as_deref()
+                                .is_some_and(|id| !state.device_online(id, chrono::Utc::now())))
                 }
             };
             let offline = state.connectivity.state == S::Offline;
@@ -7822,10 +7916,7 @@ impl Render for Composer {
                 })
             })
             .flatten();
-        let has_new_thread_git_selectors = self
-            .state
-            .read(cx)
-            .selected_space_row()
+        let has_new_thread_git_selectors = Self::target_space(&self.target, self.state.read(cx))
             .is_some_and(|space| space.git_detected);
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
@@ -7904,7 +7995,24 @@ impl Render for Composer {
                 self.pickers
                     .update(cx, |pickers, cx| pickers.render_footer(cx))
             });
-            let usage = self.state.read(cx).context_usage;
+            // `context_usage` is the SELECTED chat's frame — a pane-fixed
+            // composer may show it only while its chat is the selected one;
+            // an inactive pane renders nothing rather than another pane's
+            // numbers.
+            let usage = {
+                let state = self.state.read(cx);
+                let serves_target = match &self.target {
+                    ChatTarget::Selected => true,
+                    ChatTarget::Fixed(chat_id) => {
+                        chat_id.as_deref() == state.selected_chat.as_deref()
+                    }
+                };
+                if serves_target {
+                    state.context_usage
+                } else {
+                    None
+                }
+            };
             container.child(
                 div()
                     .w_full()
@@ -9602,6 +9710,42 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+
+    #[gpui::test]
+    fn pane_composer_binds_to_its_minted_chat(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::for_pane(state.clone(), None, cx));
+        composer.update(cx, |composer, cx| {
+            // Unbound pane: the new-chat canvas.
+            assert_eq!(composer.current_key, "");
+            assert!(composer.target.chat_id(composer.state.read(cx)).is_none());
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("draft", cx));
+            // Binding locks the composer AND its pickers onto the chat
+            // without touching the in-flight input.
+            composer.bind_chat("pane-chat".into(), cx);
+            assert_eq!(composer.current_key, "pane-chat");
+            assert_eq!(composer.input.read(cx).text(), "draft");
+            assert_eq!(
+                composer
+                    .pickers
+                    .read(cx)
+                    .target_chat_id(composer.state.read(cx)),
+                Some("pane-chat")
+            );
+            // A global selection move doesn't re-key the pane composer.
+            composer.state.update(cx, |state, cx| {
+                state.select_chat(Some("other".into()), cx);
+            });
+            composer.on_state_changed(cx);
+            assert_eq!(composer.current_key, "pane-chat");
+            // Failed creation returns the pane to its canvas.
+            composer.reset_fixed_target(cx);
+            assert_eq!(composer.current_key, "");
+            assert!(composer.target.chat_id(composer.state.read(cx)).is_none());
+        });
     }
 }
 

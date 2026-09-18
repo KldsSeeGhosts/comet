@@ -64,8 +64,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    PaneId, PaneMode, PaneState, SplitNode, SplitTabLayout, TabId, TabPlacement, ViewId, ViewLayout,
-    WorkspaceLayout,
+    PaneId, PaneMode, PaneState, SplitNode, SplitTabLayout, TabId, TabPlacement, ViewId,
+    ViewLayout, WorkspaceLayout,
 };
 
 /// One worktree's persisted value in Super's format: the tab strip plus the
@@ -173,9 +173,7 @@ pub struct SuperLeaf {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SuperContent {
     PrimaryTab,
-    Tab {
-        tab: SuperTab,
-    },
+    Tab { tab: SuperTab },
 }
 
 /// Tab-object fields the engine pane maps onto named fields; everything else
@@ -199,7 +197,10 @@ struct Ids {
 
 impl Ids {
     fn new(reserved: BTreeSet<u64>) -> Self {
-        Self { used: reserved, next: 1 }
+        Self {
+            used: reserved,
+            next: 1,
+        }
     }
 
     fn take(&mut self) -> u64 {
@@ -215,7 +216,13 @@ impl Ids {
     /// One past the largest allocated id (the engine requires `next_id` to
     /// exceed every live view, tab and pane id).
     fn next_id(&self) -> u64 {
-        self.used.iter().next_back().copied().unwrap_or(0).saturating_add(1).max(1)
+        self.used
+            .iter()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1)
     }
 }
 
@@ -243,7 +250,11 @@ fn pane_from_tab(tab: &SuperTab) -> PaneState {
     }
     PaneState {
         session_id: tab.session_id.clone(),
-        mode: if tab.kind == "terminal" { PaneMode::Terminal } else { PaneMode::Chat },
+        mode: if tab.kind == "terminal" {
+            PaneMode::Terminal
+        } else {
+            PaneMode::Chat
+        },
         label: tab.title.clone(),
         group: None,
         provider_key: tab.provider_key.clone(),
@@ -290,7 +301,12 @@ fn node_to_engine(
     primary: &mut Option<PaneId>,
 ) -> SplitNode<PaneId> {
     match node {
-        SuperNode::Split { axis, ratio, first, second } => SplitNode::Split {
+        SuperNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => SplitNode::Split {
             horizontal: *axis == SuperAxis::Horizontal,
             ratio: *ratio,
             first: Box::new(node_to_engine(first, tab, panes, primary)),
@@ -321,7 +337,11 @@ fn tab_from_split(split: &SuperSplitLayout, tab: &SuperTab) -> SplitTabLayout {
         root,
         // A dangling active id falls back to the first leaf rather than
         // failing the import; `validate` reports the structural problem.
-        active_pane_id: if panes.contains_key(&active) { active } else { fallback },
+        active_pane_id: if panes.contains_key(&active) {
+            active
+        } else {
+            fallback
+        },
         primary_pane_id: primary.unwrap_or(fallback),
         panes,
     }
@@ -397,14 +417,26 @@ fn leaf_from_engine(pane_id: PaneId, tab: &SplitTabLayout) -> SuperNode {
         }
     };
     SuperNode::Leaf {
-        leaf: SuperLeaf { pane_id: pane_id.0, content },
+        leaf: SuperLeaf {
+            pane_id: pane_id.0,
+            content,
+        },
     }
 }
 
 fn node_from_engine(node: &SplitNode<PaneId>, tab: &SplitTabLayout) -> SuperNode {
     match node {
-        SplitNode::Split { horizontal, ratio, first, second } => SuperNode::Split {
-            axis: if *horizontal { SuperAxis::Horizontal } else { SuperAxis::Vertical },
+        SplitNode::Split {
+            horizontal,
+            ratio,
+            first,
+            second,
+        } => SuperNode::Split {
+            axis: if *horizontal {
+                SuperAxis::Horizontal
+            } else {
+                SuperAxis::Vertical
+            },
             ratio: *ratio,
             first: Box::new(node_from_engine(first, tab)),
             second: Box::new(node_from_engine(second, tab)),
@@ -437,13 +469,22 @@ pub fn engine_to_super(layout: &WorkspaceLayout) -> Option<SuperWorktreeValue> {
     for tab_id in &order {
         let tab = view.tabs.get(tab_id)?;
         tabs.push(tab_from_pane(
-            tab.panes.get(&tab.primary_pane_id).unwrap_or(&PaneState::default()),
+            tab.panes
+                .get(&tab.primary_pane_id)
+                .unwrap_or(&PaneState::default()),
         ));
         // A single-pane tab exports as `null`: the engine cannot distinguish
         // "no split tree" from a single-leaf tree and Super equates the two.
-        split_layouts.push(if tab.panes.len() <= 1 { None } else { Some(split_from_engine(tab)) });
+        split_layouts.push(if tab.panes.len() <= 1 {
+            None
+        } else {
+            Some(split_from_engine(tab))
+        });
     }
-    let active_tab = order.iter().position(|id| *id == view.active_tab_id).unwrap_or(0);
+    let active_tab = order
+        .iter()
+        .position(|id| *id == view.active_tab_id)
+        .unwrap_or(0);
     Some(SuperWorktreeValue {
         tabs,
         active_tab,

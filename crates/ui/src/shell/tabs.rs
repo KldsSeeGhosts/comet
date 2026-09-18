@@ -40,9 +40,27 @@ pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
 }
 
 impl Shell {
+    /// The composer the current chat surface owns: in workspace mode the
+    /// FOCUSED pane's composer, in the trivial layout the shared dock
+    /// composer. Every shell interaction that targets "the" composer
+    /// (focus, drops, interrupts, shortcuts) must go through here so a pane
+    /// composer receives it instead of the unmounted global entity.
+    pub(super) fn active_composer(&self) -> Entity<Composer> {
+        if self.workspace_mode() {
+            self.workspace
+                .focused_pane()
+                .and_then(|pane| self.workspace.chat_surfaces.get(&pane))
+                .map(|surface| surface.composer.clone())
+                .unwrap_or_else(|| self.composer.clone())
+        } else {
+            self.composer.clone()
+        }
+    }
+
     /// Navigation requests focus once the destination composer renders.
     pub(super) fn focus_composer(&mut self, cx: &mut Context<Self>) {
-        self.composer.update(cx, |composer, cx| {
+        let composer = self.active_composer();
+        composer.update(cx, |composer, cx| {
             composer.focus_pending = true;
             cx.notify();
         });
@@ -142,8 +160,15 @@ impl Shell {
     /// `[new-session +] [harness icon + session title] … [toggle-changes]`.
     /// Replaces the tab strip; inherits its titlebar duties (drag region,
     /// animated left inset, the toggle-changes button on git projects).
+    ///
+    /// Workspace mode renders the identity block EMPTY: the content area
+    /// already shows exactly one identity row — the view tab strip below
+    /// this bar (Super parity) — so a workspace title + device tag up here
+    /// would duplicate it (user report). The bar keeps its full height,
+    /// drag region, animated inset, and trailing controls.
     pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        let workspace_mode = !self.workspace.is_trivial();
         // The canvas titles as NOTHING (user request — a "New session"
         // header over the empty canvas was noise); the bar keeps its height,
         // drag region, and buttons. A session appends its target as a muted
@@ -156,27 +181,40 @@ impl Shell {
             bool,
         ) = {
             let state = self.state.read(cx);
-            match state.selected_chat_row() {
-                Some(chat) => {
-                    let folder = chat
-                        .space_id
-                        .as_deref()
-                        .and_then(|id| state.space_row(id))
-                        .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "~".to_string());
-                    let device = state
-                        .device_name(&chat.device_id)
-                        .unwrap_or("Unknown device");
-                    (
-                        SharedString::from(transcript::single_line(
-                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                        )),
-                        Some(SharedString::from(format!("{folder} @ {device}"))),
-                        chat.config.as_ref().map(|c| c.harness),
-                        false,
-                    )
+            if workspace_mode {
+                // No identity block in workspace mode (see the doc comment):
+                // the strip is the identity row. Building the title here only
+                // to hide it invited the duplicate it was asked to remove, so
+                // the values stay empty.
+                (
+                    SharedString::from(""),
+                    None,
+                    None,
+                    state.selected_chat_row().is_none(),
+                )
+            } else {
+                match state.selected_chat_row() {
+                    Some(chat) => {
+                        let folder = chat
+                            .space_id
+                            .as_deref()
+                            .and_then(|id| state.space_row(id))
+                            .map(|s| s.display_name().to_string())
+                            .unwrap_or_else(|| "~".to_string());
+                        let device = state
+                            .device_name(&chat.device_id)
+                            .unwrap_or("Unknown device");
+                        (
+                            SharedString::from(transcript::single_line(
+                                &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                            )),
+                            Some(SharedString::from(format!("{folder} @ {device}"))),
+                            chat.config.as_ref().map(|c| c.harness),
+                            false,
+                        )
+                    }
+                    None => (SharedString::from(""), None, None, true),
                 }
-                None => (SharedString::from(""), None, None, true),
             }
         };
 
@@ -313,10 +351,13 @@ impl Shell {
             .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
             // In panel takeover the header strip spans the whole band — the
             // title would sit UNDER it (both flex_none, the row overflows and
-            // paint order stacks them), so it hides for the duration.
-            .when(!takeover, |el| {
+            // paint order stacks them), so it hides for the duration. In
+            // workspace mode the block is suppressed outright (the view tab
+            // strip is the single identity row).
+            .when(!takeover && !workspace_mode, |el| {
                 el.child(
                     div()
+                        .id(SharedString::from("titlebar-identity"))
                         .min_w_0()
                         .flex()
                         .flex_row()

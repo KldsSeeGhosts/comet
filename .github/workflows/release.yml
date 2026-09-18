@@ -157,10 +157,13 @@ jobs:
           ver="${GITHUB_REF_NAME#v}"
           ls dist/
           for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
-              macos-arm64.dmg macos-arm64-app.tar.gz \
               windows-x86_64.zip windows-x86_64.exe; do
             test -f "dist/zeron-$ver-$platform" \
               || { echo "missing artifact for tag v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
+          done
+          for platform in macos-arm64.dmg macos-arm64-app.tar.gz; do
+            test -f "dist/noches-$ver-$platform" \
+              || { echo "missing Noches artifact for tag v$ver: $platform - check builds and Cargo.toml version"; exit 1; }
           done
           echo "VERSION=$ver" >> "$GITHUB_ENV"
       - name: updater manifest

@@ -54,20 +54,37 @@ fn reference_import_matches_super_structure() -> Result<(), Box<dyn std::error::
 
     // Tab 0: horizontal 0.5 over two vertical 0.5 stacks.
     let tab0 = &view.tabs[&TabId(5)];
-    let SplitNode::Split { horizontal: h0, ratio: r0, first: f0, second: s0 } = &tab0.root
+    let SplitNode::Split {
+        horizontal: h0,
+        ratio: r0,
+        first: f0,
+        second: s0,
+    } = &tab0.root
     else {
         panic!("tab 0 root must be a split");
     };
     assert!(h0);
     assert_eq!(*r0, 0.5);
-    let SplitNode::Split { horizontal: h1, ratio: r1, first: f1, second: s1 } = f0.as_ref() else {
+    let SplitNode::Split {
+        horizontal: h1,
+        ratio: r1,
+        first: f1,
+        second: s1,
+    } = f0.as_ref()
+    else {
         panic!("tab 0 first branch must be a split");
     };
     assert!(!h1);
     assert_eq!(*r1, 0.5);
     assert_eq!(**f1, SplitNode::leaf(PaneId(4)));
     assert_eq!(**s1, SplitNode::leaf(PaneId(7)));
-    let SplitNode::Split { horizontal: h2, ratio: r2, first: f2, second: s2 } = s0.as_ref() else {
+    let SplitNode::Split {
+        horizontal: h2,
+        ratio: r2,
+        first: f2,
+        second: s2,
+    } = s0.as_ref()
+    else {
         panic!("tab 0 second branch must be a split");
     };
     assert!(!h2);
@@ -82,11 +99,17 @@ fn reference_import_matches_super_structure() -> Result<(), Box<dyn std::error::
     assert_eq!(p4.mode, PaneMode::Chat);
     assert_eq!(p4.provider_key.as_deref(), Some("codex"));
     assert_eq!(p4.session_id.as_deref(), Some("codex-17896269968694"));
-    assert_eq!(p4.conversation_id.as_deref(), Some("conv:codex:codex-17896269968694"));
+    assert_eq!(
+        p4.conversation_id.as_deref(),
+        Some("conv:codex:codex-17896269968694")
+    );
     assert_eq!(p4.permission_mode.as_deref(), Some("bypass"));
     assert_eq!(p4.label, None);
     assert!(!p4.title_sc_owned);
-    assert_eq!(p4.extra["tab_uuid"], json!("522129b3-0508-42c8-a986-6008254fc986"));
+    assert_eq!(
+        p4.extra["tab_uuid"],
+        json!("522129b3-0508-42c8-a986-6008254fc986")
+    );
     assert_eq!(p4.extra["messages_snapshot"], json!([]));
     assert_eq!(p4.extra["thinking_enabled"], json!(true));
 
@@ -100,7 +123,10 @@ fn reference_import_matches_super_structure() -> Result<(), Box<dyn std::error::
     assert_eq!(p7.extra["last_context_tokens"], json!(24034));
 
     assert_eq!(tab0.panes[&PaneId(2)].provider_key.as_deref(), Some("pi"));
-    assert_eq!(tab0.panes[&PaneId(3)].provider_key.as_deref(), Some("codex"));
+    assert_eq!(
+        tab0.panes[&PaneId(3)].provider_key.as_deref(),
+        Some("codex")
+    );
 
     // Tab 1: null split layout imports as a single synthesized pane.
     let tab1 = &view.tabs[&TabId(6)];
@@ -117,7 +143,13 @@ fn reference_import_matches_super_structure() -> Result<(), Box<dyn std::error::
     // Tab 2: horizontal 0.5 with the terminal split; active pane is the
     // secondary one (9) while the primary stays 8.
     let tab2 = &view.tabs[&TabId(11)];
-    let SplitNode::Split { horizontal, ratio, first, second } = &tab2.root else {
+    let SplitNode::Split {
+        horizontal,
+        ratio,
+        first,
+        second,
+    } = &tab2.root
+    else {
         panic!("tab 2 root must be a split");
     };
     assert!(horizontal);
@@ -216,7 +248,9 @@ fn foreign_ratio_imports_but_fails_validation() -> Result<(), Box<dyn std::error
     let layout = super_to_engine(&value);
     assert!(matches!(
         layout.validate(),
-        Err(LayoutError::Invalid("split ratio must be finite and within 0.1..=0.9"))
+        Err(LayoutError::Invalid(
+            "split ratio must be finite and within 0.1..=0.9"
+        ))
     ));
 
     // The bridge itself neither clamps nor rejects: ratios round-trip
