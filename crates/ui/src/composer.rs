@@ -3997,6 +3997,37 @@ fn slash_error_message(err: &RpcError) -> SharedString {
     }
 }
 
+/// One pane composer's user-editable state at the moment its surface is torn
+/// down (a project switch parks the pane; see
+/// `Shell::parked_pane_drafts`). Restored verbatim into the fresh composer
+/// the rebuilt surface gets ([`Composer::restore_draft_state`]).
+///
+/// Only pane-local, user-authored content is carried: the live input text,
+/// the per-chat-key draft/attachment/appshot maps, and the draft a queue
+/// edit displaced. Deliberately EXCLUDED — global or host-coupled, never the
+/// pane's property: the model/harness picker choices (agent identity is
+/// global), in-flight send/interrupt/mention/slash tasks, popup + lightbox
+/// chrome, layout/flip measurements, failure banners, and the queue-edit
+/// LEASE machinery (`editing_queued`, lease ids, ack bookkeeping). A
+/// host-issued lease cannot be resurrected on a new entity, so a switch that
+/// catches an edit mid-flight salvages the DISPLACED draft (text +
+/// attachments + appshots, the user's own words) as the pane's plain unsent
+/// draft and lets the leased row's text go — the row stays in the queue
+/// panel, where the edit can be re-initiated.
+#[derive(Clone, Default)]
+pub(crate) struct ComposerDraftState {
+    /// Chat key the live input text belonged to (`""` = new-chat canvas).
+    live_key: String,
+    /// The unsent words for `live_key` (empty when there were none).
+    live_text: String,
+    /// Displaced drafts for the other keys this composer navigated.
+    drafts: HashMap<String, String>,
+    /// Staged-but-unsent attachments per chat key.
+    attachments: HashMap<String, Vec<StagedAttachment>>,
+    /// Captured window shots per chat key.
+    appshots: HashMap<String, Vec<CapturedAppshot>>,
+}
+
 pub struct Composer {
     pub(crate) state: Entity<AppState>,
     /// The chat this instance serves (see [`ChatTarget`]).
@@ -4454,6 +4485,79 @@ impl Composer {
         } else {
             self.drafts.insert(restore_key.to_string(), text);
         }
+    }
+
+    /// Park everything user-authored for [`Self::restore_draft_state`] (see
+    /// [`ComposerDraftState`] for what is excluded and why). Called when a
+    /// project switch tears this pane's surface down.
+    pub(crate) fn snapshot_draft_state(&self, cx: &App) -> ComposerDraftState {
+        // While a queue edit holds the input, the text belongs to the HOST's
+        // leased queued row — the user's own words are the displaced draft.
+        // Salvage those (extending the key's staged attachments/appshots) on
+        // top of every other key's parked state, and let the lease go.
+        if let Some((displaced, displaced_attachments, displaced_appshots)) =
+            self.queue_edit_draft.clone()
+        {
+            let mut state = ComposerDraftState {
+                live_key: self.current_key.clone(),
+                live_text: displaced,
+                drafts: self.drafts.clone(),
+                attachments: self.attachments.clone(),
+                appshots: self.appshots.clone(),
+            };
+            state
+                .attachments
+                .entry(self.current_key.clone())
+                .or_default()
+                .extend(displaced_attachments);
+            state
+                .appshots
+                .entry(self.current_key.clone())
+                .or_default()
+                .extend(displaced_appshots);
+            return state;
+        }
+        ComposerDraftState {
+            live_key: self.current_key.clone(),
+            live_text: self.input.read(cx).text().to_string(),
+            drafts: self.drafts.clone(),
+            attachments: self.attachments.clone(),
+            appshots: self.appshots.clone(),
+        }
+    }
+
+    /// Rehydrate a parked draft state into a fresh pane composer. The
+    /// receiving maps start empty, so the merge is a pure move; the live
+    /// text lands in the input only when the keys match and the input is
+    /// still empty (never clobbering newer typing) — otherwise it is
+    /// displaced like any other per-key draft.
+    pub(crate) fn restore_draft_state(
+        &mut self,
+        state: ComposerDraftState,
+        cx: &mut Context<Self>,
+    ) {
+        let ComposerDraftState {
+            live_key,
+            live_text,
+            drafts,
+            attachments,
+            appshots,
+        } = state;
+        self.drafts.extend(drafts);
+        for (key, staged) in attachments {
+            self.attachments.entry(key).or_default().extend(staged);
+        }
+        for (key, shots) in appshots {
+            self.appshots.entry(key).or_default().extend(shots);
+        }
+        if !live_text.is_empty() {
+            if live_key == self.current_key && self.input.read(cx).text().is_empty() {
+                self.input.update(cx, |input, cx| input.set_text(live_text, cx));
+            } else {
+                self.drafts.insert(live_key, live_text);
+            }
+        }
+        cx.notify();
     }
 
     /// The space the target's canvas/git decisions resolve against: a bound

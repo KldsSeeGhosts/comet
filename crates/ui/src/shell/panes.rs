@@ -173,6 +173,12 @@ impl Shell {
         };
         let focused = self.workspace.focused_pane() == Some(pane);
         composer.update(cx, |composer, _| composer.focus_pending = focused);
+        // Project-switch parking: rehydrate the draft state parked for this
+        // (space, pane). Adopted composers rehydrate too — `restore_draft_state`
+        // only fills an EMPTY input, so the adopted dock composer keeps any
+        // text it already carries for this key (never clobbered) while a
+        // stranded park (the adopt fired after the park) still lands.
+        self.rehydrate_pane_draft(pane, &composer, cx);
         let composer_observation = cx.observe(&composer, move |shell: &mut Shell, composer, cx| {
             shell.sync_pane_composer_target(pane, &composer, cx);
         });
@@ -191,6 +197,36 @@ impl Shell {
             composer_events,
             composer_observation,
             transcript_events,
+        }
+    }
+
+    /// Snapshot every pane composer's unsent state into
+    /// [`Shell::parked_pane_drafts`], keyed by the space being left. Runs
+    /// before `install_layout` drops the surfaces; the space is captured
+    /// before `restore_workspace_layout` re-points `active_workspace_space`.
+    fn park_pane_drafts(&mut self, cx: &mut Context<Self>) {
+        let space = self.active_workspace_space.clone();
+        let panes: Vec<PaneId> = self.workspace.chat_surfaces.keys().copied().collect();
+        for pane in panes {
+            let composer = self.workspace.chat_surfaces[&pane].composer.clone();
+            let snapshot = composer.read(cx).snapshot_draft_state(cx);
+            self.parked_pane_drafts.insert((space.clone(), pane), snapshot);
+        }
+    }
+
+    /// Consume the parked draft for `(active space, pane)` into a freshly
+    /// created pane composer. Snapshots from other spaces (and unknown
+    /// panes) never match, so ordinary splits and tab adds stay untouched;
+    /// entries are removed on restore so the cache stays bounded.
+    fn rehydrate_pane_draft(
+        &mut self,
+        pane: PaneId,
+        composer: &Entity<Composer>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (self.active_workspace_space.clone(), pane);
+        if let Some(state) = self.parked_pane_drafts.remove(&key) {
+            composer.update(cx, |composer, cx| composer.restore_draft_state(state, cx));
         }
     }
 
@@ -1360,13 +1396,20 @@ impl Shell {
     /// snapshotted into the store first, so a fast switch never loses the
     /// debounce window's changes. The incoming entry falls back to the
     /// default single-pane layout when missing or invalid. Pane surfaces
-    /// rebuild lazily in the ensure pass; the FOCUSED pane's session is
-    /// re-selected in AppState so sidebar/global routing follows it.
+    /// rebuild lazily in the ensure pass, rehydrating the draft state parked
+    /// on the way out, so unsent input survives the round trip; the FOCUSED
+    /// pane's session is re-selected in AppState so sidebar/global routing
+    /// follows it.
     pub(crate) fn restore_workspace_layout(
         &mut self,
         space: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // Park every pane's unsent composer state before install_layout
+        // drops the surfaces, keyed by the space being LEFT (captured before
+        // `active_workspace_space` flips below; pane-id numerals repeat
+        // across spaces' trees, so the space is part of the key).
+        self.park_pane_drafts(cx);
         if self.workspace.take_dirty() {
             self.workspace_layouts.set_layout(
                 self.active_workspace_space.as_deref(),

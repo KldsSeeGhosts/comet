@@ -1376,6 +1376,17 @@ pub struct Shell {
     workspace_save_task: Option<Task<()>>,
     active_workspace_space: Option<String>,
     workspace_space_loaded: bool,
+    /// Unsent pane composer content parked while a project switch tears the
+    /// pane surfaces down (`restore_workspace_layout`), keyed
+    /// `(space, pane)` — PaneId numerals are only unique WITHIN one space's
+    /// persisted tree, so the space qualifies the key. In-memory session
+    /// nicety, never persisted; entries are consumed one-for-one by the
+    /// surface recreation that rehydrates them, so the map stays bounded by
+    /// spaces × panes.
+    parked_pane_drafts: std::collections::HashMap<
+        (Option<String>, zeron_workspace::PaneId),
+        crate::composer::ComposerDraftState,
+    >,
     /// Explicit user navigation target that must survive a workspace layout
     /// restore. `Some(Some(chat_id))` = sidebar click / deep link;
     /// `Some(None)` = new-session request. `None` = no pending navigation
@@ -1802,6 +1813,7 @@ impl Shell {
             workspace_save_task: None,
             active_workspace_space: None,
             workspace_space_loaded: false,
+            parked_pane_drafts: std::collections::HashMap::new(),
             pending_explicit_nav: None,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).

@@ -293,3 +293,210 @@ fn clicking_the_active_pane_does_not_refocus_the_composer(cx: &mut TestAppContex
         assert!(!shell.active_composer().read(cx).focus_pending);
     }).unwrap();
 }
+
+// ---- project-switch draft parking ----
+
+/// The pane composer bound to `chat_id` (the ensure pass guarantees one).
+fn pane_composer_for_chat(shell: &Shell, chat_id: &str) -> Entity<Composer> {
+    shell.workspace.chat_surfaces.values()
+        .find(|surface| surface.chat_id.as_deref() == Some(chat_id))
+        .map(|surface| surface.composer.clone())
+        .unwrap_or_else(|| panic!("no pane surface bound to {chat_id}"))
+}
+
+/// Seed two spaces with one chat each and land the boot on space `a`.
+fn seed_two_spaces(shell: &mut Shell, cx: &mut Context<Shell>) {
+    shell.state.update(cx, |state, _| {
+        state.spaces = vec![
+            serde_json::from_value(space("a")).unwrap(),
+            serde_json::from_value(space("b")).unwrap(),
+        ];
+        state.chats = vec![
+            serde_json::from_value(chat("chat-a1", "a")).unwrap(),
+            serde_json::from_value(chat("chat-a2", "a")).unwrap(),
+            serde_json::from_value(chat("chat-b1", "b")).unwrap(),
+        ];
+        state.selected_space = Some("a".into());
+        state.selected_chat = Some("chat-a1".into());
+        state.auto_selected = true;
+        state.chats_synced = true;
+        state.spaces_synced = true;
+    });
+}
+
+fn select_space(shell: &mut Shell, id: &str, cx: &mut Context<Shell>) {
+    shell.state.update(cx, |state, cx| {
+        state.select_space(Some(id.into()), cx)
+    });
+    shell.on_state_changed(&shell.state.clone(), cx);
+}
+
+#[gpui::test]
+fn project_switch_preserves_each_panes_unsent_draft(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        seed_two_spaces(shell, cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        // Two chat panes in space a, each holding its own unsent draft.
+        let first = shell.workspace.focused_pane().unwrap();
+        let second = shell.workspace.split_focused_pane(Direction::Right).unwrap();
+        shell.workspace.set_pane_session(second, Some("chat-a2".into())).unwrap();
+        shell.ensure_pane_chat_surfaces(cx);
+        let composer_a1 = shell.workspace.chat_surfaces[&first].composer.clone();
+        let composer_a2 = shell.workspace.chat_surfaces[&second].composer.clone();
+        draft(&composer_a1, "alpha for a1", cx);
+        draft(&composer_a2, "beta for a2", cx);
+        shell.flush_workspace_layout(cx);
+
+        // Switching projects tears the pane surfaces (and their drafts) down.
+        select_space(shell, "b", cx);
+        assert_eq!(shell.active_workspace_space.as_deref(), Some("b"));
+        assert!(
+            shell.workspace.chat_surfaces.is_empty(),
+            "the switch dropped the pane surfaces"
+        );
+
+        // Switching back: BOTH drafts rehydrate into the correct panes.
+        select_space(shell, "a", cx);
+        let restored_a1 = pane_composer_for_chat(shell, "chat-a1");
+        let restored_a2 = pane_composer_for_chat(shell, "chat-a2");
+        assert_ne!(
+            restored_a1.entity_id(),
+            composer_a1.entity_id(),
+            "the surface rebuilt onto a fresh composer"
+        );
+        assert_ne!(restored_a2.entity_id(), composer_a2.entity_id());
+        assert_eq!(draft_text(&restored_a1, cx), "alpha for a1");
+        assert_eq!(draft_text(&restored_a2, cx), "beta for a2");
+    }).unwrap();
+}
+
+#[gpui::test]
+fn parked_drafts_survive_pane_id_reuse_across_spaces(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    // Space b's SAVED tree reuses space a's pane numerals: both anchor on
+    // PaneId(3), bound to different sessions.
+    seed_space_layout(dir.path(), "chat-b1");
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        seed_two_spaces(shell, cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        // Space a boots onto its default pane (PaneId(3) → chat-a1); a split
+        // keeps the tree non-trivial so pane surfaces exist at all.
+        let pane_a = shell.workspace.focused_pane().unwrap();
+        shell.workspace.split_focused_pane(Direction::Down).unwrap();
+        shell.ensure_pane_chat_surfaces(cx);
+        draft(&pane_composer_for_chat(shell, "chat-a1"), "alpha lives in a", cx);
+        shell.flush_workspace_layout(cx);
+
+        // a → b: PaneId(3) is REUSED for chat-b1's pane.
+        select_space(shell, "b", cx);
+        let pane_b = shell.workspace.focused_pane().unwrap();
+        assert_eq!(pane_b, pane_a, "both spaces anchor their tree on PaneId(3)");
+        let surface_b = shell.workspace.chat_surfaces[&pane_b].composer.clone();
+        assert_eq!(
+            draft_text(&surface_b, cx),
+            "",
+            "space b's pane must not inherit space a's draft"
+        );
+        draft(&surface_b, "beta lives in b", cx);
+        shell.flush_workspace_layout(cx);
+
+        // b → a: the parked (a, PaneId(3)) draft comes back, not b's.
+        select_space(shell, "a", cx);
+        assert_eq!(
+            draft_text(&pane_composer_for_chat(shell, "chat-a1"), cx),
+            "alpha lives in a"
+        );
+
+        // a → b again: b's own draft returns, still uncontaminated.
+        select_space(shell, "b", cx);
+        assert_eq!(
+            draft_text(&pane_composer_for_chat(shell, "chat-b1"), cx),
+            "beta lives in b"
+        );
+    }).unwrap();
+}
+
+#[gpui::test]
+fn canvas_pane_draft_survives_project_switch_round_trip(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        seed_two_spaces(shell, cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        // A split pane left UNBOUND: the new-chat canvas (key "").
+        let canvas = shell.workspace.split_focused_pane(Direction::Right).unwrap();
+        shell.ensure_pane_chat_surfaces(cx);
+        shell.focus_workspace_pane(canvas, cx);
+        let canvas_composer = shell.workspace.chat_surfaces[&canvas].composer.clone();
+        assert!(shell.workspace.chat_surfaces[&canvas].chat_id.is_none());
+        draft(&canvas_composer, "canvas scratch", cx);
+        shell.flush_workspace_layout(cx);
+
+        // Away and back: the unbound pane's unsent input rehydrates.
+        select_space(shell, "b", cx);
+        assert!(shell.workspace.chat_surfaces.is_empty());
+        select_space(shell, "a", cx);
+        let canvas_surface = shell.workspace.chat_surfaces.values()
+            .find(|surface| surface.chat_id.is_none())
+            .map(|surface| surface.composer.clone())
+            .unwrap_or_else(|| panic!("the canvas pane lost its surface"));
+        assert_eq!(draft_text(&canvas_surface, cx), "canvas scratch");
+    }).unwrap();
+}
+
+#[gpui::test]
+fn a_parked_queue_edit_salvages_the_displaced_draft_and_older_maps(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        seed_two_spaces(shell, cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        // A split keeps the tree non-trivial so pane surfaces exist at all.
+        shell.workspace.split_focused_pane(Direction::Down).unwrap();
+        shell.ensure_pane_chat_surfaces(cx);
+        let composer = pane_composer_for_chat(shell, "chat-a1");
+        // Accumulate an older per-key draft entry by retargeting the SAME
+        // composer the way the ensure pass does (the old text displaces
+        // into the drafts map).
+        composer.update(cx, |composer, cx| {
+            composer.set_target(crate::state::ChatTarget::Fixed(Some("chat-a2".into())), cx);
+        });
+        draft(&composer, "older a2 words", cx);
+        composer.update(cx, |composer, cx| {
+            composer.set_target(crate::state::ChatTarget::Fixed(Some("chat-a1".into())), cx);
+        });
+        assert_eq!(draft_text(&composer, cx), "");
+        // A queue edit is in flight: the input holds the HOST's leased row
+        // text while the user's own words sit displaced in queue_edit_draft.
+        // Both fields are injected directly — the real edit needs a live
+        // host to grant the lease (the same shape as the composer's own
+        // queue-edit tests).
+        composer.update(cx, |composer, _| {
+            composer.editing_queued = Some("row-1".into());
+            composer.queue_edit_draft =
+                Some(("displaced a1 words".into(), Vec::new(), Vec::new()));
+        });
+        draft(&composer, "the leased row text", cx);
+        shell.flush_workspace_layout(cx);
+
+        // Away and back: the DISPLACED words — not the leased row text —
+        // come back as the pane's draft, and the older maps survive too.
+        select_space(shell, "b", cx);
+        select_space(shell, "a", cx);
+        let restored = pane_composer_for_chat(shell, "chat-a1");
+        assert_eq!(draft_text(&restored, cx), "displaced a1 words");
+        restored.update(cx, |composer, cx| {
+            composer.set_target(crate::state::ChatTarget::Fixed(Some("chat-a2".into())), cx);
+        });
+        assert_eq!(draft_text(&restored, cx), "older a2 words");
+    }).unwrap();
+}
