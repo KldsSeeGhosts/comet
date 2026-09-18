@@ -2,23 +2,24 @@
 //! workspace snapshot for the renderer, the split/focus/close handlers behind
 //! the `workspace::` actions, the WS3 divider-drag/equalize commit path, the
 //! tool picker (the verified ⌘D contract), tab close, the pane-header context
-//! menu, the focused-pane retarget loop that keeps the live
-//! transcript/composer on the focused pane, and the WS4 tab/pane drag state
-//! machine (source → per-sample [`resolve_drop`] preview → commit on
-//! mouse-up).
+//! menu, the per-pane chat surfaces (every Chat pane owns its transcript +
+//! composer) plus the focus→selection retarget loop that keeps global
+//! routing on the focused pane, and the WS4 tab/pane drag state machine
+//! (source → per-sample [`resolve_drop`] preview → commit on mouse-up).
 //!
 //! This lives in the shell module tree (like `tabs.rs`/`spaces.rs`) because it
 //! reads Shell's private fields; everything structural sits in `crate::pane`.
 
 use super::*;
 
-use crate::pane::chrome::{tab_mark, TabChip};
+use crate::pane::chrome::{TabChip, tab_mark};
 use crate::pane::hit_test::{self, DragSource, DropPlan};
-use crate::pane::render::{workspace_outlet, PaneSnap, ViewSnap, WorkspaceSnap};
+use crate::pane::render::{PaneSnap, ViewSnap, WorkspaceSnap, workspace_outlet};
 use crate::pane::{
-    ratio_from_pointer, DividerTarget, DragSplitState, PickerCommit, ToolKind, DIVIDER_HIT_PX,
-    EQUALIZE_RATIO,
+    DIVIDER_HIT_PX, DividerTarget, DragSplitState, EQUALIZE_RATIO, PaneChatSurface, PickerCommit,
+    ToolKind, ratio_from_pointer,
 };
+use crate::state::ChatTarget;
 use zeron_workspace::{Direction, PaneId, PaneMode, TabId, ViewId};
 
 impl Shell {
@@ -29,94 +30,206 @@ impl Shell {
         !self.workspace.is_trivial()
     }
 
-    /// The workspace tree as the chat outlet. Dormant transcripts are created
-    /// lazily here (render pass, like the lazy terminal panel), then the tree
-    /// is snapshotted and handed to [`crate::pane::render`] with the live
-    /// composer block (WS3 re-homing: the composer lives in the focused pane,
-    /// the outer dock is suppressed while `workspace_mode()` holds).
+    /// The workspace tree as the chat outlet. Every Chat-mode pane in the
+    /// layout owns a live transcript+composer pair bound to its session —
+    /// created lazily here (render pass, like the lazy terminal panel) for
+    /// panes across ALL tabs/views, not only visible or focused ones — then
+    /// the tree is snapshotted and handed to [`crate::pane::render`]. The
+    /// outer dock stays suppressed while `workspace_mode()` holds.
     pub(super) fn render_workspace_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        // Dormant views: one read-only transcript per session-bound pane that
-        // isn't the focused one. Idempotent; entries persist across frames.
-        let focused = self.workspace.focused_pane();
-        let needs: Vec<PaneId> = self
-            .workspace
-            .layout
-            .views
-            .values()
-            .flat_map(|view| view.tabs.values())
-            .flat_map(|tab| tab.panes.iter())
-            .filter(|(id, state)| {
-                state.session_id.is_some()
-                    && focused != Some(**id)
-                    && !self.workspace.pane_transcripts.contains_key(id)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for pane in needs {
-            self.workspace
-                .transcript_for_pane(pane, self.state.clone(), cx);
-        }
-        let live = self.transcript.clone();
-        let composer_block = self.render_pane_composer_block(cx);
-        let dormant = self.workspace.pane_transcripts.clone();
-        let snap = Self::workspace_snapshot(&self.workspace, &self.state, &dormant, cx);
+        self.ensure_pane_chat_surfaces(cx);
+        let snap = Self::workspace_snapshot(&self.workspace, &self.state, cx);
         // WS4: the active drag's preview, converted to outlet-relative space.
         let drag_preview = self.split_drag.as_ref().and_then(preview_bounds);
-        workspace_outlet(cx, &theme, &snap, &live, composer_block, drag_preview)
+        workspace_outlet(cx, &theme, &snap, drag_preview)
     }
 
-    /// The live composer strip hosted INSIDE the focused chat pane (WS3
-    /// re-homing): the same `Entity<Composer>` the outer dock used, in a
-    /// centered max-width column with the jump-to-bottom pill floating above
-    /// it. The pane renderer overlays this at the focused pane's bottom.
-    fn render_pane_composer_block(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (has_spaces, no_project, has_selection) = {
-            let state = self.state.read(cx);
-            (
-                !state.spaces.is_empty(),
-                state.no_project,
-                state.selected_chat.is_some(),
-            )
-        };
-        let has_appshots = !self.composer.read(cx).staged_appshots().is_empty();
-        if !(has_spaces || no_project || has_appshots) {
-            return None;
-        }
-        let mut block = div()
-            .id("pane-composer")
-            .relative()
-            .w_full()
-            .px(px(10.0))
-            .pb(px(10.0))
-            .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .max_w(px(crate::composer::COMPOSER_MAX_WIDTH))
-                    .mx_auto()
-                    .child(self.composer.clone()),
-            );
-        if has_selection {
-            if let Some(pill) = self.render_jump_to_bottom(cx) {
-                block = block.child(pill);
+    /// Surface inventory: the layout binding is authoritative. A surface is
+    /// current when its `chat_id` mirror matches the pane's session AND (for
+    /// a bound session) its transcript exists — this pass is the sole place
+    /// surfaces are invalidated/recreated, so observation ordering can never
+    /// drop a just-bound composer. Called by the render pass and by
+    /// navigation that rebinds the focused pane off the render path.
+    fn ensure_pane_chat_surfaces(&mut self, cx: &mut Context<Self>) {
+        for (pane, session) in self.workspace.chat_pane_sessions() {
+            let valid = self
+                .workspace
+                .chat_surfaces
+                .get(&pane)
+                .is_some_and(|surface| {
+                    surface.chat_id == session
+                        && (session.is_none() || surface.transcript.is_some())
+                });
+            if !valid {
+                self.workspace.chat_surfaces.remove(&pane);
+                let surface = self.create_pane_chat_surface(pane, session, cx);
+                self.workspace.chat_surfaces.insert(pane, surface);
             }
         }
-        Some(block.into_any_element())
+    }
+
+    /// A pane's fixed interactive transcript for `chat_id`, fed by the same
+    /// doc watch the subagent tabs use (single-flight). Shared by the ensure
+    /// pass and the mint path in [`Self::on_pane_composer_event`].
+    fn create_pane_transcript(
+        &mut self,
+        chat_id: String,
+        cx: &mut Context<Self>,
+    ) -> (Entity<Transcript>, Subscription) {
+        self.state.update(cx, |s, cx| {
+            s.watch_subagent_doc(chat_id.clone(), cx);
+            s.watch_pane_queue(chat_id.clone(), cx);
+        });
+        let transcript =
+            cx.new(|cx| Transcript::for_session(self.state.clone(), chat_id.clone(), cx));
+        let links = Self::session_links(Some(chat_id), cx);
+        transcript.update(cx, |transcript, _| {
+            transcript.set_workspace_link_handler(links)
+        });
+        let events = cx.subscribe(&transcript, Self::on_transcript_event);
+        (transcript, events)
+    }
+
+    /// The transcript+composer pair one pane owns. `session` is the layout
+    /// binding; `None` is the pane's new-chat canvas (no transcript until a
+    /// send mints one).
+    fn create_pane_chat_surface(
+        &mut self,
+        pane: PaneId,
+        session: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> PaneChatSurface {
+        let (transcript, transcript_events) = match session.clone() {
+            Some(chat_id) => {
+                let (transcript, events) = self.create_pane_transcript(chat_id, cx);
+                (Some(transcript), Some(events))
+            }
+            None => (None, None),
+        };
+        let composer = cx.new(|cx| Composer::for_pane(self.state.clone(), session.clone(), cx));
+        // The composer binds itself to the chat it mints (and resets to the
+        // canvas on a failed first send) BEFORE the `select_chat` observers
+        // replay the session through `set_pane_session`. Mirror its target
+        // here — queued ahead of those observers — so the surface reads as
+        // current instead of being invalidated mid-flight.
+        let composer_observation = cx.observe(&composer, {
+            move |shell: &mut Shell, composer, cx| {
+                let chat_id = match &composer.read(cx).target {
+                    ChatTarget::Fixed(id) => id.clone(),
+                    ChatTarget::Selected => return,
+                };
+                if let Some(surface) = shell.workspace.chat_surfaces.get_mut(&pane)
+                    && surface.chat_id != chat_id
+                {
+                    surface.chat_id = chat_id;
+                    // The transcript is bound to the OLD session — drop it;
+                    // the owning path (the Sent event or the ensure pass)
+                    // rebuilds for the new binding.
+                    surface.transcript = None;
+                    surface.transcript_events = None;
+                }
+            }
+        });
+        let composer_events = cx.subscribe(&composer, move |shell, _, event, cx| {
+            shell.on_pane_composer_event(pane, event, cx)
+        });
+        PaneChatSurface {
+            chat_id: session,
+            transcript,
+            composer,
+            composer_events,
+            composer_observation,
+            transcript_events,
+        }
+    }
+
+    /// A workspace pane's composer event stream. Unlike the shell composer,
+    /// pane composers never drive the global dock transition — `Sent` /
+    /// `Queued` bind the layout pane to the minted chat and hand the
+    /// own-turn marker to THAT pane's transcript.
+    fn on_pane_composer_event(
+        &mut self,
+        pane: PaneId,
+        event: &ComposerEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ComposerEvent::NewThreadTransitionStarted => {
+                // Route observation drives the global dock once selection
+                // commits; workspace panes stay out of that choreography.
+                cx.notify();
+            }
+            ComposerEvent::Sent { chat_id, .. } | ComposerEvent::Queued { chat_id, .. } => {
+                // Bind the layout pane to the minted chat (idempotent — the
+                // selection sync may already have landed it) and arm the
+                // workspace persistence write.
+                let bound = self
+                    .workspace
+                    .layout
+                    .pane(pane)
+                    .and_then(|state| state.session_id.clone());
+                if bound.as_deref() != Some(chat_id.as_str()) {
+                    let _ = self.workspace.set_pane_session(pane, Some(chat_id.clone()));
+                }
+                self.workspace.mark_dirty();
+                self.note_workspace_mutation(cx);
+                // The composer already bound itself during the mint — keep
+                // that entity, mirror the session, and ensure the pane's
+                // fixed transcript exists before the marker lands.
+                let needs_transcript = self
+                    .workspace
+                    .chat_surfaces
+                    .get(&pane)
+                    .is_some_and(|surface| surface.transcript.is_none());
+                let transcript = if needs_transcript {
+                    Some(self.create_pane_transcript(chat_id.clone(), cx))
+                } else {
+                    None
+                };
+                if let Some(surface) = self.workspace.chat_surfaces.get_mut(&pane) {
+                    surface.chat_id = Some(chat_id.clone());
+                    if let Some((transcript, events)) = transcript {
+                        surface.transcript = Some(transcript);
+                        surface.transcript_events = Some(events);
+                    }
+                }
+                if let Some(transcript) = self
+                    .workspace
+                    .chat_surfaces
+                    .get(&pane)
+                    .and_then(|surface| surface.transcript.clone())
+                {
+                    transcript.update(cx, |t, cx| match event {
+                        ComposerEvent::Sent { message_id, .. } => {
+                            t.on_own_send(chat_id.clone(), message_id.clone(), cx)
+                        }
+                        ComposerEvent::Queued { message_id, .. } => {
+                            t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
+                        }
+                        ComposerEvent::NewThreadTransitionStarted => {}
+                    });
+                }
+                cx.notify();
+            }
+        }
     }
 
     /// Flatten the layout into the renderer's immutable snapshot. Titles read
     /// AppState once per frame (chat titles for session-bound panes; labels
-    /// and mode names otherwise).
+    /// and mode names otherwise). Transcript/composer clones come from each
+    /// pane's owned [`PaneChatSurface`].
     fn workspace_snapshot(
         workspace: &crate::pane::PaneHost,
         state: &Entity<AppState>,
-        dormant: &std::collections::HashMap<PaneId, Entity<Transcript>>,
         cx: &App,
     ) -> WorkspaceSnap {
         let layout = &workspace.layout;
         let global_focus = layout.active_pane_id();
-        let pane_title = |session: &Option<String>, mode: zeron_workspace::PaneMode, label: &Option<String>| -> SharedString {
+        let pane_title = |session: &Option<String>,
+                          mode: zeron_workspace::PaneMode,
+                          label: &Option<String>|
+         -> SharedString {
             if let Some(label) = label {
                 return label.clone().into();
             }
@@ -175,27 +288,36 @@ impl Shell {
                     .map(|tab| {
                         tab.panes
                             .iter()
-                            .map(|(pane_id, pane_state)| PaneSnap {
-                                pane: *pane_id,
-                                mode: pane_state.mode,
-                                title: pane_title(
-                                    &pane_state.session_id,
-                                    pane_state.mode,
-                                    &pane_state.label,
-                                ),
-                                mark: tab_mark(
-                                    pane_state.mode,
-                                    pane_state.provider_key.as_deref(),
-                                ),
-                                has_session: pane_state.session_id.is_some(),
-                                focused: global_focus == Some(*pane_id),
-                                dormant_transcript: dormant.get(pane_id).cloned(),
+                            .map(|(pane_id, pane_state)| {
+                                let surface = workspace.chat_surfaces.get(pane_id);
+                                PaneSnap {
+                                    pane: *pane_id,
+                                    mode: pane_state.mode,
+                                    title: pane_title(
+                                        &pane_state.session_id,
+                                        pane_state.mode,
+                                        &pane_state.label,
+                                    ),
+                                    mark: tab_mark(
+                                        pane_state.mode,
+                                        pane_state.provider_key.as_deref(),
+                                    ),
+                                    has_session: pane_state.session_id.is_some(),
+                                    focused: global_focus == Some(*pane_id),
+                                    transcript: surface
+                                        .and_then(|surface| surface.transcript.clone()),
+                                    composer: surface.map(|surface| surface.composer.clone()),
+                                }
                             })
                             .collect()
                     })
                     .unwrap_or_default();
                 ViewSnap {
                     view_id: *view_id,
+                    // The strip's × closes THIS view; the engine guards the
+                    // last one, but hide the control rather than offering a
+                    // no-op.
+                    closable: layout.views.len() > 1,
                     active_tab_id,
                     chips,
                     active_tab_root: view
@@ -204,7 +326,11 @@ impl Shell {
                         .map(|tab| tab.root.clone())
                         .unwrap_or_else(|| {
                             zeron_workspace::SplitNode::leaf(
-                                view.tabs.values().next().map(|tab| tab.active_pane_id).unwrap_or(PaneId(0)),
+                                view.tabs
+                                    .values()
+                                    .next()
+                                    .map(|tab| tab.active_pane_id)
+                                    .unwrap_or(PaneId(0)),
                             )
                         }),
                     panes,
@@ -225,7 +351,7 @@ impl Shell {
     // ------------------------------------------------------------------
 
     /// Click-to-focus (and the tab-switch fallback): focus the pane in the
-    /// engine, then retarget the live views to it.
+    /// engine, then sync selection + keyboard routing to it.
     pub(crate) fn focus_workspace_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
         if self.workspace.focus_pane(pane).is_err() {
             return;
@@ -233,9 +359,43 @@ impl Shell {
         self.retarget_to_focused_pane(cx);
     }
 
+    /// Apply one user-requested navigation after any required workspace
+    /// restore. Existing sessions keep their pane bindings and only move
+    /// focus; a target not yet open replaces the focused pane.
+    pub(crate) fn apply_explicit_workspace_navigation(
+        &mut self,
+        target: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(chat_id) = target.as_deref()
+            && let Some(pane) = self.find_pane_with_session(chat_id)
+        {
+            self.focus_workspace_pane(pane, cx);
+            return;
+        }
+
+        self.workspace.sync_focused_session(target.as_deref());
+        let selected = self.state.read(cx).selected_chat.clone();
+        if selected != target {
+            self.state
+                .update(cx, |state, cx| state.select_chat(target, cx));
+        }
+        // Rebind off the render path: realize the replacement surface now and
+        // hand it keyboard focus, rather than pointing focus at the composer
+        // the binding change just invalidated.
+        self.ensure_pane_chat_surfaces(cx);
+        self.focus_composer(cx);
+        self.note_workspace_mutation(cx);
+    }
+
     /// Tab chip click: make the tab active (and its view), then retarget to
     /// that tab's active pane.
-    pub(crate) fn switch_workspace_tab(&mut self, view: ViewId, tab: TabId, cx: &mut Context<Self>) {
+    pub(crate) fn switch_workspace_tab(
+        &mut self,
+        view: ViewId,
+        tab: TabId,
+        cx: &mut Context<Self>,
+    ) {
         if self.workspace.focus_tab(view, tab).is_err() {
             return;
         }
@@ -336,12 +496,7 @@ impl Shell {
         self.apply_divider_ratio(target, EQUALIZE_RATIO, cx);
     }
 
-    fn apply_divider_ratio(
-        &mut self,
-        target: &DividerTarget,
-        ratio: f64,
-        cx: &mut Context<Self>,
-    ) {
+    fn apply_divider_ratio(&mut self, target: &DividerTarget, ratio: f64, cx: &mut Context<Self>) {
         let result = match target {
             DividerTarget::View { path } => self.workspace.set_view_ratio(path, ratio),
             DividerTarget::Pane { view, tab, path } => {
@@ -365,7 +520,10 @@ impl Shell {
     /// a [`hit_test::WorkspaceGeometry`]. Stale registry entries (a frame
     /// behind an engine change) filter out against the live layout, so a
     /// mid-drag mutation resolves against what is actually on screen.
-    fn workspace_geometry(&self, content: gpui::Bounds<gpui::Pixels>) -> hit_test::WorkspaceGeometry {
+    fn workspace_geometry(
+        &self,
+        content: gpui::Bounds<gpui::Pixels>,
+    ) -> hit_test::WorkspaceGeometry {
         let layout = &self.workspace.layout;
         let panes = self
             .workspace
@@ -376,7 +534,11 @@ impl Shell {
                 let (view, tab) = layout.pane_location(*pane)?;
                 // Only include panes from the view's active tab - stale
                 // bounds from inactive tabs must not participate in hit-testing.
-                if !layout.views.get(&view).is_some_and(|v| v.active_tab_id == tab) {
+                if !layout
+                    .views
+                    .get(&view)
+                    .is_some_and(|v| v.active_tab_id == tab)
+                {
                     return None;
                 }
                 Some(hit_test::PaneRect {
@@ -401,7 +563,8 @@ impl Shell {
                 })
             })
             .collect();
-        let mut strips: std::collections::BTreeMap<ViewId, Vec<hit_test::ChipRect>> = Default::default();
+        let mut strips: std::collections::BTreeMap<ViewId, Vec<hit_test::ChipRect>> =
+            Default::default();
         for ((view, tab), bounds) in self.workspace.chip_bounds.borrow().iter() {
             if layout
                 .views
@@ -465,8 +628,8 @@ impl Shell {
 
     /// Mouse-up over the outlet: commit the last resolved plan. Invalid
     /// drops ([`DropPlan::None`]) and engine rejections (the guards below)
-    /// no-op; a real commit retargets the live views to the newly focused
-    /// pane (the engine ops all focus the moved/dropped content).
+    /// no-op; a real commit syncs selection + keyboard routing to the newly
+    /// focused pane (the engine ops all focus the moved/dropped content).
     pub(crate) fn commit_split_drop(
         &mut self,
         payload: &crate::pane::TabSplitDrag,
@@ -492,7 +655,11 @@ impl Shell {
     /// A drop that would cross a project boundary is rejected before the
     /// tree is mutated - accepting it would immediately trigger a space
     /// restore that dismantles the split.
-    fn sidebar_session_compatible(&self, session_id: &Option<String>, cx: &mut Context<Self>) -> bool {
+    fn sidebar_session_compatible(
+        &self,
+        session_id: &Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(sid) = session_id.as_deref() else {
             return true; // no session to validate
         };
@@ -542,9 +709,9 @@ impl Shell {
                                 .get(&new_view)
                                 .and_then(|v| v.tabs.values().next())
                             {
-                                if let Some(pane_id) = tab.panes.keys().next() {
-                                    let _ = self.workspace.set_pane_session(*pane_id, session_id);
-                                    self.workspace.layout.focus_pane(*pane_id).ok();
+                                if let Some(pane_id) = tab.panes.keys().next().copied() {
+                                    let _ = self.workspace.set_pane_session(pane_id, session_id);
+                                    self.workspace.layout.focus_pane(pane_id).ok();
                                 }
                             }
                             true
@@ -559,9 +726,10 @@ impl Shell {
                                 .get(&view)
                                 .and_then(|v| v.tabs.get(&tab_id))
                                 .and_then(|t| t.panes.keys().next())
+                                .copied()
                             {
-                                let _ = self.workspace.set_pane_session(*pane_id, session_id);
-                                self.workspace.layout.focus_pane(*pane_id).ok();
+                                let _ = self.workspace.set_pane_session(pane_id, session_id);
+                                self.workspace.layout.focus_pane(pane_id).ok();
                             }
                             true
                         })
@@ -762,10 +930,7 @@ impl Shell {
 
     /// The workspace overlays: the tool picker + the pane-header context
     /// menu (both `menu_at` popovers, mirrored from the chat context menu).
-    pub(super) fn render_workspace_overlays(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
+    pub(super) fn render_workspace_overlays(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut overlays = Vec::new();
         if let Some(picker) = self.tool_picker {
             overlays.push(self.render_tool_picker(picker, cx));
@@ -800,11 +965,7 @@ impl Shell {
                         this.commit_tool_picker(commit, kind, cx);
                     }))
                     .child(icon(row.icon).size(px(14.0)).text_color(theme.text_muted))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(SharedString::from(row.label)),
-                    )
+                    .child(div().flex_1().child(SharedString::from(row.label)))
                     .children(row.badge.map(|badge| {
                         div()
                             .px(px(5.0))
@@ -817,15 +978,20 @@ impl Shell {
                     })),
             );
         }
-        popover::menu_at("ws-tool-picker", picker.anchor, card.into_any_element(), None)
+        popover::menu_at(
+            "ws-tool-picker",
+            picker.anchor,
+            card.into_any_element(),
+            None,
+        )
     }
 
     // ------------------------------------------------------------------
     // Pane-header context menu (§6)
     // ------------------------------------------------------------------
 
-    /// Right-click on a pane header: focus that pane (the composer returns
-    /// from its ghost, §6) and open the split/close menu at the pointer.
+    /// Right-click on a pane header: focus that pane (keyboard routing moves
+    /// to its own composer, §6) and open the split/close menu at the pointer.
     pub(crate) fn open_workspace_pane_menu(
         &mut self,
         pane: PaneId,
@@ -833,7 +999,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.focus_workspace_pane(pane, cx);
-        self.pane_menu.open(crate::pane::PaneMenuState { pane, position });
+        self.pane_menu
+            .open(crate::pane::PaneMenuState { pane, position });
         cx.notify();
     }
 
@@ -851,55 +1018,70 @@ impl Shell {
     ) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
         let pane = menu.pane;
-        let row =
-            |id: &'static str, label: SharedString, chord: &'static str| {
-                popover::menu_row(&theme, false, id)
-                    .id(id)
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(crate::typography::ui_rems(11.5))
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .text_size(crate::typography::ui_rems(10.0))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(chord)),
-                    )
-            };
+        let row = |id: &'static str, label: SharedString, chord: &'static str| {
+            popover::menu_row(&theme, false, id)
+                .id(id)
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(10.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(chord)),
+                )
+        };
         let card = popover::popover_card(&theme)
             .w(px(232.0))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_workspace_pane_menu(cx)))
             .flex()
             .flex_col()
             .child(
-                row("ws-menu-split-right", SharedString::from("Split pane right"), "⌘D")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_workspace_pane_menu(cx);
-                        this.split_workspace_pane(Direction::Right, cx);
-                    })),
+                row(
+                    "ws-menu-split-right",
+                    SharedString::from("Split pane right"),
+                    "⌘D",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_workspace_pane_menu(cx);
+                    this.split_workspace_pane(Direction::Right, cx);
+                })),
             )
             .child(
-                row("ws-menu-split-down", SharedString::from("Split pane down"), "⇧⌘D")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_workspace_pane_menu(cx);
-                        this.split_workspace_pane(Direction::Down, cx);
-                    })),
+                row(
+                    "ws-menu-split-down",
+                    SharedString::from("Split pane down"),
+                    "⇧⌘D",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_workspace_pane_menu(cx);
+                    this.split_workspace_pane(Direction::Down, cx);
+                })),
             )
             .child(
-                row("ws-menu-view-right", SharedString::from("Split view right"), "⌥⌘D")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_workspace_pane_menu(cx);
-                        this.split_workspace_view(Direction::Right, cx);
-                    })),
+                row(
+                    "ws-menu-view-right",
+                    SharedString::from("Split view right"),
+                    "⌥⌘D",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_workspace_pane_menu(cx);
+                    this.split_workspace_view(Direction::Right, cx);
+                })),
             )
             .child(
-                row("ws-menu-view-down", SharedString::from("Split view down"), "⌥⌘⇧D")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_workspace_pane_menu(cx);
-                        this.split_workspace_view(Direction::Down, cx);
-                    })),
+                row(
+                    "ws-menu-view-down",
+                    SharedString::from("Split view down"),
+                    "⌥⌘⇧D",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_workspace_pane_menu(cx);
+                    this.split_workspace_view(Direction::Down, cx);
+                })),
             )
             .child(popover::menu_separator())
             .child(
@@ -953,17 +1135,17 @@ impl Shell {
     // Retarget loop
     // ------------------------------------------------------------------
 
-    /// Make the shell's live views follow the focused pane: prune dead cache
-    /// entries, select the pane's chat in AppState (which re-anchors the
-    /// transcript watch and the composer — the exact mechanism a sidebar click
-    /// uses), and move composer keyboard focus with it. `None` sessions land
-    /// on the new-thread canvas, whose mint-on-send binds the pane via
-    /// [`Self::sync_workspace_selection`]. Every mutation path funnels here,
-    /// which is also where the WS5 save arms.
+    /// Sync global state to the focused pane: prune dead cache entries,
+    /// select the pane's chat in AppState (the sidebar/global routing model
+    /// — pane surfaces are unaffected, each keeps its own transcript and
+    /// composer), and route keyboard focus to that pane's composer. `None`
+    /// sessions land on the new-thread canvas, whose mint-on-send binds the
+    /// pane via [`Self::sync_workspace_selection`]. Every mutation path
+    /// funnels here, which is also where the WS5 save arms.
     fn retarget_to_focused_pane(&mut self, cx: &mut Context<Self>) {
         self.sync_selection_to_focused_pane(cx);
-        // Keyboard focus follows the focused pane's composer (the ghost swap
-        // contract); a no-op while an input the user chose keeps focus.
+        // Keyboard focus follows the focused pane's own composer; a no-op
+        // while an input the user chose keeps focus.
         self.focus_composer(cx);
         cx.notify();
         self.note_workspace_mutation(cx);
@@ -1046,7 +1228,7 @@ impl Shell {
                     crate::workspace_layout_store::SAVE_DEBOUNCE_MS,
                 ))
                 .await;
-            this.update(cx, |shell, cx| shell.flush_workspace_layout(cx));
+            let _ = this.update(cx, |shell, cx| shell.flush_workspace_layout(cx));
         });
         let previous = self.workspace_save_task.replace(task);
         drop(previous);
@@ -1096,11 +1278,14 @@ impl Shell {
     /// frame) and every space switch land here. The OUTGOING tree is
     /// snapshotted into the store first, so a fast switch never loses the
     /// debounce window's changes. The incoming entry falls back to the
-    /// default single-pane layout when missing or invalid. Dormant panes
-    /// rebuild as identity cards; the FOCUSED pane's session is re-selected
-    /// in AppState so the live transcript/composer follow it (the
-    /// single-projection model).
-    pub(crate) fn restore_workspace_layout(&mut self, space: Option<String>, cx: &mut Context<Self>) {
+    /// default single-pane layout when missing or invalid. Pane surfaces
+    /// rebuild lazily in the ensure pass; the FOCUSED pane's session is
+    /// re-selected in AppState so sidebar/global routing follows it.
+    pub(crate) fn restore_workspace_layout(
+        &mut self,
+        space: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.workspace.take_dirty() {
             self.workspace_layouts.set_layout(
                 self.active_workspace_space.as_deref(),

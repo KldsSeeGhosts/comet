@@ -2601,12 +2601,19 @@ pub struct Transcript {
     /// The shell may retain this already-laid-out view briefly for its exit.
     /// Cleared as soon as the exit is invisible; never used for another chat.
     retain_on_deselect: bool,
-    /// `Some(doc_id)` pins this instance to a SUBAGENT doc: rows come from
-    /// `AppState::sub_transcript(doc_id)` instead of the selected chat, and
-    /// the instance is READ-ONLY — no echoes, no own-turn hold, and no global
-    /// attachment protection (that set is shared with the primary transcript
-    /// and overwritten wholesale).
+    /// `Some(doc_id)` pins this instance to a fixed doc: rows come from
+    /// `AppState::sub_transcript(doc_id)` instead of the selected chat.
+    /// Without `interactive_override` this is a READ-ONLY subagent tab — no
+    /// echoes, no own-turn hold, and no global attachment protection (that
+    /// set is shared with the primary transcript and overwritten wholesale).
+    /// With it, the instance is a pane-owned chat session: the same fixed
+    /// doc, but interactive like the primary (echoes, own-turn, chat-row
+    /// devices, chat liveness). Global attachment protection stays off for
+    /// every override instance either way.
     doc_override: Option<String>,
+    /// `doc_override` is an interactive pane session, not a read-only
+    /// subagent tab.
+    interactive_override: bool,
     /// Whether an override instance watches a LIVE doc (`for_doc(follow)`):
     /// only then may the working trailer render — a frozen snapshot must
     /// never spin, whatever its entries claim.
@@ -2823,7 +2830,7 @@ impl Transcript {
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        Self::build(state, None, true, cx)
+        Self::build(state, None, true, false, cx)
     }
 
     /// A read-only transcript over one SUBAGENT doc (right-pane tab). The
@@ -2838,29 +2845,46 @@ impl Transcript {
         follow: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(state, Some(doc_id), follow, cx)
+        Self::build(state, Some(doc_id), follow, false, cx)
+    }
+
+    /// An INTERACTIVE transcript pinned to one chat doc — the pane-owned
+    /// session surface (workspace mode). Same fixed-doc binding as
+    /// [`Self::for_doc`], but with the primary transcript's behavior:
+    /// bottom alignment, this chat's echoes and own-turn runway, chat-row
+    /// attachment devices, and `indicator_for` liveness. The caller starts
+    /// the doc feed (`watch_subagent_doc`).
+    pub(crate) fn for_session(
+        state: Entity<AppState>,
+        chat_id: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(state, Some(chat_id), true, true, cx)
     }
 
     fn build(
         state: Entity<AppState>,
         doc_override: Option<String>,
         follow: bool,
+        interactive_override: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         // FollowMode stays Normal: the tail pin is ours (a per-frame spring),
         // not the list's per-layout hard snap.
         //
-        // Override instances align TOP: a subagent transcript reads like a
-        // fresh notes page — entries anchored at the top, streaming growing
-        // into the empty space below, never rising from the pane's bottom.
-        // Top alignment gets that structurally (a short list rests at the
-        // top with no reservation pad), and the PIN machinery still runs on
-        // top of it for end-follow: the spring is purely distance-based, and
-        // the glue trap it was built around is Bottom-only — layout
+        // Read-only override instances align TOP: a subagent transcript reads
+        // like a fresh notes page — entries anchored at the top, streaming
+        // growing into the empty space below, never rising from the pane's
+        // bottom. Top alignment gets that structurally (a short list rests at
+        // the top with no reservation pad), and the PIN machinery still runs
+        // on top of it for end-follow: the spring is purely distance-based,
+        // and the glue trap it was built around is Bottom-only — layout
         // materializes a Top list's past-end offset to a CONCRETE position
         // every frame (gpui list.rs: only `Bottom` re-glues to the `None`
         // sentinel), so a parked spring can't re-glue and hard-track growth.
-        let alignment = if doc_override.is_some() {
+        // An interactive pane session is a conversation, not a notes page —
+        // it aligns BOTTOM like the primary transcript.
+        let alignment = if doc_override.is_some() && !interactive_override {
             ListAlignment::Top
         } else {
             ListAlignment::Bottom
@@ -2908,6 +2932,7 @@ impl Transcript {
             land_end_pending: doc_override.is_some() && !follow,
             doc_live: doc_override.is_some() && follow,
             doc_override,
+            interactive_override,
             saved_viewports: SavedViewportCache::default(),
             pending_viewport: None,
             viewport_generation: 0,
@@ -4099,10 +4124,21 @@ impl Transcript {
             for entry in entries {
                 new_rows.extend(self.rows_for(entry, false));
             }
-            if self.doc_override.is_none() {
-                for echo in state.pending_echoes() {
-                    new_rows.extend(self.rows_for(echo, true));
+            // Optimistic echoes are per-chat: the primary transcript reads
+            // the selected chat's, a pane session reads its own doc's, and a
+            // read-only subagent override renders none.
+            match self.doc_override.clone() {
+                Some(doc_id) if self.interactive_override => {
+                    for echo in state.pending_echoes_for(&doc_id) {
+                        new_rows.extend(self.rows_for(echo, true));
+                    }
                 }
+                None => {
+                    for echo in state.pending_echoes() {
+                        new_rows.extend(self.rows_for(echo, true));
+                    }
+                }
+                _ => {}
             }
             (
                 entries.is_empty(),
@@ -4613,15 +4649,23 @@ impl Transcript {
     /// device (uploads targeted it) plus this device (zeron's
     /// `uniqueIds([attachmentDeviceId, m.device_id])`).
     fn attachment_device_ids(&self, cx: &Context<Self>) -> Vec<String> {
-        // `selected_chat_row` belongs to the PRIMARY transcript's chat — an
-        // override instance has no chat row, so it claims no devices (its
-        // thumbnails degrade to placeholders instead of guessing).
-        if self.doc_override.is_some() {
+        // `selected_chat_row` belongs to the PRIMARY transcript's chat — a
+        // read-only override instance has no chat row, so it claims no
+        // devices (its thumbnails degrade to placeholders instead of
+        // guessing). A pane session resolves its OWN chat row.
+        if self.doc_override.is_some() && !self.interactive_override {
             return Vec::new();
         }
         let state = self.state.read(cx);
         let mut ids = Vec::new();
-        if let Some(chat) = state.selected_chat_row() {
+        let chat_row = if self.interactive_override {
+            self.chat_id
+                .as_deref()
+                .and_then(|id| state.chats.iter().find(|chat| chat.id == id))
+        } else {
+            state.selected_chat_row()
+        };
+        if let Some(chat) = chat_row {
             ids.push(chat.device_id.clone());
         }
         if let Some(local) = state.local_device_id.clone()
@@ -5386,7 +5430,11 @@ impl Transcript {
 
     fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let now = chrono::Utc::now();
-        let (sending, queued, elapsed_secs, seed) = if let Some(doc_id) = &self.doc_override {
+        let (sending, queued, elapsed_secs, seed) = if let Some(doc_id) = self
+            .doc_override
+            .as_deref()
+            .filter(|_| !self.interactive_override)
+        {
             // A subagent doc has no Session row — `indicator_for` would read
             // the PARENT chat's live state into this tab. Liveness rides the
             // doc itself instead: the sink's assistant entry streams until
@@ -11595,6 +11643,70 @@ mod tests {
             vec![text_part("t0", ""), text_part("t1", "   ")],
         );
         assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    fn user_echo(id: &str, text: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::User,
+            parts: vec![text_part(&format!("{id}-t"), text)],
+            created_at: 0,
+            device_id: "dev".into(),
+            status: None,
+            continuation_of: None,
+        }
+    }
+
+    /// A pane-owned (`for_session`) transcript reads ITS chat's optimistic
+    /// echoes — not the globally selected chat's — and stays pinned when the
+    /// selection moves. `for_doc` stays read-only: no echoes at all.
+    #[gpui::test]
+    fn pane_session_reads_its_own_echoes_regardless_of_selection(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            let state = cx.new(|_| AppState::new());
+            let session =
+                cx.new(|cx| Transcript::for_session(state.clone(), "pane-chat".into(), cx));
+            let doc = cx.new(|cx| Transcript::for_doc(state.clone(), "pane-chat".into(), true, cx));
+            state.update(cx, |state, _| {
+                state.selected_chat = Some("other-chat".into());
+                state.push_echo("pane-chat", user_echo("pane-echo", "pane draft"));
+                state.push_echo("other-chat", user_echo("other-echo", "other draft"));
+            });
+            session.update(cx, |this, cx| {
+                this.sync(cx);
+                assert!(
+                    this.rows.iter().any(|row| row.entry_id == "pane-echo"),
+                    "the pane session must render its own optimistic echo"
+                );
+                assert!(
+                    !this.rows.iter().any(|row| row.entry_id == "other-echo"),
+                    "the selected chat's echo must not leak into the pane"
+                );
+            });
+            doc.update(cx, |this, cx| {
+                this.sync(cx);
+                assert!(
+                    this.rows.is_empty(),
+                    "a read-only subagent transcript renders no echoes"
+                );
+            });
+            // Selection moving elsewhere still does not retarget the pane.
+            state.update(cx, |state, cx| {
+                state.select_chat(Some("third-chat".into()), cx)
+            });
+            session.update(cx, |this, cx| {
+                this.sync(cx);
+                assert_eq!(this.chat_id.as_deref(), Some("pane-chat"));
+                assert!(
+                    this.rows.iter().any(|row| row.entry_id == "pane-echo"),
+                    "the pane session keeps its own rows across selection moves"
+                );
+            });
+        });
     }
 }
 

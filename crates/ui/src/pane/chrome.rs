@@ -391,7 +391,9 @@ pub(crate) fn tab_strip(
 /// composer-shaped strip with muted "Click to focus chat" text and a
 /// non-interactive pill row mirroring the live composer's footer layout.
 /// Purely decorative — the pane container's click-to-focus handler owns the
-/// pointer.
+/// pointer. Unused since every pane renders its own live composer; kept
+/// pending the final workspace chrome cleanup.
+#[allow(dead_code)]
 pub(crate) fn ghost_composer(theme: &Theme) -> AnyElement {
     let pill = |label: &'static str| {
         div()

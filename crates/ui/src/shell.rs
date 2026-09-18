@@ -1966,11 +1966,19 @@ impl Shell {
         } else {
             self.route = Route::Chat;
         }
+        // Workspace mode: the navigation's pane rebind lands in a deferred
+        // observer — force it now so the staged shot belongs to the composer
+        // that survives (the focused pane's post-rebind surface), not the
+        // entity the rebind is about to replace.
+        if self.workspace_mode() {
+            self.apply_explicit_workspace_navigation(target.clone(), cx);
+        }
         let key = target.unwrap_or_default();
-        self.composer.update(cx, |composer, cx| {
+        let composer = self.active_composer();
+        composer.update(cx, |composer, cx| {
             composer.stage_appshot_for(key, appshot, cx)
         });
-        window.focus(&self.composer.focus_handle(cx), cx);
+        window.focus(&composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -1981,9 +1989,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.route = Route::Chat;
-        self.composer
-            .update(cx, |composer, cx| composer.show_appshot_error(message, cx));
-        window.focus(&self.composer.focus_handle(cx), cx);
+        let composer = self.active_composer();
+        composer.update(cx, |composer, cx| composer.show_appshot_error(message, cx));
+        window.focus(&composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -2254,39 +2262,7 @@ impl Shell {
             // that pane instead of overwriting another pane's binding.
             // For None (new-session): clear the focused pane's binding.
             if let Some(nav_target) = explicit_nav {
-                match nav_target {
-                    Some(ref chat_id) => {
-                        // Search the restored layout for a pane already
-                        // bound to this session; focus it rather than
-                        // duplicating the binding.
-                        let existing = self.find_pane_with_session(chat_id);
-                        if let Some(pane) = existing {
-                            self.workspace.layout.focus_pane(pane).ok();
-                            self.retarget_to_focused_pane(cx);
-                        } else {
-                            self.workspace.sync_focused_session(Some(chat_id));
-                            let current = self.state.read(cx).selected_chat.clone();
-                            if current.as_deref() != Some(chat_id.as_str()) {
-                                let target = chat_id.clone();
-                                self.state.update(cx, |state, cx| {
-                                    state.select_chat(Some(target), cx)
-                                });
-                            }
-                        }
-                    }
-                    None => {
-                        // New-session intent: clear the focused pane so the
-                        // user lands on the fresh composer canvas.
-                        self.workspace
-                            .sync_focused_session(None);
-                        let current = self.state.read(cx).selected_chat.clone();
-                        if current.is_some() {
-                            self.state.update(cx, |state, cx| {
-                                state.select_chat(None, cx)
-                            });
-                        }
-                    }
-                }
+                self.apply_explicit_workspace_navigation(nav_target, cx);
             }
         }
         // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
@@ -2661,7 +2637,7 @@ impl Shell {
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
-                self.composer
+                self.active_composer()
                     .update(cx, |composer, _| composer.focus_pending = false);
                 panel.update(cx, |panel, cx| {
                     panel.select_tab_by_key(tab, cx);
@@ -3303,7 +3279,8 @@ impl Shell {
                 }
                 self.browser_subs.remove(&id);
                 if was_active {
-                    window.focus(&self.composer.focus_handle(cx), cx);
+                    let composer = self.active_composer();
+                    window.focus(&composer.focus_handle(cx), cx);
                 }
             }
             RightSurface::Diff(id) => {
@@ -3513,7 +3490,7 @@ impl Shell {
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
         if open {
-            self.composer
+            self.active_composer()
                 .update(cx, |composer, _| composer.focus_pending = false);
             panel.update(cx, |panel, cx| panel.request_focus(cx));
             // Opening lands keyboard focus IN the shell — typing goes straight
@@ -3528,7 +3505,8 @@ impl Shell {
             // hand focus to the composer. (Cmd+J is a pure toggle — a second
             // press closes even while the terminal is focused, as in zeron's
             // `useHotkey(toggleShortcut, ... setOpenScoped(!open))`.)
-            window.focus(&self.composer.focus_handle(cx), cx);
+            let composer = self.active_composer();
+            window.focus(&composer.focus_handle(cx), cx);
         }
         self.terminal_tween_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -4166,7 +4144,7 @@ impl Shell {
         self.command_palette.is_some()
             || self.add_space.is_some()
             || self.tool_picker.is_some()
-            || self.composer.read(cx).pickers().read(cx).is_open()
+            || self.active_composer().read(cx).pickers().read(cx).is_open()
     }
 
     /// Track held modifiers for sidebar jump hints and the queue's submit hint.
@@ -4190,7 +4168,7 @@ impl Shell {
         let queue_shortcut_revealed = matches!(self.route, Route::Chat)
             && !self.overlay_owns_keyboard(cx)
             && modifier_send_hint_visible(primary, mods.alt, mods.shift);
-        self.composer.update(cx, |composer, cx| {
+        self.active_composer().update(cx, |composer, cx| {
             composer.set_queue_shortcut_revealed(queue_shortcut_revealed, cx)
         });
     }
@@ -4217,8 +4195,21 @@ impl Shell {
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
-        self.composer
-            .update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
+        // Every composer holding state for the deleted chat purges — the
+        // shared dock entity AND each pane's fixed composer (a pane bound to
+        // the deleted chat drops back to its canvas draft).
+        let mut composers = vec![self.composer.clone()];
+        for surface in self.workspace.chat_surfaces.values() {
+            if !composers
+                .iter()
+                .any(|composer| composer.entity_id() == surface.composer.entity_id())
+            {
+                composers.push(surface.composer.clone());
+            }
+        }
+        for composer in composers {
+            composer.update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
+        }
         self.mutate(
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
             cx,
@@ -7327,7 +7318,7 @@ impl Shell {
             .unwrap_or(Indicator::None);
         let interrupting = selected_chat
             .as_deref()
-            .is_some_and(|chat_id| self.composer.read(cx).is_interrupting(chat_id));
+            .is_some_and(|chat_id| self.active_composer().read(cx).is_interrupting(chat_id));
         let escape_stops_active_agent = self.settings.escape_stops_active_agent;
 
         match resolve_shell_escape(
@@ -7342,7 +7333,7 @@ impl Shell {
             ShellEscapeOutcome::Blocked => cx.stop_propagation(),
             ShellEscapeOutcome::InterruptChat(chat_id) => {
                 cx.stop_propagation();
-                self.composer
+                self.active_composer()
                     .update(cx, |composer, cx| composer.interrupt_chat(chat_id, cx));
             }
             ShellEscapeOutcome::OtherKey | ShellEscapeOutcome::Ignored => {}
@@ -7824,10 +7815,10 @@ impl Shell {
         // card. New-chat mode mints the chat id on first send.
         //
         // Workspace mode (any split/extra tab/pane — shell/panes.rs) renders
-        // the pane tree instead: the focused pane hosts `self.transcript`,
-        // the shared dock composer below stays its live composer, and dormant
-        // panes carry ghost strips. The single-pane parity gate keeps the
-        // untouched default layout on the exact historical path below.
+        // the pane tree instead: every Chat pane hosts its own transcript and
+        // composer (pane-owned surfaces), and the shared dock composer below
+        // stays suppressed. The single-pane parity gate keeps the untouched
+        // default layout on the exact historical path below.
         let departing_transcript = !has_selection && dock_frame.transcript() > 0.0;
         if !has_selection && !departing_transcript {
             self.transcript
@@ -7931,13 +7922,14 @@ impl Shell {
             .flex_col()
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 let paths = paths.paths().to_vec();
-                this.composer
-                    .update(cx, |composer, cx| composer.add_paths(paths, cx));
+                let composer = this.active_composer();
+                composer.update(cx, |composer, cx| composer.add_paths(paths, cx));
                 cx.notify();
             }))
             .on_drop::<WorkspacePathDrag>(cx.listener(
                 |this, payload: &WorkspacePathDrag, window, cx| {
-                    this.composer.update(cx, |composer, cx| {
+                    let composer = this.active_composer();
+                    composer.update(cx, |composer, cx| {
                         composer.add_workspace_path(&payload.path, payload.is_directory, window, cx)
                     });
                     cx.notify();
@@ -7945,7 +7937,8 @@ impl Shell {
             ))
             .on_drop::<RightTabDrag>(cx.listener(|this, payload: &RightTabDrag, window, cx| {
                 if let Some(path) = &payload.workspace_path {
-                    this.composer.update(cx, |composer, cx| {
+                    let composer = this.active_composer();
+                    composer.update(cx, |composer, cx| {
                         composer.add_workspace_path(&path.path, path.is_directory, window, cx)
                     });
                 }
@@ -8050,15 +8043,12 @@ impl Shell {
                     )
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
-                        // WS3 composer re-homing: in workspace mode the live
-                        // composer is hosted INSIDE the focused chat pane
+                        // WS3 composer re-homing: in workspace mode each Chat
+                        // pane renders its OWN composer as its footer
                         // (pane/render.rs), so the shared outer dock is
-                        // suppressed. Tradeoffs (documented in
-                        // shell/panes.rs): the dock clock keeps ticking for
-                        // the trivial route, so re-entering single-chat mode
-                        // re-docks normally, but the hero↔dock glide and the
-                        // composer's measured available width (still fed from
-                        // the full main column) do not track pane geometry.
+                        // suppressed. The dock clock keeps ticking for the
+                        // trivial route, so re-entering single-chat mode
+                        // re-docks normally.
                         if workspace_mode {
                             el
                         } else {
@@ -8378,7 +8368,7 @@ impl Shell {
         let elapsed_secs = started
             .map(|t| now.signed_duration_since(t).num_seconds().max(0))
             .unwrap_or(0);
-        let sending = self.composer.read(cx).is_sending();
+        let sending = self.active_composer().read(cx).is_sending();
 
         // Unused here since the Working loader moved into the transcript
         // (its trailer computes its own elapsed).
@@ -10073,7 +10063,7 @@ impl Render for Shell {
                 |this: &mut Shell, window, cx| {
                     if !window.is_window_active() {
                         this.set_jump_hints(false, cx);
-                        this.composer.update(cx, |composer, cx| {
+                        this.active_composer().update(cx, |composer, cx| {
                             composer.set_queue_shortcut_revealed(false, cx)
                         });
                     }
@@ -10087,7 +10077,7 @@ impl Render for Shell {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
                 let root = this.shortcut_focus.clone();
                 let unfocused = this.unfocused.clone();
-                let preferred = this.composer.focus_handle(cx);
+                let preferred = this.active_composer().focus_handle(cx);
                 window.on_next_frame(move |window, cx| {
                     restore_mounted_focus(&root, &preferred, &unfocused, window, cx);
                 });
@@ -10096,7 +10086,7 @@ impl Render for Shell {
         }
         let shortcut_focus = self.shortcut_focus.clone();
         let unfocused = self.unfocused.clone();
-        let preferred_focus = self.composer.focus_handle(cx);
+        let preferred_focus = self.active_composer().focus_handle(cx);
         window.defer(cx, move |window, cx| {
             restore_mounted_focus(&shortcut_focus, &preferred_focus, &unfocused, window, cx);
         });
@@ -10176,7 +10166,8 @@ impl Render for Shell {
                     if !this.right_pane_open(cx) {
                         // The hidden editor can retain a focus handle after unmounting.
                         // Restore a mounted target so the next shortcut can reopen it.
-                        window.focus(&this.composer.focus_handle(cx), cx);
+                        let composer = this.active_composer();
+                        window.focus(&composer.focus_handle(cx), cx);
                     }
                 }
             }))
@@ -10195,7 +10186,7 @@ impl Render for Shell {
             // this matched binding beats its key handler to the dispatch —
             // forward the slot instead of eating it.
             .on_action(cx.listener(|this, jump: &JumpSession, _, cx| {
-                let pickers = this.composer.read(cx).pickers().clone();
+                let pickers = this.active_composer().read(cx).pickers().clone();
                 let handled = pickers.update(cx, |pickers, cx| pickers.jump_model_slot(jump.0, cx));
                 if !handled && !this.overlay_owns_keyboard(cx) {
                     this.jump_to_session(jump.0, cx)
@@ -10272,7 +10263,7 @@ impl Render for Shell {
                 // than in `on_state_changed`).
                 if self.debug_dialog.as_deref() == Some("model") {
                     self.debug_dialog = None;
-                    self.composer
+                    self.active_composer()
                         .update(cx, |c, cx| c.debug_open_model_menu(window, cx));
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.

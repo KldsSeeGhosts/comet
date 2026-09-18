@@ -40,9 +40,27 @@ pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
 }
 
 impl Shell {
+    /// The composer the current chat surface owns: in workspace mode the
+    /// FOCUSED pane's composer, in the trivial layout the shared dock
+    /// composer. Every shell interaction that targets "the" composer
+    /// (focus, drops, interrupts, shortcuts) must go through here so a pane
+    /// composer receives it instead of the unmounted global entity.
+    pub(super) fn active_composer(&self) -> Entity<Composer> {
+        if self.workspace_mode() {
+            self.workspace
+                .focused_pane()
+                .and_then(|pane| self.workspace.chat_surfaces.get(&pane))
+                .map(|surface| surface.composer.clone())
+                .unwrap_or_else(|| self.composer.clone())
+        } else {
+            self.composer.clone()
+        }
+    }
+
     /// Navigation requests focus once the destination composer renders.
     pub(super) fn focus_composer(&mut self, cx: &mut Context<Self>) {
-        self.composer.update(cx, |composer, cx| {
+        let composer = self.active_composer();
+        composer.update(cx, |composer, cx| {
             composer.focus_pending = true;
             cx.notify();
         });

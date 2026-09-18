@@ -74,7 +74,7 @@ use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
-use crate::state::{AppState, EngineHandle};
+use crate::state::{AppState, ChatTarget, EngineHandle};
 use crate::theme::Theme;
 
 /// Dev/testing knob: `ZERON_SLOW_CATALOG_MS=<ms>` delays every harness and
@@ -513,6 +513,8 @@ struct SettingGroup {
 
 pub struct Pickers {
     state: Entity<AppState>,
+    /// The chat this instance serves (see [`ChatTarget`]).
+    target: ChatTarget,
     config: DraftConfig,
     /// Sticky last-used picks (zeron `zeron.composer.defaults:v1`): seeds the
     /// new-chat chips and is rewritten on every new-chat pick.
@@ -594,6 +596,18 @@ pub struct Pickers {
 
 impl Pickers {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        Self::with_target(state, ChatTarget::Selected, cx)
+    }
+
+    pub(crate) fn for_pane(
+        state: Entity<AppState>,
+        chat_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_target(state, ChatTarget::Fixed(chat_id), cx)
+    }
+
+    fn with_target(state: Entity<AppState>, target: ChatTarget, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| {
             ComposerInput::with_context("Search…", "PaletteSearch", cx)
                 .with_accessibility_role(gpui::Role::SearchInput)
@@ -639,7 +653,7 @@ impl Pickers {
         // only re-render on their own notify). A selection change also drops
         // the draft picks — they belonged to the previous chat/new-chat canvas.
         let state_observe = cx.observe(&state, |this: &mut Self, state, cx| {
-            let selected = state.read(cx).selected_chat.clone();
+            let selected = this.target.chat_id(state.read(cx)).map(str::to_owned);
             if selected != this.draft_owner {
                 this.draft_owner = selected;
                 this.config.harness = None;
@@ -649,8 +663,8 @@ impl Pickers {
             }
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
-            let space = state.read(cx).selected_space.clone();
-            let device = state.read(cx).effective_device_id();
+            let space = Self::target_space_id(&this.target, state.read(cx)).map(str::to_owned);
+            let device = Self::target_device_id(&this.target, state.read(cx));
             if space != this.space_owner || device != this.device_owner {
                 this.space_owner = space;
                 this.device_owner = device;
@@ -702,12 +716,17 @@ impl Pickers {
             .map(ComposerDefaults::load)
             .unwrap_or_default();
         // Restore explicit opt-outs as well as project picks before the first frame.
-        state.update(cx, |s, _| s.restore_composer_target(&defaults));
-        let draft_owner = state.read(cx).selected_chat.clone();
-        let space_owner = state.read(cx).selected_space.clone();
-        let device_owner = state.read(cx).effective_device_id();
+        // Only the global canvas owns that restore — a pane's construction
+        // must not move the shared launch target under it.
+        if matches!(target, ChatTarget::Selected) {
+            state.update(cx, |s, _| s.restore_composer_target(&defaults));
+        }
+        let draft_owner = target.chat_id(state.read(cx)).map(str::to_owned);
+        let space_owner = Self::target_space_id(&target, state.read(cx)).map(str::to_owned);
+        let device_owner = Self::target_device_id(&target, state.read(cx));
         Self {
             state,
+            target,
             space_owner,
             device_owner,
             target_generation: 0,
@@ -753,6 +772,76 @@ impl Pickers {
         }
     }
 
+    /// Bind a pane-fixed instance to the chat its first send minted: the
+    /// draft picks move under that chat's ownership and the transient
+    /// switch/menu chrome clears. `ChatTarget::bind` is a no-op for the
+    /// global Selected pickers.
+    pub(crate) fn bind_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.target.bind(chat_id);
+        self.draft_owner = self.target.chat_id(self.state.read(cx)).map(str::to_owned);
+        self.switch_error = None;
+        self.setting_menu = None;
+        self.setting_bounds = None;
+        cx.notify();
+    }
+
+    /// The chat id this instance currently serves (pane composer's bind
+    /// assertions; `None` on a new-chat canvas).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn target_chat_id<'a>(&'a self, state: &'a AppState) -> Option<&'a str> {
+        self.target.chat_id(state)
+    }
+
+    /// Back to the pane's new-chat canvas after the minted chat was deleted
+    /// on a failed first send (`bind_chat`'s inverse).
+    pub(crate) fn unbind_chat(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.target, ChatTarget::Fixed(_)) {
+            self.target = ChatTarget::Fixed(None);
+            self.draft_owner = None;
+            self.switch_error = None;
+            self.setting_menu = None;
+            self.setting_bounds = None;
+            cx.notify();
+        }
+    }
+
+    /// Space id the picker state belongs to (draft/cache invalidation): a
+    /// bound pane chat's own project, else the global pick — which is also a
+    /// `Fixed(None)` pane's launch target.
+    fn target_space_id<'a>(target: &'a ChatTarget, state: &'a AppState) -> Option<&'a str> {
+        match target {
+            ChatTarget::Fixed(Some(_)) if target.chat(state).is_some() => {
+                target.chat(state).and_then(|chat| chat.space_id.as_deref())
+            }
+            _ => state.selected_space.as_deref(),
+        }
+    }
+
+    /// The space the target's refs/git labels resolve against: a bound pane
+    /// chat's project, else the globally picked one (covers `Fixed(None)`
+    /// launch targets and a chat whose row hasn't synced yet).
+    fn target_space<'a>(target: &'a ChatTarget, state: &'a AppState) -> Option<&'a Space> {
+        match target {
+            ChatTarget::Fixed(Some(_)) if target.chat(state).is_some() => target
+                .chat(state)
+                .and_then(|chat| chat.space_id.as_deref())
+                .and_then(|id| state.space_row(id)),
+            _ => state.selected_space_row(),
+        }
+    }
+
+    /// The device the target runs on: a bound pane chat's host, else the
+    /// canvas's effective pick.
+    fn target_device_id(target: &ChatTarget, state: &AppState) -> Option<String> {
+        match target {
+            ChatTarget::Fixed(Some(_)) => target
+                .chat(state)
+                .map(|chat| chat.device_id.clone())
+                .or_else(|| state.effective_device_id()),
+            _ => state.effective_device_id(),
+        }
+    }
+
     /// Persist the sticky defaults (best-effort; picks are rare and tiny).
     fn save_defaults(&self) {
         if let Some(dir) = self.data_dir.as_deref()
@@ -768,7 +857,7 @@ impl Pickers {
 
     /// Harness is locked once the chat exists (feature-inventory §1.7).
     fn harness_locked(&self, cx: &App) -> bool {
-        self.state.read(cx).selected_chat.is_some()
+        self.target.chat_id(self.state.read(cx)).is_some()
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -782,7 +871,7 @@ impl Pickers {
     /// anywhere" from a Mac without codex).
     fn space_target(&self, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
-        let device = state.effective_device_id()?;
+        let device = Self::target_device_id(&self.target, state)?;
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
@@ -792,9 +881,8 @@ impl Pickers {
             return Some(harness);
         }
         if let Some(config) = self
-            .state
-            .read(cx)
-            .selected_chat_row()
+            .target
+            .chat(self.state.read(cx))
             .and_then(|c| c.config.as_ref())
         {
             return Some(config.harness);
@@ -826,7 +914,7 @@ impl Pickers {
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
         }
-        if let Some(chat) = self.state.read(cx).selected_chat_row() {
+        if let Some(chat) = self.target.chat(self.state.read(cx)) {
             return chat.config.as_ref().and_then(|c| c.model.as_deref());
         }
         let harness = self.effective_harness(cx)?;
@@ -838,7 +926,7 @@ impl Pickers {
     /// model's ladder, falling back to the model's default level.
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
         let explicit = self.config.reasoning.or_else(|| {
-            match self.state.read(cx).selected_chat_row() {
+            match self.target.chat(self.state.read(cx)) {
                 Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning),
                 // New chat: the remembered last-used level.
                 None => self.defaults.reasoning,
@@ -871,7 +959,7 @@ impl Pickers {
     /// selections for existing chats, the remembered picks for the model the
     /// new-chat canvas resolves to (same id [`Self::resolved`] sends).
     fn explicit_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
-        if let Some(chat) = self.state.read(cx).selected_chat_row() {
+        if let Some(chat) = self.target.chat(self.state.read(cx)) {
             return chat
                 .config
                 .as_ref()
@@ -1300,7 +1388,7 @@ impl Pickers {
     /// Rows carry checkout state (`current`, `worktreePath`) so the picker can
     /// tag refs and the checkout-kind selector can offer worktree reuse.
     fn ensure_refs(&mut self, force: bool, cx: &mut Context<Self>) {
-        let Some(space) = self.state.read(cx).selected_space_row().cloned() else {
+        let Some(space) = Self::target_space(&self.target, self.state.read(cx)).cloned() else {
             return;
         };
         if !space.git_detected {
@@ -1373,7 +1461,7 @@ impl Pickers {
         // Refs are fixed at creation: an existing session can never move
         // (wing's rule — the footer renders read-only labels there, so this
         // is a belt-and-braces guard).
-        if self.state.read(cx).selected_chat_row().is_some() {
+        if self.target.chat_id(self.state.read(cx)).is_some() {
             return;
         }
         if row.worktree_path.is_some() {
@@ -1402,7 +1490,7 @@ impl Pickers {
         if self.switching.is_some() {
             return; // one switch at a time
         }
-        let Some(space) = self.state.read(cx).selected_space_row().cloned() else {
+        let Some(space) = Self::target_space(&self.target, self.state.read(cx)).cloned() else {
             return;
         };
         let Some(engine) = self.engine(cx) else {
@@ -1490,7 +1578,7 @@ impl Pickers {
         // The card stays open on a pick (user request): model and traits
         // share one popover now, and adjusting the tray right after choosing
         // a model is the expected flow. Esc, click-out, or the chip close it.
-        if self.state.read(cx).selected_chat.is_some() {
+        if self.target.chat_id(self.state.read(cx)).is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
             self.update_chat_config(cx, move |config| config.model = Some(model_id));
@@ -1514,7 +1602,7 @@ impl Pickers {
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
         // Always a concrete selection (no toggle-back-to-default).
-        if self.state.read(cx).selected_chat.is_some() {
+        if self.target.chat_id(self.state.read(cx)).is_some() {
             self.update_chat_config(cx, move |config| config.reasoning = Some(level));
         } else {
             self.config.reasoning = Some(level);
@@ -1531,7 +1619,7 @@ impl Pickers {
         default: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.state.read(cx).selected_chat.is_some() {
+        if self.target.chat_id(self.state.read(cx)).is_some() {
             self.update_chat_config(cx, move |config| {
                 if default {
                     config.model_options.remove(&option_id);
@@ -1566,7 +1654,7 @@ impl Pickers {
     /// row always carries the CONCRETE resolved model/reasoning, with the
     /// reasoning re-clamped to the (possibly just-changed) model's ladder.
     fn update_chat_config(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut ChatConfig)) {
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+        let Some(chat_id) = self.target.chat_id(self.state.read(cx)).map(str::to_owned) else {
             return;
         };
         let resolved = self.resolved(cx);
@@ -1575,9 +1663,8 @@ impl Pickers {
         };
         // Preserve fields the pickers don't own.
         if let Some(existing) = self
-            .state
-            .read(cx)
-            .selected_chat_row()
+            .target
+            .chat(self.state.read(cx))
             .and_then(|c| c.config.as_ref())
         {
             config.sandbox = existing.sandbox;
@@ -1812,9 +1899,8 @@ impl Pickers {
     fn selected_ref_index(&self, cx: &App) -> usize {
         let rows = self.filtered_ref_rows(cx);
         let selected = self
-            .state
-            .read(cx)
-            .selected_chat_row()
+            .target
+            .chat(self.state.read(cx))
             .and_then(|c| c.branch.clone())
             .or_else(|| self.config.branch.clone());
         let index = match selected {
@@ -1897,7 +1983,7 @@ impl Pickers {
     /// device is still unknown (pre-probe boot).
     fn scoped_space_rows(&self, cx: &App) -> Vec<Space> {
         let state = self.state.read(cx);
-        let device = state.effective_device_id();
+        let device = Self::target_device_id(&self.target, state);
         state
             .spaces_sorted()
             .into_iter()
@@ -1927,14 +2013,18 @@ impl Pickers {
     /// Current project row on an unsearched open, or the final opt-out row.
     /// An implicit empty selection has no highlight until the user navigates.
     fn selected_space_index(&self, cx: &App) -> usize {
-        if self.state.read(cx).no_project {
+        let state = self.state.read(cx);
+        let no_project = match &self.target {
+            ChatTarget::Fixed(Some(_)) => self
+                .target
+                .chat(state)
+                .is_some_and(|chat| chat.space_id.is_none()),
+            _ => state.no_project,
+        };
+        if no_project {
             return self.scoped_space_rows(cx).len();
         }
-        let selected = self
-            .state
-            .read(cx)
-            .selected_space_row()
-            .map(|s| s.id.clone());
+        let selected = Self::target_space(&self.target, state).map(|s| s.id.clone());
         selected
             .as_deref()
             .and_then(|id| self.scoped_space_rows(cx).iter().position(|s| s.id == id))
@@ -2018,7 +2108,7 @@ impl Pickers {
     }
 
     fn selected_device_index(&self, cx: &App) -> usize {
-        let effective = self.state.read(cx).effective_device_id();
+        let effective = Self::target_device_id(&self.target, self.state.read(cx));
         self.device_rows(cx)
             .iter()
             .position(|d| Some(d.id.as_str()) == effective.as_deref())
@@ -2034,7 +2124,7 @@ impl Pickers {
         let (effective, local, online): (Option<String>, Option<String>, Vec<bool>) = {
             let state = self.state.read(cx);
             (
-                state.effective_device_id(),
+                Self::target_device_id(&self.target, state),
                 state.local_device_id.clone(),
                 rows.iter()
                     .map(|d| state.device_online(&d.id, now))
@@ -2117,11 +2207,7 @@ impl Pickers {
     fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
         let rows = self.filtered_space_rows(cx);
-        let selected = self
-            .state
-            .read(cx)
-            .selected_space_row()
-            .map(|s| s.id.clone());
+        let selected = Self::target_space(&self.target, self.state.read(cx)).map(|s| s.id.clone());
         let active = self.active;
         let no_project_index = rows.len();
         let scrollbar = popover::rail(self, "space-scrollbar", &theme, cx);
@@ -2586,7 +2672,7 @@ impl Pickers {
         };
         let (device_label, project_label, offline) = {
             let state = self.state.read(cx);
-            let device_id = state.effective_device_id();
+            let device_id = Self::target_device_id(&self.target, state);
             let device_label: SharedString = device_id
                 .as_deref()
                 .and_then(|id| state.device_name(id))
@@ -2596,8 +2682,7 @@ impl Pickers {
             let offline = device_id
                 .as_deref()
                 .is_some_and(|id| !state.device_online(id, chrono::Utc::now()));
-            let project_label: SharedString = state
-                .selected_space_row()
+            let project_label: SharedString = Self::target_space(&self.target, state)
                 .map(|s| s.display_name().to_string())
                 .unwrap_or_else(|| "No project".to_string())
                 .into();
@@ -2650,10 +2735,7 @@ impl Pickers {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let git = self
-            .state
-            .read(cx)
-            .selected_space_row()
+        let git = Self::target_space(&self.target, self.state.read(cx))
             .is_some_and(|space| space.git_detected);
         if !git {
             return None;
@@ -2723,11 +2805,8 @@ impl Pickers {
         // half-empty locked state.
         let (space, session, change_request) = {
             let state = self.state.read(cx);
-            let space = state.selected_space_row().cloned();
-            let session = state
-                .selected_chat
-                .as_ref()
-                .and_then(|_| state.selected_chat_row().cloned());
+            let space = Self::target_space(&self.target, state).cloned();
+            let session = self.target.chat(state).cloned();
             let change_request = session
                 .as_ref()
                 .and_then(|chat| state.change_request_for_chat(chat).cloned());
@@ -3040,7 +3119,7 @@ impl Pickers {
     /// "Showing X of Y refs" footer when the list is capped.
     fn render_branch_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).for_popup();
-        if self.state.read(cx).selected_space_row().is_none() {
+        if Self::target_space(&self.target, self.state.read(cx)).is_none() {
             return div()
                 .p(px(Theme::SPACE_SM))
                 .text_size(crate::typography::ui_rems(12.0))
@@ -3055,9 +3134,8 @@ impl Pickers {
         // pick switches the checkout (see `pick_ref`); a new chat highlights
         // the draft pick.
         let session_branch = self
-            .state
-            .read(cx)
-            .selected_chat_row()
+            .target
+            .chat(self.state.read(cx))
             .and_then(|c| c.branch.clone());
         let switching = self.switching.clone();
         let scrollbar = popover::rail(self, "branch-scrollbar", &theme, cx);
@@ -3254,7 +3332,7 @@ impl Pickers {
         // Compact tabbed layout (user request, modeled on the referenced
         // picker): the model LIST gets a fixed band of roughly seven compact
         // rows; the pinned traits tray below sizes to its sections.
-        let list_height = if self.state.read(cx).selected_chat.is_none() {
+        let list_height = if self.target.chat_id(self.state.read(cx)).is_none() {
             // Keep the settings tray visible while the model list scrolls
             // within the room below the new-chat composer.
             let tray_height = if self.setting_groups(cx).is_empty() {
@@ -4711,7 +4789,7 @@ impl Render for Pickers {
             &theme,
             cx,
         );
-        let new_chat = self.state.read(cx).selected_chat.is_none();
+        let new_chat = self.target.chat_id(self.state.read(cx)).is_none();
         let entity = cx.entity().downgrade();
         let model_chip = model_chip.relative().child(
             gpui::canvas(
