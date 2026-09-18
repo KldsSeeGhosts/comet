@@ -16,15 +16,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: 49ef4727d4b4cbbaf943d7ef4c8854b6aef48fe3
+          path: pr6
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 3876e816df6fd6e3a052e97d7960f884cee1a483
+          path: pr5
           persist-credentials: false
       - name: Export the reviewed source and stacked base
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = 49ef4727d4b4cbbaf943d7ef4c8854b6aef48fe3
-          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/noches-pr6-source.tar.gz"
-          git fetch --depth=1 origin 3876e816df6fd6e3a052e97d7960f884cee1a483
-          git archive --format=tar.gz 3876e816df6fd6e3a052e97d7960f884cee1a483 > "$RUNNER_TEMP/noches-pr5-source.tar.gz"
+          git -C pr6 archive --format=tar.gz HEAD > "$RUNNER_TEMP/noches-pr6-source.tar.gz"
+          git -C pr5 archive --format=tar.gz HEAD > "$RUNNER_TEMP/noches-pr5-source.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: noches-review-source
