@@ -673,13 +673,11 @@ impl PaneHost {
             self.layout = WorkspaceLayout::new();
             self.dirty = true;
         }
-        if is_trivial_layout(&self.layout) {
-            // The single-pane parity path renders the shell's global
-            // entities; pane surfaces exist only for workspace mode.
-            self.chat_surfaces.clear();
-        }
+        // A split collapsing to one pane does not end that pane's session.
+        // Keep its composer (and unsent draft); only remove dead/tool panes.
         let live = live_pane_ids(&self.layout.views);
-        let stale = stale_cache_keys(&live, self.chat_surfaces.keys().copied());
+        let chat_live = self.chat_pane_sessions().into_iter().map(|(pane, _)| pane).collect();
+        let stale = stale_cache_keys(&chat_live, self.chat_surfaces.keys().copied());
         for pane in stale {
             self.chat_surfaces.remove(&pane);
         }
@@ -717,7 +715,9 @@ pub fn is_trivial_layout(layout: &WorkspaceLayout) -> bool {
     layout
         .views
         .values()
-        .all(|view| view.tabs.len() == 1 && view.tabs.values().all(|tab| tab.panes.len() == 1))
+        .all(|view| view.tabs.len() == 1 && view.tabs.values().all(|tab| {
+            tab.panes.len() == 1 && tab.panes.values().all(|pane| pane.mode == PaneMode::Chat)
+        }))
 }
 
 /// Every pane id reachable from a workspace (leaves of every tab's pane

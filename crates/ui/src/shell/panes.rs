@@ -27,7 +27,7 @@ impl Shell {
     /// tab, or extra pane beyond the untouched default. False = today's exact
     /// single-chat code path (the parity gate).
     pub(super) fn workspace_mode(&self) -> bool {
-        !self.workspace.is_trivial()
+        !self.workspace.is_trivial() || !self.workspace.chat_surfaces.is_empty()
     }
 
     /// The workspace tree as the chat outlet. Every Chat-mode pane in the
@@ -45,28 +45,75 @@ impl Shell {
         workspace_outlet(cx, &theme, &snap, drag_preview)
     }
 
-    /// Surface inventory: the layout binding is authoritative. A surface is
-    /// current when its `chat_id` mirror matches the pane's session AND (for
-    /// a bound session) its transcript exists — this pass is the sole place
-    /// surfaces are invalidated/recreated, so observation ordering can never
-    /// drop a just-bound composer. Called by the render pass and by
-    /// navigation that rebinds the focused pane off the render path.
-    fn ensure_pane_chat_surfaces(&mut self, cx: &mut Context<Self>) {
-        for (pane, session) in self.workspace.chat_pane_sessions() {
-            let valid = self
-                .workspace
-                .chat_surfaces
-                .get(&pane)
-                .is_some_and(|surface| {
-                    surface.chat_id == session
-                        && (session.is_none() || surface.transcript.is_some())
-                });
-            if !valid {
-                self.workspace.chat_surfaces.remove(&pane);
+    /// Keep a pane's composer entity alive through navigation and first-send
+    /// binding. Replacing it drops drafts, queue editors and in-flight tasks.
+    pub(super) fn ensure_pane_chat_surfaces(&mut self, cx: &mut Context<Self>) {
+        self.workspace.prune_caches();
+        for (pane, _) in self.workspace.chat_pane_sessions() {
+            if let Some(composer) = self.workspace.chat_surfaces.get(&pane)
+                .map(|surface| surface.composer.clone())
+            {
+                self.sync_pane_composer_target(pane, &composer, cx);
+            }
+            let session = self.workspace.layout.pane(pane)
+                .and_then(|state| state.session_id.clone());
+            if !self.workspace.chat_surfaces.contains_key(&pane) {
                 let surface = self.create_pane_chat_surface(pane, session, cx);
                 self.workspace.chat_surfaces.insert(pane, surface);
+                continue;
+            }
+            if self.workspace.chat_surfaces[&pane].chat_id != session {
+                let surface = self.workspace.chat_surfaces.get_mut(&pane).unwrap();
+                surface.chat_id = session.clone();
+                surface.transcript = None;
+                surface.transcript_events = None;
+                let composer = surface.composer.clone();
+                composer.update(cx, |composer, cx| {
+                    composer.set_target(ChatTarget::Fixed(session.clone()), cx);
+                });
+            }
+            if self.workspace.chat_surfaces[&pane].transcript.is_none()
+                && let Some(chat_id) = session
+            {
+                let (transcript, events) = self.create_pane_transcript(chat_id, cx);
+                let surface = self.workspace.chat_surfaces.get_mut(&pane).unwrap();
+                surface.transcript = Some(transcript);
+                surface.transcript_events = Some(events);
             }
         }
+    }
+
+    /// A first send (or its rollback) changes the composer target before
+    /// AppState's observer runs. Reconcile that change with its OWN pane,
+    /// without overwriting a newer explicit navigation or a replacement
+    /// surface. This is also called during ensure so observer order is safe.
+    fn sync_pane_composer_target(
+        &mut self,
+        pane: PaneId,
+        composer: &Entity<Composer>,
+        cx: &mut Context<Self>,
+    ) {
+        let ChatTarget::Fixed(target) = &composer.read(cx).target else { return; };
+        let target = target.clone();
+        let Some(surface) = self.workspace.chat_surfaces.get(&pane) else { return; };
+        if surface.composer.entity_id() != composer.entity_id() || surface.chat_id == target {
+            return;
+        }
+        let Some(binding) = self.workspace.layout.pane(pane) else { return; };
+        if binding.mode != PaneMode::Chat
+            || (binding.session_id != surface.chat_id && binding.session_id != target)
+        {
+            return;
+        }
+        if binding.session_id != target {
+            let _ = self.workspace.set_pane_session(pane, target.clone());
+        }
+        let surface = self.workspace.chat_surfaces.get_mut(&pane).unwrap();
+        surface.chat_id = target;
+        surface.transcript = None;
+        surface.transcript_events = None;
+        self.note_workspace_mutation(cx);
+        cx.notify();
     }
 
     /// A pane's fixed interactive transcript for `chat_id`, fed by the same
@@ -107,32 +154,35 @@ impl Shell {
             }
             None => (None, None),
         };
-        let composer = cx.new(|cx| Composer::for_pane(self.state.clone(), session.clone(), cx));
-        // The composer binds itself to the chat it mints (and resets to the
-        // canvas on a failed first send) BEFORE the `select_chat` observers
-        // replay the session through `set_pane_session`. Mirror its target
-        // here — queued ahead of those observers — so the surface reads as
-        // current instead of being invalidated mid-flight.
-        let composer_observation = cx.observe(&composer, {
-            move |shell: &mut Shell, composer, cx| {
-                let chat_id = match &composer.read(cx).target {
-                    ChatTarget::Fixed(id) => id.clone(),
-                    ChatTarget::Selected => return,
-                };
-                if let Some(surface) = shell.workspace.chat_surfaces.get_mut(&pane)
-                    && surface.chat_id != chat_id
-                {
-                    surface.chat_id = chat_id;
-                    // The transcript is bound to the OLD session — drop it;
-                    // the owning path (the Sent event or the ensure pass)
-                    // rebuilds for the new binding.
-                    surface.transcript = None;
-                    surface.transcript_events = None;
-                }
-            }
+        // On the first split, keep the original input, attachments, picker
+        // choices and pending send by moving the shared composer into its
+        // matching pane. The shared event listener ignores fixed targets.
+        let adopt_shared = {
+            let composer = self.composer.read(cx);
+            matches!(composer.target, ChatTarget::Selected)
+                && composer.current_key == session.as_deref().unwrap_or_default()
+        };
+        let composer = if adopt_shared {
+            let composer = self.composer.clone();
+            composer.update(cx, |composer, cx| {
+                composer.set_target(ChatTarget::Fixed(session.clone()), cx);
+            });
+            composer
+        } else {
+            cx.new(|cx| Composer::for_pane(self.state.clone(), session.clone(), cx))
+        };
+        let focused = self.workspace.focused_pane() == Some(pane);
+        composer.update(cx, |composer, _| composer.focus_pending = focused);
+        let composer_observation = cx.observe(&composer, move |shell: &mut Shell, composer, cx| {
+            shell.sync_pane_composer_target(pane, &composer, cx);
         });
-        let composer_events = cx.subscribe(&composer, move |shell, _, event, cx| {
-            shell.on_pane_composer_event(pane, event, cx)
+        let composer_events = cx.subscribe(&composer, move |shell, composer, event, cx| {
+            if shell.workspace.chat_surfaces.get(&pane)
+                .is_some_and(|surface| surface.composer.entity_id() == composer.entity_id())
+            {
+                shell.sync_pane_composer_target(pane, &composer, cx);
+                shell.on_pane_composer_event(pane, event, cx);
+            }
         });
         PaneChatSurface {
             chat_id: session,
@@ -148,12 +198,23 @@ impl Shell {
     /// pane composers never drive the global dock transition — `Sent` /
     /// `Queued` bind the layout pane to the minted chat and hand the
     /// own-turn marker to THAT pane's transcript.
-    fn on_pane_composer_event(
+    pub(super) fn on_pane_composer_event(
         &mut self,
         pane: PaneId,
         event: &ComposerEvent,
         cx: &mut Context<Self>,
     ) {
+        if let ComposerEvent::Sent { chat_id, .. } | ComposerEvent::Queued { chat_id, .. } = event {
+            // A queue acknowledgement can arrive after this same composer
+            // navigated elsewhere. Do not rebind the pane to the old send.
+            let bound = self.workspace.layout.pane(pane)
+                .is_some_and(|state| state.session_id.as_deref() == Some(chat_id.as_str()));
+            let current = self.workspace.chat_surfaces.get(&pane)
+                .is_some_and(|surface| surface.chat_id.as_deref() == Some(chat_id.as_str()));
+            if !bound || !current {
+                return;
+            }
+        }
         match event {
             ComposerEvent::NewThreadTransitionStarted => {
                 // Route observation drives the global dock once selection
@@ -383,7 +444,6 @@ impl Shell {
         // Rebind off the render path: realize the replacement surface now and
         // hand it keyboard focus, rather than pointing focus at the composer
         // the binding change just invalidated.
-        self.ensure_pane_chat_surfaces(cx);
         self.focus_composer(cx);
         self.note_workspace_mutation(cx);
     }
@@ -1143,6 +1203,10 @@ impl Shell {
     /// pane via [`Self::sync_workspace_selection`]. Every mutation path
     /// funnels here, which is also where the WS5 save arms.
     fn retarget_to_focused_pane(&mut self, cx: &mut Context<Self>) {
+        // Adopt the original input before selecting the newly split canvas.
+        if self.workspace_mode() {
+            self.ensure_pane_chat_surfaces(cx);
+        }
         self.sync_selection_to_focused_pane(cx);
         // Keyboard focus follows the focused pane's own composer; a no-op
         // while an input the user chose keeps focus.
@@ -1293,11 +1357,21 @@ impl Shell {
             );
         }
         self.active_workspace_space = space.clone();
-        let layout = self
+        let saved_layout = self
             .workspace_layouts
             .layout_for(space.as_deref())
-            .filter(|layout| layout.validate().is_ok())
-            .unwrap_or_default();
+            .filter(|layout| layout.validate().is_ok());
+        // A missing layout is not a request to deselect the boot/session
+        // target. Seed its default pane before retargeting; a real saved
+        // layout still owns its remembered focus, including an empty canvas.
+        let initial_session = if saved_layout.is_none() {
+            self.state.read(cx).selected_chat_row()
+                .filter(|chat| chat.space_id.as_deref() == space.as_deref())
+                .map(|chat| chat.id.clone())
+        } else {
+            None
+        };
+        let layout = saved_layout.unwrap_or_default();
         // Restore alignment: a pane bound to a chat of a DIFFERENT space
         // drops its binding before anything re-selects, so a space switch can
         // never yank the app back to another space's session. Chats that have
@@ -1313,7 +1387,13 @@ impl Shell {
                     .map_or(true, |chat| chat.space_id.as_deref() == space.as_deref())
             })
         };
+        self.composer.update(cx, |composer, cx| {
+            composer.set_target(ChatTarget::Selected, cx);
+        });
         self.workspace.install_layout(layout);
+        if let Some(session) = initial_session {
+            self.workspace.sync_focused_session(Some(&session));
+        }
         for pane in foreign {
             let _ = self.workspace.set_pane_session(pane, None);
         }

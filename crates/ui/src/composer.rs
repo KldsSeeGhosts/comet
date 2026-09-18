@@ -4401,6 +4401,16 @@ impl Composer {
         composer
     }
 
+    /// Change routing without replacing the input or cancelling send tasks.
+    /// Navigation uses the normal per-chat draft swap; mint-on-send still
+    /// uses `bind_chat`, which keeps the in-progress send's input ownership.
+    pub(crate) fn set_target(&mut self, target: ChatTarget, cx: &mut Context<Self>) {
+        self.target = target.clone();
+        self.pickers.update(cx, |pickers, cx| pickers.set_target(target, cx));
+        self.on_state_changed(cx);
+        cx.notify();
+    }
+
     /// Bind a pane-fixed composer (and its pickers) to a chat — `send` calls
     /// this with the just-minted id before the selection observer can run.
     /// The input text is untouched; `ChatTarget::bind` is a no-op for the

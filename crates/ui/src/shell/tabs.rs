@@ -59,6 +59,15 @@ impl Shell {
 
     /// Navigation requests focus once the destination composer renders.
     pub(super) fn focus_composer(&mut self, cx: &mut Context<Self>) {
+        if self.workspace_mode() {
+            self.ensure_pane_chat_surfaces(cx);
+            let focused = self.workspace.focused_pane();
+            for (pane, surface) in &self.workspace.chat_surfaces {
+                if Some(*pane) != focused {
+                    surface.composer.update(cx, |composer, _| composer.focus_pending = false);
+                }
+            }
+        }
         let composer = self.active_composer();
         composer.update(cx, |composer, cx| {
             composer.focus_pending = true;

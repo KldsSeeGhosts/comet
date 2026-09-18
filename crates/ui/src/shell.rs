@@ -1662,7 +1662,11 @@ impl Shell {
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
-            move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+            move |_this: &mut Shell, composer, event: &ComposerEvent, cx| {
+                if matches!(composer.read(cx).target, crate::state::ChatTarget::Fixed(_)) {
+                    return;
+                }
+                match event {
                 ComposerEvent::NewThreadTransitionStarted => {
                     // Route observation drives the dock once selection commits.
                     cx.notify();
@@ -1682,6 +1686,7 @@ impl Shell {
                     transcript.update(cx, |t, cx| {
                         t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
                     });
+                }
                 }
             }
         });
@@ -2243,24 +2248,17 @@ impl Shell {
         if state.read(cx).chats_synced {
             self.prune_dead_workspace_sessions(cx);
         }
-        // WS5: the content area holds the ACTIVE SPACE's workspace tree.
-        // Restore it on boot (first synced frame) and on every space switch;
-        // the remembered focused pane re-selects its chat in AppState.
+        // Restore a project's layout before applying explicit navigation. The
+        // intent must also be consumed within the same project: otherwise a
+        // sidebar click can replace the focused pane instead of focusing the
+        // pane that already owns the requested session.
         let selected_space = state.read(cx).selected_space.clone();
-        if state.read(cx).spaces_synced
-            && (!self.workspace_space_loaded || self.active_workspace_space != selected_space)
-        {
-            // Consume pending explicit navigation intent (set by open_chat /
-            // open_new_session). `None` = passive restore (boot or background
-            // space sync) where the saved layout's focus should win.
+        if state.read(cx).spaces_synced {
             let explicit_nav = self.pending_explicit_nav.take();
-            self.workspace_space_loaded = true;
-            self.restore_workspace_layout(selected_space, cx);
-            // Re-apply the explicit target so the user's intent wins over
-            // whatever the restored layout's focused pane had (or lacked).
-            // For Some(chat_id): if the chat already exists in a pane, focus
-            // that pane instead of overwriting another pane's binding.
-            // For None (new-session): clear the focused pane's binding.
+            if !self.workspace_space_loaded || self.active_workspace_space != selected_space {
+                self.workspace_space_loaded = true;
+                self.restore_workspace_layout(selected_space, cx);
+            }
             if let Some(nav_target) = explicit_nav {
                 self.apply_explicit_workspace_navigation(nav_target, cx);
             }
@@ -12945,6 +12943,8 @@ impl Shell {
 
 #[cfg(test)]
 mod workspace_persistence {
+    include!("shell/workspace_regressions.rs");
+    include!("shell/pane_surface_regressions.rs");
     use super::*;
     use gpui::{AppContext, TestAppContext};
 

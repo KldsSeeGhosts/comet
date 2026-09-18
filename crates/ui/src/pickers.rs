@@ -652,38 +652,8 @@ impl Pickers {
         // Chat selection / config changes must re-render the chips (child views
         // only re-render on their own notify). A selection change also drops
         // the draft picks — they belonged to the previous chat/new-chat canvas.
-        let state_observe = cx.observe(&state, |this: &mut Self, state, cx| {
-            let selected = this.target.chat_id(state.read(cx)).map(str::to_owned);
-            if selected != this.draft_owner {
-                this.draft_owner = selected;
-                this.config.harness = None;
-                this.config.model = None;
-                this.config.reasoning = None;
-                this.switch_error = None;
-            }
-            // A space switch invalidates the branch draft + cache — the folder
-            // (and possibly the device) changed under them.
-            let space = Self::target_space_id(&this.target, state.read(cx)).map(str::to_owned);
-            let device = Self::target_device_id(&this.target, state.read(cx));
-            if space != this.space_owner || device != this.device_owner {
-                this.space_owner = space;
-                this.device_owner = device;
-                this.target_generation = this.target_generation.wrapping_add(1);
-                this.setting_menu = None;
-                this.setting_bounds = None;
-                this.refs_task = None;
-                this.load_task = None;
-                this.config.branch = None;
-                this.config.checkout = CheckoutKind::default();
-                this.refs = Loadable::Idle;
-                this.refs_space = None;
-                // Catalogs are per-DEVICE (fetched from the space's host):
-                // a space switch may land on another device, so refetch.
-                this.harnesses = Loadable::Idle;
-                this.models.clear();
-                this.catalog_rev += 1;
-            }
-            cx.notify();
+        let state_observe = cx.observe(&state, |this: &mut Self, _, cx| {
+            this.refresh_target(cx);
         });
         // A Settings → Agents toggle changed some device's enabled set:
         // force-refresh the cached catalog so the rail/chips follow without a
@@ -770,6 +740,45 @@ impl Pickers {
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
         }
+    }
+
+    pub(crate) fn set_target(&mut self, target: ChatTarget, cx: &mut Context<Self>) {
+        self.target = target;
+        self.refresh_target(cx);
+    }
+
+    fn refresh_target(&mut self, cx: &mut Context<Self>) {
+        let selected = self.target.chat_id(self.state.read(cx)).map(str::to_owned);
+        if selected != self.draft_owner {
+            self.draft_owner = selected;
+            self.config.harness = None;
+            self.config.model = None;
+            self.config.reasoning = None;
+            self.switch_error = None;
+        }
+        // A space switch invalidates the branch draft + cache — the folder
+        // (and possibly the device) changed under them.
+        let space = Self::target_space_id(&self.target, self.state.read(cx)).map(str::to_owned);
+        let device = Self::target_device_id(&self.target, self.state.read(cx));
+        if space != self.space_owner || device != self.device_owner {
+            self.space_owner = space;
+            self.device_owner = device;
+            self.target_generation = self.target_generation.wrapping_add(1);
+            self.setting_menu = None;
+            self.setting_bounds = None;
+            self.refs_task = None;
+            self.load_task = None;
+            self.config.branch = None;
+            self.config.checkout = CheckoutKind::default();
+            self.refs = Loadable::Idle;
+            self.refs_space = None;
+            // Catalogs are per-DEVICE (fetched from the space's host):
+            // a space switch may land on another device, so refetch.
+            self.harnesses = Loadable::Idle;
+            self.models.clear();
+            self.catalog_rev += 1;
+        }
+        cx.notify();
     }
 
     /// Bind a pane-fixed instance to the chat its first send minted: the
