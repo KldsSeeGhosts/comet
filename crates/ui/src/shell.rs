@@ -7969,6 +7969,24 @@ impl Shell {
                     }
                 },
             ))
+            // WS4 single-pane drag surface: per-sample resolution feeds the
+            // preview overlay below and the drop's split direction (the
+            // workspace outlet owns the samples in workspace mode; the
+            // handler guards on that). Mouse-up without a matching drop
+            // clears the state so no stale preview lingers.
+            .on_drag_move(cx.listener(
+                |this, event: &gpui::DragMoveEvent<crate::pane::TabSplitDrag>, _, cx| {
+                    this.apply_single_pane_drag_move(event, cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.cancel_split_drag(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.cancel_split_drag(cx)),
+            )
             // The hero is deliberately outside the transcript EdgeFade below:
             // it must paint under the overlaid titlebar instead of becoming
             // fully transparent across the titlebar's inset band.
@@ -8116,6 +8134,23 @@ impl Shell {
                     })
                     .child("Drop to attach"),
             )
+            // WS4 single-pane split preview: the same accent wash + ring the
+            // workspace outlet paints, over the half of the content area the
+            // dropped session's pane would take. Painted last so it sits
+            // above the transcript underlay; dead-center drags resolve to no
+            // preview (§3) and the drop keeps the legacy right split.
+            .children(self.split_drag_preview().map(|bounds| {
+                div()
+                    .absolute()
+                    .left(bounds.origin.x)
+                    .top(bounds.origin.y)
+                    .w(bounds.size.width)
+                    .h(bounds.size.height)
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.accent)
+                    .bg(theme.accent.opacity(0.12))
+            }))
             .into_any_element()
     }
 

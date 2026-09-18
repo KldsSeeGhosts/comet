@@ -38,9 +38,14 @@ use zeron_workspace::{Direction, PaneId, TabId, ViewId, edge_zone};
 pub(crate) const FLIP_SMOOTH_PX: f32 = 4.0;
 
 /// A pane edge within this distance of the workspace content edge counts as
-/// the workspace-outer edge (→ view-level split). The outlet pads 3px per
-/// side; 6 covers the padding plus rounding.
-pub(crate) const BOUNDARY_EPSILON_PX: f32 = 6.0;
+/// the workspace-outer edge (→ view-level split). Panes sit
+/// [`super::render::PANE_TREE_PAD_PX`] inside their view region (the pane
+/// tree's gutter) and sub-pixel snapping adds a fraction, so the epsilon is
+/// the gutter plus slack. (It was 6 = the outlet's 3px padding + rounding
+/// before the gutter existed; against the padded outlet hitbox every pane
+/// edge sat ~9px inside the "boundary", silently turning workspace-outer
+/// drags into pane-level splits.)
+pub(crate) const BOUNDARY_EPSILON_PX: f32 = super::render::PANE_TREE_PAD_PX + 2.0;
 
 /// Vertical slack added above/below a tab strip's chips when hit-testing the
 /// strip row (chips are 22px tall in a 30px row).
@@ -133,6 +138,36 @@ pub(crate) fn edge_at(rect: &Rect, x: f32, y: f32) -> Option<Direction> {
         f64::from(rect.w),
         f64::from(rect.h),
     )
+}
+
+/// The workspace content region inside an outlet hitbox: the outlet pads the
+/// sides and bottom by `pad` and the top by `top_pad` (the unified titlebar
+/// band), and the view regions paint exactly inside the remainder. Boundary
+/// math must compare pane edges against THIS region — the raw outlet hitbox
+/// includes the padding, which pushed every real edge past the boundary
+/// epsilon. Degenerate inputs clamp to an empty rect, which [`Rect::valid`]
+/// rejects so resolution fails closed.
+pub(crate) fn outlet_content(outlet: &Rect, pad: f32, top_pad: f32) -> Rect {
+    Rect::new(
+        outlet.x + pad,
+        outlet.y + top_pad,
+        (outlet.w - 2.0 * pad).max(0.0),
+        (outlet.h - pad - top_pad).max(0.0),
+    )
+}
+
+/// The single-pane (non-workspace) drop zone over the legacy content area:
+/// the whole area is the focused pane, so the pointer resolves through the
+/// same outer-20% edge rule as the workspace matrix. Returns the hovered
+/// split direction plus the would-be new-pane half
+/// ([`Rect::half_adjacent`]). `None` at dead center (§3: no indicator) and
+/// off the content (drag over the sidebar or the chrome), where the legacy
+/// receiver keeps its un-zoned commit.
+pub(crate) fn single_pane_split(content: &Rect, x: f32, y: f32) -> Option<(Direction, Rect)> {
+    if !content.valid() || !content.contains(x, y) {
+        return None;
+    }
+    edge_at(content, x, y).map(|direction| (direction, content.half_adjacent(direction)))
 }
 
 /// Whether the pane's edge on `dir`'s side sits at the workspace content
@@ -867,5 +902,93 @@ mod tests {
         assert!(matches!(r.plan, DropPlan::SplitPane { pane: PaneId(1), .. }));
         let r = resolve_drop(&geom, 504.0, 300.0, DragSource::TabChip(T2, V1), Some(PaneId(2)));
         assert!(matches!(r.plan, DropPlan::SplitPane { pane: PaneId(2), .. }));
+    }
+
+    // ---- outlet content region (the drag geometry's coordinate anchor) ----
+
+    #[test]
+    fn outlet_content_strips_the_outlet_padding() {
+        // The outlet hitbox at (0,0) 1000x800 with the render.rs constants:
+        // 3px sides/bottom, TITLEBAR+3 top. The view regions paint exactly
+        // inside the remainder — the region boundary math must compare
+        // against.
+        let outlet = rect(0.0, 0.0, 1000.0, 800.0);
+        let content = outlet_content(&outlet, super::super::render::OUTLET_PAD_PX, super::super::render::OUTLET_TOP_PAD_PX);
+        assert_eq!(
+            content,
+            rect(
+                3.0,
+                3.0 + crate::theme::Theme::TITLEBAR_HEIGHT,
+                994.0,
+                800.0 - 6.0 - crate::theme::Theme::TITLEBAR_HEIGHT
+            )
+        );
+        // An offset outlet translates the content, never resizes it.
+        let content = outlet_content(&rect(120.0, 40.0, 500.0, 400.0), 3.0, 41.0);
+        assert_eq!(content, rect(123.0, 81.0, 494.0, 356.0));
+        // Degenerate paddings clamp to an empty rect — rejected by `valid`,
+        // so resolution fails closed instead of inventing a boundary.
+        assert!(!outlet_content(&rect(0.0, 0.0, 4.0, 10.0), 3.0, 41.0).valid());
+    }
+
+    #[test]
+    fn boundary_epsilon_covers_the_pane_tree_gutter() {
+        // A pane inset from the content edge by exactly the pane tree gutter
+        // (render.rs's PANE_TREE_PAD_PX) is a BOUNDARY pane — this is the
+        // regression: the epsilon predates the gutter and outer-edge drags
+        // resolved as pane-level splits.
+        let content = rect(3.0, 41.0, 994.0, 756.0);
+        let gutter = super::super::render::PANE_TREE_PAD_PX;
+        let boundary = rect(3.0 + gutter, 41.0 + gutter, 994.0 - 2.0 * gutter, 756.0 - 2.0 * gutter);
+        for dir in [Direction::Left, Direction::Right, Direction::Up, Direction::Down] {
+            assert!(
+                touches_boundary(&boundary, &content, dir),
+                "{dir:?} edge at the gutter must read as the workspace boundary"
+            );
+        }
+        // One gutter deeper (e.g. the right half of a horizontal split) is
+        // interior on the sides again.
+        let interior = rect(3.0 + gutter, 41.0 + gutter, 400.0, 756.0 - 2.0 * gutter);
+        assert!(!touches_boundary(&interior, &content, Direction::Right));
+        assert!(touches_boundary(&interior, &content, Direction::Left));
+    }
+
+    // ---- single-pane (legacy) drop zones ----
+
+    #[test]
+    fn single_pane_split_resolves_each_edge_zone_to_its_half() {
+        let content = rect(0.0, 0.0, 800.0, 600.0);
+        // The outer 20% bands: left, right, up, down.
+        assert_eq!(
+            single_pane_split(&content, 20.0, 300.0),
+            Some((Direction::Left, rect(0.0, 0.0, 400.0, 600.0)))
+        );
+        assert_eq!(
+            single_pane_split(&content, 780.0, 300.0),
+            Some((Direction::Right, rect(400.0, 0.0, 400.0, 600.0)))
+        );
+        assert_eq!(
+            single_pane_split(&content, 400.0, 30.0),
+            Some((Direction::Up, rect(0.0, 0.0, 800.0, 300.0)))
+        );
+        assert_eq!(
+            single_pane_split(&content, 400.0, 575.0),
+            Some((Direction::Down, rect(0.0, 300.0, 800.0, 300.0)))
+        );
+    }
+
+    #[test]
+    fn single_pane_split_is_silent_at_center_and_off_content() {
+        let content = rect(100.0, 50.0, 800.0, 600.0);
+        // Dead center: the §3 rule — no indicator.
+        assert_eq!(single_pane_split(&content, 500.0, 350.0), None);
+        // Just past the 20% bands in both axes: still center.
+        assert_eq!(single_pane_split(&content, 300.0, 250.0), None);
+        // Over the sidebar / status strip: off the content entirely.
+        assert_eq!(single_pane_split(&content, 40.0, 350.0), None);
+        assert_eq!(single_pane_split(&content, 500.0, 1000.0), None);
+        // Degenerate content never resolves.
+        assert_eq!(single_pane_split(&rect(0.0, 0.0, 0.0, 600.0), 0.0, 0.0), None);
+        assert_eq!(single_pane_split(&content, f32::NAN, 350.0), None);
     }
 }

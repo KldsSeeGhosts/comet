@@ -14,7 +14,9 @@ use super::*;
 
 use crate::pane::chrome::{TabChip, tab_mark};
 use crate::pane::hit_test::{self, DragSource, DropPlan};
-use crate::pane::render::{PaneSnap, ViewSnap, WorkspaceSnap, workspace_outlet};
+use crate::pane::render::{
+    OUTLET_PAD_PX, OUTLET_TOP_PAD_PX, PaneSnap, ViewSnap, WorkspaceSnap, workspace_outlet,
+};
 use crate::pane::{
     DIVIDER_HIT_PX, DividerTarget, DragSplitState, EQUALIZE_RATIO, PaneChatSurface, PickerCommit,
     ToolKind, ratio_from_pointer,
@@ -41,7 +43,7 @@ impl Shell {
         self.ensure_pane_chat_surfaces(cx);
         let snap = Self::workspace_snapshot(&self.workspace, &self.state, cx);
         // WS4: the active drag's preview, converted to outlet-relative space.
-        let drag_preview = self.split_drag.as_ref().and_then(preview_bounds);
+        let drag_preview = self.split_drag_preview();
         workspace_outlet(cx, &theme, &snap, drag_preview)
     }
 
@@ -632,11 +634,21 @@ impl Shell {
     /// The pure resolution's input: the paint-time registries flattened into
     /// a [`hit_test::WorkspaceGeometry`]. Stale registry entries (a frame
     /// behind an engine change) filter out against the live layout, so a
-    /// mid-drag mutation resolves against what is actually on screen.
+    /// mid-drag mutation resolves against what is actually on screen. The
+    /// outlet hitbox (re-read every sample, so a resize mid-drag cannot drag
+    /// stale edges along) shrinks by the outlet's own padding — the same
+    /// constants `pane::render` lays out with — into the content region the
+    /// view regions paint into, which is the edge boundary detection compares
+    /// against.
     fn workspace_geometry(
         &self,
-        content: gpui::Bounds<gpui::Pixels>,
+        outlet: gpui::Bounds<gpui::Pixels>,
     ) -> hit_test::WorkspaceGeometry {
+        let content = hit_test::outlet_content(
+            &hit_test::Rect::from_bounds(outlet),
+            OUTLET_PAD_PX,
+            OUTLET_TOP_PAD_PX,
+        );
         let layout = &self.workspace.layout;
         let panes = self
             .workspace
@@ -700,7 +712,7 @@ impl Shell {
             });
         }
         hit_test::WorkspaceGeometry {
-            content: hit_test::Rect::from_bounds(content),
+            content,
             panes,
             views,
             strips: strips.into_iter().collect(),
@@ -737,6 +749,61 @@ impl Shell {
             self.split_drag = Some(next);
             cx.notify();
         }
+    }
+
+    /// `on_drag_move` on the SINGLE-PANE content area (the workspace outlet
+    /// is not rendered there, so the legacy container is the only drag
+    /// surface): the whole area is the focused pane, so the sample resolves
+    /// through [`hit_test::single_pane_split`] — the same outer-20% edge rule
+    /// as the workspace matrix — and stores the same [`DragSplitState`] the
+    /// workspace path uses, so the preview overlay paints and
+    /// [`Self::accept_sidebar_session_drop`] can honor the hovered half.
+    /// Workspace mode must win when both surfaces are live (the outlet owns
+    /// the geometry); only sidebar sessions drag here (chips and headers
+    /// exist only inside the outlet).
+    pub(crate) fn apply_single_pane_drag_move(
+        &mut self,
+        event: &gpui::DragMoveEvent<crate::pane::TabSplitDrag>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_mode() || event.drag(cx).source != DragSource::SidebarSession {
+            return;
+        }
+        let source = event.drag(cx).source;
+        let pointer = event.event.position;
+        let content = hit_test::Rect::from_bounds(event.bounds);
+        let resolution = match (
+            self.workspace.focused_pane(),
+            hit_test::single_pane_split(&content, f32::from(pointer.x), f32::from(pointer.y)),
+        ) {
+            (Some(pane), Some((direction, half))) => hit_test::DropResolution {
+                plan: DropPlan::SplitPane { pane, direction },
+                preview: Some(half),
+                anchor: None,
+            },
+            _ => hit_test::DropResolution {
+                plan: DropPlan::None,
+                preview: None,
+                anchor: None,
+            },
+        };
+        let next = DragSplitState {
+            source,
+            pointer,
+            root_bounds: event.bounds,
+            resolution,
+        };
+        if self.split_drag.as_ref() != Some(&next) {
+            self.split_drag = Some(next);
+            cx.notify();
+        }
+    }
+
+    /// The active drag's preview rect in its paint surface's local
+    /// coordinates — the workspace outlet in workspace mode, the single-pane
+    /// content area otherwise. Both render the same accent overlay from this.
+    pub(crate) fn split_drag_preview(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
+        self.split_drag.as_ref().and_then(preview_bounds)
     }
 
     /// Mouse-up over the outlet: commit the last resolved plan. Invalid
@@ -867,14 +934,24 @@ impl Shell {
 
     /// Accept a sidebar session drop on the single-pane content area (the
     /// workspace outlet is not rendered, so this is the entry point for
-    /// drag-to-split from the default screen). Splits right from the
-    /// focused pane. Validates the dragged session's space before mutating.
+    /// drag-to-split from the default screen). Splits the focused pane toward
+    /// the half the preview tracked via `apply_single_pane_drag_move`. A drop
+    /// with no tracked zone — dead center (§3: no indicator) or a mouse-up
+    /// that never sampled the content — keeps the legacy right split.
+    /// Validates the dragged session's space before mutating.
     pub(crate) fn accept_sidebar_session_drop(
         &mut self,
         payload: &crate::pane::TabSplitDrag,
         cx: &mut Context<Self>,
     ) {
-        self.split_drag = None;
+        let direction = self
+            .split_drag
+            .take()
+            .and_then(|state| match state.resolution.plan {
+                DropPlan::SplitPane { direction, .. } => Some(direction),
+                _ => None,
+            })
+            .unwrap_or(Direction::Right);
         if !self.sidebar_session_compatible(&payload.session_id, cx) {
             cx.notify();
             return;
@@ -885,11 +962,7 @@ impl Shell {
             return;
         };
         let new_pane = crate::pane::chat_pane_state();
-        if let Ok(pane_id) = self
-            .workspace
-            .layout
-            .split_pane(target, zeron_workspace::Direction::Right, new_pane)
-        {
+        if let Ok(pane_id) = self.workspace.layout.split_pane(target, direction, new_pane) {
             let _ = self.workspace.set_pane_session(pane_id, session_id);
             self.workspace.layout.focus_pane(pane_id).ok();
             self.retarget_to_focused_pane(cx);
@@ -1490,10 +1563,17 @@ impl Shell {
 }
 
 /// The active drag's preview rect ([`hit_test::DropResolution::preview`] is
-/// window-space) converted into the outlet's coordinate space, where the
-/// overlay div is absolutely positioned. `None` when the resolution has no
-/// preview (center moves, strip drops, invalid drops — the verified §3 rule
-/// that the center shows NO indicator).
+/// window-space) converted into the coordinate space of the surface that
+/// paints it (the workspace outlet, or the single-pane content area), where
+/// the overlay div is absolutely positioned. GPUI/Taffy measure an
+/// `.absolute()` child's `.left()/.top()` insets from the containing block's
+/// PADDING box — its border-box origin plus its border — and both surfaces
+/// are borderless, so subtracting `root_bounds.origin` (the surface's
+/// paint-time hitbox origin, `DragMoveEvent::bounds`) is exact; the
+/// container's padding is deliberately NOT subtracted (it does not shift
+/// absolute children). `None` when the resolution has no preview (center
+/// moves, strip drops, invalid drops — the verified §3 rule that the center
+/// shows NO indicator).
 fn preview_bounds(state: &DragSplitState) -> Option<gpui::Bounds<gpui::Pixels>> {
     let rect = state.resolution.preview?;
     let origin = state.root_bounds.origin;
@@ -1504,4 +1584,65 @@ fn preview_bounds(state: &DragSplitState) -> Option<gpui::Bounds<gpui::Pixels>> 
         ),
         size: gpui::size(gpui::px(rect.w), gpui::px(rect.h)),
     })
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    /// The outlet hitbox (sidebar + titlebar in front of it) the previews in
+    /// these tests convert from.
+    fn root_bounds() -> gpui::Bounds<gpui::Pixels> {
+        gpui::Bounds {
+            origin: gpui::point(gpui::px(320.0), gpui::px(70.0)),
+            size: gpui::size(gpui::px(1000.0), gpui::px(800.0)),
+        }
+    }
+
+    #[test]
+    fn preview_bounds_converts_window_space_to_the_overlay_surface() {
+        // A SplitPane resolution's window-space half-pane converts by
+        // origin subtraction only — the overlay's `.absolute()` insets are
+        // measured from the surface's border-box origin (its padding does
+        // not shift absolute children), so subtracting padding here would
+        // double-count it.
+        let state = DragSplitState {
+            source: DragSource::SidebarSession,
+            pointer: gpui::point(gpui::px(600.0), gpui::px(300.0)),
+            root_bounds: root_bounds(),
+            resolution: hit_test::DropResolution {
+                plan: DropPlan::SplitPane {
+                    pane: PaneId(3),
+                    direction: Direction::Right,
+                },
+                preview: Some(hit_test::Rect::new(500.0, 200.0, 250.0, 192.5)),
+                anchor: Some(PaneId(3)),
+            },
+        };
+        let bounds = preview_bounds(&state).unwrap();
+        assert_eq!(bounds.origin, gpui::point(gpui::px(180.0), gpui::px(130.0)));
+        assert_eq!(
+            bounds.size,
+            gpui::size(gpui::px(250.0), gpui::px(192.5))
+        );
+    }
+
+    #[test]
+    fn preview_bounds_is_none_without_a_preview() {
+        // Center move: the §3 rule — no indicator, nothing to convert.
+        let state = DragSplitState {
+            source: DragSource::PaneHeader(PaneId(1)),
+            pointer: gpui::point(gpui::px(600.0), gpui::px(300.0)),
+            root_bounds: root_bounds(),
+            resolution: hit_test::DropResolution {
+                plan: DropPlan::MoveIntoPane {
+                    view: ViewId(1),
+                    tab_before: None,
+                },
+                preview: None,
+                anchor: Some(PaneId(1)),
+            },
+        };
+        assert_eq!(preview_bounds(&state), None);
+    }
 }

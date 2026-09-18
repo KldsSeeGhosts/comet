@@ -54,6 +54,21 @@ use crate::transcript::Transcript;
 use super::chrome::{self, TabChip};
 use super::flex_weights;
 use super::{DIVIDER_HIT_PX, DividerDrag, DividerGhost, DividerTarget};
+/// The workspace outlet's outer padding: 3px on the sides and bottom, and
+/// the unified titlebar band plus the same 3px on top. Shared with
+/// `shell/panes.rs`'s drag geometry so the hit-test `content` region is
+/// derived from the SAME constants the outlet lays out with — the preview
+/// overlay, the pane/view rects and the boundary math must all reference one
+/// coordinate space, not two.
+pub(crate) const OUTLET_PAD_PX: f32 = 3.0;
+pub(crate) const OUTLET_TOP_PAD_PX: f32 = Theme::TITLEBAR_HEIGHT + OUTLET_PAD_PX;
+
+/// The pane tree's inner gutter: each view's active tab pane tree pads this
+/// much inside its view region, so the outermost pane edges sit this far
+/// inside the workspace content edge. `hit_test::BOUNDARY_EPSILON_PX` is
+/// sized from it.
+pub(crate) const PANE_TREE_PAD_PX: f32 = 6.0;
+
 /// Immutable render-time snapshot of the workspace tree. Built per frame
 /// (cheap: small trees, cloned ids/titles only).
 pub(crate) struct WorkspaceSnap {
@@ -109,11 +124,15 @@ pub(crate) struct PaneSnap {
 /// WS4: the outlet is the drag surface. `drag_preview` — the active drag's
 /// resolved preview rect in outlet-relative coordinates — paints ABOVE the
 /// tree as an occluding accent wash + 1px ring (§3: half-pane for splits,
-/// full top-level region for view splits, nothing at center). The root's
-/// `on_drag_move` receives every pointer sample while a [`TabSplitDrag`] is
-/// live (GPUI capture dispatch, inside or outside the outlet), `on_drop`
-/// commits on mouse-up inside, and the mouse-up/out listeners clear the
-/// state when a drag ends without a commit (drop over the sidebar etc.).
+/// full top-level region for view splits, nothing at center). The offsets
+/// feed an `.absolute()` child, which Taffy measures from this div's
+/// border-box origin (its padding does NOT shift absolute children), and the
+/// conversion subtracts exactly that origin — `DragMoveEvent::bounds`, this
+/// div's paint-time hitbox. The root's `on_drag_move` receives every pointer
+/// sample while a [`TabSplitDrag`] is live (GPUI capture dispatch, inside or
+/// outside the outlet), `on_drop` commits on mouse-up inside, and the
+/// mouse-up/out listeners clear the state when a drag ends without a commit
+/// (drop over the sidebar etc.).
 pub(crate) fn workspace_outlet(
     cx: &Context<'_, Shell>,
     theme: &Theme,
@@ -126,11 +145,11 @@ pub(crate) fn workspace_outlet(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .p(px(3.0))
+        .p(px(OUTLET_PAD_PX))
         // The unified window titlebar is an overlay. Workspace chrome must
         // begin below it so tab chips and their close controls remain visible
         // and clickable instead of painting underneath the titlebar.
-        .pt(px(Theme::TITLEBAR_HEIGHT + 3.0))
+        .pt(px(OUTLET_TOP_PAD_PX))
         .child(view_node(cx, theme, &snap.root, &[], snap))
         // The live drop preview: accent wash (~0.12 alpha) + 1px accent ring,
         // rounded ~8px (§3), painted above everything it covers.
@@ -244,7 +263,7 @@ fn view_node(
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .p(px(6.0))
+                    .p(px(PANE_TREE_PAD_PX))
                     .child(pane_tree),
             );
             col.into_any_element()
