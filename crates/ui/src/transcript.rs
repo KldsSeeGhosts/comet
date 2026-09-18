@@ -2614,6 +2614,16 @@ pub struct Transcript {
     /// `doc_override` is an interactive pane session, not a read-only
     /// subagent tab.
     interactive_override: bool,
+    /// The instance's list is still `ListAlignment::Top`: a sparse pane
+    /// conversation rests at the pane's top instead of hugging the composer
+    /// under a dead void. Latches off in [`Self::lock_pane_tail_on_overflow`]
+    /// the first time content outgrows the viewport (the ListState is
+    /// rebuilt Bottom — alignment is construct-only); one-way because rows
+    /// only accumulate within an instance, and a new session mints a fresh
+    /// Transcript. Read-only subagent docs are NOT part of this pipeline —
+    /// their pin runs under Top from the start (see `build`), so this field
+    /// is false for them and the latch machinery must stay inert.
+    top_anchored: bool,
     /// Whether an override instance watches a LIVE doc (`for_doc(follow)`):
     /// only then may the working trailer render — a frozen snapshot must
     /// never spin, whatever its entries claim.
@@ -2733,6 +2743,8 @@ pub struct Transcript {
     spring_kick: bool,
     /// One `on_next_frame` callback in flight at most.
     spring_scheduled: bool,
+    /// One first-overflow tail-lock check in flight (top-anchored panes).
+    tail_lock_scheduled: bool,
     scroll_anim: Option<Task<()>>,
     /// Last pointer sample while markdown selection owns a left-button drag.
     selection_drag_position: Option<Point<Pixels>>,
@@ -2851,9 +2863,12 @@ impl Transcript {
     /// An INTERACTIVE transcript pinned to one chat doc — the pane-owned
     /// session surface (workspace mode). Same fixed-doc binding as
     /// [`Self::for_doc`], but with the primary transcript's behavior:
-    /// bottom alignment, this chat's echoes and own-turn runway, chat-row
-    /// attachment devices, and `indicator_for` liveness. The caller starts
-    /// the doc feed (`watch_subagent_doc`).
+    /// this chat's echoes and own-turn runway, chat-row attachment devices,
+    /// and `indicator_for` liveness. The caller starts the doc feed
+    /// (`watch_subagent_doc`). Alignment starts TOP so a sparse conversation
+    /// rests under the pane header instead of hanging off the composer
+    /// ([`Self::lock_pane_tail_on_overflow`] adopts Bottom — pin, glue, and
+    /// spring tail-follow — the moment content first overflows the pane).
     pub(crate) fn for_session(
         state: Entity<AppState>,
         chat_id: String,
@@ -2872,23 +2887,31 @@ impl Transcript {
         // FollowMode stays Normal: the tail pin is ours (a per-frame spring),
         // not the list's per-layout hard snap.
         //
-        // Read-only override instances align TOP: a subagent transcript reads
+        // Override instances align TOP. A read-only subagent transcript reads
         // like a fresh notes page — entries anchored at the top, streaming
         // growing into the empty space below, never rising from the pane's
-        // bottom. Top alignment gets that structurally (a short list rests at
-        // the top with no reservation pad), and the PIN machinery still runs
-        // on top of it for end-follow: the spring is purely distance-based,
-        // and the glue trap it was built around is Bottom-only — layout
-        // materializes a Top list's past-end offset to a CONCRETE position
-        // every frame (gpui list.rs: only `Bottom` re-glues to the `None`
-        // sentinel), so a parked spring can't re-glue and hard-track growth.
-        // An interactive pane session is a conversation, not a notes page —
-        // it aligns BOTTOM like the primary transcript.
-        let alignment = if doc_override.is_some() && !interactive_override {
+        // bottom — and stays Top for its lifetime. A pane SESSION starts Top
+        // for the same reason (a short conversation must rest under the pane
+        // header, not hang off the composer under a dead void), but its
+        // streaming phase is a conversation: [`Self::lock_pane_tail_on_overflow`]
+        // rebuilds the ListState with Bottom on the first real overflow, and
+        // everything below assumes Bottom from there. Top alignment gets the
+        // anchoring structurally (a short list rests at the top with no
+        // reservation pad), and the PIN machinery still runs on top of it for
+        // end-follow: the spring is purely distance-based, and the glue trap
+        // it was built around is Bottom-only — layout materializes a Top
+        // list's past-end offset to a CONCRETE position every frame (gpui
+        // list.rs: only `Bottom` re-glues to the `None` sentinel), so a
+        // parked spring can't re-glue and hard-track growth. That is exactly
+        // why a locked pane session must rebuild the ListState rather than
+        // "run pinned on Top": stick-to-bottom streaming needs the glue.
+        // The primary transcript aligns BOTTOM, as it always has.
+        let alignment = if doc_override.is_some() {
             ListAlignment::Top
         } else {
             ListAlignment::Bottom
         };
+        let top_anchored = doc_override.is_some() && interactive_override;
         let list = ListState::new(0, alignment, px(OVERDRAW_PX));
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
@@ -2933,6 +2956,7 @@ impl Transcript {
             doc_live: doc_override.is_some() && follow,
             doc_override,
             interactive_override,
+            top_anchored,
             saved_viewports: SavedViewportCache::default(),
             pending_viewport: None,
             viewport_generation: 0,
@@ -2973,6 +2997,7 @@ impl Transcript {
             spring_settled_at: None,
             spring_kick: false,
             spring_scheduled: false,
+            tail_lock_scheduled: false,
             scroll_anim: None,
             selection_drag_position: None,
             selection_scroll_task: None,
@@ -3642,6 +3667,10 @@ impl Transcript {
         // new rows. The height tree remains available when the prompt or tail
         // is outside the viewport, so neither can block the handoff.
         if self.list.tail_reservation_filled() {
+            // Natural content consumed the reservation: the conversation now
+            // overflows the pane. A top-anchored session must hand tail-follow
+            // a Bottom list BEFORE the engage below scrolls it.
+            self.lock_pane_tail_on_overflow(cx);
             let held = self.own_turn.take().is_some_and(|a| a.held);
             self.own_turn_last_tick = None;
             self.list.set_tail_reservation(None);
@@ -3904,6 +3933,76 @@ impl Transcript {
         self.list.logical_scroll_top().item_ix >= self.rows.len()
     }
 
+    /// Whether the instance's ListState is `ListAlignment::Top`: true for
+    /// life for read-only subagent docs (top-anchored notes pages whose pin
+    /// still runs — see `build`), true only until the first overflow for a
+    /// pane session ([`Self::lock_pane_tail_on_overflow`]), and always false
+    /// for the dock transcript. Test-visible alongside the observable scroll
+    /// state so the latch can't be asserted as a tautology.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_top_anchored(&self) -> bool {
+        self.top_anchored || (self.doc_override.is_some() && !self.interactive_override)
+    }
+
+    /// Whether the pane's natural content is taller than the viewport — the
+    /// [`Self::lock_pane_tail_on_overflow`] trigger. Runs post-layout
+    /// (`window.on_next_frame`), so measured heights and viewport bounds are
+    /// fresh. A live own-turn reservation pads the measured tail with scroll
+    /// room that is NOT content, so while the anchor exists only its
+    /// natural-content fill signal counts (`tail_reservation_filled`).
+    /// Sub-pixel measurement noise must not latch the one-way transition.
+    fn pane_content_overflows(&self) -> bool {
+        if self.own_turn.is_some() {
+            self.list.tail_reservation_filled()
+        } else {
+            self.list.max_offset_for_scrollbar().y > px(1.0)
+        }
+    }
+
+    /// First-overflow transition for a top-anchored pane session: rebuild the
+    /// ListState with Bottom alignment (gpui exposes no alignment setter) and
+    /// hand the viewport to the standard tail machinery — from here on this
+    /// transcript is indistinguishable from a Bottom-built one. Runs from
+    /// `window.on_next_frame`, i.e. after layout. At the transition the
+    /// conversation was fully visible one frame earlier (a top-anchored list
+    /// shows everything until it first overflows), so a pinned rebuild lands
+    /// glued at the end without a perceptible jump; growth re-glues exactly
+    /// like the primary transcript's. One-way: content only accumulates
+    /// within an instance, and a cleared/new session mints a fresh
+    /// Transcript (Top again).
+    fn lock_pane_tail_on_overflow(&mut self, cx: &mut Context<Self>) {
+        if !self.top_anchored || !self.pane_content_overflows() {
+            return;
+        }
+        // Read off the OLD list: a Top list's offset is always concrete.
+        let previous = self.list.logical_scroll_top();
+        let count = self.rows.len();
+        let mut list = ListState::new(count, ListAlignment::Bottom, px(OVERDRAW_PX));
+        let weak = cx.weak_entity();
+        list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
+            weak.update(cx, |this: &mut Transcript, cx| {
+                this.handle_scroll(event, cx)
+            })
+            .ok();
+        });
+        self.list = list;
+        self.top_anchored = false;
+        if self.pinned {
+            // Re-pin to the same state a Bottom-built transcript attaches
+            // with: glued at the end, pin armed.
+            self.last_scroll_distance = 0.0;
+            self.show_jump_button = false;
+            self.list.scroll_to_end();
+            self.wake_spring();
+        } else {
+            // An own-turn hold or user scroll owned the viewport at the
+            // transition: carry its item anchor over so the next layout
+            // (which re-measures every row) holds the same position.
+            self.list.scroll_to(previous);
+        }
+        cx.notify();
+    }
+
     /// One spring frame: observe target growth, step the stepper, apply the
     /// delta, and park on landing. Runs from `window.on_next_frame`,
     /// i.e. after layout — measurements are fresh.
@@ -3912,7 +4011,10 @@ impl Transcript {
             return;
         }
         self.spring_kick = false;
-        if !self.pinned {
+        // A top-anchored pane has no tail to chase (the pin's sync branch is
+        // skipped); a stray kick — e.g. a restick observed at the pre-lock
+        // end — must not walk a Top list toward its bottom edge.
+        if !self.pinned || self.top_anchored {
             self.spring_last_tick = None;
             return;
         }
@@ -4340,7 +4442,13 @@ impl Transcript {
         if self.own_turn.is_some() {
             self.own_turn_kick = true;
         }
-        if self.pinned {
+        // While top-anchored the pin has nothing to hold — a short list shows
+        // every row — and `scroll_to_end` under Top would sink the whole
+        // conversation to the pane's bottom edge (the bug this transition
+        // exists to prevent). [`Self::lock_pane_tail_on_overflow`] hands the
+        // pin a Bottom list at first overflow; from then on this branch runs
+        // unchanged.
+        if self.pinned && !self.top_anchored {
             if live_following {
                 self.list.scroll_to_end();
                 self.spring.reset();
@@ -7747,6 +7855,25 @@ impl Render for Transcript {
                     .update(cx, |this: &mut Transcript, cx| {
                         this.own_turn_scheduled = false;
                         this.step_own_turn(cx);
+                    })
+                    .ok();
+            });
+        }
+        // Top-anchored pane sessions lock to Bottom on first overflow. The
+        // check runs one frame after THIS render, i.e. after this frame's
+        // layout has measured whatever sync just spliced (a notify always
+        // produces that frame, so the observation can never go stale). The
+        // callback notifies only on the transition, so a sparse pane costs
+        // no frames. Armed before the spring driver so the lock callback
+        // runs ahead of any spring tick on the following frame.
+        if self.top_anchored && !self.rows.is_empty() && !self.tail_lock_scheduled {
+            self.tail_lock_scheduled = true;
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |this: &mut Transcript, cx| {
+                        this.tail_lock_scheduled = false;
+                        this.lock_pane_tail_on_overflow(cx);
                     })
                     .ok();
             });
@@ -11707,6 +11834,213 @@ mod tests {
                 );
             });
         });
+    }
+
+    /// The alignment regression suite for pane-owned sessions: a sparse
+    /// conversation rests at the pane TOP (no dead void above row 0), the
+    /// first real overflow latches the list to Bottom via the real frame
+    /// callback, and the latch never reverts. The dock transcript keeps its
+    /// Bottom-built ListState and read-only docs stay top-anchored.
+    mod pane_tail_alignment {
+        use super::*;
+
+        const PANE_W: Pixels = px(420.0);
+        const PANE_H: Pixels = px(300.0);
+
+        fn init(cx: &mut gpui::App, dir: &std::path::Path) -> Entity<AppState> {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir, cx);
+            cx.new(|_| AppState::new())
+        }
+
+        fn feed(
+            this: &mut Transcript,
+            entries: Vec<SessionMessageEntry>,
+            cx: &mut Context<Transcript>,
+        ) {
+            this.state.update(cx, |state, _| {
+                state.set_subagent_snapshot("pane-chat".into(), entries);
+            });
+            this.sync(cx);
+        }
+
+        fn draw(transcript: &Entity<Transcript>, visual: &mut gpui::VisualTestContext) {
+            // Draw the transcript entity itself so the REAL rows render and
+            // measure (the test platform's NoopTextSystem gives deterministic
+            // metrics), exactly like the pane's viewport.
+            visual.draw(point(px(0.), px(0.)), size(PANE_W, PANE_H), |_, _| {
+                transcript.clone().into_any_element()
+            });
+        }
+
+        fn short_entry() -> Vec<SessionMessageEntry> {
+            vec![assistant(
+                "m1",
+                MessageStatus::Complete,
+                vec![text_part("t", "Short reply.")],
+            )]
+        }
+
+        fn overflowing_entries() -> Vec<SessionMessageEntry> {
+            vec![
+                assistant(
+                    "m1",
+                    MessageStatus::Complete,
+                    vec![text_part("t", "Short reply.")],
+                ),
+                assistant(
+                    "m2",
+                    MessageStatus::Streaming,
+                    vec![text_part("t", &"streamed paragraph.\n\n".repeat(60))],
+                ),
+            ]
+        }
+
+        #[gpui::test]
+        fn pane_session_starts_top_anchored_and_latches_bottom_on_overflow(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let state = cx.update(|cx| init(cx, dir.path()));
+            let transcript = cx.update(|cx| {
+                cx.new(|cx| Transcript::for_session(state.clone(), "pane-chat".into(), cx))
+            });
+            let mut visual = cx.add_empty_window();
+
+            // Short conversation: anchored under the pane top, nothing flips.
+            transcript.update(&mut visual.cx, |this, cx| feed(this, short_entry(), cx));
+            draw(&transcript, &mut visual);
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            transcript.update(&mut visual.cx, |this, cx| {
+                assert!(this.is_top_anchored(), "a sparse pane session starts Top");
+                assert!(!this.pane_content_overflows());
+                let viewport = this.list.viewport_bounds();
+                assert_eq!(viewport.size.height, PANE_H);
+                let first = this.list.bounds_for_item(0).expect("first row laid out");
+                assert!(
+                    first.top() - viewport.top() <= px(1.0),
+                    "short content must rest at the pane top, not hang off the composer"
+                );
+            });
+
+            // First real overflow: the render-armed frame callback rebuilds
+            // the ListState with Bottom and re-pins to the end.
+            transcript
+                .update(&mut visual.cx, |this, cx| feed(this, overflowing_entries(), cx));
+            draw(&transcript, &mut visual);
+            transcript.update(&mut visual.cx, |this, _| {
+                assert!(
+                    this.pane_content_overflows(),
+                    "the streamed tail must outgrow the {}px pane before the latch",
+                    PANE_H
+                );
+                // Still Top-anchored: the head rests at the pane top and the
+                // whole overflow reads as distance below the fold.
+                assert!(this.is_top_anchored());
+                assert!(this.distance_from_bottom() > 100.0);
+            });
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            transcript.update(&mut visual.cx, |this, _| {
+                assert!(
+                    !this.is_top_anchored(),
+                    "first overflow must latch the list to Bottom"
+                );
+                assert!(this.pinned);
+            });
+            draw(&transcript, &mut visual);
+            transcript.update(&mut visual.cx, |this, _| {
+                // The past-end (glued) state exposes no item bounds —
+                // `bounds_for_item` is None for every row — so the pinned
+                // tail is observed through the scroll state: distance 0.
+                assert!(this.is_glued());
+                assert!(
+                    this.distance_from_bottom() <= 2.0,
+                    "a locked pane must pin the tail to the bottom like the dock transcript"
+                );
+            });
+
+            // The latch is one-way: shrinking rows never flips back to Top.
+            transcript.update(&mut visual.cx, |this, cx| feed(this, short_entry(), cx));
+            draw(&transcript, &mut visual);
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            transcript.update(&mut visual.cx, |this, _| {
+                assert!(
+                    !this.is_top_anchored(),
+                    "a row shrink must not revert the Bottom latch"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn latch_carries_an_unpinned_viewport_instead_of_snapping_to_the_end(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let state = cx.update(|cx| init(cx, dir.path()));
+            let transcript = cx.update(|cx| {
+                cx.new(|cx| Transcript::for_session(state.clone(), "pane-chat".into(), cx))
+            });
+            let mut visual = cx.add_empty_window();
+
+            transcript.update(&mut visual.cx, |this, cx| feed(this, short_entry(), cx));
+            draw(&transcript, &mut visual);
+            // A wheel-away (or an own-send hold) owns the viewport: the pin
+            // is off while the content overflows.
+            transcript.update(&mut visual.cx, |this, cx| {
+                this.pinned = false;
+                feed(this, overflowing_entries(), cx);
+            });
+            draw(&transcript, &mut visual);
+            transcript.update(&mut visual.cx, |this, cx| {
+                assert!(this.pane_content_overflows());
+                this.lock_pane_tail_on_overflow(cx);
+                assert!(!this.is_top_anchored());
+            });
+            draw(&transcript, &mut visual);
+            transcript.update(&mut visual.cx, |this, _| {
+                // The carried {0, 0} anchor keeps the head at the pane top:
+                // the latch must NOT glue the viewport to the end for a user
+                // who was already scrolled away from it.
+                assert!(!this.is_glued());
+                assert_eq!(this.list.logical_scroll_top().item_ix, 0);
+                assert!(this.distance_from_bottom() > 100.0);
+            });
+        }
+
+        #[gpui::test]
+        fn dock_transcript_stays_bottom_and_read_only_docs_stay_top(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            cx.update(|cx| {
+                let state = init(cx, dir.path());
+                // The primary single-pane dock transcript (shell.rs builds it
+                // with `Transcript::new`) keeps its Bottom-built ListState.
+                let dock = cx.new(|cx| Transcript::new(state.clone(), cx));
+                assert!(
+                    !dock.read(cx).is_top_anchored(),
+                    "the dock transcript must stay Bottom-aligned"
+                );
+                assert!(
+                    dock.read(cx).is_glued(),
+                    "a fresh Bottom list starts glued at the end"
+                );
+                // Read-only subagent docs are top-anchored notes pages, and
+                // pane sessions START top-anchored (until first overflow).
+                let doc = cx.new(|cx| Transcript::for_doc(state.clone(), "sub".into(), true, cx));
+                assert!(doc.read(cx).is_top_anchored());
+                let pane =
+                    cx.new(|cx| Transcript::for_session(state, "pane-chat".into(), cx));
+                assert!(pane.read(cx).is_top_anchored());
+            });
+        }
     }
 }
 
