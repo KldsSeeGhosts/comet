@@ -2235,58 +2235,19 @@ impl Shell {
         if state.read(cx).chats_synced {
             self.prune_dead_workspace_sessions(cx);
         }
-        // WS5: the content area holds the ACTIVE SPACE's workspace tree.
-        // Restore it on boot (first synced frame) and on every space switch;
-        // the remembered focused pane re-selects its chat in AppState.
+        // Restore a project's layout before applying explicit navigation. The
+        // intent must also be consumed within the same project: otherwise a
+        // sidebar click can replace the focused pane instead of focusing the
+        // pane that already owns the requested session.
         let selected_space = state.read(cx).selected_space.clone();
-        if state.read(cx).spaces_synced
-            && (!self.workspace_space_loaded || self.active_workspace_space != selected_space)
-        {
-            // Consume pending explicit navigation intent (set by open_chat /
-            // open_new_session). `None` = passive restore (boot or background
-            // space sync) where the saved layout's focus should win.
+        if state.read(cx).spaces_synced {
             let explicit_nav = self.pending_explicit_nav.take();
-            self.workspace_space_loaded = true;
-            self.restore_workspace_layout(selected_space, cx);
-            // Re-apply the explicit target so the user's intent wins over
-            // whatever the restored layout's focused pane had (or lacked).
-            // For Some(chat_id): if the chat already exists in a pane, focus
-            // that pane instead of overwriting another pane's binding.
-            // For None (new-session): clear the focused pane's binding.
+            if !self.workspace_space_loaded || self.active_workspace_space != selected_space {
+                self.workspace_space_loaded = true;
+                self.restore_workspace_layout(selected_space, cx);
+            }
             if let Some(nav_target) = explicit_nav {
-                match nav_target {
-                    Some(ref chat_id) => {
-                        // Search the restored layout for a pane already
-                        // bound to this session; focus it rather than
-                        // duplicating the binding.
-                        let existing = self.find_pane_with_session(chat_id);
-                        if let Some(pane) = existing {
-                            self.workspace.layout.focus_pane(pane).ok();
-                            self.retarget_to_focused_pane(cx);
-                        } else {
-                            self.workspace.sync_focused_session(Some(chat_id));
-                            let current = self.state.read(cx).selected_chat.clone();
-                            if current.as_deref() != Some(chat_id.as_str()) {
-                                let target = chat_id.clone();
-                                self.state.update(cx, |state, cx| {
-                                    state.select_chat(Some(target), cx)
-                                });
-                            }
-                        }
-                    }
-                    None => {
-                        // New-session intent: clear the focused pane so the
-                        // user lands on the fresh composer canvas.
-                        self.workspace
-                            .sync_focused_session(None);
-                        let current = self.state.read(cx).selected_chat.clone();
-                        if current.is_some() {
-                            self.state.update(cx, |state, cx| {
-                                state.select_chat(None, cx)
-                            });
-                        }
-                    }
-                }
+                self.apply_explicit_workspace_navigation(nav_target, cx);
             }
         }
         // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
@@ -12954,6 +12915,7 @@ impl Shell {
 
 #[cfg(test)]
 mod workspace_persistence {
+    include!("shell/workspace_regressions.rs");
     use super::*;
     use gpui::{AppContext, TestAppContext};
 

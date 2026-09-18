@@ -233,6 +233,28 @@ impl Shell {
         self.retarget_to_focused_pane(cx);
     }
 
+    /// Apply explicit navigation after restoring the destination project.
+    /// Sessions already open keep their pane; a new target replaces only the
+    /// focused pane, including the new-session canvas.
+    pub(crate) fn apply_explicit_workspace_navigation(
+        &mut self,
+        target: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(chat_id) = target.as_deref()
+            && let Some(pane) = self.find_pane_with_session(chat_id)
+        {
+            self.focus_workspace_pane(pane, cx);
+            return;
+        }
+        self.workspace.sync_focused_session(target.as_deref());
+        if self.state.read(cx).selected_chat != target {
+            self.state.update(cx, |state, cx| state.select_chat(target, cx));
+        }
+        self.focus_composer(cx);
+        self.note_workspace_mutation(cx);
+    }
+
     /// Tab chip click: make the tab active (and its view), then retarget to
     /// that tab's active pane.
     pub(crate) fn switch_workspace_tab(&mut self, view: ViewId, tab: TabId, cx: &mut Context<Self>) {
@@ -538,14 +560,13 @@ impl Shell {
                         .layout
                         .split_view(view, direction, new_pane)
                         .is_ok_and(|new_view| {
-                            if let Some(tab) = self.workspace.layout.views
+                            let pane_id = self.workspace.layout.views
                                 .get(&new_view)
-                                .and_then(|v| v.tabs.values().next())
-                            {
-                                if let Some(pane_id) = tab.panes.keys().next() {
-                                    let _ = self.workspace.set_pane_session(*pane_id, session_id);
-                                    self.workspace.layout.focus_pane(*pane_id).ok();
-                                }
+                                .and_then(|view| view.tabs.values().next())
+                                .and_then(|tab| tab.panes.keys().next().copied());
+                            if let Some(pane_id) = pane_id {
+                                let _ = self.workspace.set_pane_session(pane_id, session_id);
+                                self.workspace.layout.focus_pane(pane_id).ok();
                             }
                             true
                         })
@@ -555,13 +576,13 @@ impl Shell {
                         .layout
                         .add_tab(view, new_pane)
                         .is_ok_and(|tab_id| {
-                            if let Some(pane_id) = self.workspace.layout.views
+                            let pane_id = self.workspace.layout.views
                                 .get(&view)
-                                .and_then(|v| v.tabs.get(&tab_id))
-                                .and_then(|t| t.panes.keys().next())
-                            {
-                                let _ = self.workspace.set_pane_session(*pane_id, session_id);
-                                self.workspace.layout.focus_pane(*pane_id).ok();
+                                .and_then(|view| view.tabs.get(&tab_id))
+                                .and_then(|tab| tab.panes.keys().next().copied());
+                            if let Some(pane_id) = pane_id {
+                                let _ = self.workspace.set_pane_session(pane_id, session_id);
+                                self.workspace.layout.focus_pane(pane_id).ok();
                             }
                             true
                         })
@@ -1108,11 +1129,21 @@ impl Shell {
             );
         }
         self.active_workspace_space = space.clone();
-        let layout = self
+        let saved_layout = self
             .workspace_layouts
             .layout_for(space.as_deref())
-            .filter(|layout| layout.validate().is_ok())
-            .unwrap_or_default();
+            .filter(|layout| layout.validate().is_ok());
+        // A missing layout is not a request to deselect the boot/session
+        // target. Seed its default pane before retargeting; a real saved
+        // layout still owns its remembered focus, including an empty canvas.
+        let initial_session = if saved_layout.is_none() {
+            self.state.read(cx).selected_chat_row()
+                .filter(|chat| chat.space_id.as_deref() == space.as_deref())
+                .map(|chat| chat.id.clone())
+        } else {
+            None
+        };
+        let layout = saved_layout.unwrap_or_default();
         // Restore alignment: a pane bound to a chat of a DIFFERENT space
         // drops its binding before anything re-selects, so a space switch can
         // never yank the app back to another space's session. Chats that have
@@ -1129,6 +1160,9 @@ impl Shell {
             })
         };
         self.workspace.install_layout(layout);
+        if let Some(session) = initial_session {
+            self.workspace.sync_focused_session(Some(&session));
+        }
         for pane in foreign {
             let _ = self.workspace.set_pane_session(pane, None);
         }
