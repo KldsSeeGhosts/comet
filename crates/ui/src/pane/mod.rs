@@ -264,22 +264,13 @@ pub(crate) fn tool_pane_state(kind: ToolKind) -> PaneState {
     }
 }
 
-/// What a picked tool row commits (no layout happens until a row is picked —
-/// ⌘D/⇧⌘D only OPEN the picker; Esc cancels with zero layout change, §2).
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PickerCommit {
-    /// Split the focused pane (⌘D / ⇧⌘D semantics).
-    SplitPane(Direction),
-    /// Add a tab to one view ("+" in a tab strip — no split).
-    AddTab { view: ViewId },
-}
-
-/// Open tool-picker state: the commit contract plus the window-space anchor
-/// (the focused pane's top-left for ⌘D/⇧⌘D per §2; the "+" trigger's position
-/// for tab strips).
+/// Open tool-picker state: the view a picked row adds its tab to, plus the
+/// window-space anchor (the "+" trigger's position). The picker's ONLY role
+/// is the tab-strip launcher now — pane splits (⌘D/⇧⌘D, context menu) commit
+/// a new chat directly and never open it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ToolPickerState {
-    pub commit: PickerCommit,
+    pub view: ViewId,
     pub anchor: gpui::Point<Pixels>,
 }
 

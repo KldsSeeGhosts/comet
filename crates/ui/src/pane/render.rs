@@ -524,9 +524,12 @@ fn split_child(weight: f32, child: AnyElement) -> AnyElement {
 
 /// One pane: click-to-focus container, its header (the chat identity row —
 /// `closable` only gates the ×), and the pane's own transcript + composer
-/// body. Focus is internal routing state only — every pane carries the same
-/// border and the same element tree. A paint-time canvas records the pane's
-/// bounds for the tool-picker anchor.
+/// body. Focus is internal routing state only. The container is deliberately
+/// CHROMELESS — no rounding, border, or fill (product decision, Super parity):
+/// every pane sits flush on the same frost glass the single-chat route uses,
+/// so a split reads as one surface that grew, not white cards laid on gray.
+/// Separation is the dividers' 1px hairlines alone. A paint-time canvas
+/// records the pane's bounds for the tool-picker anchor.
 fn pane_container(
     cx: &Context<'_, Shell>,
     theme: &Theme,
@@ -544,10 +547,6 @@ fn pane_container(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(theme.border_strong)
-        .bg(theme.bg)
         // Click anywhere in the pane focuses it (§7); the listener no-ops
         // when the pane is already focused, so scrolling a transcript never
         // yanks keyboard focus. Dividers sit OUTSIDE every pane container,

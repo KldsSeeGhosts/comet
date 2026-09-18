@@ -18,8 +18,8 @@ use crate::pane::render::{
     OUTLET_PAD_PX, OUTLET_TOP_PAD_PX, PaneSnap, ViewSnap, WorkspaceSnap, workspace_outlet,
 };
 use crate::pane::{
-    DIVIDER_HIT_PX, DividerTarget, DragSplitState, EQUALIZE_RATIO, PaneChatSurface, PickerCommit,
-    ToolKind, ratio_from_pointer,
+    DIVIDER_HIT_PX, DividerTarget, DragSplitState, EQUALIZE_RATIO, PaneChatSurface, ToolKind,
+    ratio_from_pointer,
 };
 use crate::state::ChatTarget;
 use zeron_workspace::{Direction, PaneId, PaneMode, TabId, ViewId};
@@ -1153,23 +1153,27 @@ impl Shell {
     }
 
     // ------------------------------------------------------------------
-    // Tool picker (the verified ⌘D contract, interaction-truth §2)
+    // Split actions + the tab-strip tool picker
     // ------------------------------------------------------------------
 
-    /// ⌘D / ⇧⌘D: OPEN the tool picker anchored to the focused pane's
-    /// top-left. NO split happens here — the split commits when a row is
-    /// picked, so Esc cancels with zero layout change. Pressing the chord
-    /// again toggles the picker closed.
+    /// ⌘D / ⇧⌘D and the context-menu split rows: split the focused pane and
+    /// commit a NEW CHAT pane immediately. (§2's open-the-picker-first
+    /// contract is superseded by product decision: every split grows a chat —
+    /// terminals have no surface yet anyway — so a popup that could only ever
+    /// mint the same pane is friction. The picker lives on solely as the
+    /// tab-strip "+" launcher.)
     pub(crate) fn split_workspace_pane(&mut self, direction: Direction, cx: &mut Context<Self>) {
         if !matches!(self.route, Route::Chat) || self.overlay_owns_keyboard(cx) {
             return;
         }
-        let anchor = self.focused_pane_anchor();
-        self.tool_picker = Some(crate::pane::ToolPickerState {
-            commit: PickerCommit::SplitPane(direction),
-            anchor,
-        });
-        cx.notify();
+        if self
+            .workspace
+            .split_focused_pane_with(direction, crate::pane::tool_pane_state(ToolKind::Chat))
+            .is_err()
+        {
+            return;
+        }
+        self.retarget_to_focused_pane(cx);
     }
 
     /// "+" in a view's tab strip: open the tool picker anchored at the
@@ -1183,7 +1187,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         if let Some(picker) = self.tool_picker {
-            if matches!(picker.commit, PickerCommit::AddTab { view: v } if v == view) {
+            if picker.view == view {
                 self.close_tool_picker(cx);
                 return;
             }
@@ -1193,22 +1197,10 @@ impl Shell {
         }
         // Anchor just below the trigger; menu_at snaps to the window edge.
         self.tool_picker = Some(crate::pane::ToolPickerState {
-            commit: PickerCommit::AddTab { view },
+            view,
             anchor: gpui::point(anchor.x, anchor.y + gpui::px(26.0)),
         });
         cx.notify();
-    }
-
-    /// The picker anchor: the focused pane's last painted top-left (§2).
-    /// The untouched default layout has no pane canvases yet (the parity path
-    /// renders no tree), so the fallback is the content area's top-left under
-    /// the overlaid titlebar — `menu_at` snaps to the window margins, so the
-    /// approximation stays on-screen.
-    fn focused_pane_anchor(&self) -> gpui::Point<gpui::Pixels> {
-        if let Some(bounds) = self.workspace.focused_pane_bounds() {
-            return gpui::point(bounds.origin.x, bounds.origin.y);
-        }
-        gpui::point(gpui::px(12.0), gpui::px(Theme::TITLEBAR_HEIGHT + 12.0))
     }
 
     pub(crate) fn close_tool_picker(&mut self, cx: &mut Context<Self>) {
@@ -1217,25 +1209,19 @@ impl Shell {
         }
     }
 
-    /// A picked row: the zero-layout-until-now contract ends here — commit
-    /// the split (or the tab add) with the row's tool as the new pane state.
+    /// A picked row: commit the row's tool as a new tab added to the picker's
+    /// view (the only commit the picker owns since splits went direct).
     pub(crate) fn commit_tool_picker(
         &mut self,
-        commit: PickerCommit,
+        view: ViewId,
         kind: ToolKind,
         cx: &mut Context<Self>,
     ) {
-        let result = match commit {
-            PickerCommit::SplitPane(direction) => self
-                .workspace
-                .split_focused_pane_with(direction, crate::pane::tool_pane_state(kind))
-                .map(|_| ()),
-            PickerCommit::AddTab { view } => self
-                .workspace
-                .add_tab_with(view, crate::pane::tool_pane_state(kind))
-                .map(|_| ()),
-        };
-        if result.is_err() {
+        if self
+            .workspace
+            .add_tab_with(view, crate::pane::tool_pane_state(kind))
+            .is_err()
+        {
             return;
         }
         self.retarget_to_focused_pane(cx);
@@ -1269,13 +1255,13 @@ impl Shell {
             .child(popover::menu_heading(&theme, "Choose a tool"));
         for row in crate::pane::TOOL_PICKER_ROWS {
             let row_id = format!("ws-tool-{:?}", row.kind);
-            let (kind, commit) = (row.kind, picker.commit);
+            let (kind, view) = (row.kind, picker.view);
             card = card.child(
                 popover::menu_row(&theme, false, row_id.clone())
                     .id(SharedString::from(row_id))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.close_tool_picker(cx);
-                        this.commit_tool_picker(commit, kind, cx);
+                        this.commit_tool_picker(view, kind, cx);
                     }))
                     .child(icon(row.icon).size(px(14.0)).text_color(theme.text_muted))
                     .child(div().flex_1().child(SharedString::from(row.label)))
