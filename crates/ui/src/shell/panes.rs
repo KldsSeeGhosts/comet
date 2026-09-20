@@ -63,7 +63,12 @@ impl Shell {
     pub(super) fn render_workspace_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         self.ensure_pane_chat_surfaces(cx);
-        let snap = Self::workspace_snapshot(&self.workspace, &self.state, cx);
+        let available =
+            (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0);
+        let action_control =
+            self.render_project_actions_control(available, px(self.viewport_height), cx);
+        let snap =
+            Self::workspace_snapshot(&self.workspace, &self.state, action_control, cx);
         // WS4: the active drag's preview, converted to outlet-relative space.
         let drag_preview = self.split_drag_preview();
         workspace_outlet(cx, &theme, &snap, drag_preview)
@@ -75,9 +80,9 @@ impl Shell {
     /// supplies its own headers). Not closable and not a drag source — the
     /// trivial layout has no splits to re-dock.
     pub(super) fn render_primary_pane_header(
-        &self,
+        &mut self,
         theme: &Theme,
-        cx: &Context<Self>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(pane) = self.workspace.focused_pane() else {
             return Empty.into_any_element();
@@ -90,6 +95,10 @@ impl Shell {
                 .unwrap_or_else(|| SharedString::from("New session"));
             (title, row.is_some())
         };
+        let available =
+            (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0);
+        let action_control =
+            self.render_project_actions_control(available, px(self.viewport_height), cx);
         chrome::pane_header(
             pane,
             title,
@@ -97,6 +106,7 @@ impl Shell {
             theme.text_muted.opacity(0.55),
             false,
             has_selection,
+            action_control,
             false,
             theme,
             cx,
@@ -390,6 +400,7 @@ impl Shell {
     fn workspace_snapshot(
         workspace: &crate::pane::PaneHost,
         state: &Entity<AppState>,
+        action_control: Option<AnyElement>,
         cx: &App,
     ) -> WorkspaceSnap {
         let layout = &workspace.layout;
@@ -511,6 +522,7 @@ impl Shell {
             pane_bounds: workspace.pane_bounds_handle(),
             view_bounds: workspace.view_bounds_handle(),
             chip_bounds: workspace.chip_bounds_handle(),
+            action_control: std::rc::Rc::new(std::cell::RefCell::new(action_control)),
         }
     }
 

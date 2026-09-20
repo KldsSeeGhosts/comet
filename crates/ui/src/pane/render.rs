@@ -81,6 +81,9 @@ pub(crate) struct WorkspaceSnap {
     pub view_bounds: Rc<RefCell<std::collections::BTreeMap<ViewId, Bounds<Pixels>>>>,
     /// WS4: the tab chips' rects (strip drop/reorder targets).
     pub chip_bounds: Rc<RefCell<std::collections::BTreeMap<(ViewId, TabId), Bounds<Pixels>>>>,
+    /// The focused pane's project Action control. Recursive rendering
+    /// consumes it exactly once when it reaches that pane.
+    pub action_control: Rc<RefCell<Option<AnyElement>>>,
 }
 
 pub(crate) struct ViewSnap {
@@ -577,6 +580,9 @@ fn pane_container(
             theme.text_muted.opacity(0.55),
             closable,
             pane.focused && pane.has_session,
+            pane.focused
+                .then(|| snap.action_control.borrow_mut().take())
+                .flatten(),
             true,
             theme,
             cx,

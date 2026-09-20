@@ -123,6 +123,7 @@ pub(crate) fn pane_header(
     dot: Hsla,
     closable: bool,
     show_changes: bool,
+    action_control: Option<AnyElement>,
     draggable: bool,
     theme: &Theme,
     cx: &Context<'_, Shell>,
@@ -196,6 +197,7 @@ pub(crate) fn pane_header(
                 .text_color(theme.text_muted)
                 .child(title),
         )
+        .when_some(action_control, |el, action| el.child(action))
         // The right-pane toggle lives on the pane header — the window-wide
         // chat header that used to carry it is gone. Shown only on the
         // focused session-bound pane so idle panes stay quiet.
