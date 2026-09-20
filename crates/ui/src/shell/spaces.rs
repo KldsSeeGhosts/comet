@@ -1487,13 +1487,14 @@ impl Shell {
                             .justify_center()
                             .rounded(px(5.0))
                             .cursor_pointer()
-                            .text_color(theme.text_muted.opacity(0.65))
-                            .hover(|el| el.bg(theme.glass_hover()).text_color(theme.text))
+                            .role(gpui::Role::Button)
+                            .aria_label("New session in project")
+                            .hover(|el| el.bg(theme.glass_hover()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.open_new_session_in_space(space_id.clone(), cx);
                             }))
-                            .child(icon(icons::PLUS).size(px(12.0))),
+                            .child(icon(icons::PLUS).size(px(12.0)).text_color(theme.text_muted)),
                     )
                 })
                 .child(chevron);
