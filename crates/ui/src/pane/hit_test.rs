@@ -8,7 +8,7 @@
 //! |-----------------------------------------------|-----------------------------------|
 //! | pane CENTER                                   | move into that pane's tab group; preview = the pane's full rect |
 //! | INTERIOR edge (engine's outer-20% rule)       | pane-level split; preview = the half adjacent to the hovered edge |
-//! | workspace-OUTER edge of a boundary pane       | view-level split of the adjacent top-level region; preview = that view's full rect |
+//! | workspace gutter beyond a boundary pane      | view-level split; preview = the incoming half of that view |
 //! | a view's tab strip                            | reorder (same view) / move into that strip (other views); preview = a 2px insertion marker |
 //!
 //! All geometry is plain `f32` rects (no GPUI types in the math), so the
@@ -51,10 +51,9 @@ pub(crate) const BOUNDARY_EPSILON_PX: f32 = super::render::PANE_TREE_PAD_PX + 2.
 /// strip row (chips are 22px tall in a 30px row).
 pub(crate) const STRIP_BAND_PX: f32 = 4.0;
 
-/// The outermost ring of the workspace content: a pointer inside it (on a
-/// boundary pane edge) resolves to a VIEW-level split even when the workspace
-/// holds a single pane. Outside the ring, a boundary pane's outer-20% zone
-/// stays a pane-level split.
+/// Maximum distance from the workspace edge for a view split. The pointer
+/// must also be outside the pane, in its surrounding gutter. Drops inside
+/// an island remain pane splits regardless of the number of siblings.
 pub(crate) const OUTER_RING_PX: f32 = 18.0;
 
 /// How far outside a pane's rect a pointer may sit and still hit it: the pane
@@ -140,14 +139,15 @@ impl Rect {
             && self.h > 0.0
     }
 
-    /// The half of the rect adjacent to `dir` — the SplitPane preview shape
-    /// (the split lands the dragged content in the half the cursor hovers).
+    /// The incoming split's footprint, excluding the shared resize gutter.
     pub(crate) fn half_adjacent(&self, dir: Direction) -> Rect {
+        let width = ((self.w - super::DIVIDER_HIT_PX) / 2.0).max(0.0);
+        let height = ((self.h - super::DIVIDER_HIT_PX) / 2.0).max(0.0);
         match dir {
-            Direction::Left => Rect::new(self.x, self.y, self.w / 2.0, self.h),
-            Direction::Right => Rect::new(self.x + self.w / 2.0, self.y, self.w / 2.0, self.h),
-            Direction::Up => Rect::new(self.x, self.y, self.w, self.h / 2.0),
-            Direction::Down => Rect::new(self.x, self.y + self.h / 2.0, self.w, self.h / 2.0),
+            Direction::Left => Rect::new(self.x, self.y, width, self.h),
+            Direction::Right => Rect::new(self.right() - width, self.y, width, self.h),
+            Direction::Up => Rect::new(self.x, self.y, self.w, height),
+            Direction::Down => Rect::new(self.x, self.bottom() - height, self.w, height),
         }
     }
 }
@@ -216,8 +216,8 @@ pub(crate) fn single_pane_geometry(
 /// The single-pane (non-workspace) drop zone over the legacy content area:
 /// resolved through the same [`resolve_drop`] matrix as the workspace
 /// outlet, against the synthetic one-pane geometry the post-drop workspace
-/// will paint — the outer 18px ring is a view split, the rest of the
-/// outer-20% zone a pane split, and the center a `MoveIntoPane` tab join.
+/// will paint: the outer gutter is a view split, the pane's outer-20% zone
+/// a pane split, and the center a `MoveIntoPane` tab join.
 /// Previews therefore describe the post-drop inset pane, never the raw
 /// window edge.
 pub(crate) fn resolve_single_pane_drop(
@@ -341,8 +341,8 @@ pub(crate) enum DropPlan {
 pub(crate) enum PreviewKind {
     /// A pane-level split: the half-pane adjacent to the hovered edge.
     PaneHalf,
-    /// A view-level split: a contained ring around the whole view region.
-    ViewRing,
+    /// A view-level split: the incoming half of the targeted view region.
+    ViewHalf,
     /// A center/tab-join or existing-pane focus: a wash over the full pane.
     FullTarget,
     /// A strip drop: the thin insertion line at the resolved position.
@@ -467,8 +467,8 @@ pub(crate) fn resolve_drop(
                         .iter()
                         .find(|v| v.view == hit.view)
                         .map(|v| DropPreview {
-                            rect: v.rect,
-                            kind: PreviewKind::ViewRing,
+                            rect: v.rect.half_adjacent(direction),
+                            kind: PreviewKind::ViewHalf,
                         }),
                     anchor: Some(hit.pane),
                 }
@@ -520,10 +520,9 @@ pub(crate) fn in_outer_ring(content: &Rect, x: f32, y: f32, direction: Direction
 }
 
 /// Whether an edge hit on a boundary pane resolves to a view-level split:
-/// the pane's hovered edge must touch the workspace content boundary AND
-/// (the workspace holds more than one pane, or the pointer sits inside the
-/// outermost [`OUTER_RING_PX`] ring — which keeps a lone pane's outer edge
-/// a view split while the rest of its outer-20% zone stays a pane split).
+/// the pointer must cross the pane's outer edge into the workspace gutter.
+/// Inside an island, an edge drop always splits that island, including the
+/// bottom edge of a pane with siblings in the same tab.
 fn view_level_drop(
     geom: &WorkspaceGeometry,
     hit: &PaneRect,
@@ -531,8 +530,15 @@ fn view_level_drop(
     y: f32,
     direction: Direction,
 ) -> bool {
-    touches_boundary(&hit.rect, &geom.content, direction)
-        && (geom.panes.len() > 1 || in_outer_ring(&geom.content, x, y, direction))
+    let outside_pane = match direction {
+        Direction::Left => x <= hit.rect.x,
+        Direction::Right => x >= hit.rect.right(),
+        Direction::Up => y <= hit.rect.y,
+        Direction::Down => y >= hit.rect.bottom(),
+    };
+    outside_pane
+        && touches_boundary(&hit.rect, &geom.content, direction)
+        && in_outer_ring(&geom.content, x, y, direction)
 }
 
 /// Whether the plan would extract the dragged tab out of a view the engine
@@ -802,7 +808,7 @@ mod tests {
         );
         assert_eq!(
             r.preview,
-            preview(rect(250.0, 30.0, 250.0, 385.0), PreviewKind::PaneHalf)
+            preview(rect(254.0, 30.0, 246.0, 385.0), PreviewKind::PaneHalf)
         );
         // Down edge of p1 (bottom at 415) — interior too.
         let r = resolve_drop(&geom, 250.0, 412.0, DragSource::TabChip(T2, V1), None);
@@ -815,7 +821,7 @@ mod tests {
         );
         assert_eq!(
             r.preview,
-            preview(rect(0.0, 222.5, 500.0, 192.5), PreviewKind::PaneHalf)
+            preview(rect(0.0, 226.5, 500.0, 188.5), PreviewKind::PaneHalf)
         );
     }
 
@@ -845,10 +851,37 @@ mod tests {
     // ---- workspace-outer edges: view-level split ----
 
     #[test]
-    fn workspace_outer_edge_resolves_split_view_with_full_region_preview() {
+    fn dragging_below_one_sibling_stays_local_until_the_outer_gutter() {
+        let geom = two_by_two();
+        for source in [
+            DragSource::SidebarSession,
+            DragSource::TabChip(T2, V1),
+            DragSource::PaneHeader(PaneId(1)),
+        ] {
+            // Even 1px inside the bottom-left island targets that island,
+            // not the view containing all four panes.
+            let local = resolve_drop(&geom, 250.0, 799.0, source, None);
+            assert_eq!(local.plan, DropPlan::SplitPane {
+                pane: PaneId(3), direction: Direction::Down,
+            });
+            assert_eq!(local.preview,
+                preview(rect(0.0, 611.5, 500.0, 188.5), PreviewKind::PaneHalf));
+            // Crossing the outside edge deliberately targets the whole view.
+            // Its preview must show the lower destination, never a full ring.
+            let outer = resolve_drop(&geom, 250.0, 800.0, source, local.anchor);
+            assert_eq!(outer.plan, DropPlan::SplitView {
+                view: V1, direction: Direction::Down,
+            });
+            assert_eq!(outer.preview,
+                preview(rect(0.0, 404.0, 1000.0, 396.0), PreviewKind::ViewHalf));
+        }
+    }
+
+    #[test]
+    fn workspace_outer_edge_resolves_split_view_with_directional_preview() {
         let geom = three_views();
         // V3's right edge is the workspace right boundary.
-        let r = resolve_drop(&geom, 997.0, 400.0, DragSource::TabChip(T1, V1), None);
+        let r = resolve_drop(&geom, 1000.0, 400.0, DragSource::TabChip(T1, V1), None);
         assert_eq!(
             r.plan,
             DropPlan::SplitView {
@@ -858,10 +891,10 @@ mod tests {
         );
         assert_eq!(
             r.preview,
-            preview(rect(700.0, 0.0, 300.0, 800.0), PreviewKind::ViewRing)
+            preview(rect(854.0, 0.0, 146.0, 800.0), PreviewKind::ViewHalf)
         );
         // V1's left edge is the workspace left boundary.
-        let r = resolve_drop(&geom, 3.0, 400.0, DragSource::TabChip(T2, V2), None);
+        let r = resolve_drop(&geom, 0.0, 400.0, DragSource::TabChip(T2, V2), None);
         assert_eq!(
             r.plan,
             DropPlan::SplitView {
@@ -871,7 +904,7 @@ mod tests {
         );
         assert_eq!(
             r.preview,
-            preview(rect(0.0, 0.0, 300.0, 800.0), PreviewKind::ViewRing)
+            preview(rect(0.0, 0.0, 146.0, 800.0), PreviewKind::ViewHalf)
         );
     }
 
@@ -891,7 +924,7 @@ mod tests {
                 vec![chip(T1, rect(8.0, 4.0, 120.0, 22.0)), chip(T2, rect(132.0, 4.0, 120.0, 22.0))],
             )],
         };
-        let r = resolve_drop(&geom, 797.0, 300.0, DragSource::TabChip(T1, V1), None);
+        let r = resolve_drop(&geom, 800.0, 300.0, DragSource::TabChip(T1, V1), None);
         assert_eq!(
             r.plan,
             DropPlan::SplitView {
@@ -903,13 +936,13 @@ mod tests {
         // engine (the last view can never empty) — the preview suppresses so
         // the drop no-ops honestly.
         geom.views[0].tab_count = 1;
-        let r = resolve_drop(&geom, 797.0, 300.0, DragSource::TabChip(T1, V1), None);
+        let r = resolve_drop(&geom, 800.0, 300.0, DragSource::TabChip(T1, V1), None);
         assert_eq!(r.plan, DropPlan::None);
         // A header over the workspace-outer edge of ANOTHER pane (headers
         // only exist on ≥2-pane tabs, so the hovered pane differs from the
         // source): the pane re-docks as a new top-level region.
         let geom = three_views();
-        let r = resolve_drop(&geom, 997.0, 400.0, DragSource::PaneHeader(PaneId(1)), None);
+        let r = resolve_drop(&geom, 1000.0, 400.0, DragSource::PaneHeader(PaneId(1)), None);
         assert_eq!(
             r.plan,
             DropPlan::SplitView {
@@ -934,8 +967,8 @@ mod tests {
         let r = resolve_drop(&geom, 10.0, 10.0, DragSource::TabChip(T2, V1), None);
         assert_eq!(
             r.plan,
-            DropPlan::SplitView {
-                view: V1,
+            DropPlan::SplitPane {
+                pane: PaneId(1),
                 direction: Direction::Left
             }
         );
@@ -1186,17 +1219,17 @@ mod tests {
     }
 
     #[test]
-    fn single_pane_outer_ring_resolves_view_splits_with_view_ring() {
+    fn single_pane_outer_gutter_previews_the_new_view_destination() {
         // The lone pane's edges touch the content boundary, but only the
-        // outermost OUTER_RING_PX band resolves as a view-level split —
-        // previewing the whole content region as a contained ring.
+        // gutter outside the pane resolves as a view-level split,
+        // previewing the half where the new view will land.
         let outlet = rect(0.0, 0.0, 800.0, 600.0);
         let (content, _) = single_pane_rects(outlet);
         let cases = [
-            (17.0, 300.0, Direction::Left),
-            (783.0, 300.0, Direction::Right),
-            (400.0, 17.0, Direction::Up),
-            (400.0, 583.0, Direction::Down),
+            (6.0, 300.0, Direction::Left),
+            (794.0, 300.0, Direction::Right),
+            (400.0, 6.0, Direction::Up),
+            (400.0, 594.0, Direction::Down),
         ];
         for (x, y, direction) in cases {
             let r = resolve_single_pane_drop(&outlet, PaneId(1), V1, T1, x, y, None);
@@ -1210,7 +1243,7 @@ mod tests {
             );
             assert_eq!(
                 r.preview,
-                preview(content, PreviewKind::ViewRing),
+                preview(content.half_adjacent(direction), PreviewKind::ViewHalf),
                 "({x}, {y})"
             );
             assert_eq!(r.anchor, Some(PaneId(1)), "({x}, {y})");

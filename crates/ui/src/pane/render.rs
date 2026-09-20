@@ -178,26 +178,14 @@ pub(crate) fn workspace_outlet(
 /// identically on both surfaces. The [`PreviewKind`] the resolver produced
 /// chooses the paint: a solid accent line for strip insertions, a half-pane
 /// wash for pane splits, a fainter full-pane wash for tab joins and
-/// existing-pane focuses, and a contained accent ring for view splits — the
-/// ring insets 1px on every side so it never clips into the native window
-/// edge. No listeners, no animation — direct manipulation stays
+/// existing-pane focuses, and a stronger half-region wash for view splits.
+/// No listeners, no animation — direct manipulation stays
 /// synchronized with the resolved drop plan.
 pub(crate) fn split_drop_preview(
     bounds: Bounds<Pixels>,
     kind: PreviewKind,
     theme: &Theme,
 ) -> AnyElement {
-    let bounds = match kind {
-        PreviewKind::ViewRing => {
-            let origin = gpui::point(bounds.origin.x + px(1.0), bounds.origin.y + px(1.0));
-            let size = gpui::size(
-                gpui::px((f32::from(bounds.size.width) - 2.0).max(0.0)),
-                gpui::px((f32::from(bounds.size.height) - 2.0).max(0.0)),
-            );
-            Bounds { origin, size }
-        }
-        _ => bounds,
-    };
     let el = div()
         .absolute()
         .left(bounds.origin.x)
@@ -207,21 +195,22 @@ pub(crate) fn split_drop_preview(
     match kind {
         PreviewKind::Insertion => el.rounded(px(1.0)).bg(theme.accent).into_any_element(),
         PreviewKind::PaneHalf => el
-            .rounded(px(8.0))
+            .rounded(px(PANE_ISLAND_RADIUS_PX))
             .border_1()
             .border_color(theme.accent)
             .bg(theme.accent.opacity(0.14))
             .into_any_element(),
         PreviewKind::FullTarget => el
-            .rounded(px(8.0))
+            .rounded(px(PANE_ISLAND_RADIUS_PX))
             .border_1()
             .border_color(theme.accent)
             .bg(theme.accent.opacity(0.08))
             .into_any_element(),
-        PreviewKind::ViewRing => el
-            .rounded(px(8.0))
+        PreviewKind::ViewHalf => el
+            .rounded(px(PANE_ISLAND_RADIUS_PX))
             .border_2()
             .border_color(theme.accent)
+            .bg(theme.accent.opacity(0.14))
             .into_any_element(),
     }
 }
@@ -273,6 +262,7 @@ fn view_node(
             let view_bounds_cell = snap.view_bounds.clone();
             let view_id = view.view_id;
             let mut col = div()
+                .relative()
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
@@ -574,7 +564,13 @@ fn pane_container(
         .child(
             canvas(
                 move |bounds, _, _| {
-                    bounds_cell.borrow_mut().insert(pane_id, bounds);
+                    // The absolute canvas fills the padding box. Include
+                    // the island's 1px border in drag/drop geometry.
+                    let outer = Bounds {
+                        origin: gpui::point(bounds.origin.x - px(1.0), bounds.origin.y - px(1.0)),
+                        size: gpui::size(bounds.size.width + px(2.0), bounds.size.height + px(2.0)),
+                    };
+                    bounds_cell.borrow_mut().insert(pane_id, outer);
                 },
                 |_, _, _, _| {},
             )
