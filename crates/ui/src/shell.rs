@@ -75,6 +75,7 @@ actions!(
         ToggleChanges,
         AddSpacePalette,
         ToggleCommandPalette,
+        OpenModelPicker,
         NewSession,
         OpenSettings,
         NextSession,

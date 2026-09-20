@@ -269,7 +269,6 @@ impl Shell {
                     ix == active,
                     chat.archived,
                     None,
-                    None,
                     Some(&query),
                     &theme,
                     cx,
