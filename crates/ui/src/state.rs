@@ -707,6 +707,13 @@ pub struct AppState {
     /// the engine LRU — closing a tab MUST go through
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
+    /// Pending-message queues keyed by chat id for pane-fixed composers.
+    /// Independent of `selected_chat`: a pane keeps reading its own queue
+    /// while another chat is selected.
+    pane_queues: HashMap<String, Vec<zeron_doc::QueuedMessage>>,
+    /// One queue watch task per fixed pane chat (single-flight per key;
+    /// dropping the task cancels the engine-side watch).
+    pane_queue_tasks: HashMap<String, Task<()>>,
 }
 
 /// Text/reasoning growth changes the transcript without changing session
@@ -771,6 +778,8 @@ impl AppState {
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
+            pane_queues: HashMap::new(),
+            pane_queue_tasks: HashMap::new(),
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -1193,6 +1202,15 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// A pane-fixed chat's pending-message queue (empty until its watch's
+    /// first frame lands, or while unwatched).
+    pub(crate) fn pane_queue(&self, chat_id: &str) -> &[zeron_doc::QueuedMessage] {
+        self.pane_queues
+            .get(chat_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// Watch a SUBAGENT doc (`WatchDocMessages` works for any doc id).
     /// Single-flight per key; a frozen snapshot already in place wins — the
     /// watch would race the (complete) blob with a possibly-purged live doc.
@@ -1386,9 +1404,14 @@ impl AppState {
     pub fn pending_echoes(&self) -> &[SessionMessageEntry] {
         self.selected_chat
             .as_deref()
-            .and_then(|id| self.echoes.get(id))
-            .map(|v| v.as_slice())
+            .map(|id| self.pending_echoes_for(id))
             .unwrap_or(&[])
+    }
+
+    /// Unconfirmed echoes for `chat_id`, in send order — the pane-owned
+    /// transcript scope's counterpart to [`Self::pending_echoes`].
+    pub(crate) fn pending_echoes_for(&self, chat_id: &str) -> &[SessionMessageEntry] {
+        self.echoes.get(chat_id).map(Vec::as_slice).unwrap_or(&[])
     }
 
     // ---- queries ----
@@ -1646,6 +1669,8 @@ impl AppState {
         self.transfers.clear();
         self.local_device_id = None;
         self.update = None;
+        self.pane_queues.clear();
+        self.pane_queue_tasks.clear();
         cx.notify();
     }
 
@@ -1856,6 +1881,29 @@ impl AppState {
     /// watch server-side. Selecting a chat also lands in its space and marks it
     /// seen (a global-list click must switch the tab strip too).
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
+        self.select_chat_with_space_follow(chat_id, true, cx);
+    }
+
+    /// Workspace-pane selection: identical to [`Self::select_chat`] except the
+    /// chat's project is NOT followed. A workspace layout stays owned by the
+    /// space it was opened from — a pane bound to another space's session
+    /// (a sidebar drop can dock any chat) selects that session's transcript
+    /// and watches without repointing `selected_space`, so the state observer
+    /// never restores a different layout over the mixed tree.
+    pub(crate) fn select_workspace_pane_chat(
+        &mut self,
+        chat_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_chat_with_space_follow(chat_id, false, cx);
+    }
+
+    fn select_chat_with_space_follow(
+        &mut self,
+        chat_id: Option<String>,
+        follow_space: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.selected_chat == chat_id {
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
@@ -1880,9 +1928,11 @@ impl AppState {
         self.queue.clear();
         self.queue_task = None;
         if let Some(id) = chat_id.as_deref() {
-            // A chat implies its project (or the lack of one); `select_chat(None)`
-            // (the new-session canvas) keeps the current project pick.
-            if let Some(chat) = self.chats.iter().find(|c| c.id == id) {
+            // A chat implies its project (or the lack of one) — but only for
+            // direct selection; a workspace pane's chat leaves the layout
+            // owner's project alone. `select_chat(None)` (the new-session
+            // canvas) keeps the current project pick either way.
+            if follow_space && let Some(chat) = self.chats.iter().find(|c| c.id == id) {
                 match chat.space_id.clone() {
                     Some(space_id) => {
                         self.selected_space = Some(space_id);
@@ -1925,6 +1975,59 @@ impl AppState {
             .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
         {
             self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+        }
+    }
+
+    /// Watch a pane-fixed chat's queue (`WatchQueue` for a chat that need not
+    /// be selected). Single-flight per key; the projection lands in
+    /// `pane_queues[chat_id]` and survives selection changes.
+    pub(crate) fn watch_pane_queue(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        if self.pane_queue_tasks.contains_key(&chat_id) {
+            return;
+        }
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        if !handle
+            .engine_info()
+            .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+        {
+            return;
+        }
+        self.pane_queues.entry(chat_id.clone()).or_default();
+        let task = spawn_pane_queue_watch(cx, handle, chat_id.clone());
+        self.pane_queue_tasks.insert(chat_id, task);
+    }
+
+    /// Replace every live queue subscription serving `chat_id` — the
+    /// selected projection via the existing path and the fixed pane watch
+    /// when one exists — while keeping each current projection visible until
+    /// its next frame lands. Used after an optimistic mutation fails.
+    pub(crate) fn refresh_chat_queue(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self.selected_chat.as_deref() == Some(chat_id) {
+            self.refresh_selected_queue(cx);
+        }
+        if self.pane_queues.contains_key(chat_id) || self.pane_queue_tasks.contains_key(chat_id) {
+            self.pane_queue_tasks.remove(chat_id);
+            self.watch_pane_queue(chat_id.to_string(), cx);
+        }
+    }
+
+    /// Apply an optimistic local edit to every live queue projection serving
+    /// `chat_id` — the selected chat's queue AND a pane-fixed chat's queue
+    /// when both exist (a pane can be bound to the selected chat, and the
+    /// projections hold the same doc-side rows until the next frame
+    /// confirms).
+    pub(crate) fn mutate_chat_queue(
+        &mut self,
+        chat_id: &str,
+        mut f: impl FnMut(&mut Vec<zeron_doc::QueuedMessage>),
+    ) {
+        if self.selected_chat.as_deref() == Some(chat_id) {
+            f(&mut self.queue);
+        }
+        if let Some(queue) = self.pane_queues.get_mut(chat_id) {
+            f(queue);
         }
     }
 
@@ -1991,6 +2094,47 @@ impl AppState {
             }
         })
         .detach();
+    }
+}
+
+/// Which chat a composer/pickers surface serves: the global selection, or a
+/// chat fixed to one pane (`Fixed(None)` = the pane's new-chat canvas, bound
+/// to the minted chat on its first send).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ChatTarget {
+    Selected,
+    Fixed(Option<String>),
+}
+
+impl ChatTarget {
+    pub(crate) fn chat_id<'a>(&'a self, state: &'a AppState) -> Option<&'a str> {
+        match self {
+            Self::Selected => state.selected_chat.as_deref(),
+            Self::Fixed(chat_id) => chat_id.as_deref(),
+        }
+    }
+
+    pub(crate) fn chat<'a>(&self, state: &'a AppState) -> Option<&'a Chat> {
+        let chat_id = self.chat_id(state)?;
+        state.chats.iter().find(|chat| chat.id == chat_id)
+    }
+
+    pub(crate) fn key(&self, state: &AppState) -> String {
+        self.chat_id(state).unwrap_or_default().to_string()
+    }
+
+    pub(crate) fn transcript<'a>(&self, state: &'a AppState) -> &'a [SessionMessageEntry] {
+        match self {
+            Self::Selected => state.transcript.as_slice(),
+            Self::Fixed(Some(chat_id)) => state.sub_transcript(chat_id),
+            Self::Fixed(None) => &[],
+        }
+    }
+
+    pub(crate) fn bind(&mut self, chat_id: String) {
+        if matches!(self, Self::Fixed(_)) {
+            *self = Self::Fixed(Some(chat_id));
+        }
     }
 }
 
@@ -2397,6 +2541,65 @@ fn spawn_queue_watch(
     })
 }
 
+/// [`spawn_queue_watch`]'s shape for a pane-fixed chat, writing
+/// `pane_queues[chat_id]` — a pane composer keeps its own queue projection
+/// independent of the selection.
+fn spawn_pane_queue_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    chat_id: String,
+) -> Task<()> {
+    #[derive(serde::Deserialize)]
+    struct QueueFrame {
+        #[serde(default)]
+        items: Vec<zeron_doc::QueuedMessage>,
+    }
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        'resubscribe: loop {
+            let params = serde_json::json!({ "chatId": chat_id });
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_QUEUE, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::debug!(%chat_id, error = %err, "pane queue watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue 'resubscribe;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let frame: QueueFrame = match serde_json::from_value(value) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed queue frame");
+                        continue;
+                    }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    // A stale pump racing a refresh finds no key.
+                    if let Some(queue) = state.pane_queues.get_mut(&chat_id) {
+                        *queue = frame.items;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
 /// [`spawn_transcript_watch`]'s shape, writing into `sub_transcripts[doc_id]`
 /// instead of the selected chat's transcript. The apply guard is per key so a
 /// subagent tab can outlive chat switches.
@@ -2442,6 +2645,21 @@ fn spawn_subagent_watch(
                         if let Err(err) = zeron_doc::apply_transcript_frame(rows, frame) {
                             tracing::warn!(%doc_id, error = %err, "resubscribing subagent watch");
                             desync = true;
+                        }
+                        if !desync {
+                            // Mirror the primary transcript's optimistic
+                            // bookkeeping (apply_transcript_frame) for the
+                            // pane-owned surfaces reading this doc: the frame
+                            // confirms echoes by id and acks a pending send by
+                            // materializing its message.
+                            if let Some(echoes) = state.echoes.get_mut(&doc_id) {
+                                echoes.retain(|echo| !rows.iter().any(|e| e.id == echo.id));
+                            }
+                            if let Some(pending) = state.pending_sends.get(&doc_id)
+                                && rows.iter().any(|e| e.id == pending.message_id)
+                            {
+                                state.pending_sends.remove(&doc_id);
+                            }
                         }
                         if text_only && !desync {
                             cx.emit(TranscriptTextChanged {
@@ -4172,6 +4390,80 @@ mod tests {
         assert!(!s.send_queued("c-remote", now));
         // …but the explicit undelivered flag still tells the truth.
         assert!(s.send_undelivered("c-remote", now));
+    }
+
+    #[test]
+    fn chat_target_scopes_lookups_to_selection_or_pane() {
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
+        state.selected_chat = Some("a".into());
+        state.apply_transcript(vec![user_entry("sel")]);
+        state.set_subagent_snapshot("b".into(), vec![user_entry("sub")]);
+
+        // Selected follows the global selection.
+        let target = ChatTarget::Selected;
+        assert_eq!(target.chat_id(&state), Some("a"));
+        assert_eq!(target.chat(&state).map(|c| c.id.as_str()), Some("a"));
+        assert_eq!(target.key(&state), "a");
+        assert_eq!(target.transcript(&state).len(), 1);
+
+        // Fixed(Some) serves its own chat + transcript, ignoring selection.
+        let fixed = ChatTarget::Fixed(Some("b".into()));
+        assert_eq!(fixed.chat_id(&state), Some("b"));
+        assert_eq!(fixed.chat(&state).map(|c| c.id.as_str()), Some("b"));
+        assert_eq!(fixed.key(&state), "b");
+        assert_eq!(fixed.transcript(&state).len(), 1);
+        assert_eq!(fixed.transcript(&state)[0].id, "sub");
+
+        // Fixed(None) is the empty pane canvas.
+        let empty = ChatTarget::Fixed(None);
+        assert_eq!(empty.chat_id(&state), None);
+        assert!(empty.chat(&state).is_none());
+        assert_eq!(empty.key(&state), "");
+        assert!(empty.transcript(&state).is_empty());
+
+        // Selection moves: Selected follows, Fixed ignores it.
+        state.selected_chat = Some("b".into());
+        assert_eq!(target.chat_id(&state), Some("b"));
+        assert_eq!(fixed.chat_id(&state), Some("b"));
+        assert_eq!(empty.chat_id(&state), None);
+
+        // bind() only re-keys a Fixed target.
+        let mut selected = ChatTarget::Selected;
+        selected.bind("c".into());
+        assert_eq!(selected, ChatTarget::Selected);
+        let mut fixed = ChatTarget::Fixed(None);
+        fixed.bind("c".into());
+        assert_eq!(fixed, ChatTarget::Fixed(Some("c".into())));
+    }
+
+    #[test]
+    fn target_queue_reads_each_targets_own_projection() {
+        use crate::composer::Composer;
+
+        let mut state = AppState::new();
+        state.selected_chat = Some("b".into());
+        state.queue = vec![zeron_doc::QueuedMessage::new("sel", "selected row", "dev")];
+        state.pane_queues.insert(
+            "a".into(),
+            vec![zeron_doc::QueuedMessage::new("pane", "pane row", "dev")],
+        );
+
+        // Selected reads the selected chat's queue.
+        let binding = ChatTarget::Selected;
+        let selected = Composer::target_queue(&binding, &state);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "sel");
+
+        // Fixed(Some("a")) reads its own projection while "b" is selected.
+        let binding = ChatTarget::Fixed(Some("a".into()));
+        let fixed = Composer::target_queue(&binding, &state);
+        assert_eq!(fixed.len(), 1);
+        assert_eq!(fixed[0].id, "pane");
+
+        // Fixed(None) — the pane canvas — has no queue.
+        let binding = ChatTarget::Fixed(None);
+        assert!(Composer::target_queue(&binding, &state).is_empty());
     }
 }
 

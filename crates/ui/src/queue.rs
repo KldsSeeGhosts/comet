@@ -20,6 +20,7 @@ use crate::composer::{Composer, QUEUE_COMPOSER_OVERLAP};
 use crate::icons::{self, icon};
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::settings::shortcuts::modifier_send_label;
+use crate::state::{AppState, ChatTarget};
 use crate::terminal::panel::{drop_index, slide_offset};
 use crate::theme::Theme;
 
@@ -279,6 +280,20 @@ fn visible_queue_rows(offset: f32, height: f32, count: usize) -> std::ops::Range
 }
 
 impl Composer {
+    /// This composer's queue projection: the selected chat's `state.queue`,
+    /// a pane-fixed chat's own `pane_queues` entry (fed by its dedicated
+    /// watch), or nothing on the new-chat canvas.
+    pub(crate) fn target_queue<'a>(
+        target: &'a ChatTarget,
+        state: &'a AppState,
+    ) -> &'a [QueuedMessage] {
+        match target {
+            ChatTarget::Selected => state.queue.as_slice(),
+            ChatTarget::Fixed(Some(chat_id)) => state.pane_queue(chat_id),
+            ChatTarget::Fixed(None) => &[],
+        }
+    }
+
     /// The queue panel, or `None` when nothing is waiting. Like the composer,
     /// it is one frosted surface; rows use spacing and hover wash rather than
     /// nesting raised cards inside it.
@@ -295,12 +310,16 @@ impl Composer {
         }
         let (items, chat_id, host_supports_actions) = {
             let state = self.state.read(cx);
-            let chat_id = state.selected_chat.clone()?;
+            let chat_id = self.target.chat_id(state).map(str::to_owned)?;
             let host_supports_actions = state.chat_host_supports(
                 &chat_id,
                 zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
             );
-            (state.queue.clone(), chat_id, host_supports_actions)
+            (
+                Self::target_queue(&self.target, state).to_vec(),
+                chat_id,
+                host_supports_actions,
+            )
         };
         self.prepare_queue_previews(&items, window, cx);
         if items.is_empty() {
@@ -681,8 +700,9 @@ impl Composer {
     ) {
         use crate::attachments;
         let state = self.state.read(cx);
-        let device = state
-            .selected_chat_row()
+        let device = self
+            .target
+            .chat(state)
             .map(|chat| chat.device_id.clone())
             .unwrap_or_default();
         let engine = state.engine().cloned();
@@ -787,7 +807,7 @@ impl Composer {
             return;
         };
         let target = (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device);
-        let chat = state.selected_chat.clone();
+        let chat = self.target.chat_id(state).map(str::to_owned);
         self.queue_full_preview = Some(cx.spawn(async move |this, cx| {
             let image = attachments::read_attachment_image(
                 &engine,
@@ -799,7 +819,7 @@ impl Composer {
             .await;
             this.update(cx, |this, cx| {
                 this.queue_full_preview = None;
-                if this.state.read(cx).selected_chat != chat {
+                if this.target.chat_id(this.state.read(cx)) != chat.as_deref() {
                     return;
                 }
                 if let Some(image) = image {
@@ -825,11 +845,9 @@ impl Composer {
         path: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        use crate::attachments;
         let device = self
-            .state
-            .read(cx)
-            .selected_chat_row()
+            .target
+            .chat(self.state.read(cx))
             .map(|chat| chat.device_id.clone())
             .unwrap_or_default();
         let cache_key = (device.clone(), path.to_string());
@@ -1073,21 +1091,27 @@ impl Composer {
             cx.notify();
             return;
         }
-        let Some(id) = self
-            .state
-            .read(cx)
-            .queue
-            .get(from)
-            .map(|item| item.id.clone())
-        else {
-            return;
+        let (id, chat_id) = {
+            let state = self.state.read(cx);
+            let Some(id) = Self::target_queue(&self.target, state)
+                .get(from)
+                .map(|item| item.id.clone())
+            else {
+                return;
+            };
+            let Some(chat_id) = self.target.chat_id(state).map(str::to_owned) else {
+                return;
+            };
+            (id, chat_id)
         };
         self.state.update(cx, |state, cx| {
-            if from < state.queue.len() {
-                let item = state.queue.remove(from);
-                state.queue.insert(to.min(state.queue.len()), item);
-                cx.notify();
-            }
+            state.mutate_chat_queue(&chat_id, |queue| {
+                if from < queue.len() {
+                    let item = queue.remove(from);
+                    queue.insert(to.min(queue.len()), item);
+                }
+            });
+            cx.notify();
         });
         self.queue_rpc(
             methods::MOVE_QUEUED_MESSAGE,
@@ -1108,10 +1132,10 @@ impl Composer {
         };
         let (chat_id, host_device_id, supported) = {
             let state = self.state.read(cx);
-            let Some(chat_id) = state.selected_chat.clone() else {
+            let Some(chat_id) = self.target.chat_id(state).map(str::to_owned) else {
                 return;
             };
-            let Some(host_device_id) = state.selected_chat_row().map(|chat| chat.device_id.clone())
+            let Some(host_device_id) = self.target.chat(state).map(|chat| chat.device_id.clone())
             else {
                 return;
             };
@@ -1145,40 +1169,42 @@ impl Composer {
                 .await;
             this.update(cx, |composer, cx| {
                 composer.queue_removing.remove(&id);
-                let selected_matches =
-                    composer.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str());
+                // The composer reports while it still serves the chat; the
+                // queue projection for that chat reconciles either way.
+                let target_matches =
+                    composer.target.chat_id(composer.state.read(cx)) == Some(chat_id.as_str());
                 match result {
                     Ok(reply)
                         if queue_mutation_acknowledged(methods::REMOVE_QUEUED_MESSAGE, &reply) =>
                     {
-                        if selected_matches {
-                            composer.state.update(cx, |state, cx| {
-                                state.queue.retain(|item| item.id != id);
-                                cx.notify();
+                        composer.state.update(cx, |state, cx| {
+                            state.mutate_chat_queue(&chat_id, |queue| {
+                                queue.retain(|item| item.id != id)
                             });
-                        }
+                            cx.notify();
+                        });
                     }
                     Ok(reply) => {
                         tracing::debug!(
                             ?reply,
                             "queued message had already left the queue before removal"
                         );
-                        if selected_matches {
+                        if target_matches {
                             composer.failure =
                                 Some("That message had already left the queue".into());
-                            composer
-                                .state
-                                .update(cx, |state, cx| state.refresh_selected_queue(cx));
                         }
+                        composer
+                            .state
+                            .update(cx, |state, cx| state.refresh_chat_queue(&chat_id, cx));
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "host-authoritative queue removal failed");
-                        if selected_matches {
+                        if target_matches {
                             composer.failure = Some("Couldn't remove the message".into());
-                            composer
-                                .state
-                                .update(cx, |state, cx| state.refresh_selected_queue(cx));
                         }
+                        composer
+                            .state
+                            .update(cx, |state, cx| state.refresh_chat_queue(&chat_id, cx));
                     }
                 }
                 cx.notify();
@@ -1225,10 +1251,10 @@ impl Composer {
         }
         let (id, delivery_blocked, host_supports_actions) = {
             let state = self.state.read(cx);
-            let Some(chat_id) = state.selected_chat.as_deref() else {
+            let Some(chat_id) = self.target.chat_id(state) else {
                 return;
             };
-            let Some(item) = latest_queued_message(&state.queue) else {
+            let Some(item) = latest_queued_message(Self::target_queue(&self.target, state)) else {
                 return;
             };
             (
@@ -1261,10 +1287,10 @@ impl Composer {
         };
         let (chat_id, host_device_id, supported) = {
             let state = self.state.read(cx);
-            let Some(chat_id) = state.selected_chat.clone() else {
+            let Some(chat_id) = self.target.chat_id(state).map(str::to_owned) else {
                 return;
             };
-            let Some(host_device_id) = state.selected_chat_row().map(|chat| chat.device_id.clone())
+            let Some(host_device_id) = self.target.chat(state).map(|chat| chat.device_id.clone())
             else {
                 return;
             };
@@ -1278,7 +1304,10 @@ impl Composer {
             cx.notify();
             return;
         }
-        if !self.state.read(cx).queue.iter().any(|item| item.id == id) {
+        if !Self::target_queue(&self.target, self.state.read(cx))
+            .iter()
+            .any(|item| item.id == id)
+        {
             return;
         }
         let owner_device_id = engine.engine_info().device_id.clone();
@@ -1371,9 +1400,9 @@ impl Composer {
                         let text = if !attachments.is_empty() && text == crate::attachments::ATTACHMENT_ONLY_TEXT {
                             String::new()
                         } else { text };
-                        let selected_matches = composer.state.read(cx).selected_chat.as_deref()
+                        let target_matches = composer.target.chat_id(composer.state.read(cx))
                             == Some(chat_id.as_str());
-                        if !selected_matches || !composer.can_edit_queue_in_composer() {
+                        if !target_matches || !composer.can_edit_queue_in_composer() {
                             // Navigation or another composer action won acquisition. Release
                             // immediately; the expiry/review path is the backup.
                             let params = serde_json::json!({
@@ -1679,11 +1708,11 @@ impl Composer {
         };
         let (chat_id, host_device_id, host_supports_action) = {
             let state = self.state.read(cx);
-            let Some(chat_id) = state.selected_chat.clone() else {
+            let Some(chat_id) = self.target.chat_id(state).map(str::to_owned) else {
                 return;
             };
             let host = queue_action_needs_host(method)
-                .then(|| state.selected_chat_row().map(|chat| chat.device_id.clone()))
+                .then(|| self.target.chat(state).map(|chat| chat.device_id.clone()))
                 .flatten();
             let supported = !queue_action_needs_host(method)
                 || state.chat_host_supports(
@@ -1755,7 +1784,7 @@ impl Composer {
                         }
                         composer
                             .state
-                            .update(cx, |state, cx| state.refresh_selected_queue(cx));
+                            .update(cx, |state, cx| state.refresh_chat_queue(&chat_id, cx));
                     })
                     .ok();
                 }
@@ -1768,10 +1797,14 @@ impl Composer {
                                 cx.notify();
                             });
                         }
-                        composer.failure = Some(failure.into());
+                        if composer.target.chat_id(composer.state.read(cx))
+                            == Some(chat_id.as_str())
+                        {
+                            composer.failure = Some(failure.into());
+                        }
                         composer
                             .state
-                            .update(cx, |state, cx| state.refresh_selected_queue(cx));
+                            .update(cx, |state, cx| state.refresh_chat_queue(&chat_id, cx));
                         cx.notify();
                     })
                     .ok();
