@@ -7,10 +7,10 @@
 //! Hosting rules:
 //! - every Chat-mode pane renders its OWN transcript (or an empty canvas
 //!   area for an unbound pane) over its OWN composer footer — focus changes
-//!   nothing in the element tree; every pane carries the same
-//!   `theme.border_strong` 1px border;
-//! - pane focus is internal state only (keyboard/selection routing), still
-//!   driven by click-to-focus on the pane container;
+//!   nothing in the element tree; each pane is a rounded island painted
+//!   with the active theme's content background and border tokens;
+//! - click-to-focus controls keyboard/selection routing and strengthens the
+//!   island's border without changing its size or dimming other panes;
 //! - every pane renders its header — the pane's chat identity row;
 //! - a sole top-level view hides its tab strip when it has a single tab;
 //!   the strip survives for multi-tab views and any view whose close
@@ -69,6 +69,9 @@ pub(crate) const OUTLET_TOP_PAD_PX: f32 = OUTLET_PAD_PX;
 /// sized from it.
 pub(crate) const PANE_TREE_PAD_PX: f32 = 6.0;
 
+/// Shared by every leaf, including nested horizontal and vertical splits.
+const PANE_ISLAND_RADIUS_PX: f32 = 12.0;
+
 /// Immutable render-time snapshot of the workspace tree. Built per frame
 /// (cheap: small trees, cloned ids/titles only).
 pub(crate) struct WorkspaceSnap {
@@ -108,8 +111,8 @@ pub(crate) struct PaneSnap {
     /// Kept in the snapshot contract for the shell's pane bookkeeping; the
     /// header's changes-toggle gate also reads it (focused + bound only).
     pub has_session: bool,
-    /// The one globally focused pane — internal routing state plus the
-    /// changes-toggle gate; it no longer changes what the pane body renders.
+    /// The one globally focused pane — routing, the changes-toggle gate,
+    /// and island border emphasis; it does not change the pane body.
     pub focused: bool,
     /// The pane's own interactive transcript (`None` on the new-chat canvas
     /// or for a pane with no surface).
@@ -372,7 +375,7 @@ fn pane_node(
 /// A split's two children with a divider between them: weighted flex with
 /// zero basis so ratios map exactly to sizes regardless of content, and a
 /// fixed-width invisible hit strip straddling the node line (§1: ~8px hit
-/// area; the visual hairline stays a thin centered line). Dragging commits
+/// area; a centered hairline appears on hover). Dragging commits
 /// live ratio updates to THIS node only; double-click equalizes it.
 fn split_container(
     cx: &Context<'_, Shell>,
@@ -417,7 +420,8 @@ fn split_container(
 }
 
 /// The divider strip: an invisible [`DIVIDER_HIT_PX`] hit area straddling the
-/// node line with a 1px hairline at its center that brightens on hover.
+/// node line with a 1px hairline at its center visible on hover. At rest the
+/// gap exposes the shell backdrop between the islands' own borders.
 /// Starts a GPUI drag ([`DividerDrag`]) so the container's `on_drag_move`
 /// receives pointer samples; mouse-up (or double-click) resolves here.
 /// `.occlude()` keeps the click that starts a drag from reaching anything
@@ -446,7 +450,7 @@ fn divider(
                 .h_full()
                 .bg(crate::motion::hover_blend(
                     &hover_key,
-                    theme.hairline(0.10),
+                    theme.border_strong.opacity(0.0),
                     theme.border_strong,
                 ))
                 .into_any_element()
@@ -457,7 +461,7 @@ fn divider(
                 .w_full()
                 .bg(crate::motion::hover_blend(
                     &hover_key,
-                    theme.hairline(0.10),
+                    theme.border_strong.opacity(0.0),
                     theme.border_strong,
                 ))
                 .into_any_element()
@@ -527,12 +531,11 @@ fn split_child(weight: f32, child: AnyElement) -> AnyElement {
 
 /// One pane: click-to-focus container, its header (the chat identity row —
 /// `closable` only gates the ×), and the pane's own transcript + composer
-/// body. Focus is internal routing state only. The container is deliberately
-/// CHROMELESS — no rounding, border, or fill (product decision, Super parity):
-/// every pane sits flush on the same frost glass the single-chat route uses,
-/// so a split reads as one surface that grew, not white cards laid on gray.
-/// Separation is the dividers' 1px hairlines alone. A paint-time canvas
-/// records the pane's bounds for the tool-picker anchor.
+/// body. Each leaf is a complete island, with an opaque content background
+/// for reading and the shell's chosen backdrop visible through the gutters.
+/// Theme tokens preserve light, dark, and custom palettes. Focus changes
+/// only the border color, so switching panes never shifts their contents.
+/// A paint-time canvas records the pane's bounds for the tool-picker anchor.
 fn pane_container(
     cx: &Context<'_, Shell>,
     theme: &Theme,
@@ -549,6 +552,14 @@ fn pane_container(
         .relative()
         .flex()
         .flex_col()
+        .rounded(px(PANE_ISLAND_RADIUS_PX))
+        .bg(theme.bg)
+        .border_1()
+        .border_color(if pane.focused {
+            theme.border_strong
+        } else {
+            theme.border
+        })
         .overflow_hidden()
         // Click anywhere in the pane focuses it (§7); the listener no-ops
         // when the pane is already focused, so scrolling a transcript never
