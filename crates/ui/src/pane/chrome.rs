@@ -64,6 +64,14 @@ impl gpui::Render for ChromeTooltip {
     }
 }
 
+/// The pane's session avatar status: buddy icon, indicator state, and badge color.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PaneBuddy {
+    pub session_key: SharedString,
+    pub status: zeron_proto::ChatIndicator,
+    pub status_color: Hsla,
+}
+
 /// A tab chip's provider mark: the harness brand icon + optional tint
 /// (Claude gets its brand orange; everything else renders in the muted text
 /// tone). Default chat panes carry the app logo.
@@ -125,15 +133,15 @@ pub(crate) struct TabChip {
 
 /// The pane header's fixed height — also the chat identity row on the
 /// legacy single-pane route and the transcript's top fade inset.
-pub(crate) const PANE_HEADER_HEIGHT: f32 = 28.0;
+pub(crate) const PANE_HEADER_HEIGHT: f32 = 36.0;
 
-/// The pane header: status dot + truncated title left, labelled controls right.
+/// The pane header: truncated title left, labelled controls right.
 /// Right-click opens the split/close menu. Draggable headers can be re-docked.
 pub(crate) fn pane_header(
     pane: PaneId,
     title: SharedString,
     mark: TabMark,
-    dot: Hsla,
+    buddy: Option<&PaneBuddy>,
     closable: bool,
     show_changes: bool,
     action_control: Option<AnyElement>,
@@ -170,11 +178,9 @@ pub(crate) fn pane_header(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(6.0))
+        .gap(px(8.0))
         .pl(px(10.0))
         .pr(px(6.0))
-        .border_b_1()
-        .border_color(theme.hairline(0.08))
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -202,15 +208,49 @@ pub(crate) fn pane_header(
                 },
             )
         })
-        .child(div().size(px(6.0)).flex_none().rounded_full().bg(dot))
+        .when_some(buddy, |el, buddy| {
+            let (image, blink_image) = crate::sidebar_buddy::avatar_for_session(&buddy.session_key);
+            el.child(
+                div()
+                    .size(px(24.0))
+                    .flex_none()
+                    .child(
+                        crate::sidebar_buddy::buddy(
+                            format!("pane-buddy-{}", pane.0),
+                            image,
+                            blink_image,
+                            buddy.status,
+                            false,
+                            buddy.status_color,
+                            theme.bg,
+                        )
+                        .size(24.0),
+                    ),
+            )
+        })
+        .when(buddy.is_none(), |el| {
+            el.child(
+                div()
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        icon(mark.icon)
+                            .size(px(18.0))
+                            .text_color(mark.tint.unwrap_or(theme.text_muted)),
+                    ),
+            )
+        })
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(crate::typography::ui_rems(11.0))
+                .text_size(crate::typography::ui_rems(12.5))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.text_muted)
+                .text_color(theme.text)
                 .child(title),
         )
         .when_some(action_control, |el, action| el.child(action))

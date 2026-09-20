@@ -106,8 +106,9 @@ pub(crate) struct PaneSnap {
     pub pane: PaneId,
     pub mode: PaneMode,
     pub title: SharedString,
-    /// The pane's provider mark (header dot-side identity + drag ghost).
+    /// The pane's provider mark (provider drag ghost identity).
     pub mark: chrome::TabMark,
+    pub buddy: Option<chrome::PaneBuddy>,
     /// Kept in the snapshot contract for the shell's pane bookkeeping; the
     /// header's changes-toggle gate also reads it (focused + bound only).
     pub has_session: bool,
@@ -584,7 +585,7 @@ fn pane_container(
             pane.pane,
             pane.title.clone(),
             pane.mark,
-            theme.text_muted.opacity(0.55),
+            pane.buddy.as_ref(),
             closable,
             pane.focused && pane.has_session,
             pane.focused

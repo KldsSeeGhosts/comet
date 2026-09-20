@@ -560,7 +560,15 @@ impl Shell {
 
         if let Some(action) = preferred.clone() {
             let run_action = action.clone();
+            let action_label = SharedString::from(action.name.clone());
             let main = action_segment(&theme, "project-action-main")
+                .role(gpui::Role::Button)
+                .aria_label(action_label.clone())
+                .tooltip(move |_, cx| {
+                    cx.new(|_| SurfaceTabTooltip {
+                        text: action_label.clone(),
+                    }).into()
+                })
                 .when(!can_run, |el| el.opacity(0.45))
                 .when(can_run, |el| {
                     el.cursor_pointer()
@@ -595,6 +603,13 @@ impl Shell {
             );
         } else if unavailable {
             let retry = action_segment(&theme, "project-actions-unavailable")
+                .role(gpui::Role::Button)
+                .aria_label("Actions unavailable")
+                .tooltip(|_, cx| {
+                    cx.new(|_| SurfaceTabTooltip {
+                        text: "Actions unavailable".into(),
+                    }).into()
+                })
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -607,10 +622,7 @@ impl Shell {
                     icon(icons::DANGER_TRIANGLE)
                         .size(px(13.0))
                         .text_color(theme.danger),
-                )
-                .when(show_label, |el| {
-                    el.child(SharedString::from("Actions unavailable"))
-                });
+                );
             control = control.child(retry);
         } else {
             let add = action_segment(&theme, "project-action-add")
