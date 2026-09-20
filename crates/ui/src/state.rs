@@ -90,7 +90,7 @@ struct InProcessEngine {
     refresh_task: tokio::task::JoinHandle<()>,
     /// Serves this engine to other viewports over the IPC port. `None` when the
     /// port was already taken — the window still works over its own transport.
-    ipc_task: Option<tokio::task::JoinHandle<()>>,
+    ipc_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     client: RpcClient,
 }
 
@@ -106,8 +106,12 @@ impl EngineBackend for InProcessEngine {
         self.boot_task.abort();
         // Stop accepting first: a viewport must not connect midway through the
         // drain and queue work against stores that are closing.
-        if let Some(ipc) = &self.ipc_task {
+        let ipc_task = self.ipc_task.lock().await.take();
+        if let Some(ipc) = ipc_task {
             ipc.abort();
+            // `abort` only requests cancellation. Observe task completion so the
+            // listener is closed before bootstrap reports an assembly failure.
+            let _ = ipc.await;
         }
         if let Some(runtime) = self.runtime.lock().await.take() {
             runtime.shutdown().await;
@@ -362,7 +366,7 @@ impl EngineHandle {
                 runtime,
                 boot_task,
                 refresh_task,
-                ipc_task,
+                ipc_task: tokio::sync::Mutex::new(ipc_task),
                 client,
             }),
             engine_info,
@@ -443,6 +447,23 @@ impl EngineHandle {
                 tracing::warn!(%url, error = %err, "not an engine; embedding instead");
                 None
             }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_client(client: RpcClient) -> Self {
+        Self {
+            inner: Arc::new(RemoteEngine {
+                client: Arc::new(client),
+                url: "memory://test".into(),
+                lifecycle_task: tokio::sync::Mutex::new(None),
+            }),
+            engine_info: EngineInfo {
+                device_id: "local".into(),
+                workspace_scope: WorkspaceScope::Local,
+                capabilities: Vec::new(),
+            },
+            deferred_state: None,
         }
     }
 
@@ -1840,6 +1861,13 @@ impl AppState {
             if let Some(id) = chat_id {
                 self.mark_chat_seen(&id, cx);
             }
+            // No-op selects still notify (same contract as `select_space`):
+            // the Shell arms its pending explicit-navigation intent right
+            // before calling this, and that intent is consumed only by the
+            // state observer. A silent no-op would leave it armed for an
+            // unrelated later frame, which would then rebind focus or clear
+            // a pane long after the user's click.
+            cx.notify();
             return;
         }
         self.selected_chat = chat_id.clone();

@@ -40,13 +40,16 @@ pub mod motion;
 mod new_thread_background_effects;
 mod new_thread_background_image;
 mod new_thread_background_mask;
+mod notice;
 pub mod notify;
+pub mod pane;
 pub mod pickers;
 pub mod popover;
 pub mod queue;
 pub mod rail;
 pub mod settings;
 pub mod shell;
+mod sidebar_buddy;
 pub mod sound;
 pub mod state;
 pub(crate) mod surface_chrome;
@@ -57,6 +60,7 @@ pub mod theme_library;
 pub mod transcript;
 pub mod typography;
 mod workspace_links;
+pub mod workspace_layout_store;
 
 use std::path::PathBuf;
 
@@ -65,6 +69,16 @@ use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOp
 
 pub use state::EngineBootConfig;
 pub use zeron_proto::HarnessId;
+
+/// Whether a control whose primary action is click activation may also start
+/// a GPUI drag from the same hitbox. GPUI promotes pointer travel above 2 px
+/// to a drag. Normal Windows click jitter can cross that threshold, cancel the
+/// click, and leave the drag ghost following the pointer instead of activating
+/// the control. Drag-first controls (resize handles, scrollbars, queue rows)
+/// intentionally do not use this policy.
+pub(crate) const fn click_activation_drag_enabled() -> bool {
+    !cfg!(target_os = "windows")
+}
 
 /// Everything the headed binary passes in (config/env resolution lives in
 /// `apps/zeron`, not here).
@@ -151,6 +165,10 @@ pub fn run_app(config: UiConfig) {
         typography::init(
             ui_settings.ui_font_family.clone(),
             ui_settings.ui_font_size,
+            ui_settings.terminal_font_family.clone(),
+            ui_settings.terminal_font_size,
+            ui_settings.code_font_family.clone(),
+            ui_settings.code_font_size,
             font_availability,
             cx,
         );
@@ -203,6 +221,13 @@ pub fn run_app(config: UiConfig) {
         let quit_state = state.clone();
         cx.on_app_quit(move |cx| {
             settings::flush(cx);
+            // WS5: flush per-space workspace layouts past their debounce
+            // window (each Shell owns its store; windows are the only path in).
+            for window in cx.windows() {
+                if let Some(handle) = window.downcast::<shell::Shell>() {
+                    let _ = handle.update(cx, |shell, _, cx| shell.flush_workspace_layout(cx));
+                }
+            }
             let shutdown =
                 quit_state.read(cx).engine().cloned().map(|handle| {
                     gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
@@ -285,12 +310,12 @@ fn open_main_window(
                 // the titlebar, not the menu bar.
                 // macOS: frameless-inset chrome like the original Electron app
                 // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
-                // feature-inventory §1.1). No title text — the strip is
-                // custom-drawn (zed sets `title: None` the same way). On
+                // feature-inventory §1.1). The strip is custom-drawn. Windows
+                // still needs a native title for taskbar previews and Alt+Tab. On
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: None,
+                    title: cfg!(target_os = "windows").then(|| "Zeron".into()),
                     appears_transparent: true,
                     // Native lights are 14px tall: top 14 → center 21, matching
                     // the 38px titlebar row with 4px top-only content padding.

@@ -133,7 +133,10 @@ icon_assets![
     (PEN, "pen"),
     (ARCHIVE_MINIMALISTIC, "archive-minimalistic"),
     (TRASH_BIN_MINIMALISTIC, "trash-bin-minimalistic"),
+    // Shared settings glyph: user-supplied horizontal sliders.
     (SETTINGS_MINIMALISTIC, "settings-minimalistic"),
+    // Compact cog for the sidebar footer's settings action.
+    (SETTINGS_GEAR, "settings-gear"),
     (LOGOUT_2, "logout-2"),
     (MAGNIFER, "magnifer"),
     (COMMAND, "command"),
@@ -158,6 +161,25 @@ icon_assets![
     // Hand-drawn bot head (antenna + eyes + ears) in the Solar Linear style
     // — the embedded set has no bot/robot glyph. Subagent tabs.
     (BOT, "bot"),
+    // Open Design's full-color buddy cast used by active sidebar sessions.
+    (BOT_ORBIT, "bot-orbit"),
+    (BOT_ORBIT_BLINK, "bot-orbit-blink"),
+    (BOT_VISOR, "bot-visor"),
+    (BOT_VISOR_BLINK, "bot-visor-blink"),
+    (BOT_DOME, "bot-dome"),
+    (BOT_DOME_BLINK, "bot-dome-blink"),
+    (BOT_BOX, "bot-box"),
+    (BOT_BOX_BLINK, "bot-box-blink"),
+    (BOT_EARS, "bot-ears"),
+    (BOT_EARS_BLINK, "bot-ears-blink"),
+    (BOT_HALO, "bot-halo"),
+    (BOT_HALO_BLINK, "bot-halo-blink"),
+    (BOT_SPROUT, "bot-sprout"),
+    (BOT_SPROUT_BLINK, "bot-sprout-blink"),
+    (BOT_BOLT, "bot-bolt"),
+    (BOT_BOLT_BLINK, "bot-bolt-blink"),
+    (BOT_BASIC, "bot-basic"),
+    (BOT_BASIC_BLINK, "bot-basic-blink"),
     // Hand-drawn bell + speaker in the Solar Linear style (like the terminal/
     // plus/return ports) — the embedded set has neither.
     (BELL, "bell"),

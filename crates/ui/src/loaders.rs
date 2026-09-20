@@ -13,7 +13,9 @@ use gpui::{
     PathBuilder, Render, RenderOnce, SharedString, Styled, Window, canvas, div, point, px,
 };
 
-use crate::motion::{self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, ZERON_PULSE};
+use crate::motion::{
+    self, EASE_IN_OUT, GRADIENT_SPIN, MotionSpec, PULSE_STAGGER, SPLASH_OUT, ZERON_PULSE,
+};
 use crate::theme::{GlyphPalette, Theme};
 
 // Shared with the terminal viewport (`zeron_proto::motion`) so both animate the
@@ -170,6 +172,144 @@ pub fn mini_mono_spinner(
     cx: &mut App,
 ) -> impl IntoElement {
     mini_spinner_tinted(key, cell_px, [tint; 3], view, cx)
+}
+
+/// Three-bar live-session equalizer from the Open Design sidebar.
+pub fn mini_equalizer(
+    key: impl Into<SharedString>,
+    tint: gpui::Hsla,
+    _view: EntityId,
+    _cx: &mut App,
+) -> impl IntoElement {
+    MiniEqualizer {
+        key: key.into(),
+        tint,
+    }
+}
+
+#[derive(IntoElement)]
+struct MiniEqualizer {
+    key: SharedString,
+    tint: gpui::Hsla,
+}
+
+impl RenderOnce for MiniEqualizer {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let view = window.with_global_id(self.key.into(), |id, window| {
+            window.with_element_state(id, |previous: Option<Entity<MiniEqualizerView>>, _| {
+                let view =
+                    previous.unwrap_or_else(|| cx.new(|_| MiniEqualizerView { tint: self.tint }));
+                view.update(cx, |view, cx| {
+                    if view.tint != self.tint {
+                        view.tint = self.tint;
+                        cx.notify();
+                    }
+                });
+                (view.clone(), view)
+            })
+        });
+        view.cached(gpui::StyleRefinement::default().w(px(11.0)).h(px(10.0)))
+    }
+}
+
+struct MiniEqualizerView {
+    tint: gpui::Hsla,
+}
+
+impl Render for MiniEqualizerView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        const EQUALIZER: MotionSpec = MotionSpec::new(1050, EASE_IN_OUT);
+        let reduced_motion = cx.reduce_motion();
+        let delta = motion::pulse_delta(&EQUALIZER, cx.entity_id(), cx);
+        let tint = self.tint;
+        div()
+            .h(px(10.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.5))
+            .children((0..3).map(move |bar| {
+                let phase = delta + bar as f32 * 0.17;
+                let wave = ((phase.fract() * std::f32::consts::TAU).cos() + 1.0) * 0.5;
+                let height = if reduced_motion {
+                    9.0
+                } else {
+                    9.0 * (0.28 + 0.72 * wave)
+                };
+                div().w(px(2.0)).h(px(height)).rounded(px(1.0)).bg(tint)
+            }))
+    }
+}
+
+pub fn mini_waiting_ping(key: impl Into<SharedString>, tint: gpui::Hsla) -> impl IntoElement {
+    MiniWaitingPing {
+        key: key.into(),
+        tint,
+    }
+}
+
+#[derive(IntoElement)]
+struct MiniWaitingPing {
+    key: SharedString,
+    tint: gpui::Hsla,
+}
+
+impl RenderOnce for MiniWaitingPing {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let view = window.with_global_id(self.key.into(), |id, window| {
+            window.with_element_state(id, |previous: Option<Entity<MiniWaitingPingView>>, _| {
+                let view =
+                    previous.unwrap_or_else(|| cx.new(|_| MiniWaitingPingView { tint: self.tint }));
+                view.update(cx, |view, cx| {
+                    if view.tint != self.tint {
+                        view.tint = self.tint;
+                        cx.notify();
+                    }
+                });
+                (view.clone(), view)
+            })
+        });
+        view.cached(gpui::StyleRefinement::default().w(px(15.0)).h(px(15.0)))
+    }
+}
+
+struct MiniWaitingPingView {
+    tint: gpui::Hsla,
+}
+
+impl Render for MiniWaitingPingView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        const WAITING_PING: MotionSpec = MotionSpec::new(1600, EASE_IN_OUT);
+        let reduced_motion = cx.reduce_motion();
+        let phase = motion::pulse_delta(&WAITING_PING, cx.entity_id(), cx);
+        let progress = if reduced_motion {
+            0.0
+        } else {
+            (phase / 0.7).min(1.0)
+        };
+        let ring_size = 5.0 + 10.0 * progress;
+        let ring_opacity = if phase < 0.7 {
+            0.55 * (1.0 - progress)
+        } else {
+            0.0
+        };
+
+        div()
+            .relative()
+            .size(px(15.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .absolute()
+                    .size(px(ring_size))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(self.tint.opacity(ring_opacity)),
+            )
+            .child(div().size(px(5.0)).rounded_full().bg(self.tint))
+    }
 }
 
 fn mini_spinner_tinted(

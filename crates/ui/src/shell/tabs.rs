@@ -94,8 +94,11 @@ impl Shell {
 
     /// Open a session from the sidebar: select it, the main area follows.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
+        // Track the explicit navigation so workspace restore preserves it.
+        self.pending_explicit_nav = Some(Some(chat_id.clone()));
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         cx.notify();
@@ -105,8 +108,12 @@ impl Shell {
     /// re-homes the canvas onto that project; under "All" the current pick
     /// (the last selected project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
+        // Track the explicit new-session intent so workspace restore
+        // does not overwrite it with a saved layout's focused chat.
+        self.pending_explicit_nav = Some(None);
         let target = {
             let state = self.state.read(cx);
             self.settings

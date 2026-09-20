@@ -1,0 +1,294 @@
+{
+  "version": 1,
+  "selections": [
+    {
+      "key": {
+        "workspace_id": "4d62cf01-c49e-48dc-848b-0879f756ccf5",
+        "project_id": "f921d64e-d6ea-4688-8656-4bc93bc94650",
+        "worktree_name": "main"
+      },
+      "value": {
+        "tabs": [
+          {
+            "tab_uuid": "522129b3-0508-42c8-a986-6008254fc986",
+            "kind": "api-chat",
+            "provider_key": "codex",
+            "provider_profile_selection": {
+              "mode": "cli_default"
+            },
+            "preferred_model_id": "devin/swe-2",
+            "session_id": "codex-17896269968694",
+            "api_chat_thread_id": "codex-17896269968694",
+            "conversation_id": "conv:codex:codex-17896269968694",
+            "messages_snapshot": [],
+            "thinking_enabled": true,
+            "permission_mode": "bypass"
+          },
+          {
+            "tab_uuid": "680aaaa7-4bd7-4f91-a6ac-892364e9aebe",
+            "kind": "api-chat",
+            "provider_key": "pi",
+            "provider_profile_selection": {
+              "mode": "inherit"
+            },
+            "preferred_model_id": "cpa/devin/swe-2",
+            "model_reasoning_effort": "max",
+            "session_id": "pi-17896281496055",
+            "api_chat_thread_id": "pi-17896281496055",
+            "conversation_id": "conv:pi:pi-17896281496055",
+            "messages_snapshot": [],
+            "thinking_enabled": true
+          },
+          {
+            "tab_uuid": "06d4e7c4-3886-4b8c-8aa5-882ad9ca4f25",
+            "kind": "terminal",
+            "preset_key": "terminal",
+            "working_directory_path": "/Users/kidsseemac/superconductor/projects/open-design-project",
+            "title": "Terminal"
+          }
+        ],
+        "active_tab": 0,
+        "split_layouts": [
+          {
+            "root": {
+              "kind": "split",
+              "axis": "horizontal",
+              "ratio": 0.5,
+              "first": {
+                "kind": "split",
+                "axis": "vertical",
+                "ratio": 0.5,
+                "first": {
+                  "kind": "leaf",
+                  "leaf": {
+                    "pane_id": 4,
+                    "content": {
+                      "kind": "primary-tab"
+                    }
+                  }
+                },
+                "second": {
+                  "kind": "leaf",
+                  "leaf": {
+                    "pane_id": 7,
+                    "content": {
+                      "kind": "tab",
+                      "tab": {
+                        "tab_uuid": "dce293b4-3fc8-4e52-9aed-ad23352fe5b7",
+                        "kind": "api-chat",
+                        "provider_key": "pi",
+                        "provider_profile_selection": {
+                          "mode": "inherit"
+                        },
+                        "preferred_model_id": "cpa/devin/swe-2",
+                        "model_reasoning_effort": "max",
+                        "session_id": "/Users/kidsseemac/.pi/agent/sessions/--Users-kidsseemac-superconductor-projects-open-design-project--/4276-1789626872171166000.jsonl",
+                        "api_chat_thread_id": "/Users/kidsseemac/.pi/agent/sessions/--Users-kidsseemac-superconductor-projects-open-design-project--/4276-1789626872171166000.jsonl",
+                        "conversation_id": "conv:pi:pi-17896268437211",
+                        "title": "Mac Storage Cleanup",
+                        "title_sc_owned": true,
+                        "messages_snapshot": [
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-0",
+                            "role": "assistant",
+                            "content": "I'll survey the disk first, then dig into the biggest consumers."
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-1",
+                            "role": "assistant",
+                            "content": "Disk is 28% used (317Gi free), so this is housekeeping, not an emergency. Scanning the usual suspects now."
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-2",
+                            "role": "assistant",
+                            "content": "`AiStack` is the biggest item at 16G. Breaking that down plus a few more cache dirs."
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-3",
+                            "role": "assistant",
+                            "content": ""
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-4",
+                            "role": "assistant",
+                            "content": ""
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-5",
+                            "role": "assistant",
+                            "content": "Found the big one. Checking a few last things, then I'll summarize."
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-6",
+                            "role": "assistant",
+                            "content": ""
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-7",
+                            "role": "assistant",
+                            "content": "Done scanning. Here's the picture:\n\n**Disk**: 460Gi total, 119Gi used, **317Gi free** (28%) - no urgency, this is housekeeping.\n\n## Big wins (safest first)\n\n| Size | Item | Notes |\n|---|---|---|\n| **14G** | `~/AiStack/Noches/zeron/target/debug` | Rust build artifacts. Repo has uncommitted changes but `target/` is pure build output - `cargo clean` or `rm -rf target` is 100% safe, it just forces a rebuild next time. Last build Sep 17. |\n| **1.8G** | `~/.cache/codex-runtimes` | Cached Codex runtimes; regenerated on demand. |\n| **1.5G** | `~/Library/Developer/Xcode/DerivedData` | Xcode build artifacts, safe to wipe. |\n| **~680M** | `~/Downloads` | Only 4 files: `zen-profile.tar.zst` (332M), `ZCode-3.11.2-mac-arm64.dmg` (225M), `helium_0.17.0.1_arm64-macos.dmg` (122M). The DMGs are installers - if those apps are already installed, delete them. Keep `zen-profile.tar.zst` if it's your browser profile backup. |\n| **1.0G** | `~/Library/Caches/zen` | Browser cache, auto-rebuilds. |\n| **721M** | `~/.cargo/registry` | Shared dep cache. `cargo cache` or trim; deleting means re-downloading crates. |\n| **557M** | `~/Library/Caches/ms-playwright` | Playwright browser binaries. Safe if you're not actively running Playwright tests; re-downloads on next run. |\n| **460M** | `~/Library/Application Support/com.apple.wallpaper` | macOS wallpaper cache - regenerates, safe. |\n| **406M** | `~/Library/Caches/org.swift.swiftpm` | Swift package cache, re-fetched as needed. |\n| **637M** | `~/Library/Application Support/zen` | Zen browser profile data - **not** a cache; only delete if you no longer use Zen (loses tabs/logins/settings). |\n| **199M** | `zeron/target/macos-dev` | Second build profile, same deal as debug. |\n\n## Skipped / keep\n\n- `~/.codex` (1.2G): sessions, logs, plugins - mostly small per item, deleting loses history.\n- `~/.zcode`, `~/.pi`, `~/.superconductor`: tool config/data, small.\n- `Documents`, `Music`, `Projects`: user files, nothing obviously junk.\n\n**Total reclaimable without touching user data: ~21G**, almost all from `zeron/target` + caches + Downloads installers.\n\nWant me to go ahead and clear the unambiguous ones? I'd suggest: `zeron/target`, `DerivedData`, the two `.dmg` files, `~/.cache/codex-runtimes`, `ms-playwright`, and `com.apple.wallpaper` - that's ~18G. I'll leave `zen-profile.tar.zst`, the Zen profile, and `~/.cargo` alone unless you say otherwise.\n\n\u001b[38;2;144;144;144m✻ Worked for 58s · done 2:35 AM\u001b[0m"
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-8",
+                            "role": "assistant",
+                            "content": "I'll survey the disk first, then dig into the biggest consumers."
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-9",
+                            "role": "assistant",
+                            "content": "Disk is 28% used (317Gi free), so this is housekeeping, not an emergency. Scanning the usual suspects now."
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-10",
+                            "role": "assistant",
+                            "content": "`AiStack` is the biggest item at 16G. Breaking that down plus a few more cache dirs."
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-11",
+                            "role": "assistant",
+                            "content": ""
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-12",
+                            "role": "assistant",
+                            "content": ""
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-13",
+                            "role": "assistant",
+                            "content": "Found the big one. Checking a few last things, then I'll summarize."
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-14",
+                            "role": "assistant",
+                            "content": ""
+                          },
+                          {
+                            "id": "pi-17896268437211-assistant-1-pi-message-15",
+                            "role": "assistant",
+                            "content": "Done scanning. Here's the picture:\n\n**Disk**: 460Gi total, 119Gi used, **317Gi free** (28%) - no urgency, this is housekeeping.\n\n## Big wins (safest first)\n\n| Size | Item | Notes |\n|---|---|---|\n| **14G** | `~/AiStack/Noches/zeron/target/debug` | Rust build artifacts. Repo has uncommitted changes but `target/` is pure build output - `cargo clean` or `rm -rf target` is 100% safe, it just forces a rebuild next time. Last build Sep 17. |\n| **1.8G** | `~/.cache/codex-runtimes` | Cached Codex runtimes; regenerated on demand. |\n| **1.5G** | `~/Library/Developer/Xcode/DerivedData` | Xcode build artifacts, safe to wipe. |\n| **~680M** | `~/Downloads` | Only 4 files: `zen-profile.tar.zst` (332M), `ZCode-3.11.2-mac-arm64.dmg` (225M), `helium_0.17.0.1_arm64-macos.dmg` (122M). The DMGs are installers - if those apps are already installed, delete them. Keep `zen-profile.tar.zst` if it's your browser profile backup. |\n| **1.0G** | `~/Library/Caches/zen` | Browser cache, auto-rebuilds. |\n| **721M** | `~/.cargo/registry` | Shared dep cache. `cargo cache` or trim; deleting means re-downloading crates. |\n| **557M** | `~/Library/Caches/ms-playwright` | Playwright browser binaries. Safe if you're not actively running Playwright tests; re-downloads on next run. |\n| **460M** | `~/Library/Application Support/com.apple.wallpaper` | macOS wallpaper cache - regenerates, safe. |\n| **406M** | `~/Library/Caches/org.swift.swiftpm` | Swift package cache, re-fetched as needed. |\n| **637M** | `~/Library/Application Support/zen` | Zen browser profile data - **not** a cache; only delete if you no longer use Zen (loses tabs/logins/settings). |\n| **199M** | `zeron/target/macos-dev` | Second build profile, same deal as debug. |\n\n## Skipped / keep\n\n- `~/.codex` (1.2G): sessions, logs, plugins - mostly small per item, deleting loses history.\n- `~/.zcode`, `~/.pi`, `~/.superconductor`: tool config/data, small.\n- `Documents`, `Music`, `Projects`: user files, nothing obviously junk.\n\n**Total reclaimable without touching user data: ~21G**, almost all from `zeron/target` + caches + Downloads installers.\n\nWant me to go ahead and clear the unambiguous ones? I'd suggest: `zeron/target`, `DerivedData`, the two `.dmg` files, `~/.cache/codex-runtimes`, `ms-playwright`, and `com.apple.wallpaper` - that's ~18G. I'll leave `zen-profile.tar.zst`, the Zen profile, and `~/.cargo` alone unless you say otherwise.\n\n\u001b[38;2;144;144;144m✻ Worked for 58s · done 2:35 AM\u001b[0m"
+                          }
+                        ],
+                        "thinking_enabled": true,
+                        "context_window": 262000,
+                        "last_context_tokens": 24034
+                      }
+                    }
+                  }
+                }
+              },
+              "second": {
+                "kind": "split",
+                "axis": "vertical",
+                "ratio": 0.5,
+                "first": {
+                  "kind": "leaf",
+                  "leaf": {
+                    "pane_id": 2,
+                    "content": {
+                      "kind": "tab",
+                      "tab": {
+                        "tab_uuid": "d0d18c04-d63b-444f-a4de-fd0b116b19a2",
+                        "kind": "api-chat",
+                        "provider_key": "pi",
+                        "provider_profile_selection": {
+                          "mode": "inherit"
+                        },
+                        "preferred_model_id": "cpa/devin/swe-2",
+                        "model_reasoning_effort": "max",
+                        "session_id": "pi-17896269896172",
+                        "api_chat_thread_id": "pi-17896269896172",
+                        "conversation_id": "conv:pi:pi-17896269896172",
+                        "messages_snapshot": [],
+                        "thinking_enabled": true
+                      }
+                    }
+                  }
+                },
+                "second": {
+                  "kind": "leaf",
+                  "leaf": {
+                    "pane_id": 3,
+                    "content": {
+                      "kind": "tab",
+                      "tab": {
+                        "tab_uuid": "1a573c30-78c6-40c3-adc8-76e2100904e9",
+                        "kind": "api-chat",
+                        "provider_key": "codex",
+                        "provider_profile_selection": {
+                          "mode": "cli_default"
+                        },
+                        "preferred_model_id": "devin/swe-2",
+                        "session_id": "codex-17896269932133",
+                        "api_chat_thread_id": "codex-17896269932133",
+                        "conversation_id": "conv:codex:codex-17896269932133",
+                        "messages_snapshot": [],
+                        "thinking_enabled": true,
+                        "permission_mode": "bypass"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "active_pane_id": 4,
+            "primary_pane_id": 4
+          },
+          null,
+          {
+            "root": {
+              "kind": "split",
+              "axis": "horizontal",
+              "ratio": 0.5,
+              "first": {
+                "kind": "leaf",
+                "leaf": {
+                  "pane_id": 8,
+                  "content": {
+                    "kind": "primary-tab"
+                  }
+                }
+              },
+              "second": {
+                "kind": "leaf",
+                "leaf": {
+                  "pane_id": 9,
+                  "content": {
+                    "kind": "tab",
+                    "tab": {
+                      "tab_uuid": "3eb14165-cb2b-44aa-9dc8-38c07f61bfa5",
+                      "kind": "terminal",
+                      "preset_key": "terminal",
+                      "working_directory_path": "/Users/kidsseemac/superconductor/projects/open-design-project",
+                      "title": "Terminal"
+                    }
+                  }
+                }
+              }
+            },
+            "active_pane_id": 9,
+            "primary_pane_id": 8
+          }
+        ],
+        "file_tree_expanded_dirs": [],
+        "file_tree_scroll_top_index": 0,
+        "file_tree_selected_path": null,
+        "change_list_view_mode": null,
+        "change_list_expanded_commits": [],
+        "change_list_selected_path": null,
+        "change_list_selected_section": null,
+        "change_list_selected_grouped_repo": null,
+        "change_list_scroll_top_index": 0,
+        "diff_filter": null,
+        "diff_expanded_files": [],
+        "diff_scroll_top_index": 0
+      }
+    }
+  ],
+  "active_selection": {
+    "workspace_id": "4d62cf01-c49e-48dc-848b-0879f756ccf5",
+    "project_id": "f921d64e-d6ea-4688-8656-4bc93bc94650",
+    "worktree_name": "main"
+  },
+  "expanded_branch_groups": []
+}
