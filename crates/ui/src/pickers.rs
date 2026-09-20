@@ -2482,7 +2482,7 @@ impl Pickers {
         chip_icon: Option<(&'static str, Option<gpui::Hsla>)>,
         // The chip never collapses while identity resolves (user report):
         // `icon_loading` swaps the brand slot for the pixel-glyph loader
-        // (harness unknown), `label_loading` swaps the text for a ghost bar
+        // (harness unknown), `label_loading` shows an explicit loading label
         // (model unknown).
         icon_loading: bool,
         label_loading: bool,
@@ -2561,7 +2561,7 @@ impl Pickers {
                 },
             )
             .when(label_loading, |el| {
-                el.child(popover::skeleton_bar(56.0, cx.entity_id(), cx))
+                el.child(div().min_w_0().truncate().child("Loading models…"))
             })
             .when(!label_loading, |el| {
                 el.child(div().min_w_0().truncate().child(label))

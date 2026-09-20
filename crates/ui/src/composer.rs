@@ -79,7 +79,7 @@ pub(crate) const QUEUE_COMPOSER_OVERLAP: f32 = 18.0;
 /// The original floating selector rows use the same 20px chip height as the
 /// established-thread footer. Their surrounding rows own no plate or border.
 const NEW_THREAD_SELECTOR_ROW_HEIGHT: f32 = 20.0;
-// Accommodate the 24px usage indicator and PR badge without overflowing the
+// Accommodate the PR badge without overflowing the
 // row's equal 8px top/bottom gutters.
 const SESSION_FOOTER_HEIGHT: f32 = 24.0;
 
@@ -4196,6 +4196,11 @@ impl Composer {
         frame: crate::composer_dock::DockFrame,
         cx: &mut Context<Self>,
     ) {
+        // The shell still ticks its shared dock while that composer has been
+        // adopted by a split. Pane-owned composers use local footer geometry.
+        if matches!(self.target, ChatTarget::Fixed(_)) {
+            return;
+        }
         let changed = self.dock_frame != Some(frame);
         self.dock_height_changed |= self
             .dock_frame
@@ -4445,6 +4450,10 @@ impl Composer {
     /// Navigation uses the normal per-chat draft swap; mint-on-send still
     /// uses `bind_chat`, which keeps the in-progress send's input ownership.
     pub(crate) fn set_target(&mut self, target: ChatTarget, cx: &mut Context<Self>) {
+        if matches!(target, ChatTarget::Fixed(_)) && self.dock_frame.take().is_some() {
+            self.dock_clearance_correction = 0.0;
+            self.dock_height_changed = true;
+        }
         self.target = target.clone();
         self.pickers.update(cx, |pickers, cx| pickers.set_target(target, cx));
         self.on_state_changed(cx);
@@ -7518,7 +7527,13 @@ impl Render for Composer {
             .flex_col()
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG))
-            .pb(px(Theme::SPACE_LG))
+            // Split panes supply their own 10px bottom inset. Do not stack
+            // the standalone composer's padding on top of that gutter.
+            .pb(px(if matches!(self.target, ChatTarget::Fixed(_)) {
+                0.0
+            } else {
+                Theme::SPACE_LG
+            }))
             .when_some(failure, |el, message| {
                 // Amber with "Warning" for the offline-ish case (engine not
                 // connected), red with "Error" for send/run failures. Click
@@ -7878,6 +7893,13 @@ impl Render for Composer {
             .map_or(strip_width_hint + PILL_BORDER_V, |bounds| {
                 f32::from(bounds.size.width)
             });
+        let usage = crate::context_usage::usage_for_target(self.state.read(cx), &self.target);
+        let has_context_ring = crate::context_usage::has_window(usage);
+        let context_ring = has_context_ring.then(|| {
+            crate::context_usage::render(usage, self.state.clone(), self.target.clone(), &theme)
+                .into_any_element()
+        });
+        let context_ring_width = if has_context_ring { 30.0 } else { 0.0 };
         let model_travel = (surface_width
             - PILL_BORDER_V
             - 12.0
@@ -7889,6 +7911,7 @@ impl Render for Composer {
                 .map_or(0.0, |bounds| f32::from(bounds.size.width))
             - ACTION_PRIMARY_GAP
             - 28.0
+            - context_ring_width
             - morph_cluster_inset(expanded, layout_morph_t))
         .max(0.0);
         let (model_side, model_opacity, model_drift) = model_handoff(self.model_handoff_position);
@@ -7965,7 +7988,15 @@ impl Render for Composer {
                                 .child(attach)
                                 .child(model_picker),
                         )
-                        .child(send_button),
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .children(context_ring)
+                                .child(send_button),
+                        ),
                 )
         } else {
             // Compact pill: attachment on the left, input in the middle,
@@ -8027,8 +8058,12 @@ impl Render for Composer {
                                 .flex_none()
                                 .pl(px(ACTION_PRIMARY_GAP))
                                 .pr(px(morph_cluster_inset(false, layout_morph_t)))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
                                 .relative()
                                 .top(px(-cluster_dy))
+                                .children(context_ring)
                                 .child(send_button),
                         ),
                 )
@@ -8112,36 +8147,18 @@ impl Render for Composer {
 
         // The lower slot keeps a stable footprint for Git projects while its
         // old floating checkout/ref controls dissolve into the session footer.
-        // Non-Git sessions grow the slot continuously from zero.
-        let session_chrome = 1.0 - new_thread_chrome;
+        // Non-Git panes need no footer now that context usage is in the pill.
+        // The standalone dock retains its reserved slot during route morphs.
         let bottom_slot = if has_new_thread_git_selectors || self.dock_frame.is_some() {
             1.0
         } else {
-            session_chrome
+            0.0
         };
         let container = if bottom_slot > 0.0 {
             let footer = (session_chrome_opacity > 0.0).then(|| {
                 self.pickers
                     .update(cx, |pickers, cx| pickers.render_footer(cx))
             });
-            // `context_usage` is the SELECTED chat's frame — a pane-fixed
-            // composer may show it only while its chat is the selected one;
-            // an inactive pane renders nothing rather than another pane's
-            // numbers.
-            let usage = {
-                let state = self.state.read(cx);
-                let serves_target = match &self.target {
-                    ChatTarget::Selected => true,
-                    ChatTarget::Fixed(chat_id) => {
-                        chat_id.as_deref() == state.selected_chat.as_deref()
-                    }
-                };
-                if serves_target {
-                    state.context_usage
-                } else {
-                    None
-                }
-            };
             container.child(
                 div()
                     .w_full()
@@ -8171,16 +8188,7 @@ impl Render for Composer {
                                 .flex()
                                 .items_center()
                                 .opacity(session_chrome_opacity)
-                                .child(div().flex_1().min_w_0().children(footer.flatten()))
-                                .children(crate::context_usage::has_window(usage).then(|| {
-                                    div().flex_none().pr(px(10.0)).child(
-                                        crate::context_usage::render(
-                                            usage,
-                                            self.state.clone(),
-                                            &theme,
-                                        ),
-                                    )
-                                })),
+                                .child(div().flex_1().min_w_0().children(footer.flatten())),
                         )
                     }),
             )
@@ -8243,6 +8251,28 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
         (dir, window)
+    }
+
+    #[gpui::test]
+    fn adopting_a_composer_into_a_split_releases_shared_dock_geometry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle.update(cx, |composer, _, cx| {
+            let frame = crate::composer_dock::DockFrame::settled(false);
+            composer.set_dock_frame(frame, cx);
+            composer.input.update(cx, |input, cx| input.set_text("Keep this draft", cx));
+            composer.set_target(ChatTarget::Fixed(None), cx);
+            assert!(composer.dock_frame.is_none());
+            assert_eq!(composer.input.read(cx).text(), "Keep this draft");
+            // The shell continues ticking after adoption; it must not put the
+            // single-pane footer reservation back into the island.
+            composer.set_dock_frame(frame, cx);
+            assert!(composer.dock_frame.is_none());
+            composer.set_target(ChatTarget::Selected, cx);
+            composer.set_dock_frame(frame, cx);
+            assert_eq!(composer.dock_frame, Some(frame));
+        }).unwrap();
     }
 
     #[gpui::test]

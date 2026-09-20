@@ -1,4 +1,5 @@
 //! Context occupancy is read from the replicated chat snapshot, never local CLI state.
+use crate::state::{AppState, ChatTarget};
 use crate::theme::Theme;
 use gpui::{
     Context, IntoElement, PathBuilder, Render, SharedString, Window, canvas, div, point,
@@ -6,9 +7,19 @@ use gpui::{
 };
 use zeron_proto::ContextUsage;
 
-pub fn render(
+/// The replicated usage frame belongs to the selected chat. Neither an
+/// unbound composer nor another split may borrow its ring or tooltip data.
+pub(crate) fn usage_for_target(state: &AppState, target: &ChatTarget) -> Option<ContextUsage> {
+    let chat_id = target.chat_id(state)?;
+    (state.selected_chat.as_deref() == Some(chat_id))
+        .then_some(state.context_usage)
+        .flatten()
+}
+
+pub(crate) fn render(
     usage: Option<ContextUsage>,
     state: gpui::Entity<crate::state::AppState>,
+    target: ChatTarget,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let fraction = usage.and_then(ContextUsage::fraction);
@@ -52,26 +63,24 @@ pub fn render(
     )
     .size(px(16.0));
     let label = fraction
-        .map(|f| format!("{:.0}%", f * 100.0))
-        .unwrap_or_else(|| "—".into());
+        .map(|f| format!("Context window: {:.0}% used", f * 100.0))
+        .unwrap_or_else(|| "Context window: usage not reported".into());
     div()
         .id("context-usage")
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(5.0))
-        .h(px(24.0))
-        .px(px(6.0))
+        .justify_center()
+        .size(px(24.0))
         .rounded(px(6.0))
-        .text_size(px(11.0))
-        .text_color(color)
+        .aria_label(SharedString::from(label))
         .hover(|s| s.bg(crate::theme::ink(0.05)))
         .child(ring)
-        .child(SharedString::from(label))
         .tooltip(move |_, cx| {
             cx.new(|cx| UsageCard {
                 _subscription: cx.observe(&state, |_, _, cx| cx.notify()),
                 state: state.clone(),
+                target: target.clone(),
             })
             .into()
         })
@@ -79,6 +88,7 @@ pub fn render(
 
 struct UsageCard {
     state: gpui::Entity<crate::state::AppState>,
+    target: ChatTarget,
     _subscription: gpui::Subscription,
 }
 
@@ -157,9 +167,10 @@ impl Render for UsageCard {
                     .line_height(px(19.0))
                     .whitespace_nowrap()
                     .text_color(theme.text_muted)
-                    .child(SharedString::from(details(
-                        self.state.read(cx).context_usage,
-                    ))),
+                    .child(SharedString::from(details(usage_for_target(
+                        self.state.read(cx),
+                        &self.target,
+                    )))),
             );
         crate::frost::frosted(crate::popover::CARD_RADIUS, crate::frost::MENU_BLUR, card)
     }
@@ -168,6 +179,26 @@ impl Render for UsageCard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_never_leaks_to_another_pane_or_an_unbound_composer() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("chat-a".into());
+        state.context_usage = Some(ContextUsage {
+            tokens: Some(42_000),
+            window: Some(200_000),
+        });
+        let bound = ChatTarget::Fixed(Some("chat-a".into()));
+        assert!(has_window(usage_for_target(&state, &bound)));
+        assert!(has_window(usage_for_target(&state, &ChatTarget::Selected)));
+        assert!(usage_for_target(&state, &ChatTarget::Fixed(Some("chat-b".into()))).is_none());
+        assert!(usage_for_target(&state, &ChatTarget::Fixed(None)).is_none());
+        // A tooltip left open across navigation must not adopt chat-b's frame.
+        state.selected_chat = Some("chat-b".into());
+        assert!(usage_for_target(&state, &bound).is_none());
+        state.selected_chat = None;
+        assert!(usage_for_target(&state, &ChatTarget::Selected).is_none());
+    }
     #[test]
     fn indicator_needs_a_reported_window() {
         assert!(!has_window(None));

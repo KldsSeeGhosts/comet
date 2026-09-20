@@ -56,6 +56,17 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         }, |_, cx| cx.new(|cx| shell::Shell::new(state.clone(), boot, cx))).unwrap();
         state.update(cx, |_, cx| cx.notify());
+        // Optional sample telemetry for checking the in-composer context ring.
+        // This fixture has no engine and never reads a real session's usage.
+        if std::env::var_os("ZERON_PREVIEW_CONTEXT_USAGE").is_some() {
+            state.update(cx, |state, cx| {
+                state.context_usage = Some(zeron_proto::ContextUsage {
+                    tokens: Some(84_000), window: Some(200_000),
+                });
+                state.transcript_replayed = true;
+                cx.notify();
+            });
+        }
         cx.activate(true);
     });
     Ok(())
