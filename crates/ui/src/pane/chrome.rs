@@ -8,12 +8,11 @@
 //! - unfocused chat panes render a static composer-shaped strip reading
 //!   "Click to focus chat" with a muted, NON-interactive pill row (§7);
 //! - tab chips carry a provider mark + title; the ACTIVE chip gets a raised
-//!   surface + accent underline (§8); a close × is revealed on chip hover and
+//!   surface + accent underline (§8); a visible close ×
 //!   closes the tab (engine semantics: last tab of the only view = no-op);
 //! - the strip ends in a "+" that opens the TOOL PICKER (§2) committed as an
 //!   `add_tab` to that view;
-//! - the pane header reveals its close × on hover (functional →
-//!   `close_pane`); pop-out/maximize render as decorative chrome pending WS6;
+//! - pane header controls stay visible and labelled; close calls `close_pane`;
 //!   right-click opens the split/close context menu AND focuses the pane (§6).
 //!
 //! WS4 makes both drag SOURCES: a chip drags as [`DragSource::TabChip`], a
@@ -45,6 +44,25 @@ use crate::theme::Theme;
 
 use super::hit_test::DragSource;
 use super::{SplitDragGhost, TabSplitDrag};
+
+struct ChromeTooltip(&'static str);
+
+impl gpui::Render for ChromeTooltip {
+    fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(px(11.0))
+            .text_color(theme.text)
+            .child(self.0)
+    }
+}
 
 /// A tab chip's provider mark: the harness brand icon + optional tint
 /// (Claude gets its brand orange; everything else renders in the muted text
@@ -109,13 +127,8 @@ pub(crate) struct TabChip {
 /// legacy single-pane route and the transcript's top fade inset.
 pub(crate) const PANE_HEADER_HEIGHT: f32 = 28.0;
 
-/// The pane header: status dot + truncated title left; pop-out/maximize/close
-/// right — revealed on hover (Super §6). The close is functional; pop-out and
-/// maximize are decorative until WS6 wires their flows. Right-click opens the
-/// split/close context menu (and focuses the pane, §6). Every workspace pane
-/// renders one — it is the chat identity row. WS4: a `draggable` header is a
-/// drag source — dragging it moves/re-docks the pane (drop targets resolve
-/// in `pane/hit_test.rs`).
+/// The pane header: status dot + truncated title left, labelled controls right.
+/// Right-click opens the split/close menu. Draggable headers can be re-docked.
 pub(crate) fn pane_header(
     pane: PaneId,
     title: SharedString,
@@ -128,23 +141,27 @@ pub(crate) fn pane_header(
     theme: &Theme,
     cx: &Context<'_, Shell>,
 ) -> AnyElement {
-    let header_key = format!("pane-header-hover-{}", pane.0);
-    // Controls hide until the header hovers; the × additionally gets its own
-    // hover wash (hitboxes nest, so hovering the × keeps the header "on").
-    let reveal = || motion::hover_blend(&header_key, gpui::transparent_black(), theme.text_muted);
-    let control = |key: String, child_icon: AnyElement| {
+    let control = |key: String, path: &'static str, label: &'static str| {
         div()
             .id(SharedString::from(key.clone()))
-            .size(px(20.0))
+            .size(px(24.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
             .rounded(px(5.0))
-            .text_color(reveal())
+            .role(gpui::Role::Button)
+            .aria_label(label)
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                cx.stop_propagation();
+                window.prevent_default();
+            })
+            .tooltip(move |_, cx| cx.new(|_| ChromeTooltip(label)).into())
             .bg(motion::hover_blend(&key, gpui::transparent_black(), theme.wash(0.12)))
             .on_hover(motion::hover_listener(key))
-            .child(child_icon)
+            // GPUI SVGs require their own color; a parent div's tint is ignored.
+            .child(icon(path).size(px(14.0)).text_color(theme.text_muted))
     };
     div()
         .id(SharedString::from(format!("pane-header-{}", pane.0)))
@@ -158,7 +175,6 @@ pub(crate) fn pane_header(
         .pr(px(6.0))
         .border_b_1()
         .border_color(theme.hairline(0.08))
-        .on_hover(motion::hover_listener(header_key.clone()))
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -205,9 +221,8 @@ pub(crate) fn pane_header(
             el.child(
                 control(
                     format!("pane-changes-{}", pane.0),
-                    icon(icons::SIDEBAR_MINIMALISTIC)
-                        .size(px(11.0))
-                        .into_any_element(),
+                    icons::SIDEBAR_MINIMALISTIC,
+                    "Toggle right sidebar",
                 )
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -216,23 +231,12 @@ pub(crate) fn pane_header(
                 })),
             )
         })
-        // TODO(WS6): pop-out (detach this tab into its own view) — decorative
-        // until the detach flow exists.
-        .child(control(
-            format!("pane-popout-{}", pane.0),
-            icon(icons::EXPAND_ARROWS).size(px(11.0)).into_any_element(),
-        ).opacity(0.35).cursor_default())
-        // TODO(WS6): maximize (collapse the sibling panes of this split) —
-        // decorative until the layout preset presets land.
-        .child(control(
-            format!("pane-maximize-{}", pane.0),
-            icon(icons::WINDOW_MAXIMIZE).size(px(11.0)).into_any_element(),
-        ).opacity(0.35).cursor_default())
         .when(closable, |el| {
             el.child(
                 control(
                     format!("pane-close-{}", pane.0),
-                    icon(icons::CLOSE).size(px(12.0)).into_any_element(),
+                    icons::CLOSE,
+                    "Close pane",
                 )
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, event, window, cx| {
@@ -356,7 +360,7 @@ pub(crate) fn tab_strip(
                 })
                 .child(icon(chip.mark.icon).size(px(11.0)).flex_none().text_color(mark_tint))
                 .child(div().min_w_0().truncate().child(chip.label.clone()))
-                // Close ×, revealed on chip hover; closes the tab (last tab
+                // Close × closes the tab (last tab
                 // of the only view is an engine-guarded no-op).
                 .child(
                     div()
@@ -368,14 +372,9 @@ pub(crate) fn tab_strip(
                         .justify_center()
                         .rounded(px(4.0))
                         .cursor_pointer()
-                        // Revealed while the CHIP is hovered (the chip's
-                        // hover fade drives the tint); brightens on its own
-                        // hover via the background wash.
-                        .text_color(motion::hover_blend(
-                            &chip_hover_key,
-                            gpui::transparent_black(),
-                            theme.text_muted,
-                        ))
+                        .role(gpui::Role::Button)
+                        .aria_label("Close tab")
+                        .tooltip(|_, cx| cx.new(|_| ChromeTooltip("Close tab")).into())
                         .bg(motion::hover_blend(
                             &close_hover_key,
                             gpui::transparent_black(),
@@ -386,7 +385,7 @@ pub(crate) fn tab_strip(
                             cx.stop_propagation();
                             this.close_workspace_tab(view, tab, cx);
                         }))
-                        .child(icon(icons::CLOSE).size(px(9.0))),
+                        .child(icon(icons::CLOSE).size(px(11.0)).text_color(theme.text_muted)),
                 ),
         );
     }
@@ -404,7 +403,9 @@ pub(crate) fn tab_strip(
             .justify_center()
             .rounded(px(6.0))
             .cursor_pointer()
-            .text_color(theme.text_muted.opacity(0.8))
+            .role(gpui::Role::Button)
+            .aria_label("Add tab")
+            .tooltip(|_, cx| cx.new(|_| ChromeTooltip("Add tab")).into())
             .bg(motion::hover_blend(&plus_key, gpui::transparent_black(), theme.wash(0.09)))
             .on_hover(motion::hover_listener(plus_key))
             .on_mouse_down(
@@ -414,7 +415,7 @@ pub(crate) fn tab_strip(
                     this.open_workspace_tool_picker_for_tab(view, event.position, cx);
                 }),
             )
-            .child(icon(icons::PLUS).size(px(11.0))),
+            .child(icon(icons::PLUS).size(px(14.0)).text_color(theme.text_muted)),
     );
     strip.into_any_element()
 }

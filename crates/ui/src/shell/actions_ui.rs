@@ -685,7 +685,7 @@ impl Shell {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.refresh_project_actions(context.clone(), cx)
                             }))
-                            .child(icon(icons::REFRESH).size(px(15.0)))
+                            .child(icon(icons::REFRESH).size(px(15.0)).text_color(theme.text_muted))
                             .child(SharedString::from("Retry")),
                     )
                 });
