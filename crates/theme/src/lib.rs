@@ -465,6 +465,13 @@ pub struct ThemeColors {
     pub diff_hunk: Color,
 }
 
+impl ThemeColors {
+    /// Live indicator / ok state color (`--ok`).
+    pub fn ok(&self) -> Color {
+        self.success
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalPalette {
@@ -502,6 +509,26 @@ impl ThemeVariant {
                 self.colors.background,
             ),
         }
+    }
+
+    /// Live indicator color for the working state (`--working`).
+    pub fn working_color(&self, selection: AccentSelection) -> Color {
+        self.accent_for(selection).activity
+    }
+
+    /// Live indicator color for the ok / completed state (`--ok`).
+    pub fn ok_color(&self) -> Color {
+        self.colors.success
+    }
+
+    /// Live indicator color for the warning / awaiting state (`--warning`).
+    pub fn warning_color(&self) -> Color {
+        self.colors.warning
+    }
+
+    /// Live indicator color for the danger / errored state (`--danger`).
+    pub fn danger_color(&self) -> Color {
+        self.colors.danger
     }
 }
 
@@ -761,6 +788,20 @@ mod tests {
             let color: Color = source.parse().unwrap();
             let json = serde_json::to_string(&color).unwrap();
             assert_eq!(serde_json::from_str::<Color>(&json).unwrap(), color);
+        }
+    }
+
+    #[test]
+    fn live_indicator_parity() {
+        let registry = ThemeRegistry::builtin();
+        for family in &registry.families {
+            for variant in &family.variants {
+                assert_eq!(variant.ok_color(), variant.colors.success);
+                assert_eq!(variant.colors.ok(), variant.colors.success);
+                assert_eq!(variant.warning_color(), variant.colors.warning);
+                assert_eq!(variant.danger_color(), variant.colors.danger);
+                assert_eq!(variant.working_color(AccentSelection::ThemeDefault), variant.accent.activity);
+            }
         }
     }
 

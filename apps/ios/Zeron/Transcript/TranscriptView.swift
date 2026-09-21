@@ -47,7 +47,7 @@ struct TranscriptView: View {
                             .foregroundStyle(Theme.text)
                             .frame(width: 44, height: 44)
                     }
-                    .glassEffect(.regular.interactive(), in: Circle())
+                    .nochesGlass(.regular.interactive(), in: Circle())
                     .accessibilityLabel("Jump to latest")
                     .accessibilityIdentifier("jump-to-latest")
                     .padding(12)
@@ -597,7 +597,7 @@ struct InputChipView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.textMuted)
                 .frame(width: 20, height: 20)
-                .background(whiteAlpha(0.09), in: RoundedRectangle(cornerRadius: 6))
+                .background(Theme.wash(0.09), in: RoundedRectangle(cornerRadius: 6))
             Text("Question")
                 .font(Theme.sans(12, weight: .medium))
                 .foregroundStyle(Theme.text)
@@ -609,7 +609,7 @@ struct InputChipView: View {
         }
         .padding(.horizontal, 8)
         .frame(height: 34)
-        .background(whiteAlpha(0.045), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(whiteAlpha(0.08), lineWidth: 1))
+        .background(Theme.wash(0.045), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.wash(0.08), lineWidth: 1))
     }
 }

@@ -683,8 +683,12 @@ pub struct Theme {
     pub warning_muted: Hsla,
     /// Success / online — emerald.
     pub success: Hsla,
+    /// Live indicator / ok state color (alias for `success` / `--ok`).
+    pub ok: Hsla,
     /// Working / streaming indicator in the selected accent family.
     pub busy: Hsla,
+    /// Live indicator / working state color (alias for `busy` / `--working`).
+    pub working: Hsla,
     /// Three-tone animated pixel glyph palette in the selected accent family.
     pub glyph: GlyphPalette,
     /// Softer success for text on a success-tinted chip.
@@ -734,6 +738,8 @@ pub struct Theme {
     pub terminal: TerminalColors,
 
     // ---- fonts ----
+    /// UI font family (`theme.font_ui` in the brand spec).
+    pub font_ui: SharedString,
     /// UI font family (bundling of Geist lands with asset work; until then the
     /// text system falls back to the system sans when the family is missing).
     pub font_sans: SharedString,
@@ -1087,7 +1093,9 @@ impl Theme {
             warning: oklch(0.828, 0.189, 84.429),      // amber-400
             warning_muted: oklch(0.924, 0.12, 95.746), // amber-200
             success: oklch(0.765, 0.177, 163.223),     // emerald-400
+            ok: oklch(0.765, 0.177, 163.223),
             busy: accent.activity,
+            working: accent.activity,
             glyph: accent.glyph,
             success_muted: oklch(0.845, 0.143, 164.978), // emerald-300
             surface_raised_hover: neutral(0.29),
@@ -1109,6 +1117,7 @@ impl Theme {
             diff_del: oklch(0.704, 0.191, 22.216),  // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
             terminal: TerminalColors::zeron(Appearance::Dark),
+            font_ui: "Geist".into(),
             font_sans: "Geist".into(),
             font_sans_fixed: "Geist".into(),
             font_mono: "Geist Mono".into(),
@@ -1182,7 +1191,9 @@ impl Theme {
             warning: oklch(0.555, 0.163, 48.998),       // amber-700 — carries 12px text
             warning_muted: oklch(0.473, 0.137, 46.201), // amber-800
             success: oklch(0.596, 0.145, 163.225),      // emerald-600
+            ok: oklch(0.596, 0.145, 163.225),
             busy: accent.activity,
+            working: accent.activity,
             glyph: accent.glyph,
             success_muted: oklch(0.508, 0.118, 165.612), // emerald-700
             // Opaque pills darken on hover here rather than brighten — same
@@ -1208,6 +1219,7 @@ impl Theme {
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
             terminal: TerminalColors::zeron(Appearance::Light),
+            font_ui: "Geist".into(),
             font_sans: "Geist".into(),
             font_sans_fixed: "Geist".into(),
             font_mono: "Geist Mono".into(),
@@ -1232,7 +1244,14 @@ impl Theme {
     }
 
     fn with_font_sans(mut self, family: SharedString) -> Self {
-        self.font_sans = family;
+        self.font_sans = family.clone();
+        self.font_ui = family;
+        self
+    }
+
+    pub fn with_font_ui(mut self, family: SharedString) -> Self {
+        self.font_sans = family.clone();
+        self.font_ui = family;
         self
     }
 
@@ -1347,8 +1366,10 @@ impl Theme {
         theme.warning = model_color(colors.warning);
         theme.warning_muted = model_color(colors.warning_muted);
         theme.success = model_color(colors.success);
+        theme.ok = model_color(colors.success);
         theme.success_muted = model_color(colors.success_muted);
         theme.busy = model_color(accent.activity);
+        theme.working = model_color(accent.activity);
         theme.glyph = GlyphPalette {
             light: model_color(accent.glyph[0]),
             mid: model_color(accent.glyph[1]),
@@ -1368,6 +1389,7 @@ impl Theme {
         theme.diff_del = model_color(colors.diff_delete);
         theme.diff_hunk_bg = model_color(colors.diff_hunk);
         theme.terminal = TerminalColors::from_variant(variant);
+        theme.font_ui = theme.font_sans.clone();
         if !is_curated_builtin {
             theme.terminal.foreground = model_color(harden_model_foreground(
                 variant.terminal.foreground,
@@ -2703,8 +2725,33 @@ mod tests {
         for appearance in [Appearance::Dark, Appearance::Light] {
             let theme = Theme::for_appearance(appearance).with_font_sans("Inter".into());
             assert_eq!(theme.font_sans.as_ref(), "Inter");
+            assert_eq!(theme.font_ui.as_ref(), "Inter");
             assert_eq!(theme.font_sans_fixed.as_ref(), "Geist");
             assert_eq!(theme.font_mono.as_ref(), "Geist Mono");
+        }
+    }
+
+    #[test]
+    fn live_indicator_tokens_parity() {
+        for t in [Theme::dark(), Theme::light()] {
+            assert_eq!(t.working, t.busy);
+            assert_eq!(t.ok, t.success);
+            assert_eq!(t.font_ui, t.font_sans);
+            assert_eq!(t.font_ui.as_ref(), "Geist");
+            assert_eq!(t.font_mono.as_ref(), "Geist Mono");
+
+            // Contrast parity checks
+            assert!(contrast_ratio(t.ok, t.bg) >= 3.0);
+            assert!(contrast_ratio(t.danger, t.bg) >= 3.0);
+        }
+        let registry = ThemeRegistry::builtin();
+        for family in &registry.families {
+            for variant in &family.variants {
+                let theme = Theme::from_variant(variant, AccentSelection::ThemeDefault, SurfacePreference::ThemeDefault);
+                assert_eq!(theme.ok, theme.success);
+                assert_eq!(theme.working, theme.busy);
+                assert_eq!(theme.font_ui, theme.font_sans);
+            }
         }
     }
 

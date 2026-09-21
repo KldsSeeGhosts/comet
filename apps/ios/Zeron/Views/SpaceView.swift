@@ -184,7 +184,7 @@ struct NewSpaceSheet: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(32)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(AppearanceSettings.shared.scheme)
         .task(id: selectedDeviceId) {
             await load(path: nil)
         }
@@ -206,7 +206,7 @@ struct NewSpaceSheet: View {
                         HStack(spacing: 7) {
                             Circle()
                                 .fill(model.deviceOnline(device.id)
-                                    ? Theme.statusCompleted.opacity(0.9) : whiteAlpha(0.18))
+                                    ? Theme.statusCompleted.opacity(0.9) : Theme.wash(0.18))
                                 .frame(width: 6, height: 6)
                             Text(device.name)
                                 .font(Theme.sans(13, weight: .medium))
@@ -214,7 +214,7 @@ struct NewSpaceSheet: View {
                         }
                         .padding(.horizontal, 14)
                         .frame(height: 36)
-                        .background(selected ? whiteAlpha(0.15) : whiteAlpha(0.05), in: Capsule())
+                        .background(selected ? Theme.wash(0.15) : Theme.wash(0.05), in: Capsule())
                     }
                     .buttonStyle(.plain)
                 }
@@ -234,7 +234,7 @@ struct NewSpaceSheet: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(listing?.parent == nil ? Theme.textFaint.opacity(0.4) : Theme.text)
                     .frame(width: 32, height: 32)
-                    .background(whiteAlpha(0.06), in: Circle())
+                    .background(Theme.wash(0.06), in: Circle())
             }
             .buttonStyle(.plain)
             .disabled(listing?.parent == nil)

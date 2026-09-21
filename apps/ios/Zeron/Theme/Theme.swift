@@ -1,56 +1,55 @@
-// Always-dark monochrome theme — a direct port of crates/ui/src/theme.rs.
-//
-// Colors are computed from the same oklch definitions the desktop app uses
-// (Björn Ottosson's OKLab matrices, the ones CSS Color 4 specifies), so every
-// surface and accent lands on identical sRGB values. **Numbers drive layout,
-// colors are paint**: layout constants are plain numbers and never depend on
-// which color is painted.
+// Semantic theme roles resolved from the desktop theme catalog.
+// Built-in colors and accents are exported from zeron-theme. Layout metrics
+// stay independent from the selected palette; UIKit and SwiftUI share roles.
 
 import SwiftUI
 
 enum Theme {
-    // ---- paint: neutral surfaces (oklch chroma 0) ----
-    /// Main panel background — sampled #060606.
-    static let bg = grey(6)
-    /// Shell / sidebar surface — sampled #0d0d0d.
-    static let surface = grey(13)
+    static func wash(_ alpha: Double) -> Color {
+        (AppearanceSettings.shared.isDark ? Color.white : Color.black).opacity(alpha)
+    }
+    // ---- paint: surfaces ----
+    /// Main content background.
+    static var bg: Color { AppearanceSettings.shared.color("background") }
+    /// Shell / sidebar surface.
+    static var surface: Color { AppearanceSettings.shared.color("shell") }
     /// Raised surface: popovers, dialogs, cards.
-    static let surfaceRaised = neutral(0.235)
+    static var surfaceRaised: Color { AppearanceSettings.shared.color("raised") }
     /// Hover/pressed wash for interactive rows (white, low alpha).
-    static let elementHover = whiteAlpha(0.06)
+    static var elementHover: Color { AppearanceSettings.shared.color("hover") }
     /// Active/selected wash.
-    static let elementActive = whiteAlpha(0.10)
-    /// Hairline border — white at low alpha so it reads on any surface.
-    static let border = whiteAlpha(0.08)
+    static var elementActive: Color { AppearanceSettings.shared.color("active") }
+    /// Theme-authored hairline border.
+    static var border: Color { AppearanceSettings.shared.color("border") }
     /// Stronger border for focused/raised edges.
-    static let borderStrong = whiteAlpha(0.14)
+    static var borderStrong: Color { AppearanceSettings.shared.color("borderStrong") }
 
     // ---- paint: text ----
-    static let text = neutral(0.922)       // ~neutral-200
-    static let textMuted = neutral(0.708)  // ~neutral-400
-    static let textFaint = neutral(0.556)  // ~neutral-500
+    static var text: Color { AppearanceSettings.shared.color("text") }
+    static var textMuted: Color { AppearanceSettings.shared.color("textMuted") }
+    static var textFaint: Color { AppearanceSettings.shared.color("textFaint") }
 
     // ---- paint: accents ----
-    static let accent = oklch(0.673, 0.182, 276.935)        // indigo-400
-    static let accentStrong = oklch(0.585, 0.233, 277.117)  // indigo-500
-    static let danger = oklch(0.704, 0.191, 22.216)         // red-400
-    static let dangerSoft = oklch(0.808, 0.114, 19.571)     // red-300
-    static let warning = oklch(0.828, 0.189, 84.429)        // amber-400
+    static var accent: Color { AppearanceSettings.shared.accentColor("primary") }
+    static var accentStrong: Color { AppearanceSettings.shared.accentColor("strong") }
+    static var danger: Color { AppearanceSettings.shared.color("danger") }
+    static var dangerSoft: Color { AppearanceSettings.shared.color("dangerMuted") }
+    static var warning: Color { AppearanceSettings.shared.color("warning") }
 
     // ---- paint: status dots (shell/spaces.rs status_dot_color) ----
-    static let statusWorking = oklch(0.718, 0.202, 349.761)   // pink-400
-    static let statusCompleted = oklch(0.765, 0.177, 163.223) // emerald-400
+    static var statusWorking: Color { AppearanceSettings.shared.accentColor("activity") }
+    static var statusCompleted: Color { AppearanceSettings.shared.color("success") }
     /// Claude brand orange — kept even on the mono surface.
     static let claudeBrand = Color(red: 0xD9 / 255.0, green: 0x77 / 255.0, blue: 0x57 / 255.0)
 
-    // ---- paint: markdown inline code (violet family) ----
-    static let inlineCodeText = oklch(0.811, 0.111, 293.571)  // violet-300
-    static let inlineCodeWash = oklch(0.702, 0.183, 293.541).opacity(0.12) // violet-400 @ 0.12
+    // ---- paint: markdown inline code ----
+    static var inlineCodeText: Color { AppearanceSettings.color(AppearanceSettings.shared.current.syntax["stringSpecial"] ?? "#8b7cf6") }
+    static var inlineCodeWash: Color { inlineCodeText.opacity(0.12) }
 
     // ---- paint: syntax tokens (soft, paint-only) ----
-    static let tokenKeyword = oklch(0.709, 0.129, 20.0)   // soft rose
-    static let tokenString = oklch(0.770, 0.110, 168.0)   // soft green
-    static let tokenNumber = oklch(0.780, 0.120, 80.0)    // soft amber
+    static var tokenKeyword: Color { AppearanceSettings.color(AppearanceSettings.shared.current.syntax["keyword"] ?? "#8b7cf6") }
+    static var tokenString: Color { AppearanceSettings.color(AppearanceSettings.shared.current.syntax["string"] ?? "#8b7cf6") }
+    static var tokenNumber: Color { AppearanceSettings.color(AppearanceSettings.shared.current.syntax["number"] ?? "#8b7cf6") }
 
     // ---- numbers drive layout (pt) ----
     static let bubbleRadius: CGFloat = 22
