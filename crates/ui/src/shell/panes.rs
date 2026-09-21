@@ -47,8 +47,16 @@ impl Shell {
     /// Whether the content area renders the workspace tree: any split, extra
     /// tab, or extra pane beyond the untouched default. False = today's exact
     /// single-chat code path (the parity gate).
+    ///
+    /// The per-pane `chat_surfaces` cache is deliberately NOT part of this
+    /// gate. It keeps a survivor composer (and unsent draft) alive when a
+    /// split collapses, but routing on that inventory latched the opaque
+    /// pane-island surface after every split→close cycle (issue #8). The
+    /// collapse handoff in [`Self::promote_trivial_chat_surface_to_dock`]
+    /// moves that draft into the shared dock and clears the cache so a
+    /// single session always takes the glass path.
     pub(super) fn workspace_mode(&self) -> bool {
-        !self.workspace.is_trivial() || !self.workspace.chat_surfaces.is_empty()
+        !self.workspace.is_trivial()
     }
 
     /// Whether the shell's transcript-underlay fade may take a TOP ramp.
@@ -1490,16 +1498,59 @@ impl Shell {
     /// pane via [`Self::sync_workspace_selection`]. Every mutation path
     /// funnels here, which is also where the WS5 save arms.
     fn retarget_to_focused_pane(&mut self, cx: &mut Context<Self>) {
-        // Adopt the original input before selecting the newly split canvas.
         if self.workspace_mode() {
+            // Adopt the original input before selecting the newly split canvas.
             self.ensure_pane_chat_surfaces(cx);
+            self.sync_selection_to_focused_pane(cx);
+        } else {
+            // Selection first: promote re-seats the dock composer on Selected
+            // and restores the survivor draft under that key.
+            self.sync_selection_to_focused_pane(cx);
+            self.promote_trivial_chat_surface_to_dock(cx);
         }
-        self.sync_selection_to_focused_pane(cx);
         // Keyboard focus follows the focused pane's own composer; a no-op
         // while an input the user chose keeps focus.
         self.focus_composer(cx);
         cx.notify();
         self.note_workspace_mutation(cx);
+    }
+
+    /// Collapse-to-single-session handoff. `chat_surfaces` keeps a survivor
+    /// composer (and unsent draft) alive while a split exists; once the
+    /// layout is trivial again that draft must move into the shared dock
+    /// composer so the glass single-session route shows the same unsent
+    /// text. The cache is then dropped — it must never pin `workspace_mode`.
+    fn promote_trivial_chat_surface_to_dock(&mut self, cx: &mut Context<Self>) {
+        if !self.workspace.is_trivial() {
+            return;
+        }
+        self.workspace.prune_caches();
+        let survivor = self
+            .workspace
+            .focused_pane()
+            .and_then(|pane| self.workspace.chat_surfaces.remove(&pane));
+        self.workspace.chat_surfaces.clear();
+        let Some(surface) = survivor else {
+            return;
+        };
+        // The dock already owns this entity (first-pane adopt). Re-seat it on
+        // Selected so the single-session route tracks sidebar selection again.
+        if surface.composer.entity_id() == self.composer.entity_id() {
+            self.composer.update(cx, |composer, cx| {
+                composer.set_target(ChatTarget::Selected, cx);
+            });
+            return;
+        }
+        let parked = surface.composer.read(cx).snapshot_draft_state(cx);
+        self.composer.update(cx, |composer, cx| {
+            composer.set_target(ChatTarget::Selected, cx);
+            // Empty the live input so restore can place the survivor's words
+            // (restore only fills an empty input under a matching key).
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+            composer.restore_draft_state(parked, cx);
+        });
     }
 
     /// Search the current workspace layout for a pane already bound to

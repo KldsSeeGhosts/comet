@@ -59,13 +59,51 @@ fn collapsing_to_one_pane_keeps_its_composer_and_draft(cx: &mut TestAppContext) 
         let survivor = shell.active_composer();
         draft(&survivor, "draft in the surviving pane", cx);
         shell.close_workspace_pane(first, cx);
-        shell.ensure_pane_chat_surfaces(cx);
         assert!(shell.workspace.is_trivial());
-        assert!(shell.workspace_mode());
+        // The collapse handoff drops the pane-surface cache and re-seats the
+        // dock, so the glass single-session route returns (issue #8) while
+        // the survivor's unsent words stay in the active composer.
+        assert!(!shell.workspace_mode());
         assert_eq!(shell.workspace.focused_pane(), Some(second));
-        assert_eq!(shell.active_composer().entity_id(), survivor.entity_id());
-        assert_eq!(draft_text(&survivor, cx), "draft in the surviving pane");
-        assert!(!shell.workspace.chat_surfaces.contains_key(&first));
+        assert_eq!(draft_text(&shell.active_composer(), cx), "draft in the surviving pane");
+        assert!(shell.workspace.chat_surfaces.is_empty());
+    }).unwrap();
+}
+
+/// Issue #8: a live `chat_surfaces` entry must never pin the opaque
+/// workspace route. After a split collapses, the glass single-session path
+/// stays on even if the cache is repopulated (ensure / a later render pass).
+#[gpui::test]
+fn a_live_surface_cache_does_not_latch_the_workspace_route(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        prepare_selected_composer(shell, cx);
+        let first = shell.workspace.focused_pane().unwrap();
+        let original = shell.composer.clone();
+        draft(&original, "keep this on the glass canvas", cx);
+        shell.split_workspace_view(Direction::Right, cx);
+        let second = shell.workspace.focused_pane().unwrap();
+        // Close the NEW pane: the survivor is the adopted dock composer.
+        shell.close_workspace_pane(second, cx);
+        assert!(shell.workspace.is_trivial());
+        assert!(!shell.workspace_mode());
+        assert_eq!(shell.workspace.focused_pane(), Some(first));
+        assert_eq!(draft_text(&shell.active_composer(), cx), "keep this on the glass canvas");
+        // Re-populate the cache the way a later ensure/render pass would.
+        shell.ensure_pane_chat_surfaces(cx);
+        assert!(
+            !shell.workspace.chat_surfaces.is_empty(),
+            "ensure rebuilds the survivor surface"
+        );
+        assert!(
+            !shell.workspace_mode(),
+            "the cache must not latch the opaque workspace route (issue #8)"
+        );
+        assert!(shell.transcript_underlay_fades_top());
+        assert!(!shell.pane_chrome_wins_titlebar_band());
+        assert_eq!(draft_text(&shell.active_composer(), cx), "keep this on the glass canvas");
     }).unwrap();
 }
 
@@ -835,16 +873,16 @@ fn split_panes_drop_the_underlay_top_ramp_and_win_the_titlebar_band(
             assert!(!shell.transcript_underlay_fades_top());
             assert!(shell.pane_chrome_wins_titlebar_band());
 
-            // Collapsing back to one pane keeps the workspace route (its
-            // chat surfaces persist — see the draft-preservation suites), so
-            // the pane-owned chrome ordering stays with it.
+            // Collapsing back to one pane returns the glass single-session
+            // route (issue #8): the pane-surface cache is a draft-preserving
+            // inventory, not a workspace-route latch, so the underlay top
+            // ramp and window-drag strip come back with it.
             let second = shell.workspace.focused_pane().unwrap();
             shell.close_workspace_pane(second, cx);
-            shell.ensure_pane_chat_surfaces(cx);
             assert!(shell.workspace.is_trivial());
-            assert!(shell.workspace_mode());
-            assert!(!shell.transcript_underlay_fades_top());
-            assert!(shell.pane_chrome_wins_titlebar_band());
+            assert!(!shell.workspace_mode());
+            assert!(shell.transcript_underlay_fades_top());
+            assert!(!shell.pane_chrome_wins_titlebar_band());
         })
         .unwrap();
 }

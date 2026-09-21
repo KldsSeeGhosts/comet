@@ -686,7 +686,9 @@ impl PaneHost {
             self.dirty = true;
         }
         // A split collapsing to one pane does not end that pane's session.
-        // Keep its composer (and unsent draft); only remove dead/tool panes.
+        // Keep its composer (and unsent draft) until the shell's
+        // `promote_trivial_chat_surface_to_dock` handoff moves that draft
+        // into the shared dock; only remove dead/tool panes here.
         let live = live_pane_ids(&self.layout.views);
         let chat_live = self.chat_pane_sessions().into_iter().map(|(pane, _)| pane).collect();
         let stale = stale_cache_keys(&chat_live, self.chat_surfaces.keys().copied());
