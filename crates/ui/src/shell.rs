@@ -1665,6 +1665,58 @@ pub struct Shell {
 }
 
 impl Shell {
+    /// The shared dock's composer event stream (notes-app send glide, worktree
+    /// setup). Extracted so a collapse handoff can rebind it onto the adopted
+    /// survivor composer without reconstructing the handler.
+    fn dock_composer_events(
+        composer: &Entity<Composer>,
+        transcript: Entity<Transcript>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(composer, {
+            let transcript = transcript.clone();
+            move |this: &mut Shell, composer, event: &ComposerEvent, cx| {
+                if matches!(composer.read(cx).target, crate::state::ChatTarget::Fixed(_)) {
+                    return;
+                }
+                match event {
+                    ComposerEvent::NewThreadTransitionStarted => {
+                        // Route observation drives the dock once selection commits.
+                        cx.notify();
+                    }
+                    ComposerEvent::Sent {
+                        chat_id,
+                        message_id,
+                    } => {
+                        transcript.update(cx, |t, cx| {
+                            t.on_own_send(chat_id.clone(), message_id.clone(), cx)
+                        });
+                    }
+                    ComposerEvent::Queued {
+                        chat_id,
+                        message_id,
+                    } => {
+                        transcript.update(cx, |t, cx| {
+                            t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
+                        });
+                    }
+                    ComposerEvent::WorktreeSetup {
+                        chat_id,
+                        setup_action,
+                        setup_error,
+                        target_device_id,
+                    } => this.attach_worktree_setup(
+                        chat_id.clone(),
+                        setup_action.clone(),
+                        setup_error.clone(),
+                        target_device_id.clone(),
+                        cx,
+                    ),
+                }
+            }
+        })
+    }
+
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
@@ -1679,48 +1731,7 @@ impl Shell {
         });
         // Every send glides the prompt to the viewport top and reserves the
         // reply's space below it (notes-app parity).
-        let composer_events = cx.subscribe(&composer, {
-            let transcript = transcript.clone();
-            move |this: &mut Shell, composer, event: &ComposerEvent, cx| {
-                if matches!(composer.read(cx).target, crate::state::ChatTarget::Fixed(_)) {
-                    return;
-                }
-                match event {
-                ComposerEvent::NewThreadTransitionStarted => {
-                    // Route observation drives the dock once selection commits.
-                    cx.notify();
-                }
-                ComposerEvent::Sent {
-                    chat_id,
-                    message_id,
-                } => {
-                    transcript.update(cx, |t, cx| {
-                        t.on_own_send(chat_id.clone(), message_id.clone(), cx)
-                    });
-                }
-                ComposerEvent::Queued {
-                    chat_id,
-                    message_id,
-                } => {
-                    transcript.update(cx, |t, cx| {
-                        t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
-                    });
-                }
-                ComposerEvent::WorktreeSetup {
-                    chat_id,
-                    setup_action,
-                    setup_error,
-                    target_device_id,
-                } => this.attach_worktree_setup(
-                    chat_id.clone(),
-                    setup_action.clone(),
-                    setup_error.clone(),
-                    target_device_id.clone(),
-                    cx,
-                ),
-                }
-            }
-        });
+        let composer_events = Self::dock_composer_events(&composer, transcript.clone(), cx);
         // Spawn chips open their subagent's transcript as a right-pane tab.
         let transcript_events = cx.subscribe(&transcript, Self::on_transcript_event);
         // Working-indicator heartbeat: notify once a second while a session is

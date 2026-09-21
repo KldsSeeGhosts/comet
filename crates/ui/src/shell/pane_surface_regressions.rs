@@ -60,13 +60,98 @@ fn collapsing_to_one_pane_keeps_its_composer_and_draft(cx: &mut TestAppContext) 
         draft(&survivor, "draft in the surviving pane", cx);
         shell.close_workspace_pane(first, cx);
         assert!(shell.workspace.is_trivial());
-        // The collapse handoff drops the pane-surface cache and re-seats the
-        // dock, so the glass single-session route returns (issue #8) while
-        // the survivor's unsent words stay in the active composer.
+        // The collapse handoff adopts the survivor entity as the dock
+        // composer (issue #8): glass route back, same live Composer.
         assert!(!shell.workspace_mode());
         assert_eq!(shell.workspace.focused_pane(), Some(second));
+        assert_eq!(
+            shell.active_composer().entity_id(),
+            survivor.entity_id(),
+            "the survivor Composer entity is adopted, never rebuilt from a draft snapshot"
+        );
+        assert_eq!(draft_text(&survivor, cx), "draft in the surviving pane");
         assert_eq!(draft_text(&shell.active_composer(), cx), "draft in the surviving pane");
         assert!(shell.workspace.chat_surfaces.is_empty());
+    }).unwrap();
+}
+
+/// Issue #8 + review: the collapse handoff must keep the survivor's live
+/// Composer state (queue-edit lease, displaced draft) and must not merge the
+/// closed neighbor's attachments into the dock.
+#[gpui::test]
+fn collapsing_preserves_live_composer_state_and_isolates_attachments(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        prepare_selected_composer(shell, cx);
+        let first = shell.workspace.focused_pane().unwrap();
+        shell.split_workspace_view(Direction::Right, cx);
+        let second = shell.workspace.focused_pane().unwrap();
+        shell.ensure_pane_chat_surfaces(cx);
+        let closed = shell.workspace.chat_surfaces[&first].composer.clone();
+        let survivor = shell.workspace.chat_surfaces[&second].composer.clone();
+        assert_ne!(closed.entity_id(), survivor.entity_id());
+
+        // Closed neighbor stages an attachment that must die with its pane.
+        closed.update(cx, |composer, _| {
+            let key = composer.current_key.clone();
+            composer.attachments.insert(
+                key,
+                vec![crate::attachments::stage_png_bytes(
+                    "closed.png".into(),
+                    b"closed".to_vec(),
+                )],
+            );
+        });
+        // Survivor holds a live queue-edit lease plus its own attachment.
+        survivor.update(cx, |composer, _| {
+            let key = composer.current_key.clone();
+            composer.attachments.insert(
+                key,
+                vec![crate::attachments::stage_png_bytes(
+                    "survivor.png".into(),
+                    b"survivor".to_vec(),
+                )],
+            );
+            composer.editing_queued = Some("row-lease".into());
+            composer.queue_edit_draft =
+                Some(("displaced words".into(), Vec::new(), Vec::new()));
+        });
+        draft(&survivor, "the leased row text", cx);
+
+        shell.close_workspace_pane(first, cx);
+        assert!(!shell.workspace_mode());
+        assert_eq!(shell.active_composer().entity_id(), survivor.entity_id());
+        shell.active_composer().update(cx, |composer, cx| {
+            assert_eq!(
+                composer.editing_queued.as_deref(),
+                Some("row-lease"),
+                "the queue-edit lease survives the collapse"
+            );
+            assert_eq!(
+                composer.queue_edit_draft.as_ref().map(|(text, ..)| text.as_str()),
+                Some("displaced words"),
+                "the displaced draft survives the collapse"
+            );
+            assert_eq!(composer.input.read(cx).text(), "the leased row text");
+            let names: Vec<&str> = composer
+                .staged()
+                .iter()
+                .map(|att| att.name.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["survivor.png"],
+                "only the survivor's attachments remain"
+            );
+            assert!(
+                !composer.attachments.values().flatten().any(|a| a.name == "closed.png"),
+                "the closed pane's attachments must not leak into the dock"
+            );
+        });
     }).unwrap();
 }
 
@@ -90,6 +175,7 @@ fn a_live_surface_cache_does_not_latch_the_workspace_route(cx: &mut TestAppConte
         assert!(shell.workspace.is_trivial());
         assert!(!shell.workspace_mode());
         assert_eq!(shell.workspace.focused_pane(), Some(first));
+        assert_eq!(shell.active_composer().entity_id(), original.entity_id());
         assert_eq!(draft_text(&shell.active_composer(), cx), "keep this on the glass canvas");
         // Re-populate the cache the way a later ensure/render pass would.
         shell.ensure_pane_chat_surfaces(cx);

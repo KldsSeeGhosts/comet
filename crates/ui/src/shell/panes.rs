@@ -1517,9 +1517,14 @@ impl Shell {
 
     /// Collapse-to-single-session handoff. `chat_surfaces` keeps a survivor
     /// composer (and unsent draft) alive while a split exists; once the
-    /// layout is trivial again that draft must move into the shared dock
-    /// composer so the glass single-session route shows the same unsent
-    /// text. The cache is then dropped — it must never pin `workspace_mode`.
+    /// layout is trivial again that entity is adopted as the shared dock
+    /// composer so the glass single-session route keeps the same live state.
+    /// The cache is then dropped — it must never pin `workspace_mode`.
+    ///
+    /// Never rebuild from [`crate::composer::ComposerDraftState`]: that
+    /// snapshot is intentionally lossy (no in-flight send/interrupt tasks,
+    /// no queue-edit lease) and `restore_draft_state` merges maps, so a
+    /// closed neighbor's attachments could leak into the dock.
     fn promote_trivial_chat_surface_to_dock(&mut self, cx: &mut Context<Self>) {
         if !self.workspace.is_trivial() {
             return;
@@ -1530,26 +1535,53 @@ impl Shell {
             .focused_pane()
             .and_then(|pane| self.workspace.chat_surfaces.remove(&pane));
         self.workspace.chat_surfaces.clear();
-        let Some(surface) = survivor else {
+        let Some(mut surface) = survivor else {
             return;
         };
-        // The dock already owns this entity (first-pane adopt). Re-seat it on
-        // Selected so the single-session route tracks sidebar selection again.
-        if surface.composer.entity_id() == self.composer.entity_id() {
-            self.composer.update(cx, |composer, cx| {
-                composer.set_target(ChatTarget::Selected, cx);
-            });
-            return;
+        // Adopt the pane transcript too so own-send markers and scroll state
+        // from a live send stay with the canvas (new-chat canvas has none).
+        if let Some(transcript) = surface.transcript.take() {
+            self.transcript = transcript;
+            self._transcript_events = cx.subscribe(&self.transcript, Self::on_transcript_event);
+            let links = Self::session_links(surface.chat_id.clone(), cx);
+            self.transcript
+                .update(cx, |transcript, _| transcript.set_workspace_link_handler(links));
         }
-        let parked = surface.composer.read(cx).snapshot_draft_state(cx);
+        // Preserve the survivor entity itself (in-flight sends, queue-edit
+        // lease, failure banners, staged attachments all live on it).
+        if surface.composer.entity_id() != self.composer.entity_id() {
+            self.composer = surface.composer;
+        }
+        self.reseat_composer_as_dock(cx);
+        self._composer_events =
+            Self::dock_composer_events(&self.composer, self.transcript.clone(), cx);
+    }
+
+    /// Flip the adopted composer onto `ChatTarget::Selected` so the dock
+    /// event stream and the next first-split adopt see a normal dock
+    /// composer — without dropping a still-valid queue-edit lease across the
+    /// Fixed→Selected projection flip.
+    fn reseat_composer_as_dock(&self, cx: &mut Context<Self>) {
         self.composer.update(cx, |composer, cx| {
+            let key = ChatTarget::Selected.key(composer.state.read(cx));
+            if composer.current_key == key {
+                composer.target = ChatTarget::Selected;
+                composer
+                    .pickers()
+                    .clone()
+                    .update(cx, |pickers, cx| pickers.set_target(ChatTarget::Selected, cx));
+                cx.notify();
+                return;
+            }
+            // Key changes: park the live queue-edit lease, run the normal
+            // navigation swap, then put the lease back if hygiene dropped it.
+            let editing_queued = composer.editing_queued.take();
+            let queue_edit_draft = composer.queue_edit_draft.take();
             composer.set_target(ChatTarget::Selected, cx);
-            // Empty the live input so restore can place the survivor's words
-            // (restore only fills an empty input under a matching key).
-            composer
-                .input
-                .update(cx, |input, cx| input.set_text(String::new(), cx));
-            composer.restore_draft_state(parked, cx);
+            if composer.editing_queued.is_none() {
+                composer.editing_queued = editing_queued;
+                composer.queue_edit_draft = queue_edit_draft;
+            }
         });
     }
 
