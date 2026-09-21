@@ -286,8 +286,21 @@ mod tests {
             0,
             "no per-row writes"
         );
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert_eq!(persistence.writes.load(Ordering::Relaxed), 1);
+        // SAVE_INTERVAL is 1s; a fixed deadline leaves only the scheduler
+        // margin for the flush's blocking-pool hop, which a loaded CI runner
+        // can exceed. Poll instead, then hold the coalescing bound.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while persistence.writes.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("debounced flush must fire after SAVE_INTERVAL");
+        assert_eq!(
+            persistence.writes.load(Ordering::Relaxed),
+            1,
+            "replay burst must coalesce to one write"
+        );
         let (bytes, cursor, _) = store.load_snapshot_with_cursor("whale").unwrap().unwrap();
         assert_eq!(cursor, 1000);
         assert!(store.snapshot_cursor_verified("whale").unwrap());

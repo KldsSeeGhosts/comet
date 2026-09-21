@@ -118,12 +118,15 @@ pub fn mac_app_artifact(version: &str) -> String {
 /// trigger an update loop.
 pub fn version_newer(latest: &str, current: &str) -> bool {
     fn parts(v: &str) -> Option<Vec<u64>> {
-        let nums: Vec<u64> = v
+        // Strip an optional leading `v` and any semver pre-release or build
+        // suffix (`-noches.1`, `+build`, etc.) so that `0.2.72-noches.1`
+        // compares as `0.2.72`.
+        let base = v
             .trim()
-            .trim_start_matches('v')
-            .split('.')
-            .map(|p| p.parse().ok())
-            .collect::<Option<_>>()?;
+            .trim_start_matches('v');
+        let base = base.split_once('-').map_or(base, |(b, _)| b);
+        let base = base.split_once('+').map_or(base, |(b, _)| b);
+        let nums: Vec<u64> = base.split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
         (!nums.is_empty()).then_some(nums)
     }
     match (parts(latest), parts(current)) {
@@ -1214,6 +1217,14 @@ mod tests {
         // Garbage never counts as newer.
         assert!(!version_newer("", "0.1.0"));
         assert!(!version_newer("nightly", "0.1.0"));
+        // Pre-release / fork suffixes: the numeric base is what matters.
+        assert!(version_newer("0.2.81", "0.2.72-noches.1"));
+        assert!(!version_newer("0.2.72", "0.2.72-noches.1"));
+        assert!(!version_newer("0.2.71", "0.2.72-noches.1"));
+        assert!(version_newer("0.2.73-beta1", "0.2.72-noches.1"));
+        // Build metadata (`+`) is also stripped.
+        assert!(version_newer("0.2.81", "0.2.72+build.42"));
+        assert!(!version_newer("0.2.72+build.42", "0.2.72"));
     }
 
     #[test]

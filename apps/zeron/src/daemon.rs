@@ -271,10 +271,15 @@ fn launchd_exec_path_for(exe: &Path, home: Option<&Path>) -> String {
         .is_some_and(|app_root| exe.starts_with(app_root));
     if installed {
         if let Some(home) = home {
+            // launchd plists are macOS-only (POSIX paths). `Path::join`
+            // inserts `\` on Windows, which broke
+            // `installed_exe_uses_the_current_symlink` on windows-2022
+            // (`/home/u\.zeron/...` vs `/home/u/.zeron/...`). Normalize to
+            // forward slashes for the plist.
             return home
                 .join(".zeron/app/current/zeron")
                 .to_string_lossy()
-                .to_string();
+                .replace('\\', "/");
         }
     }
     format!("{}", exe.display())
