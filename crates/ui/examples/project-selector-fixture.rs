@@ -45,7 +45,7 @@ fn main() {
             ])).unwrap();
             s
         });
-        let boot = EngineBootConfig { data_dir: data, ipc_port: 0, edge_url: String::new(),
+        let boot = EngineBootConfig { remote: None, data_dir: data, ipc_port: 0, edge_url: String::new(),
             edge_token: None, org_id: None, workos_client_id: None,
             default_harness: HarnessId::ClaudeCode };
         cx.open_window(WindowOptions {

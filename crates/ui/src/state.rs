@@ -91,6 +91,8 @@ impl Drop for WatchPreparation {
 /// Everything needed to reach (or start) an engine.
 #[derive(Debug, Clone)]
 pub struct EngineBootConfig {
+    /// An explicit remote target never falls back to the local engine.
+    pub remote: Option<zeron_rpc::remote::ConnectionProfile>,
     /// Data directory for the embedded engine (`~/.zeron`).
     pub data_dir: PathBuf,
     /// Localhost IPC port to probe / serve.
@@ -123,6 +125,7 @@ pub enum EngineMode {
 trait EngineBackend: Send + Sync {
     fn client(&self) -> &RpcClient;
     fn mode(&self) -> EngineMode;
+    fn connection_status(&self) -> Option<tokio::sync::watch::Receiver<zeron_rpc::remote::ConnectionState>> { None }
     /// Graceful teardown (drains runs / flushes docs for the in-process engine).
     async fn shutdown(&self);
 }
@@ -268,11 +271,85 @@ pub struct EngineHandle {
     deferred_state: Option<tokio::sync::watch::Receiver<DeferredEngineState>>,
 }
 
+struct NativeRemoteEngine {
+    remote: zeron_rpc::remote::RemoteClient,
+    endpoint: String,
+}
+
+#[async_trait]
+impl EngineBackend for NativeRemoteEngine {
+    fn client(&self) -> &RpcClient { &self.remote.client }
+    fn mode(&self) -> EngineMode { EngineMode::Remote { url: self.endpoint.clone() } }
+    fn connection_status(&self) -> Option<tokio::sync::watch::Receiver<zeron_rpc::remote::ConnectionState>> {
+        Some(self.remote.status.clone())
+    }
+    async fn shutdown(&self) { self.remote.shutdown().await; }
+}
+
+/// A saved remote computer refused the connection key outright (gateway 401)
+/// rather than being unreachable. Typed so the boot path can pin the sidebar
+/// badge to `Unauthorized` and show pairing copy instead of the transient
+/// "Check that remote access and Tailscale are running" fallback.
+#[derive(Debug)]
+struct RemoteAccessRevoked(String);
+
+impl std::fmt::Display for RemoteAccessRevoked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Access to {} was revoked or its connection key is invalid. Pair this computer again.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RemoteAccessRevoked {}
+
+/// The actionable revocation copy, shared by the boot path and the attached
+/// status watch so both failures read identically.
+fn access_revoked_message(host: &str) -> String {
+    RemoteAccessRevoked(host.to_string()).to_string()
+}
+
 impl EngineHandle {
     /// Probe the IPC port and connect (daemon listening) or embed (nothing there).
     /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
     /// tokio tasks.
     pub async fn bootstrap(config: EngineBootConfig) -> anyhow::Result<EngineHandle> {
+        if let Some(profile) = config.remote {
+            let remote = zeron_rpc::remote::connect(profile.clone())?;
+            let info = match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                query_engine_info(&remote.client),
+            )
+            .await
+            {
+                Ok(Ok(info)) => info,
+                Ok(Err(err)) => {
+                    // The gateway answers 401 before the pending call is failed,
+                    // so the status watch — not the RPC error — names a revoked
+                    // key. Anything else stays a generic transport failure.
+                    if remote.status.borrow().clone()
+                        == zeron_rpc::remote::ConnectionState::Unauthorized
+                    {
+                        return Err(RemoteAccessRevoked(profile.name).into());
+                    }
+                    return Err(err.into());
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "{} is unavailable. Check that remote access and Tailscale are running, then retry.",
+                        profile.name
+                    ))
+                }
+            };
+            anyhow::ensure!(info.device_id == profile.device_id, "The remote computer's identity changed. Pair it again.");
+            return Ok(Self {
+                inner: Arc::new(NativeRemoteEngine { remote, endpoint: profile.endpoint }),
+                engine_info: info,
+                deferred_state: None,
+            });
+        }
         // Invariant: at most one bootstrap in this process runs probe+embed at
         // a time. The winner binds the deferred IPC listener before releasing
         // the gate, so a concurrent viewport's probe finds it and attaches as
@@ -648,6 +725,8 @@ pub struct UploadProgress {
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
 pub struct AppState {
+    pub remote_host: Option<String>,
+    pub remote_connection: Option<zeron_rpc::remote::ConnectionState>,
     pub connection: ConnectionStatus,
     /// Fixed data boundary of the attached engine. Authentication may change
     /// in place, but changing this scope requires assembling a new runtime.
@@ -789,6 +868,8 @@ impl Default for AppState {
 impl AppState {
     pub fn new() -> Self {
         Self {
+            remote_host: None,
+            remote_connection: None,
             connection: ConnectionStatus::Connecting,
             workspace_scope: None,
             auth: None,
@@ -1169,6 +1250,58 @@ impl AppState {
 
     pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
         self.update = Some(status);
+    }
+
+    /// Mirror a remote connection-state frame into the sidebar badge. A
+    /// transition to `Unauthorized` means the saved key no longer opens the
+    /// host: fail the connection with the pairing copy and retire every
+    /// standing subscription, so their resubscribe loops stop retrying a link
+    /// that can never attach.
+    fn apply_remote_status(
+        &mut self,
+        value: zeron_rpc::remote::ConnectionState,
+        cx: &mut Context<Self>,
+    ) {
+        let revoked = value == zeron_rpc::remote::ConnectionState::Unauthorized;
+        self.remote_connection = Some(value);
+        if revoked {
+            let host = self
+                .remote_host
+                .clone()
+                .unwrap_or_else(|| "the remote computer".to_string());
+            self.connection = ConnectionStatus::Failed(access_revoked_message(&host));
+            // This runs inside the status watch task and the sweep below aborts
+            // that very task; a task must not cancel its own in-flight poll, so
+            // hand the sweep to the next tick.
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |state, cx| {
+                    // A retry or a replacement attachment may land between
+                    // ticks; never cancel a newer generation's watches.
+                    if state.remote_connection
+                        == Some(zeron_rpc::remote::ConnectionState::Unauthorized)
+                    {
+                        state.retire_standing_watches();
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Drop every standing engine subscription — streaming watches, transcript,
+    /// change requests and queues — without clearing cached chats, sessions or
+    /// transcript: the workspace is not being replaced, and a revoked pairing
+    /// must not blank what the user was reading.
+    fn retire_standing_watches(&mut self) {
+        self.watch_tasks.clear();
+        self.transcript_task = None;
+        self.change_request_tasks.clear();
+        self.queue_task = None;
+        self.pane_queue_tasks.clear();
+        self.sub_watch_tasks.clear();
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
@@ -1829,6 +1962,8 @@ impl AppState {
     pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
+            s.remote_host = config.remote.as_ref().map(|p| p.name.clone());
+            s.remote_connection = config.remote.as_ref().map(|_| zeron_rpc::remote::ConnectionState::Connecting);
             s.connection = ConnectionStatus::Connecting;
             s.workspace_scope = None;
             s.auth = None;
@@ -1839,17 +1974,31 @@ impl AppState {
         cx.spawn(async move |cx| {
             let outcome = match boot.await {
                 Ok(Ok(handle)) => Ok(handle),
-                Ok(Err(err)) => Err(format!("{err:#}")),
-                Err(join_err) => Err(join_err.to_string()),
+                Ok(Err(err)) => {
+                    // Downcast before formatting: the typed error is what tells
+                    // a revoked key apart from a host that is merely offline.
+                    let revoked = err.downcast_ref::<RemoteAccessRevoked>().is_some();
+                    Err((revoked, format!("{err:#}")))
+                }
+                Err(join_err) => Err((false, join_err.to_string())),
             };
             // NB: at the pinned rev `Entity::update(&mut AsyncApp)` returns the
             // closure's value directly (no Result) — AsyncApp implements
             // AppContext like App does.
             state.update(cx, |s, cx| match outcome {
                 Ok(handle) => s.attach_engine(handle, cx),
-                Err(message) => {
+                Err((revoked, message)) => {
                     tracing::error!(%message, "engine bootstrap failed");
                     s.connection = ConnectionStatus::Failed(message);
+                    if revoked {
+                        s.remote_connection =
+                            Some(zeron_rpc::remote::ConnectionState::Unauthorized);
+                    } else if s.remote_host.is_some() {
+                        // Other remote failures are transient until the user
+                        // says otherwise; the retry path stays open.
+                        s.remote_connection =
+                            Some(zeron_rpc::remote::ConnectionState::Reconnecting);
+                    }
                     cx.notify();
                 }
             });
@@ -1870,6 +2019,19 @@ impl AppState {
         self.local_device_id = Some(engine_info.device_id.clone());
         self.engine = Some(handle.clone());
         let mut watch_tasks = Vec::with_capacity(8);
+        if let Some(mut status) = handle.inner.connection_status() {
+            watch_tasks.push(cx.spawn(async move |this, cx| {
+                loop {
+                    let value = status.borrow_and_update().clone();
+                    let revoked = value == zeron_rpc::remote::ConnectionState::Unauthorized;
+                    if this.update(cx, |s, cx| s.apply_remote_status(value, cx)).is_err() { break; }
+                    // A revocation retires this task on the next tick; stop
+                    // pumping frames rather than racing the sweep.
+                    if revoked { break; }
+                    if status.changed().await.is_err() { break; }
+                }
+            }));
+        }
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
             watch_tasks.push(task);
         }
@@ -2404,7 +2566,7 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
         loop {
             let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
+                .subscribe_checked(methods::WATCH_CHATS, serde_json::json!({}))
                 .await
             {
                 Ok(rx) => rx,
@@ -2551,7 +2713,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
         loop {
             let mut rx = match handle
                 .client()
-                .subscribe(method, serde_json::json!({}))
+                .subscribe_checked(method, serde_json::json!({}))
                 .await
             {
                 Ok(rx) => rx,
@@ -2646,7 +2808,7 @@ fn spawn_transcript_watch(
             let params = serde_json::json!({ "chatId": chat_id, "openingTail": true });
             let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                .subscribe_checked(methods::WATCH_DOC_MESSAGES, params)
                 .await
             {
                 Ok(rx) => rx,
@@ -2742,7 +2904,7 @@ fn spawn_queue_watch(
             let params = serde_json::json!({ "chatId": chat_id });
             let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_QUEUE, params)
+                .subscribe_checked(methods::WATCH_QUEUE, params)
                 .await
             {
                 Ok(rx) => rx,
@@ -2801,7 +2963,7 @@ fn spawn_pane_queue_watch(
             let params = serde_json::json!({ "chatId": chat_id });
             let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_QUEUE, params)
+                .subscribe_checked(methods::WATCH_QUEUE, params)
                 .await
             {
                 Ok(rx) => rx,
@@ -2855,7 +3017,7 @@ fn spawn_subagent_watch(
             let params = serde_json::json!({ "chatId": doc_id });
             let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                .subscribe_checked(methods::WATCH_DOC_MESSAGES, params)
                 .await
             {
                 Ok(rx) => rx,
@@ -3033,6 +3195,7 @@ mod tests {
         ));
         let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
+            remote: None,
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
@@ -3060,9 +3223,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_remote_never_embeds_when_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote_port = free_port().await;
+        let local_port = free_port().await;
+        let result = EngineHandle::bootstrap(EngineBootConfig {
+            remote: Some(zeron_rpc::remote::ConnectionProfile {
+                id: "test".into(), name: "Unavailable computer".into(),
+                endpoint: format!("ws://127.0.0.1:{remote_port}"),
+                token: "a".repeat(64), device_id: "remote".into(),
+            }),
+            data_dir: dir.path().to_path_buf(), ipc_port: local_port,
+            edge_url: "http://127.0.0.1:1".into(), edge_token: None,
+            org_id: None, workos_client_id: None, default_harness: HarnessId::Mock,
+        }).await;
+        assert!(result.is_err());
+        assert!(!dir.path().join("device-id").exists());
+        assert!(!dir.path().join("profiles").exists());
+        assert!(tokio::net::TcpListener::bind(("127.0.0.1", local_port)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn revoked_remote_access_reports_the_typed_error_without_embedding() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // A gateway that refuses the websocket upgrade with 401: the client
+        // flips to Unauthorized and fails every pending call.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let gateway = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 2048];
+            let _ = socket.read(&mut head).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let local_port = free_port().await;
+        let error = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            EngineHandle::bootstrap(EngineBootConfig {
+                remote: Some(zeron_rpc::remote::ConnectionProfile {
+                    id: "revoked".into(),
+                    name: "Revoked computer".into(),
+                    endpoint,
+                    token: "a".repeat(64),
+                    device_id: "remote".into(),
+                }),
+                data_dir: dir.path().to_path_buf(),
+                ipc_port: local_port,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: HarnessId::Mock,
+            }),
+        )
+        .await
+        .expect("a revoked key fails fast")
+        {
+            Ok(handle) => {
+                handle.shutdown().await;
+                panic!("a revoked key must not attach a handle");
+            }
+            Err(error) => error,
+        };
+        gateway.await.unwrap();
+        let message = format!("{error:#}");
+        assert!(
+            error.downcast_ref::<RemoteAccessRevoked>().is_some(),
+            "revocation must survive as a typed error: {message}"
+        );
+        assert_eq!(
+            message,
+            "Access to Revoked computer was revoked or its connection key is invalid. Pair this computer again."
+        );
+        assert!(
+            !message.contains("is unavailable"),
+            "the transient-network fallback must not shadow a revocation: {message}"
+        );
+        // The failure came from the gateway, not a locally embedded engine.
+        assert!(!dir.path().join("device-id").exists());
+        assert!(tokio::net::TcpListener::bind(("127.0.0.1", local_port)).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn bootstrap_embeds_engine_when_port_is_free() {
         let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
+            remote: None,
             data_dir: dir.path().to_path_buf(),
             ipc_port: free_port().await,
             edge_url: "http://127.0.0.1:1".into(),
@@ -3101,6 +3353,7 @@ mod tests {
         let port = free_port().await;
 
         let error = match EngineHandle::bootstrap(EngineBootConfig {
+            remote: None,
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
@@ -3158,6 +3411,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
+            remote: None,
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
@@ -3196,6 +3450,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let port = free_port().await;
         let handle = EngineHandle::bootstrap(EngineBootConfig {
+            remote: None,
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
@@ -3238,6 +3493,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let port = free_port().await;
         let config = EngineBootConfig {
+            remote: None,
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
@@ -3298,6 +3554,7 @@ mod tests {
         let port = squatter.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
+            remote: None,
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
@@ -3325,6 +3582,7 @@ mod tests {
     async fn production_bootstrap_opens_local_data_without_sign_in() {
         let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
+            remote: None,
             data_dir: dir.path().to_path_buf(),
             ipc_port: free_port().await,
             edge_url: "http://127.0.0.1:1".into(),
@@ -3346,7 +3604,7 @@ mod tests {
 
         let mut auth = handle
             .client()
-            .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
+            .subscribe_checked(methods::AUTH_STATUS, serde_json::json!({}))
             .await
             .unwrap();
         assert_eq!(
@@ -3376,6 +3634,7 @@ mod tests {
         )
         .unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
+            remote: None,
             data_dir: dir.path().to_path_buf(),
             ipc_port: free_port().await,
             edge_url: "http://127.0.0.1:1".into(),
@@ -3434,6 +3693,7 @@ mod tests {
 
         let ui_dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
+            remote: None,
             data_dir: ui_dir.path().to_path_buf(),
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),

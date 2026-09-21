@@ -85,6 +85,7 @@ pub(crate) const fn click_activation_drag_enabled() -> bool {
 /// `apps/zeron`, not here).
 #[derive(Debug, Clone)]
 pub struct UiConfig {
+    pub remote: Option<zeron_rpc::remote::ConnectionProfile>,
     /// Data directory — engine stores + `ui-settings.json`.
     pub data_dir: PathBuf,
     /// Localhost IPC port: connect if an engine daemon is listening, embed if not.
@@ -107,6 +108,7 @@ pub struct UiConfig {
 impl UiConfig {
     fn boot(&self) -> EngineBootConfig {
         EngineBootConfig {
+            remote: self.remote.clone(),
             data_dir: self.data_dir.clone(),
             ipc_port: self.ipc_port,
             edge_url: self.edge_url.clone(),
@@ -343,6 +345,25 @@ fn observe_main_window_geometry<T: 'static>(window: &mut gpui::Window, cx: &gpui
     .detach();
 }
 
+/// Each host has its own window, selections and subscriptions. Closing a remote
+/// window never stops the host engine or affects local work.
+pub(crate) fn open_connection_window(mut boot: EngineBootConfig, remote: Option<zeron_rpc::remote::ConnectionProfile>, cx: &mut App) {
+    boot.remote = remote;
+    let state = cx.new(|_| state::AppState::new());
+    state::AppState::bootstrap(state.clone(), boot.clone(), cx);
+    // Keep an embedded local engine alive after its last window closes, then
+    // drain it at app quit. Remote states may drop with their window.
+    let keep_local = boot.remote.is_none().then(|| state.clone());
+    let weak = state.downgrade();
+    cx.on_app_quit(move |cx| {
+        let state = keep_local.clone().or_else(|| weak.upgrade());
+        let shutdown = state.and_then(|s| s.read(cx).engine().cloned())
+            .map(|handle| gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await }));
+        async move { if let Some(task) = shutdown { let _ = task.await; } }
+    }).detach();
+    open_main_window(state, boot, cx);
+}
+
 fn open_main_window(
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
@@ -370,7 +391,7 @@ fn open_main_window(
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: cfg!(target_os = "windows").then(|| "Zeron".into()),
+                    title: Some(boot.remote.as_ref().map_or_else(|| "Noches".into(), |host| format!("Noches · {}", host.name).into())),
                     appears_transparent: true,
                     // Native lights are 14px tall: top 14 → center 21, matching
                     // the 38px titlebar row with 4px top-only content padding.

@@ -18,6 +18,9 @@ use clap::{Parser, Subcommand};
     about = "Multi-device controller for coding agents"
 )]
 struct Cli {
+    /// Open a saved remote computer by connection id or name.
+    #[arg(long)]
+    connection: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
     /// Open a Zeron conversation URL.
@@ -223,9 +226,16 @@ fn main() -> anyhow::Result<()> {
         },
         None => {
             let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
+            let remote = match cli.connection.or_else(|| std::env::var("NOCHES_CONNECTION").ok()) {
+                Some(name) => Some(zeron_rpc::remote::Connections::load(&paths::data_dir())?.hosts.into_iter()
+                    .find(|h| h.id == name || h.name == name)
+                    .ok_or_else(|| anyhow::anyhow!("Saved connection not found: {name}"))?),
+                None => None,
+            };
             // Headed: the UI probes ZERON_IPC_PORT and connects to a running
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
             zeron_ui::run_app(zeron_ui::UiConfig {
+                remote,
                 data_dir: paths::data_dir(),
                 ipc_port: std::env::var("ZERON_IPC_PORT")
                     .ok()

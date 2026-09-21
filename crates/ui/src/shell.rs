@@ -40,6 +40,7 @@ use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearancePage, AppearanceSettingsEvent};
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::connections::ConnectionsPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
@@ -462,6 +463,7 @@ pub fn apply_keymap(
 /// The settings sections (feature-inventory §1.5 routes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
+    Connections,
     Devices,
     /// Which harnesses the composer offers (enable/disable toggles).
     Harnesses,
@@ -476,7 +478,8 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
+        SettingsSection::Connections,
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
@@ -492,6 +495,7 @@ impl SettingsSection {
     /// `settingsTitle` — the same strings in both places).
     pub fn label(self) -> &'static str {
         match self {
+            SettingsSection::Connections => "Connections",
             SettingsSection::Devices => "Devices",
             SettingsSection::Harnesses => "Agents",
             SettingsSection::Agents => "Accounts",
@@ -1485,6 +1489,7 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
+    connections_page: Option<Entity<ConnectionsPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
@@ -1763,6 +1768,14 @@ impl Shell {
             }
         });
         let data_dir = boot.data_dir.clone();
+        // Host IDs are untrusted pairing data: encode bytes rather than joining
+        // a raw ID as a filesystem path. Local and remote projectless layouts
+        // must never overwrite each other.
+        let layout_dir = boot.remote.as_ref().map_or_else(|| data_dir.clone(), |host| {
+            use sha2::Digest;
+            let key = format!("{:x}", sha2::Sha256::digest(host.device_id.as_bytes()));
+            data_dir.join("remote-layouts").join(key)
+        });
         let settings = settings::current(cx);
         state.update(cx, |state, cx| {
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
@@ -1834,7 +1847,7 @@ impl Shell {
             pane_menu: popover::Popup::default(),
             divider_dragging: false,
             split_drag: None,
-            workspace_layouts: crate::workspace_layout_store::WorkspaceLayoutStore::load(&data_dir),
+            workspace_layouts: crate::workspace_layout_store::WorkspaceLayoutStore::load(&layout_dir),
             workspace_save_task: None,
             active_workspace_space: None,
             workspace_space_loaded: false,
@@ -1881,6 +1894,7 @@ impl Shell {
             route,
             nav,
             devices_page: None,
+            connections_page: None,
             archived_page: None,
             appearance_page: None,
             files_settings_page: None,
@@ -3858,6 +3872,14 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match section {
+            SettingsSection::Connections => {
+                if self.connections_page.is_none() {
+                    let state = self.state.clone();
+                    let boot = self.boot.clone();
+                    self.connections_page = Some(cx.new(|cx| ConnectionsPage::new(state, boot, cx)));
+                }
+                self.connections_page.as_ref().unwrap().clone().into_any_element()
+            }
             SettingsSection::Devices => {
                 if self.devices_page.is_none() {
                     let state = self.state.clone();
@@ -4274,6 +4296,7 @@ impl Shell {
     }
 
     fn request_sign_out(&mut self, cx: &mut Context<Self>) {
+        if self.boot.remote.is_some() { return; }
         self.close_user_menu(cx);
         if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
             return;
@@ -4427,6 +4450,7 @@ impl Shell {
     /// Failure falls back to the quit-and-reopen dialog — the local profile is
     /// untouched, so the old path is always a safe exit.
     fn start_synced_switch(&mut self, import: bool, cx: &mut Context<Self>) {
+        if self.boot.remote.is_some() { return; }
         if self.runtime_change_task.is_some() {
             return;
         }
@@ -4679,6 +4703,7 @@ impl Shell {
     }
 
     fn start_sign_in(&mut self, cx: &mut Context<Self>) {
+        if self.boot.remote.is_some() { return; }
         let scope = self.state.read(cx).workspace_scope;
         if scope == Some(WorkspaceScope::Development) {
             return;
@@ -5564,6 +5589,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
+            SettingsSection::Connections => icons::GLOBAL,
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
@@ -6250,7 +6276,7 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        let menu_identity: SharedString = match workspace_scope {
+        let menu_identity: SharedString = if let Some(remote) = &self.boot.remote { format!("Work runs on {}", remote.name).into() } else { match workspace_scope {
             Some(WorkspaceScope::Local) => {
                 if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
                     "Sync ready after restart".into()
@@ -6263,10 +6289,10 @@ impl Shell {
                 .as_ref()
                 .map(|u| SharedString::from(u.email.clone()))
                 .unwrap_or_else(|| SharedString::from("Not signed in")),
-        };
+        } };
         let user_menu = self.render_user_menu(
             local_device_name,
-            Some(SharedString::from("online")),
+            Some(SharedString::from(if self.boot.remote.is_some() { crate::settings::connections::status_label(self.state.read(cx).remote_connection.as_ref()) } else { "online" })),
             menu_identity,
             theme,
             cx,
@@ -6358,7 +6384,7 @@ impl Shell {
                                     .line_height(px(12.0))
                                     .font_family(theme.font_mono.clone())
                                     .text_color(theme.text_faint)
-                                    .child(SharedString::from("LOCAL PROFILE")),
+                                    .child(SharedString::from(self.boot.remote.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "LOCAL PROFILE".into()))),
                             ),
                     ),
             )
@@ -6491,6 +6517,7 @@ impl Shell {
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
     /// (`zeron update`); click dismisses it for that version.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.boot.remote.is_some() { return None; }
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
             return None;
@@ -6632,7 +6659,7 @@ impl Shell {
     ) -> AnyElement {
         let theme = &theme.for_popup();
         let open = self.user_menu.is_open();
-        let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
+        let action = if self.boot.remote.is_some() { None } else { account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow) };
         let remote_hover = motion::hover_t("remote-control-motion");
         let remote_degrees = if remote_hover < 0.30 {
             -11.0 * (remote_hover / 0.30)
@@ -6700,7 +6727,11 @@ impl Shell {
                             .size(px(6.0))
                             .flex_none()
                             .rounded_full()
-                            .bg(theme.success),
+                            .bg(match self.state.read(cx).remote_connection.as_ref() {
+                                Some(zeron_rpc::remote::ConnectionState::Unauthorized) => theme.danger,
+                                Some(zeron_rpc::remote::ConnectionState::Connecting | zeron_rpc::remote::ConnectionState::Reconnecting) => theme.text_muted,
+                                _ => theme.success,
+                            }),
                     )
                     .child(
                         div()
@@ -6749,7 +6780,7 @@ impl Shell {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
-                        this.open_settings(SettingsSection::Devices, cx);
+                        this.open_settings(SettingsSection::Connections, cx);
                     }))
                     .child(
                         icon(icons::SMARTPHONE)
@@ -11075,6 +11106,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let boot = EngineBootConfig {
+            remote: None,
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
             edge_url: "http://127.0.0.1:1".into(),
@@ -11767,6 +11799,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -11839,6 +11872,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -11940,6 +11974,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -12046,6 +12081,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -12131,6 +12167,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -12209,6 +12246,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -12274,6 +12312,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -12402,6 +12441,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -12498,6 +12538,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -12576,6 +12617,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -12638,6 +12680,7 @@ mod exit_regressions {
             Shell::new(
                 state,
                 EngineBootConfig {
+                    remote: None,
                     data_dir: dir.path().into(),
                     ipc_port: 0,
                     edge_url: "http://127.0.0.1:1".into(),
@@ -12815,6 +12858,7 @@ mod right_tab_mouse_regressions {
                 let mut shell = Shell::new(
                     state,
                     EngineBootConfig {
+                        remote: None,
                         data_dir: dir.path().into(),
                         ipc_port: 0,
                         edge_url: "http://127.0.0.1:1".into(),
@@ -13178,6 +13222,7 @@ mod workspace_persistence {
         Shell::new(
             cx.new(|_| AppState::new()),
             EngineBootConfig {
+                remote: None,
                 data_dir: dir.into(),
                 ipc_port: 0,
                 edge_url: "http://127.0.0.1:1".into(),
