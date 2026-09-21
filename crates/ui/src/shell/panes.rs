@@ -1525,6 +1525,11 @@ impl Shell {
     /// snapshot is intentionally lossy (no in-flight send/interrupt tasks,
     /// no queue-edit lease) and `restore_draft_state` merges maps, so a
     /// closed neighbor's attachments could leak into the dock.
+    ///
+    /// The pane transcript is deliberately NOT adopted: `Transcript::for_session`
+    /// pins `doc_override`, so `Transcript::sync()` ignores selection changes
+    /// and the glass route would stay welded to the survivor session. The
+    /// primary `Transcript::new` already tracks selection and is kept.
     fn promote_trivial_chat_surface_to_dock(&mut self, cx: &mut Context<Self>) {
         if !self.workspace.is_trivial() {
             return;
@@ -1535,18 +1540,9 @@ impl Shell {
             .focused_pane()
             .and_then(|pane| self.workspace.chat_surfaces.remove(&pane));
         self.workspace.chat_surfaces.clear();
-        let Some(mut surface) = survivor else {
+        let Some(surface) = survivor else {
             return;
         };
-        // Adopt the pane transcript too so own-send markers and scroll state
-        // from a live send stay with the canvas (new-chat canvas has none).
-        if let Some(transcript) = surface.transcript.take() {
-            self.transcript = transcript;
-            self._transcript_events = cx.subscribe(&self.transcript, Self::on_transcript_event);
-            let links = Self::session_links(surface.chat_id.clone(), cx);
-            self.transcript
-                .update(cx, |transcript, _| transcript.set_workspace_link_handler(links));
-        }
         // Preserve the survivor entity itself (in-flight sends, queue-edit
         // lease, failure banners, staged attachments all live on it).
         if surface.composer.entity_id() != self.composer.entity_id() {

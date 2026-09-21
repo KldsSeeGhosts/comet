@@ -3560,6 +3560,17 @@ impl Transcript {
     /// previous reservation and drop the messages back down — user report).
     /// [`Self::step_own_turn`] sizes the reservation and eases the prompt to
     /// its top inset. Replacing a previous anchor starts a new glide.
+    pub(crate) fn showing_chat(&self) -> Option<&str> {
+        self.chat_id.as_deref()
+    }
+
+    /// Test hook: run the selection/doc sync immediately instead of waiting
+    /// for the deferred state observer.
+    #[cfg(test)]
+    pub(crate) fn sync_for_test(&mut self, cx: &mut Context<Self>) {
+        self.sync(cx);
+    }
+
     pub fn on_own_send(&mut self, chat_id: String, message_id: String, cx: &mut Context<Self>) {
         self.user_collapse_scroll = None;
         self.cancel_user_hold();

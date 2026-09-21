@@ -75,6 +75,42 @@ fn collapsing_to_one_pane_keeps_its_composer_and_draft(cx: &mut TestAppContext) 
     }).unwrap();
 }
 
+/// Issue: a collapse must not leave the glass route on a `for_session`
+/// transcript (pinned via `doc_override`). After keeping chat A and closing
+/// the neighbor, selecting chat B must retarget the primary transcript.
+#[gpui::test]
+fn collapsing_keeps_a_selection_following_transcript(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        prepare_selected_composer(shell, cx);
+        assert!(shell.transcript.read(cx).rail_enabled(), "boot uses the primary transcript");
+        shell.transcript.update(cx, |t, cx| t.sync_for_test(cx));
+        assert_eq!(shell.transcript.read(cx).showing_chat(), Some("chat-a"));
+        shell.split_workspace_view(Direction::Right, cx);
+        let second = shell.workspace.focused_pane().unwrap();
+        // Close the NEW pane: the survivor is chat A on the adopted dock composer.
+        shell.close_workspace_pane(second, cx);
+        assert!(!shell.workspace_mode());
+        assert!(
+            shell.transcript.read(cx).rail_enabled(),
+            "collapse must keep the primary transcript, not a for_session pin"
+        );
+        shell.transcript.update(cx, |t, cx| t.sync_for_test(cx));
+        assert_eq!(shell.transcript.read(cx).showing_chat(), Some("chat-a"));
+
+        shell.open_chat("chat-b".into(), cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        shell.transcript.update(cx, |t, cx| t.sync_for_test(cx));
+        assert_eq!(
+            shell.transcript.read(cx).showing_chat(),
+            Some("chat-b"),
+            "the glass route's primary transcript must follow selection after collapse"
+        );
+    }).unwrap();
+}
+
 /// Issue #8 + review: the collapse handoff must keep the survivor's live
 /// Composer state (queue-edit lease, displaced draft) and must not merge the
 /// closed neighbor's attachments into the dock.
