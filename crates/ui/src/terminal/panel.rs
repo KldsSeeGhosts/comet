@@ -805,6 +805,18 @@ impl TerminalPanel {
             return StreamDisposition::Stop;
         };
         let target = tab.target_device_id.clone();
+        let seq = match &event {
+            TerminalEvent::Data { seq, .. } | TerminalEvent::Exit { seq, .. } => *seq,
+        };
+        if seq <= tab.last_seq {
+            return StreamDisposition::Continue;
+        }
+        if seq > tab.last_seq.saturating_add(1) {
+            // Replay is bounded. Never feed bytes following an unknown gap into
+            // a parser that might still be inside an escape sequence.
+            tab.emulator = Emulator::new(tab.emulator.cols() as u16, tab.emulator.rows() as u16);
+            tab.emulator.feed(b"[terminal output omitted while disconnected]\r\n");
+        }
         match event {
             TerminalEvent::Data { seq, data } => {
                 tab.last_seq = seq;

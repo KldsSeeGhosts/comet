@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU32, Ordering},
@@ -28,14 +28,14 @@ pub enum NativeEvent {
 pub struct BrowserData(Arc<Mutex<Weak<Worker>>>);
 
 struct Worker {
-    child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
+    child: Arc<Mutex<Child>>,
+    commands: super::command_writer::CommandWriter,
     routes: Arc<Mutex<HashMap<u32, Weak<Route>>>>,
     next_id: AtomicU32,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        if let Ok(child) = self.child.get_mut() {
+        if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -161,9 +161,25 @@ impl BrowserData {
                 }
             }
         }).map_err(|e| e.to_string())?;
+        let child = Arc::new(Mutex::new(child));
+        let failed_child = child.clone();
+        let failed_routes = routes.clone();
+        let commands = super::command_writer::CommandWriter::new(stdin, move || {
+            if let Ok(mut child) = failed_child.lock() { let _ = child.kill(); }
+            for route in failed_routes.lock().unwrap().values().filter_map(Weak::upgrade) {
+                let mut state = route.state.lock().unwrap();
+                state.loading = false;
+                state.error = Some("The browser helper stopped accepting input. Reopen the tab.".into());
+                drop(state);
+                let _ = route.tx.try_send(NativeEvent::Changed);
+            }
+        }).map_err(|error| {
+            if let Ok(mut child) = child.lock() { let _ = child.kill(); let _ = child.wait(); }
+            error.to_string()
+        })?;
         let worker = Arc::new(Worker {
-            child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
+            child,
+            commands,
             routes,
             next_id: AtomicU32::new(1),
         });
@@ -175,10 +191,7 @@ impl Worker {
     fn send(&self, id: u32, mut command: Value) -> Result<(), String> {
         command["id"] = id.into();
         let data = serde_json::to_vec(&command).map_err(|e| e.to_string())?;
-        let mut pipe = self.stdin.lock().unwrap();
-        pipe.write_all(&(data.len() as u32).to_le_bytes())
-            .and_then(|_| pipe.write_all(&data))
-            .map_err(|e| e.to_string())
+        self.commands.send(data)
     }
 }
 

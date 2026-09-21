@@ -132,6 +132,29 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     }
 }
 
+/// Validate that a version string is safe for use as a path component and follows
+/// expected release version syntax (ASCII alphanumeric characters, dots, hyphens,
+/// underscores, no path separators or `..` traversals, with at least one digit).
+pub fn validate_version(version: &str) -> anyhow::Result<&str> {
+    let trimmed = version.trim();
+    if trimmed.is_empty() || trimmed != version || trimmed.len() > 128 {
+        bail!("version string cannot be empty");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+        bail!("malformed version string contains path separators or traversal: {trimmed}");
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        bail!("malformed version string contains invalid characters: {trimmed}");
+    }
+    if !trimmed.chars().any(|c| c.is_ascii_digit()) {
+        bail!("version string must contain at least one digit: {trimmed}");
+    }
+    Ok(trimmed)
+}
+
 /// Fetch the newest release metadata: `manifest.json`, falling back to
 /// `latest.txt` (version only, no checksums) for pre-manifest releases.
 pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
@@ -350,6 +373,17 @@ pub async fn download_release_file(
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
+    download_release_file_verified(edge_url, manifest, file, dest)
+        .await
+        .map(|_| ())
+}
+
+async fn download_release_file_verified(
+    edge_url: &str,
+    manifest: &Manifest,
+    file: &str,
+    dest: &Path,
+) -> anyhow::Result<String> {
     let url = format!("{}/{file}", release_base(edge_url)?);
     let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
     if expected.is_none() {
@@ -376,10 +410,10 @@ pub async fn download_release_file(
         hasher.update(&chunk);
         out.write_all(&chunk).await.context("writing download")?;
     }
-    out.flush().await.ok();
+    out.flush().await.context("flushing download")?;
     drop(out);
+    let actual = format!("{:x}", hasher.finalize());
     if let Some(expected) = expected {
-        let actual = format!("{:x}", hasher.finalize());
         if !actual.eq_ignore_ascii_case(expected.trim()) {
             tokio::fs::remove_file(&partial).await.ok();
             bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
@@ -388,7 +422,7 @@ pub async fn download_release_file(
     tokio::fs::rename(&partial, dest)
         .await
         .with_context(|| format!("moving {} into place", dest.display()))?;
-    Ok(())
+    Ok(actual)
 }
 
 fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
@@ -407,6 +441,49 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Stage completion marker file written after an archive is fully unpacked
+/// and verified.
+const STAGE_COMPLETE_FILE: &str = ".stage-complete";
+
+/// Metadata record stored in `STAGE_COMPLETE_FILE` tying the staged files
+/// to the verified artifact digest and release version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StageRecord {
+    version: String,
+    artifact: String,
+    sha256: String,
+}
+
+fn staged_mac_app_valid(
+    dir: &Path,
+    version: &str,
+    file: &str,
+    expected_sha256: Option<&str>,
+) -> bool {
+    let complete_file = dir.join(STAGE_COMPLETE_FILE);
+    let Ok(data) = std::fs::read(&complete_file) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_slice::<StageRecord>(&data) else {
+        return false;
+    };
+    if record.version != version || record.artifact != file {
+        return false;
+    }
+    if record.sha256.is_empty() {
+        return false;
+    }
+    if let Some(expected) = expected_sha256 {
+        if !record.sha256.eq_ignore_ascii_case(expected.trim()) {
+            return false;
+        }
+    }
+    let staged = dir.join("Zeron.app");
+    staged.is_dir()
+        && staged.join("Contents/MacOS/zeron").is_file()
+        && staged.join("Contents/Info.plist").is_file()
+}
+
 // ---------------------------------------------------------------------------
 // Managed (symlink) installs — the daemon/VPS path
 // ---------------------------------------------------------------------------
@@ -420,7 +497,7 @@ pub async fn stage_headless(
 ) -> anyhow::Result<PathBuf> {
     // Reject unsupported targets before creating a stage or making a request.
     require_managed_update_platform()?;
-    let version = &manifest.version;
+    let version = validate_version(&manifest.version)?;
     let dest = app_root.join(version);
     if dest.join("zeron").exists() {
         return Ok(dest);
@@ -467,6 +544,7 @@ pub async fn stage_headless(
 /// Atomically repoint `app_root/current` at `app_root/<ver>` (symlink to a temp
 /// name, then rename over — never a window with no `current`).
 pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
+    let version = validate_version(version)?;
     #[cfg(unix)]
     {
         let target = app_root.join(version);
@@ -517,29 +595,85 @@ pub async fn stage_mac_app(
 ) -> anyhow::Result<PathBuf> {
     // Reject unsupported targets before creating a stage or making a request.
     require_mac_app_update_platform()?;
-    let version = &manifest.version;
-    let dir = data_dir.join("updates").join(version);
+    let version = validate_version(&manifest.version)?;
+    let updates_dir = data_dir.join("updates");
+    let dir = updates_dir.join(version);
     let staged = dir.join("Zeron.app");
-    if staged.join("Contents/MacOS/zeron").exists() {
+    let file = mac_app_artifact(version);
+    let expected_sha256 = manifest.files.get(&file).and_then(|m| m.sha256.as_deref());
+
+    std::fs::create_dir_all(&updates_dir)
+        .with_context(|| format!("creating {}", updates_dir.display()))?;
+    // Serialize publication across processes too. Await lock acquisition on a
+    // blocking worker so another download never blocks the UI/Tokio executor.
+    let lock_path = updates_dir.join(format!(".lock-{version}"));
+    let _stage_lock = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        file.lock()?;
+        Ok(file)
+    })
+    .await??;
+    if staged_mac_app_valid(&dir, version, &file, expected_sha256) {
         return Ok(staged);
     }
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let file = mac_app_artifact(version);
-    let tarball = dir.join(&file);
-    download_release_file(edge_url, manifest, &file, &tarball).await?;
+    if dir.join(STAGE_COMPLETE_FILE).exists() {
+        bail!(
+            "a completed stage for {version} has different metadata or missing files; refusing to replace it"
+        );
+    }
+    let temp_stage = tempfile::Builder::new()
+        .prefix(&format!(".stage-{version}-"))
+        .tempdir_in(&updates_dir)
+        .with_context(|| format!("creating temporary stage in {}", updates_dir.display()))?;
+
+    let tarball = temp_stage.path().join(&file);
+    let actual_sha256 = download_release_file_verified(edge_url, manifest, &file, &tarball).await?;
     run(
         "tar",
         &[
             "-xzf",
             &tarball.to_string_lossy(),
             "-C",
-            &dir.to_string_lossy(),
+            &temp_stage.path().to_string_lossy(),
         ],
     )?;
     std::fs::remove_file(&tarball).ok();
-    if !staged.join("Contents/MacOS/zeron").exists() {
-        bail!("app tarball {file} did not contain Zeron.app");
+
+    let temp_staged = temp_stage.path().join("Zeron.app");
+    if !temp_staged.join("Contents/MacOS/zeron").is_file()
+        || !temp_staged.join("Contents/Info.plist").is_file()
+    {
+        bail!("app tarball {file} did not contain a complete Zeron.app bundle");
+    }
+
+    let record = StageRecord {
+        version: version.to_string(),
+        artifact: file.clone(),
+        sha256: actual_sha256,
+    };
+    std::fs::write(
+        temp_stage.path().join(STAGE_COMPLETE_FILE),
+        serde_json::to_vec(&record)?,
+    )?;
+
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).context("removing incomplete update stage")?;
+    }
+    match std::fs::rename(temp_stage.path(), &dir) {
+        Ok(()) => {
+            let _ = temp_stage.keep();
+        }
+        Err(err) => {
+            if staged_mac_app_valid(&dir, version, &file, expected_sha256) {
+                return Ok(staged);
+            }
+            return Err(err).with_context(|| format!("moving staged bundle to {}", dir.display()));
+        }
     }
     Ok(staged)
 }
@@ -549,6 +683,11 @@ pub async fn stage_mac_app(
 /// old bundle is restored if the second rename fails.
 pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
     require_mac_app_update_platform()?;
+    if !staged.join("Contents/MacOS/zeron").is_file()
+        || !staged.join("Contents/Info.plist").is_file()
+    {
+        bail!("staged application is incomplete");
+    }
     let parent = bundle
         .parent()
         .context("app bundle has no parent directory")?;
@@ -846,6 +985,114 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_versions_cannot_escape_stage_directories() {
+        for version in [
+            "../1", "a/1", "a\\1", "", ".", "current", " 1.2.3", "1.2.3 ", "1.2.3\n",
+        ] {
+            assert!(validate_version(version).is_err(), "accepted {version:?}");
+        }
+        assert_eq!(validate_version("0.2.73-beta1").unwrap(), "0.2.73-beta1");
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn serve_archive(
+        bytes: Vec<u8>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0; 4096];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                if !request[..n].starts_with(b"GET ") {
+                    continue;
+                }
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(&bytes).await;
+            }
+        });
+        (format!("http://{address}"), server, requests)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_stage_recovers_partial_extraction_and_serializes_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let version = "0.2.999";
+        let dir = root.path().join("updates").join(version);
+        let binary = dir.join("Zeron.app/Contents/MacOS/zeron");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"partial").unwrap();
+        let mut manifest: Manifest =
+            serde_json::from_value(serde_json::json!({"version": version})).unwrap();
+        let (url, server, _) = serve_archive(b"not an archive".to_vec()).await;
+        assert!(stage_mac_app(&url, &manifest, root.path()).await.is_err());
+        server.abort();
+        assert!(!dir.join(STAGE_COMPLETE_FILE).exists());
+        assert_eq!(std::fs::read(&binary).unwrap(), b"partial");
+
+        let source = tempfile::tempdir().unwrap();
+        let contents = source.path().join("Zeron.app/Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        std::fs::write(contents.join("MacOS/zeron"), b"complete").unwrap();
+        std::fs::write(contents.join("Info.plist"), b"plist fixture").unwrap();
+        let archive = source.path().join("app.tgz");
+        run(
+            "tar",
+            &[
+                "-czf",
+                &archive.to_string_lossy(),
+                "-C",
+                &source.path().to_string_lossy(),
+                "Zeron.app",
+            ],
+        )
+        .unwrap();
+        let bytes = std::fs::read(archive).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        manifest = serde_json::from_value(serde_json::json!({"version": version,
+            "files": { (mac_app_artifact(version)): {"sha256": digest} }}))
+        .unwrap();
+        let (url, server, requests) = serve_archive(bytes).await;
+        let (a, b) = tokio::join!(
+            stage_mac_app(&url, &manifest, root.path()),
+            stage_mac_app(&url, &manifest, root.path())
+        );
+        let staged = a.unwrap();
+        assert_eq!(staged, b.unwrap());
+        assert_eq!(
+            std::fs::read(staged.join("Contents/MacOS/zeron")).unwrap(),
+            b"complete"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+        assert_eq!(
+            stage_mac_app("http://127.0.0.1:1", &manifest, root.path())
+                .await
+                .unwrap(),
+            staged
+        );
+        assert!(root.path().join("updates").read_dir().unwrap().all(|e| {
+            !e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".stage-")
+        }));
+    }
 
     #[tokio::test]
     async fn stalled_update_headers_and_body_time_out_but_progressing_body_survives() {

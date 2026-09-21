@@ -11864,9 +11864,11 @@ version = "0.2.72"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite",
@@ -11898,6 +11900,7 @@ dependencies = [
  "uuid",
  "zeron-doc",
  "zeron-proto",
+ "zeron-sync",
 ]
 
 [[package]]

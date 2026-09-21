@@ -44,8 +44,22 @@ async fn rejecting_edge() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<
             let seen = seen.clone();
             tokio::spawn(async move {
                 let mut request = [0u8; 4096];
-                let _ = stream.read(&mut request).await;
-                seen.fetch_add(1, Ordering::SeqCst);
+                // Cancelled connects can arrive as EOF. Count an HTTP request
+                // only after receiving its complete header, not a socket close.
+                let mut used = 0;
+                loop {
+                    match stream.read(&mut request[used..]).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => used += n,
+                    }
+                    if request[..used].windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                    if used == request.len() { return; }
+                }
+                // Local port-discovery tools probe new listeners with HEAD /.
+                // That is not an Edge protocol request from this runtime.
+                if !request[..used].starts_with(b"HEAD / HTTP/1.") {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
                 let body = r#"{"error":"revoked"}"#;
                 let response = format!(
                     "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",

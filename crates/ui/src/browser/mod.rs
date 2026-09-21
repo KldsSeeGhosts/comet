@@ -1,4 +1,6 @@
 //! Device-local browser tabs. GPUI owns chrome; the native host owns pages.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod command_writer;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

@@ -25,6 +25,8 @@ const CAPTURED_ENV: &[&str] = &[
     "ZERON_DATA_DIR",
     "ZERON_EDGE_URL",
     "ZERON_EDGE_TOKEN",
+    "ZERON_RELEASES_URL",
+    "ZERON_AUTO_UPDATE",
     "ZERON_ORG_ID",
     "ZERON_WORKOS_CLIENT_ID",
     "ZERON_WORKOS_API_BASE",
@@ -259,6 +261,25 @@ fn exec_path_for(exe: &Path, home: Option<&Path>) -> String {
     }
 }
 
+fn launchd_exec_path(exe: &Path) -> String {
+    launchd_exec_path_for(exe, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+}
+
+fn launchd_exec_path_for(exe: &Path, home: Option<&Path>) -> String {
+    let installed = home
+        .map(|home| home.join(".zeron/app"))
+        .is_some_and(|app_root| exe.starts_with(app_root));
+    if installed {
+        if let Some(home) = home {
+            return home
+                .join(".zeron/app/current/zeron")
+                .to_string_lossy()
+                .to_string();
+        }
+    }
+    format!("{}", exe.display())
+}
+
 fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> String {
     let mut env_dict = String::new();
     for (key, value) in env {
@@ -268,6 +289,7 @@ fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> Str
             xml_escape(value)
         ));
     }
+    let exe_path = launchd_exec_path(exe);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -276,7 +298,7 @@ fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> Str
     <key>Label</key><string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-      <string>{exe}</string>
+      <string>{exe_path}</string>
       <string>headless</string>
     </array>
     <key>EnvironmentVariables</key>
@@ -294,7 +316,7 @@ fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> Str
 </plist>
 "#,
         label = LAUNCHD_LABEL,
-        exe = xml_escape(&exe.to_string_lossy()),
+        exe_path = xml_escape(&exe_path),
         env_dict = env_dict,
         log = xml_escape(&log.to_string_lossy()),
     )
@@ -384,12 +406,19 @@ mod tests {
             &[
                 ("PATH".into(), "/usr/bin:/bin".into()),
                 ("ZERON_EDGE_URL".into(), "https://edge.example".into()),
+                (
+                    "ZERON_RELEASES_URL".into(),
+                    "https://releases.example".into(),
+                ),
+                ("ZERON_AUTO_UPDATE".into(), "true".into()),
                 ("RUST_LOG".into(), "info,zeron=\"debug\"".into()),
             ],
         );
         assert!(unit.contains("ExecStart=/usr/local/bin/zeron headless\n"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
         assert!(unit.contains("Environment=\"ZERON_EDGE_URL=https://edge.example\"\n"));
+        assert!(unit.contains("Environment=\"ZERON_RELEASES_URL=https://releases.example\"\n"));
+        assert!(unit.contains("Environment=\"ZERON_AUTO_UPDATE=true\"\n"));
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,zeron=\\\"debug\\\"\"\n"));
         assert!(unit.contains("StartLimitIntervalSec=60\n"));
@@ -424,9 +453,23 @@ mod tests {
             ),
             "%h/.zeron/app/current/zeron"
         );
+        assert_eq!(
+            launchd_exec_path_for(
+                Path::new("/home/u/.zeron/app/0.3.0/zeron"),
+                Some(Path::new("/home/u")),
+            ),
+            "/home/u/.zeron/app/current/zeron"
+        );
         // Source build: literal path.
         assert_eq!(
             exec_path_for(
+                Path::new("/src/target/debug/zeron"),
+                Some(Path::new("/home/u"))
+            ),
+            "/src/target/debug/zeron"
+        );
+        assert_eq!(
+            launchd_exec_path_for(
                 Path::new("/src/target/debug/zeron"),
                 Some(Path::new("/home/u"))
             ),
@@ -438,13 +481,19 @@ mod tests {
     fn launchd_plist_shape() {
         let plist = render_launchd_plist(
             Path::new("/Users/x/zeron & co/zeron"),
-            &[("ZERON_EDGE_URL".into(), "https://e?a=1&b=2".into())],
+            &[
+                ("ZERON_EDGE_URL".into(), "https://e?a=1&b=2".into()),
+                ("ZERON_RELEASES_URL".into(), "https://r?a=1&b=2".into()),
+                ("ZERON_AUTO_UPDATE".into(), "1".into()),
+            ],
             Path::new("/Users/x/.zeron/daemon.log"),
         );
         assert!(plist.contains("<key>Label</key><string>sh.zeron.app</string>"));
         // XML-escaped exe path and env value.
         assert!(plist.contains("<string>/Users/x/zeron &amp; co/zeron</string>"));
         assert!(plist.contains("<string>https://e?a=1&amp;b=2</string>"));
+        assert!(plist.contains("<string>https://r?a=1&amp;b=2</string>"));
+        assert!(plist.contains("<string>1</string>"));
         assert!(plist.contains("<string>headless</string>"));
         assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
         assert!(

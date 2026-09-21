@@ -623,8 +623,13 @@ async fn models_discovers_visible_catalog_with_pagination() {
     assert_eq!(tier.choices.len(), 2, "priority and fast dedupe");
 
     // A failed probe stays useful and includes the new model in the fallback.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let failing_probe = tmp.path().join("failed-codex-probe");
+    std::fs::write(&failing_probe, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&failing_probe, std::fs::Permissions::from_mode(0o755)).unwrap();
     let fallback = CodexHarness::new()
-        .with_executable("/bin/false")
+        .with_executable(failing_probe.to_string_lossy().as_ref())
         .models()
         .await
         .expect("fallback models");
