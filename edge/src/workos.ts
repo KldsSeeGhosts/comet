@@ -15,7 +15,9 @@ const API = "https://api.workos.com";
 
 /** Thrown for rejected WorkOS calls; routes map it to 401 (same as the old
  * server's WorkOsAuthFailed). */
-export class WorkOsAuthFailed extends Error {}
+export class WorkOsAuthFailed extends Error {
+  constructor(message: string, readonly status?: number, readonly code?: string) { super(message); }
+}
 
 export interface ExchangeResult {
   readonly user: {
@@ -60,13 +62,15 @@ interface WireMembership {
 
 const failed = async (res: Response): Promise<never> => {
   let message = "authentication failed";
+  let code: string | undefined;
   try {
     const body = (await res.json()) as { message?: string; error_description?: string; error?: string };
     message = body.message ?? body.error_description ?? body.error ?? message;
+    code = body.error;
   } catch {
     /* non-JSON error body */
   }
-  throw new WorkOsAuthFailed(message);
+  throw new WorkOsAuthFailed(message, res.status, code);
 };
 
 const post = async (apiKey: string, path: string, body: unknown): Promise<Response> =>

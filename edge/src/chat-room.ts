@@ -145,18 +145,18 @@ export class ChatRoom implements DurableObject {
     else if (owner !== userId) return json({ error: "forbidden" }, 403);
 
     if (url.pathname === "/checkpoint" && request.method === "GET") {
-      const bytes = this.blobs.get(CHECKPOINT_BLOB);
-      if (!bytes) return json({ error: "not_found" }, 404);
       // Range-resumable (bytes=N- only): a 1MB load over a 1.2Mbps link that
       // dies at byte 800k resumes, where s2's export-per-join restarted.
       const range = parseRangeStart(request.headers.get("range"));
-      if (range !== null && range >= bytes.byteLength) {
+      const result = this.blobs.getRange(CHECKPOINT_BLOB, range ?? 0);
+      if (!result) return json({ error: "not_found" }, 404);
+      const { bytes: body, total } = result;
+      if (range !== null && range >= total) {
         return new Response(null, {
           status: 416,
-          headers: { "content-range": `bytes */${bytes.byteLength}` }
+          headers: { "content-range": `bytes */${total}` }
         });
       }
-      const body = range !== null ? bytes.subarray(range) : bytes;
       const headers = new Headers({
         "content-type": "application/octet-stream",
         "content-length": String(body.byteLength),
@@ -166,7 +166,7 @@ export class ChatRoom implements DurableObject {
       if (range !== null) {
         headers.set(
           "content-range",
-          `bytes ${range}-${bytes.byteLength - 1}/${bytes.byteLength}`
+          `bytes ${range}-${total - 1}/${total}`
         );
       }
       return new Response(body, { status: range !== null ? 206 : 200, headers });

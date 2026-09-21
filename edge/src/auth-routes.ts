@@ -77,7 +77,13 @@ export const handleAuthRoute = async (
         `token:${body.refreshToken.slice(0, 6)}…len${body.refreshToken.length}`,
         e instanceof WorkOsAuthFailed ? e.message : String(e)
       );
-      return authFailed(e);
+      // A failed network call or upstream outage is not revoked credentials.
+      // Keep the OAuth code so clients can pause and ask for reauthentication
+      // without deleting locally queued work.
+      const terminal = e instanceof WorkOsAuthFailed && e.code === "invalid_grant"
+        && (e.status === 400 || e.status === 401);
+      return json({ error: e instanceof WorkOsAuthFailed ? e.message : "authentication temporarily unavailable",
+        ...(terminal ? { code: "invalid_grant" } : {}) }, terminal ? 401 : 502);
     }
   }
 
