@@ -24,6 +24,25 @@ use crate::pane::{
 use crate::state::ChatTarget;
 use zeron_workspace::{Direction, PaneId, PaneMode, TabId, ViewId};
 
+fn pane_buddy(pane: PaneId, session: Option<&str>, state: &AppState, theme: &Theme) -> chrome::PaneBuddy {
+    let now = Utc::now();
+    let status = session
+        .and_then(|id| state.chats.iter().find(|chat| chat.id == id))
+        .map(|chat| state.display_status_for(chat, now))
+        .unwrap_or(zeron_proto::ChatIndicator::Idle);
+    chrome::PaneBuddy {
+        session_key: session.map(SharedString::from)
+            .unwrap_or_else(|| format!("new-pane-{}", pane.0).into()),
+        status,
+        status_color: crate::sidebar_buddy::status_color(
+            status,
+            session.is_some_and(|id| state.send_queued(id, now)),
+            session.is_some_and(|id| state.send_undelivered(id, now)),
+            theme,
+        ),
+    }
+}
+
 impl Shell {
     /// Whether the content area renders the workspace tree: any split, extra
     /// tab, or extra pane beyond the untouched default. False = today's exact
@@ -63,8 +82,9 @@ impl Shell {
     pub(super) fn render_workspace_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         self.ensure_pane_chat_surfaces(cx);
-        let available =
-            (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0);
+        let available = self.workspace.focused_pane_bounds()
+            .map(|bounds| (f32::from(bounds.size.width) - 100.0).max(0.0))
+            .unwrap_or_else(|| (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0));
         let action_control =
             self.render_project_actions_control(available, px(self.viewport_height), cx);
         let snap =
@@ -87,13 +107,13 @@ impl Shell {
         let Some(pane) = self.workspace.focused_pane() else {
             return Empty.into_any_element();
         };
-        let (title, has_selection) = {
+        let (title, has_selection, buddy) = {
             let row = self.state.read(cx).selected_chat_row();
             let title = row
                 .and_then(|chat| chat.title.clone())
                 .map(|title| SharedString::from(transcript::single_line(&title)))
                 .unwrap_or_else(|| SharedString::from("New session"));
-            (title, row.is_some())
+            (title, row.is_some(), pane_buddy(pane, row.map(|chat| chat.id.as_str()), self.state.read(cx), theme))
         };
         let available =
             (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0);
@@ -103,7 +123,7 @@ impl Shell {
             pane,
             title,
             tab_mark(PaneMode::Chat, None),
-            theme.text_muted.opacity(0.55),
+            Some(&buddy),
             false,
             has_selection,
             action_control,
@@ -481,6 +501,9 @@ impl Shell {
                                         pane_state.mode,
                                         pane_state.provider_key.as_deref(),
                                     ),
+                                    buddy: (pane_state.mode == PaneMode::Chat).then(|| pane_buddy(
+                                        *pane_id, pane_state.session_id.as_deref(), state.read(cx), Theme::of(cx),
+                                    )),
                                     has_session: pane_state.session_id.is_some(),
                                     focused: global_focus == Some(*pane_id),
                                     transcript: surface
@@ -1787,5 +1810,101 @@ mod preview_tests {
             },
         };
         assert_eq!(preview_bounds(&state), None);
+    }
+}
+
+#[cfg(test)]
+mod buddy_tests {
+    use super::*;
+
+    #[test]
+    fn moving_sessions_keeps_their_avatar_identity() {
+        let state = AppState::new();
+        let theme = Theme::default();
+        let first = pane_buddy(PaneId(1), Some("chat-a"), &state, &theme);
+        let moved = pane_buddy(PaneId(2), Some("chat-a"), &state, &theme);
+        assert_eq!(first.session_key, moved.session_key);
+        assert_eq!(first.session_key.as_ref(), "chat-a");
+        assert_ne!(
+            pane_buddy(PaneId(1), None, &state, &theme).session_key,
+            pane_buddy(PaneId(2), None, &state, &theme).session_key,
+        );
+    }
+
+    #[test]
+    fn pane_buddy_uses_bound_chat_live_status_independent_of_selection() {
+        use zeron_proto::{Chat, ChatIndicator, Session, SessionStatus};
+
+        let mut state = AppState::new();
+        let theme = Theme::default();
+
+        let bound_chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "bound-chat",
+            "deviceId": "local",
+            "spaceId": "project",
+            "title": "Build the Fieldnotes workspace",
+            "archived": false,
+            "createdAt": "2026-09-08T00:00:00Z",
+            "config": {
+                "harness": "claude-code",
+                "model": "claude-sonnet-4-6",
+                "reasoning": null,
+                "sandbox": "workspace-write"
+            }
+        }))
+        .unwrap();
+
+        let selected_chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "selected-chat",
+            "deviceId": "local",
+            "spaceId": "project",
+            "title": "Build the Fieldnotes workspace",
+            "archived": false,
+            "createdAt": "2026-09-08T00:00:00Z",
+            "config": {
+                "harness": "claude-code",
+                "model": "claude-sonnet-4-6",
+                "reasoning": null,
+                "sandbox": "workspace-write"
+            }
+        }))
+        .unwrap();
+
+        state.chats = vec![bound_chat, selected_chat];
+        state.selected_chat = Some("selected-chat".into());
+
+        // Bound chat has live Working status via Session.
+        state.sessions = vec![Session {
+            last_completed_turn: None,
+            chat_id: "bound-chat".into(),
+            device_id: "local".into(),
+            status: SessionStatus::Working,
+            started_at: None,
+            updated_at: Utc::now(),
+        }];
+
+        let bound_buddy = pane_buddy(PaneId(1), Some("bound-chat"), &state, &theme);
+        assert_eq!(bound_buddy.session_key.as_ref(), "bound-chat");
+        assert_eq!(bound_buddy.status, ChatIndicator::Working);
+        assert_eq!(bound_buddy.status_color, theme.busy);
+
+        let selected_buddy = pane_buddy(PaneId(2), Some("selected-chat"), &state, &theme);
+        assert_eq!(selected_buddy.session_key.as_ref(), "selected-chat");
+        assert_eq!(selected_buddy.status, ChatIndicator::Idle);
+
+        // Missing session yields Idle status:
+        let missing_buddy = pane_buddy(PaneId(3), Some("missing-chat"), &state, &theme);
+        assert_eq!(missing_buddy.status, ChatIndicator::Idle);
+
+        let unassigned_buddy = pane_buddy(PaneId(4), None, &state, &theme);
+        assert_eq!(unassigned_buddy.status, ChatIndicator::Idle);
+
+        // Pending send also reflects live working status on the bound chat:
+        state.sessions.clear();
+        state.begin_pending_send("bound-chat", "msg-1", Utc::now());
+
+        let pending_buddy = pane_buddy(PaneId(1), Some("bound-chat"), &state, &theme);
+        assert_eq!(pending_buddy.status, ChatIndicator::Working);
+        assert_eq!(pending_buddy.status_color, theme.busy);
     }
 }

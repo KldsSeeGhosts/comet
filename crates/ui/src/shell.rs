@@ -747,17 +747,7 @@ const SIDEBAR_LIST_GAP: f32 = 2.0;
 const SIDEBAR_ACTIVE_HARNESS_ICON_SIZE: f32 = 13.0;
 const SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE: f32 = 14.0;
 const SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP: f32 = 10.0;
-const SIDEBAR_BOT_AVATARS: [(&str, &str); 9] = [
-    (icons::BOT_ORBIT, icons::BOT_ORBIT_BLINK),
-    (icons::BOT_VISOR, icons::BOT_VISOR_BLINK),
-    (icons::BOT_DOME, icons::BOT_DOME_BLINK),
-    (icons::BOT_BOX, icons::BOT_BOX_BLINK),
-    (icons::BOT_EARS, icons::BOT_EARS_BLINK),
-    (icons::BOT_HALO, icons::BOT_HALO_BLINK),
-    (icons::BOT_SPROUT, icons::BOT_SPROUT_BLINK),
-    (icons::BOT_BOLT, icons::BOT_BOLT_BLINK),
-    (icons::BOT_BASIC, icons::BOT_BASIC_BLINK),
-];
+
 
 /// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
@@ -5762,19 +5752,7 @@ impl Shell {
         } else {
             spaces::status_dot_color(status, theme)
         };
-        let avatar_status_color = if undelivered {
-            theme.danger
-        } else if queued {
-            theme.warning
-        } else {
-            match status {
-                zeron_proto::ChatIndicator::Working => theme.busy,
-                zeron_proto::ChatIndicator::AwaitingInput => theme.warning,
-                zeron_proto::ChatIndicator::Errored => theme.danger,
-                zeron_proto::ChatIndicator::Completed => theme.success,
-                zeron_proto::ChatIndicator::Idle => theme.text_muted.opacity(0.45),
-            }
-        };
+        let avatar_status_color = crate::sidebar_buddy::status_color(status, queued, undelivered, theme);
         let status_label: Option<&'static str> = if undelivered {
             Some("Failed")
         } else if queued {
@@ -5955,11 +5933,7 @@ impl Shell {
             text.opacity(0.8)
         };
         let row_height = chat_row_height(branch.is_some(), change_request.is_some());
-        let avatar_variant = id
-            .bytes()
-            .fold(0_u8, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte));
-        let (avatar_icon, avatar_blink_icon) =
-            SIDEBAR_BOT_AVATARS[usize::from(avatar_variant) % SIDEBAR_BOT_AVATARS.len()];
+        let (avatar_icon, avatar_blink_icon) = crate::sidebar_buddy::avatar_for_session(&id);
         let worktree = branch.clone().unwrap_or_else(|| space_name.clone());
         div()
             .id(SharedString::from(row_id.clone()))

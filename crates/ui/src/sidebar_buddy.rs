@@ -13,7 +13,42 @@ const ERROR_SHAKE: MotionSpec = MotionSpec::new(3600, EASE_IN_OUT);
 const HOVER_WIGGLE: MotionSpec = MotionSpec::new(500, EASE_IN_OUT);
 const STATUS_PULSE: MotionSpec = MotionSpec::new(1600, EASE_IN_OUT);
 
-pub fn buddy(
+/// Keep session avatars identical wherever their identity is shown.
+pub(crate) fn avatar_for_session(session: &str) -> (&'static str, &'static str) {
+    use crate::icons;
+    const AVATARS: [(&str, &str); 9] = [
+        (icons::BOT_ORBIT, icons::BOT_ORBIT_BLINK),
+        (icons::BOT_VISOR, icons::BOT_VISOR_BLINK),
+        (icons::BOT_DOME, icons::BOT_DOME_BLINK),
+        (icons::BOT_BOX, icons::BOT_BOX_BLINK),
+        (icons::BOT_EARS, icons::BOT_EARS_BLINK),
+        (icons::BOT_HALO, icons::BOT_HALO_BLINK),
+        (icons::BOT_SPROUT, icons::BOT_SPROUT_BLINK),
+        (icons::BOT_BOLT, icons::BOT_BOLT_BLINK),
+        (icons::BOT_BASIC, icons::BOT_BASIC_BLINK),
+    ];
+    let variant = session.bytes().fold(0_u8, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte));
+    AVATARS[usize::from(variant) % AVATARS.len()]
+}
+
+pub(crate) fn status_color(
+    status: zeron_proto::ChatIndicator,
+    queued: bool,
+    undelivered: bool,
+    theme: &crate::theme::Theme,
+) -> Hsla {
+    if undelivered { return theme.danger; }
+    if queued { return theme.warning; }
+    match status {
+        zeron_proto::ChatIndicator::Working => theme.busy,
+        zeron_proto::ChatIndicator::AwaitingInput => theme.warning,
+        zeron_proto::ChatIndicator::Errored => theme.danger,
+        zeron_proto::ChatIndicator::Completed => theme.success,
+        zeron_proto::ChatIndicator::Idle => theme.text_muted.opacity(0.45),
+    }
+}
+
+pub(crate) fn buddy(
     key: impl Into<SharedString>,
     image: &'static str,
     blink_image: &'static str,
@@ -21,7 +56,7 @@ pub fn buddy(
     hovered: bool,
     status_color: Hsla,
     ring_color: Hsla,
-) -> impl IntoElement {
+) -> SidebarBuddy {
     let phase = image.bytes().fold(0_u16, |hash, byte| {
         hash.wrapping_mul(31).wrapping_add(u16::from(byte))
     }) as f32
@@ -35,11 +70,12 @@ pub fn buddy(
         status_color,
         ring_color,
         phase,
+        size: 36.0,
     }
 }
 
 #[derive(IntoElement)]
-struct SidebarBuddy {
+pub(crate) struct SidebarBuddy {
     key: SharedString,
     image: &'static str,
     blink_image: &'static str,
@@ -48,6 +84,14 @@ struct SidebarBuddy {
     status_color: Hsla,
     ring_color: Hsla,
     phase: f32,
+    size: f32,
+}
+
+impl SidebarBuddy {
+    pub(crate) fn size(mut self, size: f32) -> Self {
+        self.size = size;
+        self
+    }
 }
 
 impl RenderOnce for SidebarBuddy {
@@ -63,6 +107,7 @@ impl RenderOnce for SidebarBuddy {
                         status_color: self.status_color,
                         ring_color: self.ring_color,
                         phase: self.phase,
+                        size: self.size,
                         hover_started: self.hovered.then(Instant::now),
                     })
                 });
@@ -74,7 +119,8 @@ impl RenderOnce for SidebarBuddy {
                         || view.hovered != self.hovered
                         || view.status_color != self.status_color
                         || view.ring_color != self.ring_color
-                        || view.phase != self.phase;
+                        || view.phase != self.phase
+                        || view.size != self.size;
                     if changed {
                         view.image = self.image;
                         view.blink_image = self.blink_image;
@@ -83,6 +129,7 @@ impl RenderOnce for SidebarBuddy {
                         view.status_color = self.status_color;
                         view.ring_color = self.ring_color;
                         view.phase = self.phase;
+                        view.size = self.size;
                         if hover_started {
                             view.hover_started = Some(Instant::now());
                         }
@@ -92,7 +139,7 @@ impl RenderOnce for SidebarBuddy {
                 (view.clone(), view)
             })
         });
-        view.cached(gpui::StyleRefinement::default().w(px(36.0)).h(px(36.0)))
+        view.cached(gpui::StyleRefinement::default().w(px(self.size)).h(px(self.size)))
     }
 }
 
@@ -104,6 +151,7 @@ struct SidebarBuddyView {
     status_color: Hsla,
     ring_color: Hsla,
     phase: f32,
+    size: f32,
     hover_started: Option<Instant>,
 }
 
@@ -156,22 +204,23 @@ impl Render for SidebarBuddyView {
             1.0
         };
 
+        let scale = self.size / 36.0;
         div()
             .relative()
-            .size(px(36.0))
+            .size(px(self.size))
             .child(
                 img(if blink { self.blink_image } else { self.image })
-                    .size(px(36.0))
+                    .size(px(self.size))
                     .relative()
-                    .top(px(top))
-                    .left(px(left)),
+                    .top(px(top * scale))
+                    .left(px(left * scale)),
             )
             .child(
                 div()
                     .absolute()
-                    .right(px(-1.0))
-                    .bottom(px(-1.0))
-                    .size(px(13.0))
+                    .right(px(-scale))
+                    .bottom(px(-scale))
+                    .size(px(13.0 * scale))
                     .rounded_full()
                     .bg(self.ring_color)
                     .flex()
@@ -179,11 +228,37 @@ impl Render for SidebarBuddyView {
                     .justify_center()
                     .child(
                         div()
-                            .size(px(9.0))
+                            .size(px(9.0 * scale))
                             .rounded_full()
                             .bg(self.status_color)
                             .opacity(dot_opacity),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_failures_and_queue_override_working_color() {
+        let theme = crate::theme::Theme::default();
+        let working = zeron_proto::ChatIndicator::Working;
+        assert_eq!(status_color(working, false, false, &theme), theme.busy);
+        assert_eq!(status_color(working, true, false, &theme), theme.warning);
+        assert_eq!(status_color(working, true, true, &theme), theme.danger);
+    }
+
+    #[test]
+    fn avatar_for_session_regression_chat_0_and_browser_fixture() {
+        assert_eq!(
+            avatar_for_session("chat-0"),
+            (crate::icons::BOT_BASIC, crate::icons::BOT_BASIC_BLINK)
+        );
+        assert_eq!(
+            avatar_for_session("browser-fixture"),
+            (crate::icons::BOT_VISOR, crate::icons::BOT_VISOR_BLINK)
+        );
     }
 }
