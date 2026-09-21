@@ -20,6 +20,8 @@ struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var path: [Route] = []
     @State private var showNewSpace = false
+    @State private var showAppearance = false
+    @State private var showComputers = false
     @State private var showProjectlessDevices = false
     // "" = All. Sticky across launches; falls back to All if the space is gone.
     @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
@@ -42,7 +44,7 @@ struct HomeView: View {
             .scrollContentBackground(.hidden)
             .scrollEdgeEffectStyle(.soft, for: .top)
             .background(Theme.surface.ignoresSafeArea())
-            .navigationTitle("Zeron")  // feeds the back menu; not displayed
+            .navigationTitle("Noches")  // feeds the back menu; not displayed
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(removing: .title)
             .navigationDestination(for: Route.self) { route in
@@ -106,12 +108,16 @@ struct HomeView: View {
                         if model.demo != nil {
                             Text("Demo mode")
                         }
+                        Button("Appearance") { showAppearance = true }
+                        Button("Paired computers") { showComputers = true }
                         Button("Sign out", role: .destructive) { model.signOut() }
                     } label: {
                         Image(systemName: "person.circle")
                     }
                 }
             }
+            .sheet(isPresented: $showComputers) { CompanionView() }
+            .sheet(isPresented: $showAppearance) { NavigationStack { AppearanceSettingsView() } }
             .sheet(isPresented: $showNewSpace) {
                 NewSpaceSheet { spaceId in
                     path.append(.space(spaceId))

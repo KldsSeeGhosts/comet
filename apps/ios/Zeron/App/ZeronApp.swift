@@ -13,7 +13,7 @@ struct ZeronApp: App {
         WindowGroup {
             RootView()
                 .environment(model)
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(AppearanceSettings.shared.scheme)
                 // Monochrome controls: glass buttons, toolbar icons, and
                 // toggles render white like the desktop — accent stays paint
                 // for status/markdown, never chrome.
@@ -37,11 +37,14 @@ struct ZeronApp: App {
 
 struct RootView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Group {
             switch model.phase {
             case .signedOut:
+                CompanionView()
+            case .reauthenticationRequired:
                 SignInView()
             case .pickingOrg(let tokens, let orgs):
                 OrgPickerView(tokens: tokens, orgs: orgs)
@@ -49,6 +52,10 @@ struct RootView: View {
                 HomeView()
             }
         }
-        .task { model.restore() }
+        .task { model.restore(); AppearanceSettings.shared.systemDark = colorScheme == .dark }
+        .onChange(of: colorScheme) { _, value in AppearanceSettings.shared.systemDark = value == .dark }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+            model.handleMemoryWarning()
+        }
     }
 }

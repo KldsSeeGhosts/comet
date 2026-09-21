@@ -45,7 +45,7 @@ struct SignInView: View {
                     ZeronMark()
                         .frame(width: 72, height: 72)
                     VStack(spacing: 6) {
-                        Text("Zeron")
+                        Text("Noches")
                             .font(Theme.sans(28, weight: .semibold))
                             .kerning(-0.5)
                             .foregroundStyle(Theme.text)
@@ -56,6 +56,9 @@ struct SignInView: View {
                 }
 
                 VStack(spacing: 12) {
+                    if let message = model.reauthenticationMessage {
+                        Text(message).font(Theme.sans(14)).foregroundStyle(Theme.textMuted)
+                    }
                     Button {
                         signIn()
                     } label: {
@@ -64,7 +67,7 @@ struct SignInView: View {
                                 ProgressView()
                                     .tint(Theme.bg)
                             } else {
-                                Text("Log in to Zeron")
+                                Text("Connect cloud account")
                                     .font(Theme.sans(15, weight: .semibold))
                                     .foregroundStyle(Theme.bg)
                             }
@@ -204,7 +207,7 @@ struct OrgPickerView: View {
                             }
                             .padding(.horizontal, 16)
                             .frame(height: 48)
-                            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 14))
+                            .nochesGlass(.regular.interactive(), in: RoundedRectangle(cornerRadius: 14))
                         }
                         .disabled(busy)
                     }
