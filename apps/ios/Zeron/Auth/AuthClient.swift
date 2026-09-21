@@ -29,6 +29,21 @@ enum AuthError: LocalizedError {
     case http(Int, String)
     case invalidResponse
 
+    var isTerminal: Bool {
+        switch self {
+        case .http(let status, let body):
+            // The legacy edge maps even network failures to 401. Only an
+            // explicit OAuth invalid_grant establishes terminal rejection.
+            guard status == 400 || status == 401,
+                  let data = body.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+            return (json["code"] as? String) == "invalid_grant"
+                || (json["error"] as? String) == "invalid_grant"
+        case .invalidResponse:
+            return false
+        }
+    }
+
     var errorDescription: String? {
         switch self {
         case .http(let code, let body): return "Auth failed (\(code)): \(body)"

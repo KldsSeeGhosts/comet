@@ -1,15 +1,9 @@
-// Session-wide connection config: edge base URL, identity, token minting for
-// room sockets (WS auth rides the URL query — sockets can't set headers), and
-// the durable-nudge POST. Thread-safe (rooms call in from their actors).
-
+// Session-wide identity and credentials. Retirement and credential persistence
+// share one lock so an old refresh cannot write after sign-out clears Keychain.
 import Foundation
 
 final class AppConfig: @unchecked Sendable {
-    enum Mode: String {
-        case workos
-        case dev
-    }
-
+    enum Mode: String { case workos, dev }
     let edgeURL: URL
     let mode: Mode
     let userId: String
@@ -19,19 +13,22 @@ final class AppConfig: @unchecked Sendable {
 
     private let lock = NSLock()
     private var tokens: AuthTokens?
-    private var devBearer: String?
-    /// In-flight refresh shared by every caller (single-flight). WorkOS
-    /// refresh tokens are SINGLE-USE (rotated per use, desktop auth.rs
-    /// refresh_gate): without this, a cold launch's N room dials raced N
-    /// concurrent refreshes with the same token — one won and rotated it,
-    /// the rest failed, dialed with the dead access token, got rejected,
-    /// and every socket sat in backoff. That was the 5–10s "connecting"
-    /// stall on every app open past token expiry (~5 min).
+    private let devBearer: String?
     private var refreshTask: Task<String?, Never>?
+    private var retired = false
+    private var needsReauthentication = false
+    private let refreshTokens: @Sendable (String, String) async throws -> AuthTokens
+    private let persistTokens: @Sendable (AuthTokens) -> Void
+    @MainActor var onTerminalAuthError: (() -> Void)?
 
     init(edgeURL: URL, mode: Mode, userId: String, orgId: String,
          deviceId: String, deviceName: String,
-         tokens: AuthTokens? = nil, devBearer: String? = nil) {
+         tokens: AuthTokens? = nil, devBearer: String? = nil,
+         refreshTokens: (@Sendable (String, String) async throws -> AuthTokens)? = nil,
+         persistTokens: @escaping @Sendable (AuthTokens) -> Void = {
+             Keychain.save($0.accessToken, key: "accessToken")
+             Keychain.save($0.refreshToken, key: "refreshToken")
+         }) {
         self.edgeURL = edgeURL
         self.mode = mode
         self.userId = userId
@@ -40,60 +37,75 @@ final class AppConfig: @unchecked Sendable {
         self.deviceName = deviceName
         self.tokens = tokens
         self.devBearer = devBearer
-    }
-
-    func updateTokens(_ new: AuthTokens) {
-        lock.withLock {
-            tokens = new
+        self.refreshTokens = refreshTokens ?? { token, org in
+            try await AuthClient(baseURL: edgeURL).refresh(refreshToken: token, organizationId: org)
         }
+        self.persistTokens = persistTokens
     }
 
-    /// Current bearer, refreshing the WorkOS access token when needed.
-    func currentToken() async -> String? {
-        switch mode {
-        case .dev:
-            return lock.withLock { devBearer }
-        case .workos:
-            let current = lock.withLock { tokens }
-            guard let current else { return nil }
-            if !Self.isExpired(jwt: current.accessToken) {
-                return current.accessToken
-            }
-            return await refreshedToken(current: current)
-        }
-    }
+    var isRetired: Bool { lock.withLock { retired } }
 
-    /// Join (or start) the one in-flight refresh. The task clears itself
-    /// under the lock as its last act, so a caller either joins a live
-    /// refresh or starts a fresh one — never a second concurrent POST.
-    private func refreshedToken(current: AuthTokens) async -> String? {
+    func retire() {
         let task = lock.withLock {
-            if let existing = refreshTask {
-                return existing
-            }
+            retired = true
+            tokens = nil
+            let task = refreshTask
+            refreshTask = nil
+            return task
+        }
+        task?.cancel()
+    }
 
-            let task = Task<String?, Never> { [edgeURL, orgId] in
-                let client = AuthClient(baseURL: edgeURL)
-                let refreshed = try? await client.refresh(refreshToken: current.refreshToken,
-                                                          organizationId: orgId)
-                if let refreshed {
-                    self.updateTokens(refreshed)
-                    Keychain.save(refreshed.accessToken, key: "accessToken")
-                    Keychain.save(refreshed.refreshToken, key: "refreshToken")
-                } else {
-                    roomLog.error("auth: token refresh failed; using expired access token (server will reject and rooms will redial)")
+    func currentToken() async -> String? {
+        let available = lock.withLock { !retired && !needsReauthentication }
+        guard available else { return nil }
+        if mode == .dev { return lock.withLock { retired ? nil : devBearer } }
+        guard let current = lock.withLock({ tokens }) else { return nil }
+        if !Self.isExpired(jwt: current.accessToken) {
+            return lock.withLock { retired || needsReauthentication ? nil : current.accessToken }
+        }
+        return await refreshedToken()
+    }
+
+    private func refreshedToken() async -> String? {
+        let task: Task<String?, Never>? = lock.withLock {
+            guard !retired, !needsReauthentication, let current = tokens else { return nil }
+            if let existing = refreshTask { return existing }
+            // A caller that waited for the lock may already have fresh tokens.
+            if !Self.isExpired(jwt: current.accessToken) { return Task { current.accessToken } }
+            let task = Task<String?, Never> { [self] in
+                do {
+                    let refreshed = try await refreshTokens(current.refreshToken, orgId)
+                    return lock.withLock {
+                        guard !retired, !Task.isCancelled else { return nil }
+                        tokens = refreshed
+                        // Keep the write inside the retirement boundary. retire()
+                        // cannot return until these writes have completed.
+                        persistTokens(refreshed)
+                        refreshTask = nil
+                        return refreshed.accessToken
+                    }
+                } catch {
+                    let terminal = (error as? AuthError)?.isTerminal ?? false
+                    let fallback: String? = lock.withLock {
+                        guard !retired, !Task.isCancelled else { return nil }
+                        refreshTask = nil
+                        if terminal { needsReauthentication = true }
+                        return terminal ? nil : current.accessToken
+                    }
+                    if terminal {
+                        await MainActor.run {
+                            guard !self.isRetired else { return }
+                            self.onTerminalAuthError?()
+                        }
+                    }
+                    return fallback
                 }
-                self.lock.withLock {
-                    self.refreshTask = nil
-                }
-                // Failure falls back to the expired token: let the server
-                // reject; the rooms' backoff redials retry through here.
-                return refreshed?.accessToken ?? current.accessToken
             }
             refreshTask = task
             return task
         }
-        return await task.value
+        return await task?.value
     }
 
     private var wsBase: URL {

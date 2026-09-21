@@ -107,7 +107,7 @@ final class SessionStore {
     /// The shared relay to the chat's host device (uploads, sending a queued
     /// message now). Nil while the chat has no host to ask.
     func hostRelayClient() -> DeviceRelayClient? {
-        guard let hostDeviceId else { return nil }
+        guard !config.isRetired, let hostDeviceId else { return nil }
         if let hostRelay, hostRelay.deviceId == hostDeviceId {
             return hostRelay.client
         }
@@ -133,8 +133,10 @@ final class SessionStore {
     /// path on that device (what the refs trailer carries).
     func uploadAttachment(name: String, data: Data, uploadId: String? = nil,
                           progress: (@MainActor @Sendable (Double) -> Void)? = nil) async throws -> String {
-        try await uploadAttachmentChunked(relay: relayToHost(), name: name, data: data,
-                                          uploadId: uploadId, progress: progress)
+        activeUploads += 1
+        defer { activeUploads -= 1 }
+        return try await uploadAttachmentChunked(relay: relayToHost(), name: name, data: data,
+                                                uploadId: uploadId, progress: progress)
     }
 
     /// Demo-mode injection point (also used by previews).
@@ -145,10 +147,13 @@ final class SessionStore {
     }
 
     @ObservationIgnored private var saver: DocSaver?
+    @ObservationIgnored private var stopped = false
+    @ObservationIgnored private var projectTask: Task<Void, Never>?
 
     func start(holdDial: Bool = false) {
-        guard !started, !offline else { return }
+        guard !started, !offline, !config.isRetired else { return }
         started = true
+        stopped = false
         self.holdDial = holdDial
         // Local-first: the last-synced chat2 snapshot renders instantly (even
         // when the host device is offline); the join backfills incrementally
@@ -175,7 +180,7 @@ final class SessionStore {
         let localSub = doc.subscribeLocalUpdate { [weak self] update in
             let bytes = Data(update)
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, !self.stopped, !self.config.isRetired else { return }
                 if let room = self.chatRoom {
                     Task { await room.enqueue(update: bytes) }
                 }
@@ -206,13 +211,13 @@ final class SessionStore {
     /// End a preload dial-hold: an open view (or the stagger timer) wants
     /// live sync now.
     func releaseDial() {
-        guard holdDial else { return }
+        guard started, !stopped, holdDial else { return }
         holdDial = false
         connectIfReady()
     }
 
     private func connectIfReady() {
-        guard started, !offline, !holdDial, chatRoom == nil, roomGen >= 2 else { return }
+        guard started, !stopped, !config.isRetired, !offline, !holdDial, chatRoom == nil, roomGen >= 2 else { return }
         let delegate = ChatRoomClient.Delegate(
             cursor: { [weak self] in self?.cursor ?? 0 },
             containsFrontier: { [weak self] frontier in
@@ -223,7 +228,7 @@ final class SessionStore {
                 // depends on the chat's founding ops ("Add Tweets" incident,
                 // 2026-08-18). Empty fails the decode: NOT contained, fetch —
                 // always safe, never silently skips history.
-                guard let self, !frontier.isEmpty,
+                guard let self, !self.stopped, !self.config.isRetired, !frontier.isEmpty,
                       let vv = try? VersionVector.decode(bytes: frontier) else { return false }
                 // A decoded-but-EMPTY version vector is a vacuous claim every
                 // doc "includes" — the actual poison, one representation
@@ -235,7 +240,7 @@ final class SessionStore {
                 return self.doc.oplogVv().includesVv(other: vv)
             },
             applyCheckpoint: { [weak self] bytes, seq in
-                guard let self,
+                guard let self, !self.stopped, !self.config.isRetired,
                       (try? self.doc.importWith(bytes: bytes, origin: "remote")) != nil else {
                     return false
                 }
@@ -245,7 +250,7 @@ final class SessionStore {
                 return true
             },
             applyRow: { [weak self] bytes, seq in
-                guard let self else { return }
+                guard let self, !self.stopped, !self.config.isRetired else { return }
                 // Malformed remote bytes cost the row, never the doc. The
                 // cursor still advances: replaying a poison row forever is
                 // the wedge class chat2 replaces.
@@ -257,12 +262,12 @@ final class SessionStore {
                 self.saver?.poke()
             },
             advanceCursor: { [weak self] seq in
-                guard let self else { return }
+                guard let self, !self.stopped, !self.config.isRetired else { return }
                 self.cursor = max(self.cursor, seq)
                 self.saver?.poke()
             },
             clampCursor: { [weak self] seq in
-                guard let self, self.cursor > seq else { return }
+                guard let self, !self.stopped, !self.config.isRetired, self.cursor > seq else { return }
                 // Cursor amnesty (see ChatRoomClient): a cursor above the
                 // room's checkpoint is only as trustworthy as the doc under
                 // it — rows imported while their deps were missing PARK
@@ -277,7 +282,7 @@ final class SessionStore {
                 self.saver?.poke()
             },
             setCursor: { [weak self] seq in
-                guard let self, self.cursor != seq else { return }
+                guard let self, !self.stopped, !self.config.isRetired, self.cursor != seq else { return }
                 if seq < self.cursor {
                     self.cursorVerified = false
                 }
@@ -286,7 +291,7 @@ final class SessionStore {
             },
             cursorVerified: { [weak self] in self?.cursorVerified ?? false },
             setCursorVerified: { [weak self] verified in
-                guard let self, self.cursorVerified != verified else { return }
+                guard let self, !self.stopped, !self.config.isRetired, self.cursorVerified != verified else { return }
                 self.cursorVerified = verified
                 self.saver?.poke()
             },
@@ -315,10 +320,14 @@ final class SessionStore {
         // the doc's full update log as the join's first batch; once acked
         // the cursor moves and this never re-arms.
         if cursor == 0,
-           let all = try? doc.export(mode: .updates(from: VersionVector())), !all.isEmpty {
+            let all = try? doc.export(mode: .updates(from: VersionVector())), !all.isEmpty {
             Task { await client.enqueue(update: all) }
         }
-        Task { await client.start() }
+        Task { @MainActor [weak self] in
+            guard let self, !self.stopped, !self.config.isRetired, self.chatRoom === client else { return }
+            await client.start()
+            if self.stopped || self.config.isRetired { await client.stop() }
+        }
     }
 
     /// Mine the retired s2 snapshot for OUR OWN still-pending commands and
@@ -360,7 +369,7 @@ final class SessionStore {
 
     /// Backgrounding hook: persist immediately.
     func flushToDisk() {
-        saver?.flush()
+        saver?.flush(force: true)
     }
 
     /// Foreground hook: revive the room after a suspension (see
@@ -374,8 +383,19 @@ final class SessionStore {
     }
 
     func stop() {
+        started = false
+        stopped = true
+        projectTask?.cancel()
+        projectTask = nil
+        projecting = false
+        projectPending = false
+        escortTasks.values.forEach { $0.cancel() }
+        escortTasks.removeAll()
+        if let relay = hostRelay?.client { Task { await relay.close() } }
+        hostRelay = nil
         subscriptions.removeAll()
-        saver?.flush()
+        saver?.flush(force: true)
+        saver = nil
         if let chatRoom {
             Task { await chatRoom.stop() }
         }
@@ -384,6 +404,7 @@ final class SessionStore {
     }
 
     private func handle(_ event: ChatRoomEvent) {
+        guard !stopped, !config.isRetired else { return }
         switch event {
         case .connected:
             connected = true
@@ -412,17 +433,18 @@ final class SessionStore {
     /// Overlapping calls coalesce to a single trailing re-run — a streaming
     /// burst must not queue one whole-doc projection per token.
     private func project() {
+        guard !stopped else { return }
         guard !projecting else {
             projectPending = true
             return
         }
         projecting = true
         let doc = self.doc
-        Task { @MainActor [weak self] in
+        projectTask = Task { @MainActor [weak self] in
             let decoded = await Task.detached(priority: .userInitiated) {
                 Self.decodeEntries(from: doc)
             }.value
-            guard let self else { return }
+            guard let self, !Task.isCancelled, !self.stopped else { return }
             self.projecting = false
             if let decoded {
                 self.apply(decoded.entries, queue: decoded.queue)
@@ -693,6 +715,15 @@ final class SessionStore {
 
     /// uploadIds an escort is actively pushing — retry/respawn dedupes on it.
     @ObservationIgnored private var activeEscorts: Set<String> = []
+    @ObservationIgnored private var escortTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var activeUploads = 0
+
+    var hasPendingWork: Bool {
+        if activeUploads > 0 || !pendingSends.isEmpty || !activeEscorts.isEmpty || !queue.isEmpty { return true }
+        // Projection is asynchronous; consult durable commands too before eviction.
+        guard let commands = doc.getList(id: "commands").getDeepValue().listValue else { return false }
+        return commands.contains { $0.mapValue?["status"]?.stringValue == "pending" }
+    }
     /// Fraction of the current escort batch's bytes committed to the host
     /// (PR #185's "the ring tracks the real relay transfer" — the status
     /// strip narrates it as "Uploading… N%"). nil = no transfer in flight.
@@ -712,8 +743,10 @@ final class SessionStore {
         for transfer in remaining {
             activeEscorts.insert(transfer.uploadId)
         }
-        Task { @MainActor [weak self] in
+        let taskId = UUID()
+        escortTasks[taskId] = Task { @MainActor [weak self] in
             defer {
+                self?.escortTasks.removeValue(forKey: taskId)
                 for transfer in remaining {
                     self?.activeEscorts.remove(transfer.uploadId)
                 }
@@ -723,7 +756,7 @@ final class SessionStore {
             var backoffMs = Self.transferBackoffBaseMs
             let deadline = nowMs() + Self.attachmentWaitMaxMs
             let totalBytes = max(remaining.reduce(0) { $0 + $1.data.count }, 1)
-            while let self, !pending.isEmpty, nowMs() < deadline {
+            while let self, !Task.isCancelled, !self.config.isRetired, !pending.isEmpty, nowMs() < deadline {
                 do {
                     while let transfer = pending.first {
                         let doneBytes = totalBytes - pending.reduce(0) { $0 + $1.data.count }
@@ -735,12 +768,15 @@ final class SessionStore {
                                 (Double(doneBytes) + fraction * Double(transfer.data.count))
                                     / Double(totalBytes), 0.99)
                         }
+                        try Task.checkCancellation()
+                        guard !self.config.isRetired else { return }
                         UploadStash.delete(uploadId: transfer.uploadId)
                         pending.removeFirst()
                     }
                     self.nudgeHost()
                     return
                 } catch {
+                    if Task.isCancelled || self.config.isRetired { return }
                     roomLog.warning("chat2 \(self.chatId, privacy: .public): attachment transfer failed (\(error.localizedDescription, privacy: .public)); retrying in \(backoffMs)ms")
                     await OnlineBus.shared.waitBackoff(ms: backoffMs)
                     backoffMs = min(backoffMs * 2, Self.transferBackoffCapMs)

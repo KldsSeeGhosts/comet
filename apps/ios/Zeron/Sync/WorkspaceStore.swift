@@ -57,7 +57,7 @@ final class WorkspaceStore {
     }
 
     func start() {
-        guard client == nil else { return }
+        guard client == nil, !config.isRetired else { return }
         // Local-first: hydrate from the on-device blob before joining — the
         // sidebar renders immediately and the hello backfills from our
         // cursor. First run after the update: no blob → cursor null → the
@@ -81,7 +81,11 @@ final class WorkspaceStore {
                                     urlProvider: { [config] in await config.registrySocketURL() },
                                     delegate: delegate)
         self.client = client
-        Task { await client.start() }
+        Task { @MainActor [weak self] in
+            guard let self, !self.config.isRetired, self.client === client else { return }
+            await client.start()
+            if self.config.isRetired || self.client !== client { await client.stop() }
+        }
         // Pull-first bootstrap + poll-while-down: one HTTPS GET syncs the
         // sidebar in ~1 RTT while the socket dials, and while the socket is
         // down (airplane wifi strips WS upgrades) a 20s poll keeps rows,
@@ -186,6 +190,7 @@ final class WorkspaceStore {
         pollTask?.cancel()
         pollTask = nil
         saver?.flush()
+        saver = nil
         if let client {
             Task { await client.stop() }
         }
@@ -202,6 +207,7 @@ final class WorkspaceStore {
     // MARK: Server events (delivered in frame order — rows before ack)
 
     private func handle(_ event: RegistryEvent) {
+        guard !config.isRetired else { return }
         switch event {
         case .state(let seq, let full, let gcFloor, let rows, let beats):
             // On a state frame with full=true and seq < our cursor (server

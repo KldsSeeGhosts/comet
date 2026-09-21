@@ -97,9 +97,33 @@ enum DocDisk {
         var data = chat2Magic
         var le = cursor.littleEndian
         withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
-        data.append(verified ? 1 : 0)
+        // Bit 1 marks pending-command metadata as known; bit 2 pins unsent work.
+        // The snapshot and flags are replaced atomically, so eviction cannot
+        // observe a clean marker alongside newly queued commands.
+        let pending = doc.getList(id: "commands").getDeepValue().listValue?.contains {
+            $0.mapValue?["status"]?.stringValue == "pending"
+        } ?? false
+        data.append((verified ? 1 : 0) | 2 | (pending ? 4 : 0))
         data.append(snapshot)
         try? data.write(to: chat2URL(for: id), options: .atomic)
+    }
+
+    /// Read a cheap header for new snapshots; older caches need one document
+    /// inspection before deciding whether their pending work must stay warm.
+    static func hasPendingCommands(id: String) -> Bool {
+        let url = chat2URL(for: id)
+        if let file = try? FileHandle(forReadingFrom: url) {
+            defer { try? file.close() }
+            if let header = try? file.read(upToCount: 17), header.count == 17,
+               header.prefix(8) == chat2Magic, header[16] & 2 != 0 {
+                return header[16] & 4 != 0
+            }
+        }
+        let doc = LoroDoc()
+        if loadChat2(into: doc, id: id) == nil { _ = load(into: doc, id: id) }
+        return doc.getList(id: "commands").getDeepValue().listValue?.contains {
+            $0.mapValue?["status"]?.stringValue == "pending"
+        } ?? false
     }
 
     /// LRU-prune session snapshots (the workspace registry blob is always
@@ -156,8 +180,8 @@ final class DocSaver {
         }
     }
 
-    func flush() {
-        guard dirty else { return }
+    func flush(force: Bool = false) {
+        guard dirty || force else { return }
         dirty = false
         save()
     }

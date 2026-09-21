@@ -57,8 +57,8 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
     for (ix, raw) in lines.enumerated() where ix > 0 {
         let line = raw.trimmingCharacters(in: .whitespaces)
         if lines[ix - 1].trimmingCharacters(in: .whitespaces).isEmpty,
-           line.lowercased().hasPrefix("attached images (local files"),
-           line.hasSuffix("):") {
+            line.lowercased().hasPrefix("attached images (local files"),
+            line.hasSuffix("):") {
             markerIx = ix
             break
         }
@@ -130,10 +130,10 @@ struct StagedAttachment: Identifiable, Hashable {
             ext = "jpg"
         }
         guard bytes.count <= maxAttachmentBytes, let ext,
-              let image = UIImage(data: bytes) else { return nil }
+              let loaded = AttachmentImageCache.decodeOrdinaryImage(bytes, maxPixelSize: 2048) else { return nil }
         let id = UUID().uuidString.lowercased()
         return StagedAttachment(id: id, name: "photo-\(id.prefix(8)).\(ext)",
-                                data: bytes, image: image)
+                                data: bytes, image: loaded.image)
     }
 
     /// Magic-byte sniff for the formats both ends support.
@@ -144,7 +144,7 @@ struct StagedAttachment: Identifiable, Hashable {
         if b[0] == 0xFF, b[1] == 0xD8, b[2] == 0xFF { return "jpg" }
         if b[0] == 0x47, b[1] == 0x49, b[2] == 0x46, b[3] == 0x38 { return "gif" }
         if b[0] == 0x52, b[1] == 0x49, b[2] == 0x46, b[3] == 0x46,
-           b[8] == 0x57, b[9] == 0x45, b[10] == 0x42, b[11] == 0x50 { return "webp" }
+            b[8] == 0x57, b[9] == 0x45, b[10] == 0x42, b[11] == 0x50 { return "webp" }
         return nil
     }
 }
@@ -305,9 +305,18 @@ final class AttachmentImageCache {
 
     func configure(config: AppConfig) {
         if self.config !== config {
+            reset()
             self.config = config
-            relays = [:]
         }
+    }
+
+    func reset() {
+        config = nil
+        entries.removeAll()
+        loadedBytes = 0
+        let oldRelays = Array(relays.values)
+        relays.removeAll()
+        for relay in oldRelays { Task { await relay.close() } }
     }
 
     func snapshot(deviceId: String, path: String, expectedMimeType: String? = nil) -> Snapshot {
@@ -340,7 +349,7 @@ final class AttachmentImageCache {
         case .none:
             attempts = 0
         }
-        guard let config else { return }
+        guard let config, !config.isRetired else { return }
         entries[key] = .loading(attempts: attempts)
         let relay = relays[deviceId] ?? {
             let client = DeviceRelayClient(deviceId: deviceId, config: config)
@@ -349,7 +358,8 @@ final class AttachmentImageCache {
         }()
         Task { @MainActor [weak self] in
             let loaded = await Self.readImage(relay: relay, path: path, expectedMimeType: expectedMimeType)
-            guard let self, case .loading? = self.entries[key] else { return }
+            guard let self, self.config === config, !config.isRetired,
+                  case .loading? = self.entries[key] else { return }
             if let loaded {
                 self.store(key: key, name: loaded.name, image: loaded.image, bytes: loaded.bytes)
             } else {
@@ -366,8 +376,21 @@ final class AttachmentImageCache {
             store(key: Key(deviceId: deviceId, path: path, expectedMimeType: expectedMimeType),
                   name: name, image: loaded.image, bytes: loaded.bytes)
         } else {
-            guard let image = UIImage(data: data) else { return }
-            store(key: Key(deviceId: deviceId, path: path), name: name, image: image, bytes: data.count)
+            guard let loaded = Self.decodeOrdinaryImage(data) else { return }
+            store(key: Key(deviceId: deviceId, path: path), name: name, image: loaded.image, bytes: loaded.bytes)
+        }
+    }
+
+    func prune(targetBytes: Int = 0) {
+        let target = max(targetBytes, 0)
+        while loadedBytes > target {
+            let oldest = entries.compactMap { entry -> (UInt64, Key, Int)? in
+                guard case .loaded(_, _, let bytes, let used) = entry.value else { return nil }
+                return (used, entry.key, bytes)
+            }.min { $0.0 < $1.0 }
+            guard let oldest else { break }
+            entries.removeValue(forKey: oldest.1)
+            loadedBytes -= oldest.2
         }
     }
 
@@ -434,8 +457,28 @@ final class AttachmentImageCache {
             }).value else { return nil }
             return (displayName, loaded.image, loaded.bytes)
         }
-        guard let image = UIImage(data: data) else { return nil }
-        return (displayName, image, data.count)
+        guard let loaded = await Task.detached(priority: .utility, operation: {
+            Self.decodeOrdinaryImage(data)
+        }).value else { return nil }
+        return (displayName, loaded.image, loaded.bytes)
+    }
+
+    /// Decode an ordinary image with bounded dimensions (max 2048px), downsampling
+    /// and accounting for decoded bitmap resident memory (bytesPerRow * height).
+    nonisolated static func decodeOrdinaryImage(_ data: Data, maxPixelSize: Int = 2048)
+        -> (image: UIImage, bytes: Int)? {
+        guard !data.isEmpty,
+              let source = CGImageSourceCreateWithData(data as CFData,
+                  [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
+        if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ] as CFDictionary) {
+            return (UIImage(cgImage: cgImage), cgImage.bytesPerRow * cgImage.height)
+        }
+        return nil // A failed bounded decode must not fall back to a full bitmap.
     }
 
     nonisolated static let generatedMaxBytes = 24 * 1024 * 1024
@@ -486,7 +529,7 @@ struct AttachmentStripView: View {
                         .frame(width: 56, height: 56)
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                         .overlay(RoundedRectangle(cornerRadius: 10)
-                            .strokeBorder(whiteAlpha(0.11), lineWidth: 1))
+                            .strokeBorder(Theme.wash(0.11), lineWidth: 1))
                 }
                 .buttonStyle(.plain)
                 .overlay(alignment: .topTrailing) {
@@ -498,7 +541,7 @@ struct AttachmentStripView: View {
                             .foregroundStyle(Theme.text)
                             .frame(width: 18, height: 18)
                             .background(.black.opacity(0.65), in: Circle())
-                            .overlay(Circle().strokeBorder(whiteAlpha(0.2), lineWidth: 1))
+                            .overlay(Circle().strokeBorder(Theme.wash(0.2), lineWidth: 1))
                     }
                     .buttonStyle(.plain)
                     .offset(x: 5, y: -5)
@@ -590,9 +633,9 @@ struct AttachmentThumbView: View {
                 .buttonStyle(.plain)
             }
         }
-        .background(whiteAlpha(0.035))
+        .background(Theme.wash(0.035))
         .clipShape(RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(whiteAlpha(0.11), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.wash(0.11), lineWidth: 1))
         .task(id: "\(deviceId)|\(path)") {
             cache.load(deviceId: deviceId, path: path)
         }
@@ -667,7 +710,7 @@ struct GeneratedImageView: View {
                     .tint(Theme.textFaint)
                     .frame(maxWidth: .infinity)
                     .frame(height: 220)
-                    .background(whiteAlpha(0.035), in: RoundedRectangle(cornerRadius: 12))
+                    .background(Theme.wash(0.035), in: RoundedRectangle(cornerRadius: 12))
                     .accessibilityLabel("Loading generated image")
             case .error:
                 Button {
@@ -681,7 +724,7 @@ struct GeneratedImageView: View {
                         .foregroundStyle(Theme.textFaint)
                         .frame(maxWidth: .infinity)
                         .frame(height: 220)
-                        .background(whiteAlpha(0.035), in: RoundedRectangle(cornerRadius: 12))
+                        .background(Theme.wash(0.035), in: RoundedRectangle(cornerRadius: 12))
                 }
                 .buttonStyle(.plain)
                 .accessibilityHint("Tap to retry")

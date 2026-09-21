@@ -13,6 +13,7 @@ import os
 final class AppModel {
     enum Phase {
         case signedOut
+        case reauthenticationRequired
         case pickingOrg(AuthTokens, [AuthOrg])
         case ready
     }
@@ -25,6 +26,13 @@ final class AppModel {
     let connectivity = ConnectivityCenter()
     private var sessionStores: [String: SessionStore] = [:]
     private var config: AppConfig?
+    var reauthenticationMessage: String?
+    @ObservationIgnored private var lifecycleGeneration: UInt64 = 0
+    @ObservationIgnored private var preloadTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var visibleSessions: Set<String> = []
+    @ObservationIgnored private var sessionUse: [String: UInt64] = [:]
+    @ObservationIgnored private var useCounter: UInt64 = 0
+    @ObservationIgnored private var diskPending: [String: (Date, Bool)] = [:]
     @ObservationIgnored private var pathMonitor: NWPathMonitor?
     @ObservationIgnored private var lastPathKey: String?
 
@@ -197,12 +205,15 @@ final class AppModel {
     /// WorkOS paste-code exchange. Returns the org list for the picker (or
     /// connects straight away when exactly one org exists).
     func signIn(edgeURL: URL, code: String) async throws {
+        let generation = lifecycleGeneration
         let client = AuthClient(baseURL: edgeURL)
         let (user, tokens) = try await client.exchange(code: code)
+        guard generation == lifecycleGeneration else { throw CancellationError() }
         edgeURLString = edgeURL.absoluteString
         authModeRaw = AppConfig.Mode.workos.rawValue
         storedUserId = user.id
         let orgs = try await client.orgs(accessToken: tokens.accessToken)
+        guard generation == lifecycleGeneration else { throw CancellationError() }
         if let only = orgs.first, orgs.count == 1 {
             try await selectOrg(only, tokens: tokens)
         } else if orgs.isEmpty {
@@ -213,11 +224,14 @@ final class AppModel {
     }
 
     func selectOrg(_ org: AuthOrg, tokens: AuthTokens) async throws {
+        let generation = lifecycleGeneration
         guard let url = URL(string: edgeURLString) else { return }
         // Re-scope the access token to the org (adds the org_id claim).
         let client = AuthClient(baseURL: url)
         let scoped = try await client.refresh(refreshToken: tokens.refreshToken,
                                               organizationId: org.organizationId)
+        guard generation == lifecycleGeneration else { throw CancellationError() }
+        config?.retire()
         Keychain.save(scoped.accessToken, key: "accessToken")
         Keychain.save(scoped.refreshToken, key: "refreshToken")
         storedOrgId = org.organizationId
@@ -240,19 +254,43 @@ final class AppModel {
         phase = .ready
     }
 
-    func signOut() {
+    /// Retire all work tied to the current identity before clearing credentials
+    /// or caches. Reauthentication uses this without deleting durable data.
+    private func retireRuntime() {
+        lifecycleGeneration &+= 1
+        config?.retire()
+        AttachmentImageCache.shared.reset()
+        preloadTasks.values.forEach { $0.cancel() }
+        preloadTasks.removeAll()
         workspace?.stop()
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
+        visibleSessions.removeAll()
+        sessionUse.removeAll()
+        diskPending.removeAll()
+    }
+
+    func signOut() {
+        retireRuntime()
         config = nil
         demo = nil
+        reauthenticationMessage = nil
         Keychain.delete(key: "accessToken")
         Keychain.delete(key: "refreshToken")
-        DocDisk.wipeAll()  // local doc state belongs to the signed-in identity
+        DocDisk.wipeAll()
         storedUserId = ""
         storedOrgId = ""
         phase = .signedOut
+    }
+
+    private func requireReauthentication(for source: AppConfig) {
+        guard config === source else { return }
+        retireRuntime()
+        // Retain the retired identity to prevent another account from opening
+        // its cached documents when the user signs in again.
+        reauthenticationMessage = "Your session expired. Sign in again to resume your queued work."
+        phase = .reauthenticationRequired
     }
 
     private func devBearer(userId: String, orgId: String) -> String {
@@ -261,10 +299,20 @@ final class AppModel {
 
     private func connect(url: URL, mode: AppConfig.Mode, userId: String, orgId: String,
                          tokens: AuthTokens?, devBearer: String?) {
+        let previous = self.config
+        retireRuntime()
+        if let previous, previous.userId != userId || previous.orgId != orgId || previous.edgeURL != url {
+            DocDisk.wipeAll()
+        }
+        reauthenticationMessage = nil
         let config = AppConfig(edgeURL: url, mode: mode, userId: userId, orgId: orgId,
-                               deviceId: deviceId, deviceName: deviceName,
-                               tokens: tokens, devBearer: devBearer)
+                              deviceId: deviceId, deviceName: deviceName,
+                              tokens: tokens, devBearer: devBearer)
         self.config = config
+        config.onTerminalAuthError = { [weak self, weak config] in
+            guard let config else { return }
+            self?.requireReauthentication(for: config)
+        }
         let store = WorkspaceStore(config: config)
         workspace = store
         store.start()
@@ -364,7 +412,7 @@ final class AppModel {
             return HarnessCatalog.harnesses
         }
         if let live = await workspace?.listHarnesses(deviceId: deviceId),
-           !live.isEmpty {
+            !live.isEmpty {
             return live
         }
         return HarnessCatalog.harnesses
@@ -379,7 +427,7 @@ final class AppModel {
             return HarnessCatalog.models(for: harness)
         }
         if let live = await workspace?.listModels(deviceId: deviceId, harness: harness),
-           !live.isEmpty {
+            !live.isEmpty {
             return HarnessCatalog.normalize(harness: harness, models: live)
         }
         return HarnessCatalog.models(for: harness)
@@ -580,6 +628,7 @@ final class AppModel {
             request.timeoutInterval = 3
             guard let (_, response) = try? await URLSession.shared.data(for: request),
                   (response as? HTTPURLResponse)?.statusCode == 200 else { return }
+            guard !config.isRetired else { return }
             OnlineBus.shared.notifyOnline()
         }
     }
@@ -670,7 +719,10 @@ final class AppModel {
 
     func sessionStore(for chat: Chat) -> SessionStore? {
         if let demo { return demo.sessionStore(for: chat.id) }
-        guard let config else { return nil }
+        guard let config, !config.isRetired else { return nil }
+        visibleSessions.insert(chat.id)
+        useCounter &+= 1
+        sessionUse[chat.id] = useCounter
         if let existing = sessionStores[chat.id] {
             existing.hostDeviceId = chat.deviceId
             // The registry flip to chat2 can land while the store is open —
@@ -689,6 +741,7 @@ final class AppModel {
         sessionStores[chat.id] = store
         store.start()
         store.updateRoomGen(chat.roomGen)
+        trimSessionStores(keeping: Self.warmDialCap)
         return store
     }
 
@@ -762,30 +815,44 @@ final class AppModel {
     }
 
     func releaseSessionStore(chatId: String) {
-        // Preloaded stores stay warm — nothing to evict on navigation.
+        visibleSessions.remove(chatId)
+        trimSessionStores(keeping: Self.warmDialCap)
     }
 
-    /// Warm every non-archived session: stores hydrate from disk instantly
-    /// so opening a session never shows a loading state. The room DIALS are
-    /// held and released one per 300ms in attention order — N simultaneous
-    /// TLS handshakes at launch competed with the registry dial for a thin
-    /// uplink (and, pre-single-flight, raced N token refreshes), which was
-    /// the cold-open "connecting…" stall. Opening a session releases its
-    /// hold immediately (sessionStore(for:) above).
-    /// Sessions that keep a live socket without an open view. Everything else
-    /// hydrates from disk but dials on demand: 46 background joins (TLS +
-    /// hello + state each) drowned a 450kbps link for tens of seconds at
-    /// every cold open and network kick, for transcripts nobody was reading —
-    /// sidebar status (Working, presence, titles) rides the registry room, so
-    /// an undialed chat's row stays live regardless, and opening it releases
-    /// its dial instantly.
+    func handleMemoryWarning() {
+        AttachmentImageCache.shared.prune(targetBytes: 0)
+        trimSessionStores(keeping: 0)
+    }
+
+    private func trimSessionStores(keeping limit: Int) {
+        for id in sessionStores.keys.sorted(by: { sessionUse[$0, default: 0] < sessionUse[$1, default: 0] }) {
+            guard sessionStores.count > limit else { break }
+            guard !visibleSessions.contains(id), let store = sessionStores[id], !store.hasPendingWork else { continue }
+            preloadTasks.removeValue(forKey: id)?.cancel()
+            store.stop() // flushes the document before releasing it
+            sessionStores.removeValue(forKey: id)
+            sessionUse.removeValue(forKey: id)
+        }
+    }
+
+    /// Hydrate at most eight warm documents. Visible sessions and stores with
+    /// pending delivery are pinned; cold transcripts load when opened.
     static let warmDialCap = 8
 
     func preloadSessions() {
-        guard demo == nil, let config else { return }
+        guard demo == nil, let config, !config.isRetired else { return }
+        let generation = lifecycleGeneration
         var stagger: UInt64 = 0
-        var released = 0
         for chat in overviewChats where sessionStores[chat.id] == nil {
+            if sessionStores.count >= Self.warmDialCap {
+                let currentURL = DocDisk.chat2URL(for: chat.id)
+                let url = FileManager.default.fileExists(atPath: currentURL.path) ? currentURL : DocDisk.url(for: chat.id)
+                let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                if diskPending[chat.id]?.0 != date {
+                    diskPending[chat.id] = (date, DocDisk.hasPendingCommands(id: chat.id))
+                }
+                guard diskPending[chat.id]?.1 == true else { continue }
+            }
             let store = SessionStore(chatId: chat.id, config: config)
             store.hostDeviceId = chat.deviceId
             store.hostLiveness = { [weak self] deviceId in
@@ -794,22 +861,23 @@ final class AppModel {
             sessionStores[chat.id] = store
             store.start(holdDial: true)
             store.updateRoomGen(chat.roomGen)
-            guard released < Self.warmDialCap else { continue }
-            released += 1
             let delay = stagger
-            Task { @MainActor in
-                // The registry (the sidebar the user is looking at) gets the
-                // pipe to itself first: on a 240kbps link, warm chat dials
-                // racing the registry's own handshake+state pushed the
-                // connect spinner from ~1.5s to ~7s (NLC Edge, 2026-08-17).
-                // An open view still dials instantly via releaseDial.
-                let start = DispatchTime.now()
-                while !(self.workspace?.connected ?? false),
-                      DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds < 10_000_000_000 {
-                    try? await Task.sleep(nanoseconds: 200_000_000)
+            preloadTasks[chat.id] = Task { @MainActor [weak self, weak store] in
+                guard let self else { return }
+                defer {
+                    if self.lifecycleGeneration == generation { self.preloadTasks.removeValue(forKey: chat.id) }
                 }
-                if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
-                store.releaseDial()
+                let start = DispatchTime.now()
+                do {
+                    while !(self.workspace?.connected ?? false),
+                          DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds < 10_000_000_000 {
+                        try await Task.sleep(nanoseconds: 200_000_000)
+                    }
+                    if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+                    try Task.checkCancellation()
+                    guard self.lifecycleGeneration == generation, self.config === config else { return }
+                    store?.releaseDial()
+                } catch { /* retired or evicted */ }
             }
             stagger += 300_000_000
         }
