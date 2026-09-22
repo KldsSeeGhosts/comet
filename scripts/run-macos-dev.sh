@@ -20,13 +20,19 @@ if pgrep -f -x "$CONTENTS/MacOS/zeron" >/dev/null 2>&1; then
 fi
 
 cd "$ROOT"
-cargo build -p zeron
+cargo build --locked -p zeron
 
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$DATA_DIR"
 install -m 755 "$ROOT/target/debug/zeron" "$CONTENTS/MacOS/zeron"
 sed "s/__VERSION__/$VERSION/g" "$ROOT/dist/macos/Info-dev.plist" >"$CONTENTS/Info.plist"
 plutil -replace LSEnvironment.ZERON_DATA_DIR -string "$DATA_DIR" "$CONTENTS/Info.plist"
 plutil -replace LSEnvironment.ZERON_IPC_PORT -string "$IPC_PORT" "$CONTENTS/Info.plist"
+
+# The default browser needs its runtime beside the app, including source builds.
+"$ROOT/scripts/build-chromium.sh" "$DEV_ROOT/chromium" debug
+mkdir -p "$CONTENTS/Frameworks"
+rm -rf "$CONTENTS/Frameworks/Noches Browser.app"
+cp -R "$DEV_ROOT/chromium/Noches Browser.app" "$CONTENTS/Frameworks/"
 
 if [[ ! -f "$CONTENTS/Resources/zeron.icns" ]]; then
   ICONSET="$DEV_ROOT/zeron-dev.iconset"
@@ -46,12 +52,12 @@ IDENTITY="${ZERON_DEV_CODESIGN_IDENTITY:-}"
 if [[ -z "$IDENTITY" ]]; then
   IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -1)"
 fi
-if [[ -n "$IDENTITY" ]]; then
-  codesign --force --sign "$IDENTITY" --identifier sh.zeron.app.dev "$APP"
-else
-  codesign --force --sign - --identifier sh.zeron.app.dev "$APP"
+if [[ -z "$IDENTITY" ]]; then
+  IDENTITY=-
   echo "warning: no Apple Development signing identity found; macOS may ask for permissions again after a rebuild" >&2
 fi
+codesign --force --deep --sign "$IDENTITY" "$CONTENTS/Frameworks/Noches Browser.app"
+codesign --force --sign "$IDENTITY" --entitlements "$ROOT/dist/macos/voice.entitlements" --identifier sh.zeron.app.dev "$APP"
 
 echo "running Zeron Dev (bundle sh.zeron.app.dev, data $DATA_DIR, IPC $IPC_PORT)" >&2
 # LaunchServices must own the process. Launching Contents/MacOS/zeron directly

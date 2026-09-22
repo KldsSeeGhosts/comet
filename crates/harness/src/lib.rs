@@ -46,6 +46,8 @@ pub struct SteerMessage {
 
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
+    /// Host-provided connection to this conversation’s integrated browser.
+    pub browser: Option<zeron_browser::Connection>,
     /// The run sends questions and awaits answers (blocks the agent, mirrors zeron).
     pub request_input: Box<
         dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,

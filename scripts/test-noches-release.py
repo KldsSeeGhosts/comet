@@ -53,6 +53,9 @@ class ReleaseTests(unittest.TestCase):
                 package.mkdir()
                 (package / 'zeron').write_text('#!/bin/sh\nprintf "%s" ' + version)
                 (package / 'zeron').chmod(0o755)
+                (package / 'browser').mkdir()
+                (package / 'browser/noches-chromium').write_text(version)
+                (package / 'browser/resources.pak').write_bytes(b'chromium resources')
                 (package / f'{slug}.desktop').write_text('[Desktop Entry]\nType=Application\nName=Noches\nExec=zeron %u\nTryExec=zeron\n')
                 (package / f'{slug}.png').write_bytes(b'icon')
                 (package / 'install.json').write_text(json.dumps(dict(slug=slug, channel=channel, version=version)))
@@ -61,6 +64,10 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(subprocess.check_output([home / '.local/bin/noches'], text=True), '0.3.3')
             self.assertEqual(subprocess.check_output([home / '.local/bin/noches-dev'], text=True), '0.3.2-dev.1')
             self.assertEqual((home / '.local/share/noches/app/previous').resolve().name, '0.3.1')
+            for slug, link, version in [('noches', 'current', '0.3.3'), ('noches', 'previous', '0.3.1'), ('noches-dev', 'current', '0.3.2-dev.1')]:
+                browser = home / '.local/share' / slug / 'app' / link / 'browser'
+                self.assertEqual((browser / 'noches-chromium').read_text(), version)
+                self.assertEqual((browser / 'resources.pak').read_bytes(), b'chromium resources')
             desktop = (home / '.local/share/applications/noches.desktop').read_text()
             self.assertIn(f'Exec="{home}/.local/share/noches/app/current/zeron" %u', desktop)
 

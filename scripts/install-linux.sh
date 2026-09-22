@@ -42,4 +42,4 @@ PY
 ln -sfn "$root/current/$slug.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/$slug.png"
 if command -v update-desktop-database >/dev/null; then update-desktop-database "$HOME/.local/share/applications" || true; fi
 echo "Installed $slug $version. Launch it from your application menu."
-echo 'Browser tabs require WebKitGTK 4.1 and JSON-GLib runtime packages.'
+echo 'Chromium is bundled. Browser tabs require Chromium system libraries and host support for its sandbox.'

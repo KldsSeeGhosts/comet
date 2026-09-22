@@ -1,37 +1,11 @@
 # Browser on Linux
 
-The sidebar browser requires the distribution's WebKitGTK 4.1 and JSON-GLib runtime packages, including when using a prebuilt Zeron release. The Linux installer does not currently install or validate these dependencies; install them separately before opening a browser tab.
+The default browser is bundled Chromium through CEF, matching macOS. WebKitGTK is no longer a runtime requirement for the default build. See [the integrated browser guide](integrated-browser.md) for architecture, agent tools, build steps and verification.
 
-On Ubuntu or Debian:
+The runtime runs as a separate sandboxed process and sends offscreen frames to GPUI. This keeps pages within GPUI clipping and overlays on X11 and Wayland. Frames use CPU memory and texture uploads. The main app remains usable if the runtime is missing; browser tabs show an actionable error.
 
-```sh
-sudo apt install libwebkit2gtk-4.1-0 libjson-glib-1.0-0
-```
+Release packages include `browser/noches-chromium`, `libcef.so`, resources and locales. Keep the complete browser directory next to the real Noches executable. Standard Chromium system libraries are still required. Diagnose a missing Linux library with `ldd browser/noches-chromium` and `ldd browser/libcef.so`. Linux must permit Chromium's sandbox mechanisms, including user namespaces. Noches does not disable the sandbox to bypass a host restriction.
 
-On Fedora:
+For development run `scripts/build-chromium.sh /tmp/noches-runtime debug`, then set `NOCHES_CHROMIUM_HELPER=/tmp/noches-runtime/browser/noches-chromium`. CMake and Ninja are required in addition to the GPUI build dependencies.
 
-```sh
-sudo dnf install webkit2gtk4.1 json-glib
-```
-
-Zeron starts its browser helper when a page is first opened. The main application does not link to GTK or WebKit, so other app features remain available if the browser runtime is missing. WebKit runs in a separate process and uses an ephemeral website-data context shared by the open tabs.
-
-The helper sends live offscreen frames to GPUI, which draws the page alongside the rest of the app. Both X11 and Wayland use this path, including clipping, sidebar transitions, tooltips, and frosted overlays. It uses CPU-addressable frames rather than embedding a separate native browser window. Animated pages therefore incur frame-copy and texture-upload work.
-
-For development, install the development packages in addition to the normal GPUI build dependencies. These provide the `webkit2gtk-4.1` and `json-glib-1.0` pkg-config modules used to compile the helper.
-
-On Ubuntu or Debian:
-
-```sh
-sudo apt install libwebkit2gtk-4.1-dev libjson-glib-dev
-```
-
-On Fedora:
-
-```sh
-sudo dnf install webkit2gtk4.1-devel json-glib-devel
-```
-
-The build embeds the small helper executable, which is extracted to the user's cache directory when needed. WebKit itself stays system-managed and receives security updates through the distribution.
-
-HTTP(S) links in chat open new Browser tabs in their conversation. If the runtime cannot start, the tab shows the browser error; use **Open in external browser** from the transcript link's context menu or the Browser toolbar's external-open button. See [transcript link interactions and fixtures](../transcript-browser-links.md).
+The former WebKitGTK backend remains available with the explicit `webkit-browser` Cargo feature for regression fixtures. That build requires `libwebkit2gtk-4.1-dev` and `libjson-glib-dev` on Debian/Ubuntu, or `webkit2gtk4.1-devel` and `json-glib-devel` on Fedora, plus the corresponding runtime libraries. Agent control is available on the default Chromium backend.

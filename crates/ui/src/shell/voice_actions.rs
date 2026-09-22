@@ -216,7 +216,7 @@ pub(super) fn catalog() -> Vec<Action> {
         ),
         action(
             "open_settings",
-            "Open settings. section: devices, accounts, harnesses, appearance, notifications, shortcuts, appshots, files, connections, archived.",
+            "Open settings. section: devices, accounts, harnesses, appearance, notifications, shortcuts, appshots, files, connections, archived, updates.",
             Ui,
             "section?:string",
             false,

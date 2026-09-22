@@ -30,6 +30,7 @@ fi
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/zeron"
+"$ROOT/scripts/build-chromium.sh" "$STAGE" "$PROFILE"
 sed -e "s/^Name=.*/Name=$APP_NAME/" -e "s/^Exec=.*/Exec=$APP_SLUG %u/" \
   -e "s/^TryExec=.*/TryExec=$APP_SLUG/" -e "s/^Icon=.*/Icon=$APP_SLUG/" \
   -e "s|^MimeType=.*|MimeType=x-scheme-handler/$APP_SLUG;|" \

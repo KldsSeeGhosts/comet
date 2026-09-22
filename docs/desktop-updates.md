@@ -12,7 +12,7 @@ On macOS, open the DMG and drag Noches or Noches Dev to Applications. Eject the 
 
 On Linux, extract the matching x86_64 or aarch64 tarball and run `bash install.sh` inside it. Python 3 is required by the installer. The app installs under your home directory, with no root privileges and no automatic daemon installation. Launch it from the desktop application menu or `~/.local/bin/noches` / `~/.local/bin/noches-dev`.
 
-Linux release builds use Ubuntu 24.04. Other distributions need compatible glibc and graphics libraries. Browser tabs require WebKitGTK 4.1 and JSON-GLib; see [Linux browser dependencies](reference/linux-browser.md). macOS CI currently produces Apple silicon builds. Intel Mac release artifacts are not included.
+Linux release builds use Ubuntu 24.04. Other distributions need compatible glibc and graphics libraries. Packages include Chromium and require its system libraries and sandbox support; see [Linux browser dependencies](reference/linux-browser.md). macOS CI currently produces Apple silicon builds. Intel Mac release artifacts are not included.
 
 ## Channel separation and existing data
 

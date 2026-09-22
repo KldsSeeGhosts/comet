@@ -618,6 +618,17 @@ impl CodexHarness {
         };
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
+        if !title_only && let Some(browser) = &controls.browser {
+            // CLI -c values use TOML. JSON strings/arrays are compatible here.
+            cmd.arg("-c").arg(format!(
+                "mcp_servers.noches_browser.command={}",
+                serde_json::to_string(&browser.executable).unwrap()
+            ));
+            cmd.arg("-c").arg(format!(
+                "mcp_servers.noches_browser.args={}",
+                serde_json::to_string(&browser.args()).unwrap()
+            ));
+        }
         crate::compose_child_path(&mut cmd, &exe);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
@@ -784,6 +795,7 @@ async fn run_session(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
+        browser: _,
         request_input,
         mut steering,
         interrupt,

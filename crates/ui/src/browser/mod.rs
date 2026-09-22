@@ -1,14 +1,26 @@
 //! Device-local browser tabs. GPUI owns chrome; the native host owns pages.
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
 mod command_writer;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "webkit-browser"))]
 mod linux;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "webkit-browser"))]
 mod macos;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "webkit-browser"))]
 use linux as native;
-#[cfg(target_os = "macos")]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(feature = "webkit-browser")
+))]
+mod chromium;
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(feature = "webkit-browser")
+))]
+use chromium as native;
+#[cfg(all(target_os = "macos", feature = "webkit-browser"))]
 use macos as native;
+#[cfg(all(unix, not(feature = "webkit-browser")))]
+mod agent;
 pub mod model;
 mod view;
 
@@ -92,7 +104,7 @@ pub struct BrowserSurface {
     #[cfg(feature = "browser-fixture")]
     fixture_preview_open: std::rc::Rc<std::cell::Cell<Option<gpui::Point<gpui::Pixels>>>>,
     presentation: Presentation,
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     resize_inset: gpui::Pixels,
     _input_sub: Subscription,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -101,9 +113,9 @@ pub struct BrowserSurface {
     native_tx: tokio::sync::mpsc::Sender<native::NativeEvent>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     _native_task: gpui::Task<()>,
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     favicon_task: Option<gpui::Task<()>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     favicon_generation: u64,
 }
 
@@ -168,7 +180,7 @@ impl BrowserSurface {
             #[cfg(feature = "browser-fixture")]
             fixture_preview_open: Default::default(),
             presentation: Presentation::Hidden,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
             resize_inset: gpui::px(0.0),
             _input_sub: input_sub,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -177,9 +189,9 @@ impl BrowserSurface {
             native_tx,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             _native_task: native_task,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
             favicon_task: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
             favicon_generation: 0,
         }
     }
@@ -191,7 +203,7 @@ impl BrowserSurface {
         self.remote = remote;
     }
     pub fn set_shortcuts(&mut self, keymap: &crate::settings::KeymapConfig) {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
         if let Some(native) = &self.native {
             native.set_shortcuts(
                 crate::settings::ShortcutId::ALL
@@ -201,12 +213,12 @@ impl BrowserSurface {
                     .collect(),
             );
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "webkit-browser")))]
         let _ = keymap;
     }
 
     pub fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
         if let Some(native) = &self.native {
             native.focus_chrome();
         }
@@ -215,13 +227,16 @@ impl BrowserSurface {
     }
 
     /// Reserve the overlapping part of the shell divider for GPUI hit testing.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn set_resize_inset(&mut self, inset: gpui::Pixels, cx: &mut Context<Self>) {
         if self.resize_inset != inset {
             self.resize_inset = inset;
             cx.notify();
         }
     }
+
+    #[cfg(all(target_os = "macos", not(feature = "webkit-browser")))]
+    pub fn set_resize_inset(&mut self, _inset: gpui::Pixels, _cx: &mut Context<Self>) {}
 
     pub fn set_presentation(&mut self, presentation: Presentation, cx: &mut Context<Self>) {
         if self.presentation == presentation {
@@ -268,7 +283,7 @@ impl BrowserSurface {
                         {
                             if this
                                 .update(cx, |this, cx| {
-                                    #[cfg(target_os = "macos")]
+                                    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
                                     for service in &snapshot.services {
                                         this.context
                                             .data
@@ -322,7 +337,7 @@ impl BrowserSurface {
         self.clear_favicon(cx);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
             {
                 self.favicon_generation += 1;
                 self.favicon_task = None;
@@ -409,12 +424,18 @@ impl BrowserSurface {
             if let Some(native) = &mut self.native {
                 native.present(Presentation::Hidden);
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(
+                all(target_os = "linux", feature = "webkit-browser"),
+                all(
+                    any(target_os = "linux", target_os = "macos"),
+                    not(feature = "webkit-browser")
+                )
+            ))]
             if let Some(image) = self.native.as_mut().and_then(|native| native.image.take()) {
                 cx.defer(move |cx| gpui::ImageSource::Render(image).evict(None, cx));
             }
             self.native = None;
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
             {
                 self.favicon_task = None;
                 self.favicon_generation += 1;
@@ -423,7 +444,7 @@ impl BrowserSurface {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "webkit-browser"))]
 impl BrowserSurface {
     fn on_native_event(
         &mut self,
@@ -547,46 +568,52 @@ impl BrowserSurface {
     pub fn fixture_history(&mut self, forward: bool) {
         self.history(forward);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_move_cursor(&self, x: f64, y: f64) {
         self.native.as_ref().unwrap().fixture_move_cursor(x, y);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_origin(&self) -> (f32, f32) {
         self.native.as_ref().unwrap().fixture_origin()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_overlay_visible(&self) -> bool {
         self.native.as_ref().unwrap().fixture_overlay_visible()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_visibility_changes(&self) -> u64 {
         self.native.as_ref().unwrap().fixture_visibility_changes()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_focus(&self) {
         self.native.as_ref().unwrap().fixture_focus();
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_focused(&self) -> bool {
         self.native.as_ref().unwrap().fixture_focused()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_overlay_at(&self, x: f64, y: f64) -> bool {
         self.native.as_ref().unwrap().fixture_overlay_at(x, y)
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_click(&self, x: f64, y: f64) {
         self.native.as_ref().unwrap().fixture_click(x, y);
     }
     pub fn fixture_native_visible(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
         {
             self.native
                 .as_ref()
                 .is_some_and(|native| native.fixture_visible())
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            all(target_os = "linux", feature = "webkit-browser"),
+            all(
+                any(target_os = "linux", target_os = "macos"),
+                not(feature = "webkit-browser")
+            )
+        ))]
         {
             self.presentation != Presentation::Hidden
                 && self.native.as_ref().is_some_and(|n| n.image.is_some())
@@ -596,28 +623,34 @@ impl BrowserSurface {
             false
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_backdrop_layers(&self) -> String {
         self.native.as_ref().unwrap().fixture_backdrop_layers()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_page_hit(&self, x: f64, y: f64) -> bool {
         self.native.as_ref().unwrap().fixture_page_hit(x, y)
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_backdrops(&self) -> Vec<(f64, f64, f64, f64)> {
         self.native.as_ref().unwrap().fixture_backdrops()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
     pub fn fixture_geometry(&self) -> (f32, f32, f32) {
         self.native.as_ref().unwrap().fixture_geometry()
     }
     pub fn fixture_eval(&self, script: &str) {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
         if let Some(native) = &self.native {
             native.fixture_eval(script);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            all(target_os = "linux", feature = "webkit-browser"),
+            all(
+                any(target_os = "linux", target_os = "macos"),
+                not(feature = "webkit-browser")
+            )
+        ))]
         if let Some(native) = &self.native {
             native.evaluate(script);
         }

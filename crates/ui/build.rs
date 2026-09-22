@@ -2,7 +2,9 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=src/browser/linux/helper.c");
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux")
+        || env::var_os("CARGO_FEATURE_WEBKIT_BROWSER").is_none()
+    {
         return;
     }
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("zeron-webkit");

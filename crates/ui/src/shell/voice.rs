@@ -744,6 +744,7 @@ impl Shell {
                     "files" => SettingsSection::Files,
                     "connections" => SettingsSection::Connections,
                     "archived" => SettingsSection::Archived,
+                    "updates" => SettingsSection::Updates,
                     _ => return Err("Unknown settings section".into()),
                 };
                 self.open_settings(section, cx);
@@ -1029,6 +1030,25 @@ mod tests {
             },
             cx,
         )
+    }
+    #[gpui::test]
+    fn voice_can_open_updates_settings(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| initialize(dir.path(), cx));
+        let window = cx.add_window(|_, cx| shell(dir.path(), cx));
+        window
+            .update(cx, |shell, window, cx| {
+                shell
+                    .prepare_voice_action(
+                        "open_settings",
+                        json!({"section":"updates"}),
+                        window,
+                        cx,
+                    )
+                    .unwrap();
+                assert!(matches!(shell.route, Route::Settings(SettingsSection::Updates)));
+            })
+            .unwrap();
     }
     #[gpui::test]
     fn voice_escape_declines_pending_action_and_keeps_call_state(cx: &mut TestAppContext) {

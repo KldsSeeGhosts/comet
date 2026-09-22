@@ -37,6 +37,9 @@ with open(sys.argv[2], 'wb') as f: plistlib.dump(info, f)
 PLIST
 mkdir -p "$APP/Contents/Resources/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
+"$ROOT/scripts/build-chromium.sh" "$OUT_DIR/chromium" release
+mkdir -p "$APP/Contents/Frameworks"
+cp -R "$OUT_DIR/chromium/Noches Browser.app" "$APP/Contents/Frameworks/"
 
 # Icon: iconset from the pre-masked macOS icon (squircle + margins + shadow
 # baked into dist/macos/icon-1024.png — sips can't alpha-mask, so the mask is
@@ -53,7 +56,16 @@ rm -rf "$ICONSET"
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   # Hardened runtime + secure timestamp are both notarization requirements.
-  # (No --deep: Apple deprecated it; the bundle is a single Mach-O anyway.)
+  # Sign nested CEF libraries and helper bundles before their containing app.
+  BROWSER_APP="$APP/Contents/Frameworks/Noches Browser.app"
+  while IFS= read -r -d '' binary; do
+    if file "$binary" | grep -q 'Mach-O'; then
+      codesign --force --options runtime --timestamp --entitlements "$ROOT/dist/browser/entitlements.plist" --sign "$CODESIGN_IDENTITY" "$binary"
+    fi
+  done < <(find "$BROWSER_APP" -type f -print0)
+  while IFS= read -r -d '' bundle; do
+    codesign --force --options runtime --timestamp --entitlements "$ROOT/dist/browser/entitlements.plist" --sign "$CODESIGN_IDENTITY" "$bundle"
+  done < <(find "$BROWSER_APP" -depth \( -name '*.app' -o -name '*.framework' \) -type d -print0)
   codesign --force --options runtime --timestamp --entitlements "$ROOT/dist/macos/voice.entitlements" --sign "$CODESIGN_IDENTITY" "$APP"
 else
   # Ad-hoc signature so the app launches on Apple silicon (Gatekeeper still

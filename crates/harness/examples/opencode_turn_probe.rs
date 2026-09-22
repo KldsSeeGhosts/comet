@@ -43,6 +43,7 @@ async fn main() {
         .run(
             request,
             RunControls {
+                browser: None,
                 request_input: Box::new(|_| panic!("probe must not ask for input")),
                 steering,
                 interrupt: CancellationToken::new(),

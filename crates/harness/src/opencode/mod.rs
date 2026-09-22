@@ -1190,6 +1190,7 @@ async fn run_session(session: Session) {
         known_commands,
     } = session;
     let RunControls {
+        browser: _,
         request_input,
         mut steering,
         interrupt,

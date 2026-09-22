@@ -31,13 +31,25 @@ impl BrowserSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            all(target_os = "linux", feature = "webkit-browser"),
+            all(
+                any(target_os = "linux", target_os = "macos"),
+                not(feature = "webkit-browser")
+            )
+        ))]
         if self.linux_menu_key(&event.keystroke.key, cx) {
             cx.stop_propagation();
             return;
         }
         let address_focused = self.address.focus_handle(cx).is_focused(window);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            all(target_os = "linux", feature = "webkit-browser"),
+            all(
+                any(target_os = "linux", target_os = "macos"),
+                not(feature = "webkit-browser")
+            )
+        ))]
         if !address_focused
             && self.focus.is_focused(window)
             && self.presentation == super::model::Presentation::Live
@@ -51,7 +63,12 @@ impl BrowserSurface {
                 cx.stop_propagation();
                 return;
             }
-            if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt {
+            if (if cfg!(target_os = "macos") {
+                event.keystroke.modifiers.platform
+            } else {
+                event.keystroke.modifiers.control
+            }) && !event.keystroke.modifiers.alt
+            {
                 if let Some(native) = &self.native {
                     match event.keystroke.key.as_str() {
                         "c" | "x" => {
@@ -446,11 +463,11 @@ impl Render for BrowserSurface {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| {
-                    #[cfg(target_os = "macos")]
+                    #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
                     if let Some(native) = &this.native {
                         native.focus_chrome();
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(all(target_os = "macos", feature = "webkit-browser")))]
                     let _ = this;
                 }),
             )
@@ -516,7 +533,7 @@ impl Render for BrowserSurface {
             // Empty tabs share the shell's glass, like the sidebar tab picker.
             // Keep an opaque backing while native web content is loading.
             .when(has_page, |body| body.bg(theme.bg));
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "webkit-browser"))]
         let body = if let Some(native) = &self.native {
             if self.page.error.is_some() {
                 body.child(self.empty_body(&theme, cx))
@@ -546,7 +563,13 @@ impl Render for BrowserSurface {
         } else {
             body.child(self.empty_body(&theme, cx))
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            all(target_os = "linux", feature = "webkit-browser"),
+            all(
+                any(target_os = "linux", target_os = "macos"),
+                not(feature = "webkit-browser")
+            )
+        ))]
         let body = if let Some(native) = &self.native {
             if self.page.error.is_some() {
                 body.child(self.empty_body(&theme, cx))
@@ -600,7 +623,7 @@ impl Render for BrowserSurface {
                 .on_scroll_wheel(cx.listener(|this,event: &gpui::ScrollWheelEvent,_,cx| {
                     if let Some(native)=&this.native {
                         let delta=event.delta.pixel_delta(px(16.));let p=event.position-native.bounds.origin;
-                        native.command(serde_json::json!({"cmd":"scroll","x":f32::from(p.x),"y":f32::from(p.y),"dx":-f32::from(delta.x)/40.,"dy":-f32::from(delta.y)/40.,"mods":super::linux::modifiers_mask(event.modifiers)}));
+                        native.command(serde_json::json!({"cmd":"scroll","x":f32::from(p.x),"y":f32::from(p.y),"dx":-f32::from(delta.x)/40.,"dy":-f32::from(delta.y)/40.,"mods":super::native::modifiers_mask(event.modifiers)}));
                         cx.stop_propagation();
                     }
                 }))
@@ -611,7 +634,13 @@ impl Render for BrowserSurface {
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let body = body.child(self.empty_body(&theme, cx));
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(
+            all(target_os = "linux", feature = "webkit-browser"),
+            all(
+                any(target_os = "linux", target_os = "macos"),
+                not(feature = "webkit-browser")
+            )
+        ))]
         let body = body.when_some(self.linux_menu(&theme, cx), |el, menu| el.child(menu));
 
         let remote_loopback = self.remote
@@ -629,9 +658,9 @@ impl Render for BrowserSurface {
         div().id("browser-surface").size_full().flex().flex_col().track_focus(&self.focus)
             .key_context("Browser").on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(|this,event: &gpui::KeyUpEvent,w,cx| {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(all(target_os = "linux", feature = "webkit-browser"), all(any(target_os = "linux", target_os = "macos"), not(feature = "webkit-browser"))))]
                 if this.focus.is_focused(w) {this.linux_key(&event.keystroke,false);cx.stop_propagation();}
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(all(target_os = "linux", feature = "webkit-browser"), all(any(target_os = "linux", target_os = "macos"), not(feature = "webkit-browser")))))]
                 let _=(this,event,w,cx);
             }))
             .on_action(cx.listener(|this, _: &super::Reload, _, cx| this.reload(cx)))
