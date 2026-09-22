@@ -291,6 +291,19 @@ impl SessionsEngine {
             let (harness_id, session_id, mut request) = self.native_target(chat)?;
             let harness = self.inner.registry.resolve(harness_id)?;
             let mut command = harness.native_cli(&request, &session_id)?;
+            if let Some(root) = self.inner.browser_root.get() {
+                let socket = zeron_browser::socket_path(root);
+                if socket.exists() {
+                    command.with_browser(
+                        harness_id,
+                        &zeron_browser::Connection {
+                            executable: std::env::current_exe()?,
+                            socket,
+                            session: chat.into(),
+                        },
+                    );
+                }
+            }
             let checkpoint = if let Some(previous) = &binding {
                 if previous.session_id != session_id || previous.harness != harness_id {
                     return Err(error(

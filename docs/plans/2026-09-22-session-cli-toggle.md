@@ -67,7 +67,8 @@ Before native launch, the engine records a durable binding with the provider,
 exact session ID, effective request, history filename, byte offset, and prefix
 hash. It interrupts the warm structured runtime and waits for its child to exit.
 The executable and argument vector run directly in the existing PTY backend.
-The native launch inherits the host's provider configuration environment.
+The native launch inherits the host's provider configuration environment and
+keeps the conversation's integrated browser MCP connection.
 
 Returning to Chat requires an idle CLI or an exited process. The engine prevents
 new terminal input, terminates and reaps the idle CLI, validates the history
@@ -117,7 +118,10 @@ The automated tests use isolated fake provider processes and synthetic provider
 history. They do not constitute a live authenticated Claude/Codex round trip.
 The real installed Codex CLI's resume flags were checked. Claude's executable
 was unavailable on the research shell's PATH. Live provider compatibility and
-visual QA remain useful follow-up checks before merging.
+a live authenticated round trip remain follow-up checks before merging.
+The production shell was rendered with the isolated `session-cli-fixture` example,
+including a native PTY and imported reply. Captures are in
+`docs/screenshots/session-cli/`.
 
 ## Future adapters
 

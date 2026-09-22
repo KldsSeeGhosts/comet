@@ -613,6 +613,7 @@ impl Harness for CodexHarness {
             .model_options
             .get("serviceTier")
             .and_then(Value::as_str)
+            .filter(|tier| *tier != "default")
         {
             args.extend([
                 "-c".into(),

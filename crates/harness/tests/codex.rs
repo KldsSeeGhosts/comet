@@ -1396,3 +1396,15 @@ async fn native_runtime_acknowledges_exit_after_interrupt() {
         .await
         .unwrap();
 }
+
+#[test]
+fn native_cli_preserves_exact_resume_and_omits_default_service_tier() {
+    let mut req = request("unused prompt");
+    req.cwd = "/tmp/worktree with spaces".into();
+    req.model_options.insert("serviceTier".into(), "default".into());
+    let command = harness().native_cli(&req, "exact-session-id").unwrap();
+    assert_eq!(&command.args[..2], &["resume", "exact-session-id"]);
+    assert!(command.args.contains(&req.cwd));
+    assert!(!command.args.iter().any(|arg| arg.contains("service_tier")));
+    assert!(!command.args.iter().any(|arg| arg.contains("unused prompt")));
+}

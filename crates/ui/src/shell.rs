@@ -7813,7 +7813,6 @@ impl Shell {
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .pt(px(Theme::TITLEBAR_HEIGHT))
                 .flex()
                 .flex_col()
                 .child(self.render_primary_pane_header(theme, cx))

@@ -18,6 +18,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::write(
         &executable,
         r##"#!/bin/sh
+case "$1" in resume) ;; *) exit 1 ;; esac
 stty -echo
 printf '\033[2J\033[HNoches native CLI fixture\r\n\r\nSame session and working directory. This is an isolated fake provider.\r\n\r\n> '
 IFS= read -r prompt
