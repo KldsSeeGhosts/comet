@@ -110,7 +110,7 @@ def main():
     parser.add_argument("--directory", type=Path, default=Path("artifacts"))
     args = parser.parse_args()
     if args.action == "prepare":
-        channel, version = build_identity(os.environ["GITHUB_REF_NAME"], os.environ["GITHUB_RUN_NUMBER"], os.environ["GITHUB_RUN_ATTEMPT"])
+        channel, version = build_identity(os.environ.get("NOCHES_SOURCE_BRANCH", os.environ["GITHUB_REF_NAME"]), os.environ["GITHUB_RUN_NUMBER"], os.environ["GITHUB_RUN_ATTEMPT"])
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             output.write(f"channel={channel}\nversion={version}\n")
     else:
