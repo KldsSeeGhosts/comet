@@ -21,6 +21,14 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError): release.build_identity('feature/test', 12, 1)
         self.assertGreater(release.version_order('0.3.12-dev.10'), release.version_order('0.3.12-dev.9'))
 
+    def test_pr_prepare_uses_explicit_target_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / 'output'
+            env = dict(os.environ, GITHUB_REF_NAME='10/merge', NOCHES_SOURCE_BRANCH='dev',
+                       GITHUB_RUN_NUMBER='12', GITHUB_RUN_ATTEMPT='1', GITHUB_OUTPUT=str(output))
+            subprocess.run(['python3', str(ROOT / 'scripts/noches-release.py'), 'prepare'], env=env, check=True)
+            self.assertEqual(output.read_text(), 'channel=dev\nversion=0.3.12-dev.1\n')
+
     def test_complete_manifest_uses_immutable_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

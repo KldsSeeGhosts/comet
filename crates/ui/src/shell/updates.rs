@@ -152,7 +152,7 @@ impl Shell {
                     .child(format!("Build {}", zeron_update::identity::commit())),
             )
             .child(self.update_label())
-            .child(self.update_status.clone());
+            .when(ready, |page| page.child(self.update_status.clone()));
         if let Some(checked) = &self.update_checked_at {
             page = page.child(
                 div()

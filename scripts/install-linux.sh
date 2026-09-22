@@ -7,7 +7,7 @@ import json, re, sys
 m = json.load(open(sys.argv[1]))
 assert m['channel'] in ('stable', 'dev', 'local')
 assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?', m['version'])
-assert m['slug'] in ('noches', 'noches-dev', 'noches-local')
+assert m['slug'] == {'stable': 'noches', 'dev': 'noches-dev', 'local': 'noches-local'}[m['channel']]
 print(m['version']); print(m['slug']); print(m['channel'])
 PY
 )
