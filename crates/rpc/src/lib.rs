@@ -165,6 +165,8 @@ pub mod methods {
     pub const DELETE_PROJECT_ACTION: &str = "DeleteProjectAction";
     pub const RUN_PROJECT_ACTION: &str = "RunProjectAction";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
+    pub const GET_SESSION_SURFACE: &str = "GetSessionSurface";
+    pub const SWITCH_SESSION_SURFACE: &str = "SwitchSessionSurface";
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
     pub const WRITE_TERMINAL: &str = "WriteTerminal";

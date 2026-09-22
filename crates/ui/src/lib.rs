@@ -48,6 +48,7 @@ pub mod popover;
 pub mod project_actions;
 pub mod queue;
 pub mod rail;
+mod session_surface;
 pub mod settings;
 pub mod shell;
 mod sidebar_buddy;

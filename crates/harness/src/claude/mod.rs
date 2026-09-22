@@ -52,7 +52,9 @@ use zeron_proto::{
 };
 
 use crate::process::{Child, ChildStdin, Command, Stdio};
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+use crate::{
+    CancellationToken, Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child,
+};
 use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
@@ -87,6 +89,7 @@ fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
 /// it at a fake CLI with [`ClaudeHarness::with_executable`].
 pub struct ClaudeHarness {
     executable: Option<PathBuf>,
+    native_runtimes: Arc<crate::native_cli::NativeRuntimes>,
     /// Grace between the interrupt control request and SIGTERM.
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
@@ -100,6 +103,7 @@ impl Default for ClaudeHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            native_runtimes: Arc::default(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
@@ -390,6 +394,63 @@ impl Harness for ClaudeHarness {
             .cloned()
     }
 
+    fn native_runtime_exited(&self, session_id: &str) -> Option<CancellationToken> {
+        self.native_runtimes.exited(session_id)
+    }
+
+    fn native_cli(
+        &self,
+        request: &RunRequest,
+        session_id: &str,
+    ) -> Result<crate::native_cli::NativeCliCommand, HarnessError> {
+        let executable = self.resolve_executable()?;
+        let mut args = vec![format!("--resume={session_id}")];
+        if let Some(model) = &request.model {
+            let one_m = request
+                .model_options
+                .get("contextWindow")
+                .and_then(Value::as_str)
+                == Some("1m");
+            args.extend([
+                "--model".into(),
+                if one_m {
+                    format!("{model}[1m]")
+                } else {
+                    model.clone()
+                },
+            ]);
+        }
+        if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
+            args.extend(["--effort".into(), effort.into()]);
+        }
+        args.extend([
+            "--permission-mode".into(),
+            if request.auto_approve {
+                "bypassPermissions"
+            } else {
+                "default"
+            }
+            .into(),
+        ]);
+        if request.auto_approve {
+            args.push("--dangerously-skip-permissions".into());
+        }
+        Ok(crate::native_cli::NativeCliCommand { executable, args })
+    }
+
+    async fn run_strict(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        if request.resume.is_none() {
+            return Err(HarnessError::Protocol(
+                "Missing Claude resume target".into(),
+            ));
+        }
+        self.run(request, controls).await
+    }
+
     async fn run(
         &self,
         request: RunRequest,
@@ -484,7 +545,9 @@ impl ClaudeHarness {
         let _ = stdin_tx.send(StdinMsg::Line(first));
 
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-        tokio::spawn(run_session(Session {
+        let exited = CancellationToken::new();
+        let exit_guard = exited.clone().drop_guard();
+        let session = Session {
             title_only,
             child,
             stdout_lines: BufReader::new(stdout).lines(),
@@ -495,12 +558,20 @@ impl ClaudeHarness {
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
-        }));
+        };
+        tokio::spawn(async move {
+            let _exit_guard = exit_guard;
+            run_session(session).await;
+        });
 
-        Ok(futures::stream::unfold(event_rx, |mut rx| async move {
-            rx.recv().await.map(|ev| (ev, rx))
-        })
-        .boxed())
+        Ok(crate::native_cli::track(
+            futures::stream::unfold(event_rx, |mut rx| async move {
+                rx.recv().await.map(|ev| (ev, rx))
+            })
+            .boxed(),
+            self.native_runtimes.clone(),
+            exited,
+        ))
     }
 }
 

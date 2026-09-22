@@ -95,8 +95,13 @@ impl Shell {
             .unwrap_or_else(|| (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0));
         let action_control =
             self.render_project_actions_control(available, px(self.viewport_height), cx);
-        let snap =
-            Self::workspace_snapshot(&self.workspace, &self.state, action_control, cx);
+        let snap = Self::workspace_snapshot(
+            &self.workspace,
+            &self.state,
+            &self.native_surfaces,
+            action_control,
+            cx,
+        );
         // WS4: the active drag's preview, converted to outlet-relative space.
         let drag_preview = self.split_drag_preview();
         workspace_outlet(cx, &theme, &snap, drag_preview)
@@ -135,6 +140,7 @@ impl Shell {
             false,
             has_selection,
             action_control,
+            self.surface_control(pane),
             false,
             theme,
             cx,
@@ -428,6 +434,7 @@ impl Shell {
     fn workspace_snapshot(
         workspace: &crate::pane::PaneHost,
         state: &Entity<AppState>,
+        native_surfaces: &std::collections::HashMap<PaneId, super::session_surface::NativeSurface>,
         action_control: Option<AnyElement>,
         cx: &App,
     ) -> WorkspaceSnap {
@@ -498,6 +505,9 @@ impl Shell {
                             .map(|(pane_id, pane_state)| {
                                 let surface = workspace.chat_surfaces.get(pane_id);
                                 PaneSnap {
+                                    native_surface: native_surfaces
+                                        .get(pane_id)
+                                        .map(|s| s.control.clone()),
                                     pane: *pane_id,
                                     mode: pane_state.mode,
                                     title: pane_title(
@@ -1615,8 +1625,9 @@ impl Shell {
             // its space: the layout stays owned by the space it was opened
             // from, so focusing a pane bound to another space's session must
             // not trigger a layout restore that swaps the tree out.
-            self.state
-                .update(cx, |state, cx| state.select_workspace_pane_chat(session, cx));
+            self.state.update(cx, |state, cx| {
+                state.select_workspace_pane_chat(session, cx)
+            });
         }
     }
 

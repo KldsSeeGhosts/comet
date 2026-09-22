@@ -132,14 +132,20 @@ impl ChatPersistence {
     }
 
     pub(crate) fn flush_sync(&self) {
+        if let Err(error) = self.flush_checked() {
+            tracing::warn!(chat = %self.chat_id, %error, "chat snapshot failed; retrying");
+        }
+    }
+
+    pub(crate) fn flush_checked(&self) -> Result<(), String> {
         let flush = || {
             let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
             let generation = self.generation.load(Ordering::Acquire);
             if generation == self.saved.load(Ordering::Acquire) {
-                return;
+                return Ok(());
             }
             let Some(doc) = self.doc.upgrade() else {
-                return;
+                return Err("Chat document was released before persistence".into());
             };
             // Never read the cursor AFTER exporting: a concurrent import
             // could then label an older snapshot with a newer cursor.
@@ -167,10 +173,9 @@ impl ChatPersistence {
                     #[cfg(test)]
                     self.writes.fetch_add(1, Ordering::Relaxed);
                     self.saved.store(generation, Ordering::Release);
+                    Ok(())
                 }
-                Err(error) => {
-                    tracing::warn!(chat = %self.chat_id, %error, "chat snapshot failed; retrying")
-                }
+                Err(error) => Err(error),
             }
         };
         // Compatibility for synchronous shutdown/eviction and command APIs.
@@ -178,9 +183,9 @@ impl ChatPersistence {
         if tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
         {
-            tokio::task::block_in_place(flush);
+            tokio::task::block_in_place(flush)
         } else {
-            flush();
+            flush()
         }
     }
 }

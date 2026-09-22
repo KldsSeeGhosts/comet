@@ -1050,6 +1050,8 @@ fn forwardable(method: &str) -> bool {
             | methods::GET_CHECKOUT_DIFF
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
             // Terminals live on the chat's host device.
+            | methods::GET_SESSION_SURFACE
+            | methods::SWITCH_SESSION_SURFACE
             | methods::OPEN_TERMINAL
             | methods::SUBSCRIBE_TERMINAL
             | methods::WRITE_TERMINAL
@@ -2473,6 +2475,39 @@ impl RpcService for EngineRpc {
                 .map_err(|err| RpcError::Failed(err.to_string()))?;
                 RpcReply::value(&run)
             }
+            methods::GET_SESSION_SURFACE => {
+                let p: ChatParams = parse_params(params)?;
+                let state = self
+                    .sessions
+                    .session_surface(&p.chat_id, &self.terminals)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&state)
+            }
+            methods::SWITCH_SESSION_SURFACE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    chat_id: String,
+                    target: zeron_proto::SessionSurface,
+                    #[serde(default = "native_cols")]
+                    cols: u16,
+                    #[serde(default = "native_rows")]
+                    rows: u16,
+                }
+                fn native_cols() -> u16 {
+                    100
+                }
+                fn native_rows() -> u16 {
+                    30
+                }
+                let p: Params = parse_params(params)?;
+                let state = self
+                    .sessions
+                    .switch_session_surface(&p.chat_id, p.target, &self.terminals, p.cols, p.rows)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&state)
+            }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
                 // The terminal runs in the chat's checkout; a chat with no cwd (or
@@ -2505,8 +2540,9 @@ impl RpcService for EngineRpc {
             }
             methods::WRITE_TERMINAL => {
                 let p: WriteTerminalParams = parse_params(params)?;
-                self.terminals
-                    .write(&p.terminal_id, &p.data)
+                self.sessions
+                    .write_session_terminal(&self.terminals, &p.terminal_id, &p.data)
+                    .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
@@ -2519,8 +2555,8 @@ impl RpcService for EngineRpc {
             }
             methods::CLOSE_TERMINAL => {
                 let p: TerminalIdParams = parse_params(params)?;
-                self.terminals
-                    .close(&p.terminal_id)
+                self.sessions
+                    .close_session_terminal(&self.terminals, &p.terminal_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }

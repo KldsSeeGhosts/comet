@@ -105,6 +105,33 @@ pub trait Harness: Send + Sync {
         ))
     }
 
+    /// A native interactive command for this exact provider conversation.
+    fn native_cli(
+        &self,
+        _request: &RunRequest,
+        _session_id: &str,
+    ) -> Result<native_cli::NativeCliCommand, HarnessError> {
+        Err(HarnessError::Protocol(
+            "Native CLI switching is not supported by this provider".into(),
+        ))
+    }
+
+    /// Cancelled only after the provider task has reaped its child process.
+    fn native_runtime_exited(&self, _session_id: &str) -> Option<CancellationToken> {
+        None
+    }
+
+    /// Resume without ever creating a replacement conversation on failure.
+    async fn run_strict(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        Err(HarnessError::Protocol(
+            "Strict resume is not supported by this provider".into(),
+        ))
+    }
+
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,
@@ -122,6 +149,7 @@ pub mod cursor;
 pub(crate) mod executable;
 pub(crate) mod jsonrpc;
 pub mod mock;
+pub mod native_cli;
 pub mod opencode;
 pub mod process;
 pub mod shell_env;

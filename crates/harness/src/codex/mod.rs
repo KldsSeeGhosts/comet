@@ -59,7 +59,7 @@ use zeron_proto::{
 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::process::{Child, Command, Stdio};
-use crate::{Harness, HarnessError, RunControls};
+use crate::{CancellationToken, Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
     ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, notification_thread_id,
@@ -105,6 +105,7 @@ pub fn login_command(codex_home: &std::path::Path) -> Result<Command, HarnessErr
 /// fake app server with [`CodexHarness::with_executable`].
 pub struct CodexHarness {
     executable: Option<PathBuf>,
+    native_runtimes: Arc<crate::native_cli::NativeRuntimes>,
     /// Grace between `turn/interrupt` and SIGTERM.
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
@@ -118,6 +119,7 @@ impl Default for CodexHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            native_runtimes: Arc::default(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
@@ -574,12 +576,69 @@ impl Harness for CodexHarness {
             .cloned()
     }
 
+    fn native_runtime_exited(&self, session_id: &str) -> Option<CancellationToken> {
+        self.native_runtimes.exited(session_id)
+    }
+
+    fn native_cli(
+        &self,
+        request: &RunRequest,
+        session_id: &str,
+    ) -> Result<crate::native_cli::NativeCliCommand, HarnessError> {
+        let executable = self.resolve_executable()?;
+        // Match the structured driver's effective policy, without a shell.
+        let mut args = vec![
+            "resume".into(),
+            session_id.into(),
+            "--cd".into(),
+            request.cwd.clone(),
+            "--sandbox".into(),
+            "danger-full-access".into(),
+            "--ask-for-approval".into(),
+            "never".into(),
+        ];
+        if let Some(model) = &request.model {
+            args.extend(["--model".into(), model.clone()]);
+        }
+        if let Some(effort) = to_effort(request.reasoning) {
+            args.extend([
+                "-c".into(),
+                format!(
+                    "model_reasoning_effort={}",
+                    serde_json::to_string(effort).unwrap()
+                ),
+            ]);
+        }
+        if let Some(tier) = request
+            .model_options
+            .get("serviceTier")
+            .and_then(Value::as_str)
+        {
+            args.extend([
+                "-c".into(),
+                format!("service_tier={}", serde_json::to_string(tier).unwrap()),
+            ]);
+        }
+        Ok(crate::native_cli::NativeCliCommand { executable, args })
+    }
+
+    async fn run_strict(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        if request.resume.is_none() {
+            return Err(HarnessError::Protocol("Missing Codex resume target".into()));
+        }
+        self.run_with_mode(request, controls, false, true).await
+    }
+
     async fn run(
         &self,
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        self.run_with_mode(request, controls, false).await
+        self.run_with_mode(request, controls, false, false).await
     }
 
     async fn run_title(
@@ -592,7 +651,7 @@ impl Harness for CodexHarness {
         request.attachments.clear();
         request.model_options.clear();
         request.auto_approve = false;
-        self.run_with_mode(request, controls, true).await
+        self.run_with_mode(request, controls, true, false).await
     }
 }
 
@@ -602,6 +661,7 @@ impl CodexHarness {
         mut request: RunRequest,
         controls: RunControls,
         title_only: bool,
+        strict_resume: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
@@ -667,7 +727,10 @@ impl CodexHarness {
 
         let (client, incoming) = RpcClient::new(stdin, stdout);
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
-        tokio::spawn(run_session(Session {
+        let exited = CancellationToken::new();
+        let exit_guard = exited.clone().drop_guard();
+        let session = Session {
+            strict_resume,
             title_only,
             child,
             client,
@@ -678,12 +741,20 @@ impl CodexHarness {
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
-        }));
+        };
+        tokio::spawn(async move {
+            let _exit_guard = exit_guard;
+            run_session(session).await;
+        });
 
-        Ok(futures::stream::unfold(event_rx, |mut rx| async move {
-            rx.recv().await.map(|ev| (ev, rx))
-        })
-        .boxed())
+        Ok(crate::native_cli::track(
+            futures::stream::unfold(event_rx, |mut rx| async move {
+                rx.recv().await.map(|ev| (ev, rx))
+            })
+            .boxed(),
+            self.native_runtimes.clone(),
+            exited,
+        ))
     }
 }
 
@@ -692,6 +763,7 @@ impl CodexHarness {
 // ---------------------------------------------------------------------------
 
 struct Session {
+    strict_resume: bool,
     title_only: bool,
     child: Child,
     client: RpcClient,
@@ -783,6 +855,7 @@ async fn start_turn(client: &RpcClient, params: Value) -> Result<String, Harness
 /// steering mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
+        strict_resume,
         title_only,
         mut child,
         client,
@@ -901,6 +974,7 @@ async fn run_session(session: Session) {
             match client.request("thread/resume", Value::Object(p)).await {
                 Ok(thread) => thread,
                 // A missing/foreign rollout falls back to a fresh thread.
+                Err(e) if strict_resume => return Err(e),
                 Err(e) => {
                     tracing::debug!(
                         target: "zeron_harness::codex",
@@ -917,6 +991,11 @@ async fn run_session(session: Session) {
                 .await?
         };
         let thread_id = thread["thread"]["id"].as_str().unwrap_or("").to_owned();
+        if strict_resume && request.resume.as_deref() != Some(thread_id.as_str()) {
+            return Err(HarnessError::Protocol(
+                "Codex resumed a different session; refusing to send the prompt".into(),
+            ));
+        }
         let mut children = subagents::Subagents::new(thread_id.clone());
         children.restore(&thread["thread"]);
         Ok::<_, HarnessError>((thread_id, children))

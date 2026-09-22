@@ -103,6 +103,7 @@ pub(crate) struct ViewSnap {
 }
 
 pub(crate) struct PaneSnap {
+    pub native_surface: Option<Entity<crate::session_surface::SessionSurfaceControl>>,
     pub pane: PaneId,
     pub mode: PaneMode,
     pub title: SharedString,
@@ -591,15 +592,23 @@ fn pane_container(
             pane.focused
                 .then(|| snap.action_control.borrow_mut().take())
                 .flatten(),
+            pane.native_surface
+                .as_ref()
+                .map(|s| s.clone().into_any_element()),
             true,
             theme,
             cx,
         ))
-        .child(pane_body(theme, pane))
+        .child(pane_body(theme, pane, cx))
         .into_any_element()
 }
 
-fn pane_body(theme: &Theme, pane: &PaneSnap) -> AnyElement {
+fn pane_body(theme: &Theme, pane: &PaneSnap, cx: &gpui::App) -> AnyElement {
+    if let Some(surface) = &pane.native_surface
+        && surface.read(cx).is_cli()
+    {
+        return surface.read(cx).body(cx);
+    }
     match pane.mode {
         PaneMode::Terminal => div()
             .flex_1()

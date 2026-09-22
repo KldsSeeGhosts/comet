@@ -145,6 +145,7 @@ pub(crate) fn pane_header(
     closable: bool,
     show_changes: bool,
     action_control: Option<AnyElement>,
+    surface_control: Option<AnyElement>,
     draggable: bool,
     theme: &Theme,
     cx: &Context<'_, Shell>,
@@ -253,6 +254,7 @@ pub(crate) fn pane_header(
                 .text_color(theme.text)
                 .child(title),
         )
+        .when_some(surface_control, |el, control| el.child(control))
         .when_some(action_control, |el, action| el.child(action))
         // The right-pane toggle lives on the pane header — the window-wide
         // chat header that used to carry it is gone. Shown only on the

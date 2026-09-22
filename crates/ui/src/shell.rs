@@ -68,6 +68,7 @@ use crate::workspace_links::resolve_workspace_file_link;
 mod actions_ui;
 mod command_palette;
 mod panes;
+mod session_surface;
 mod spaces;
 mod tabs;
 mod voice;
@@ -1388,6 +1389,8 @@ pub struct Shell {
     /// `AppState::selected_chat`, which the focus/selection sync keeps equal
     /// to the focused pane's session (shell/panes.rs).
     workspace: crate::pane::PaneHost,
+    native_surfaces:
+        std::collections::HashMap<zeron_workspace::PaneId, session_surface::NativeSurface>,
     /// WS3: open tool picker (⌘D/⇧⌘D/tab-strip "+"). `None` = no layout
     /// impact; a picked row commits the split/tab, Esc closes with zero
     /// layout change. State + flow in `shell/panes.rs` + `pane/mod.rs`.
@@ -1894,6 +1897,7 @@ impl Shell {
             transcript,
             composer,
             workspace: crate::pane::PaneHost::new(),
+            native_surfaces: Default::default(),
             tool_picker: None,
             pane_menu: popover::Popup::default(),
             divider_dragging: false,
@@ -7795,6 +7799,25 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .child(div().flex_1().min_h_0().child(outlet))
+                .into_any_element();
+        }
+
+        self.ensure_session_surfaces(cx);
+        if !self.workspace_mode()
+            && let Some(pane) = self.workspace.layout.active_pane_id()
+            && let Some(surface) = self.native_surfaces.get(&pane)
+            && surface.control.read(cx).is_cli()
+        {
+            let body = surface.control.read(cx).body(cx);
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .flex_col()
+                .child(self.render_primary_pane_header(theme, cx))
+                .child(body)
                 .into_any_element();
         }
 

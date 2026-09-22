@@ -1346,3 +1346,53 @@ async fn registers_conversation_browser_mcp_at_process_start() {
         "{args}"
     );
 }
+
+#[tokio::test]
+async fn native_strict_resume_never_starts_fresh_or_accepts_a_replacement_id() {
+    for resume in ["resume-fail", "resume-ok"] {
+        let harness = harness();
+        let (controls, _steer, _token) = controls("Yes");
+        let mut req = request("scenario:resumed");
+        req.resume = Some(resume.into());
+        let stream = harness.run_strict(req, controls).await.unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Ok(AgentEvent::SessionStarted { .. } | AgentEvent::TextDelta { .. })
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            })
+        )));
+    }
+}
+
+#[tokio::test]
+async fn native_runtime_acknowledges_exit_after_interrupt() {
+    let harness = harness();
+    let (controls, _steer, token) = controls("Yes");
+    let mut req = request("scenario:resumed");
+    req.resume = Some("th-resumed".into());
+    let mut stream = harness.run_strict(req, controls).await.unwrap();
+    let id = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::SessionStarted { session_id, .. } = event.unwrap() {
+                return session_id;
+            }
+        }
+        panic!("missing session");
+    })
+    .await
+    .unwrap();
+    let exited = harness.native_runtime_exited(&id).unwrap();
+    assert!(!exited.is_cancelled());
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(10), exited.cancelled())
+        .await
+        .unwrap();
+}

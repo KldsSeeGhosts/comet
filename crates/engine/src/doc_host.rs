@@ -4186,6 +4186,16 @@ impl DocHost {
         entry: &SessionCommandEntry,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
+        if sessions.native_owns_chat(chat_id)
+            && matches!(
+                &entry.payload,
+                SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+            )
+        {
+            return Err(EngineError::Other(
+                "This session is open in CLI. Switch back to Chat before sending.".into(),
+            ));
+        }
         match &entry.payload {
             SessionCommandPayload::Run {
                 request,
@@ -4674,6 +4684,24 @@ impl DocHost {
             resume: None,
             worktree: None,
         })
+    }
+
+    /// A handoff may release provider ownership only after its imported
+    /// transcript has a confirmed durable snapshot.
+    pub(crate) fn persist_native_import(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
+        if handle.retired.load(Ordering::Relaxed) {
+            return Err(EngineError::Other(
+                "Chat lineage changed during CLI import; reopen the session and retry".into(),
+            ));
+        }
+        if let Some(persistence) = &handle.persistence {
+            persistence.dirty(false);
+            return persistence.flush_checked().map_err(EngineError::Other);
+        }
+        let bytes = handle.doc.export_snapshot()?;
+        self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+        handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
+        Ok(())
     }
 
     fn save_snapshot(&self, handle: &ChatDocHandle) {

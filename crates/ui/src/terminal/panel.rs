@@ -317,6 +317,7 @@ impl Render for TabGhost {
 
 pub struct TerminalPanel {
     state: Entity<AppState>,
+    bound_chat: Option<String>,
     focus_handle: FocusHandle,
     focus_pending: bool,
     chats: HashMap<String, ChatTabs>,
@@ -363,6 +364,7 @@ impl TerminalPanel {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         Self {
             state,
+            bound_chat: None,
             focus_handle: cx.focus_handle(),
             focus_pending: false,
             chats: HashMap::new(),
@@ -387,6 +389,14 @@ impl TerminalPanel {
     pub fn new_embedded(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let mut panel = Self::new(state, cx);
         panel.embedded = true;
+        panel
+    }
+
+    /// A session CLI is bound independently of sidebar selection and focus.
+    pub fn new_for_chat(state: Entity<AppState>, chat: String, cx: &mut Context<Self>) -> Self {
+        let mut panel = Self::new_embedded(state, cx);
+        panel.bound_chat = Some(chat);
+        panel.open = true;
         panel
     }
 
@@ -568,7 +578,7 @@ impl TerminalPanel {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
-        let selected = self.state.read(cx).selected_chat.clone();
+        let selected = self.selected_chat(cx);
         let switched = selected != self.last_selected;
         if switched {
             self.last_selected = selected;
@@ -604,7 +614,9 @@ impl TerminalPanel {
     }
 
     fn selected_chat(&self, cx: &App) -> Option<String> {
-        self.state.read(cx).selected_chat.clone()
+        self.bound_chat
+            .clone()
+            .or_else(|| self.state.read(cx).selected_chat.clone())
     }
 
     fn ensure_tab(&mut self, cx: &mut Context<Self>) {
@@ -625,7 +637,7 @@ impl TerminalPanel {
     }
 
     fn active_tab(&self, cx: &App) -> Option<&TerminalTab> {
-        let chat = self.state.read(cx).selected_chat.clone()?;
+        let chat = self.selected_chat(cx)?;
         let tabs = self.chats.get(&chat)?;
         tabs.tabs.get(tabs.active)
     }

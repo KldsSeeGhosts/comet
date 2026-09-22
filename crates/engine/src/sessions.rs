@@ -17,6 +17,9 @@
 //! Every dying path must instead carry its own visible error (child crash with stderr,
 //! spawn failure, stream error, engine-restart recovery).
 
+mod native;
+mod native_history;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
@@ -131,6 +134,8 @@ struct RoutedSteer {
 }
 
 struct Inner {
+    native_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    native_terminal_owners: Mutex<HashMap<String, String>>,
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
@@ -183,6 +188,8 @@ impl SessionsEngine {
         let (sessions_tx, _) = watch::channel(Vec::new());
         Self {
             inner: Arc::new(Inner {
+                native_gates: Mutex::default(),
+                native_terminal_owners: Mutex::default(),
                 device_id,
                 journal,
                 registry,
@@ -284,6 +291,9 @@ impl SessionsEngine {
     /// session parked BETWEEN turns is not: it holds a warm child with nothing
     /// outstanding, and takes the next prompt straight through its mailbox.
     pub fn turn_in_flight(&self, chat_id: &str) -> bool {
+        if self.native_owns_chat(chat_id) {
+            return true;
+        }
         lock(&self.inner.statuses)
             .get(chat_id)
             .is_some_and(is_active)
@@ -292,7 +302,10 @@ impl SessionsEngine {
     /// Any run currently working or blocked on input — the auto-updater's
     /// "don't restart from under a session" gate.
     pub fn any_active(&self) -> bool {
-        lock(&self.inner.statuses).values().any(is_active)
+        // Native activity can continue after its pane is hidden. Defer automatic
+        // engine updates until the CLI ownership has been returned to Chat.
+        !lock(&self.inner.native_terminal_owners).is_empty()
+            || lock(&self.inner.statuses).values().any(is_active)
     }
 
     /// The last request dispatched for a chat (steer→new-turn fallback).
@@ -365,6 +378,23 @@ impl SessionsEngine {
         mut message_id: Option<String>,
         startup_retry: bool,
     ) -> Result<String, EngineError> {
+        let gate = self.native_gate(chat_id);
+        let _gate = gate.lock().await;
+        self.require_chat_owner(chat_id)?;
+        if let Some(binding) = self.native_binding(chat_id)? {
+            if harness_id != binding.harness || expand_home(&request.cwd) != binding.request.cwd {
+                return Err(EngineError::Other(
+                    "The native session belongs to another provider or working directory".into(),
+                ));
+            }
+            native_history::checkpoint_at(
+                binding.checkpoint_path(),
+                binding.harness,
+                &binding.session_id,
+                &binding.request.cwd,
+            )?;
+            request.resume = Some(binding.session_id);
+        }
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
@@ -547,6 +577,9 @@ impl SessionsEngine {
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<SteerOutcome, EngineError> {
+        let gate = self.native_gate(chat_id);
+        let _gate = gate.lock().await;
+        self.require_chat_owner(chat_id)?;
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
@@ -680,6 +713,9 @@ impl SessionsEngine {
         let stale = self.inner.journal.stale_sessions()?;
         let mut recovered = 0usize;
         for chat_id in stale {
+            if self.native_owns_chat(&chat_id) {
+                continue;
+            }
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue; // a live run owns this journal
             }
@@ -1539,7 +1575,16 @@ async fn drive_run(
         }
     }
     let started = match prepared {
-        Ok(()) => harness.run(request, controls).await,
+        Ok(()) => {
+            let engine = SessionsEngine {
+                inner: inner.clone(),
+            };
+            if engine.native_binding(&chat_id).ok().flatten().is_some() {
+                harness.run_strict(request, controls).await
+            } else {
+                harness.run(request, controls).await
+            }
+        }
         Err(error) => Err(error),
     };
     let mut stream = match started {

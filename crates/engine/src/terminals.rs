@@ -204,7 +204,7 @@ impl Terminals {
         rows: u16,
         environment: &HashMap<String, String>,
     ) -> Result<TerminalSession, EngineError> {
-        self.open_session(cwd, cols, rows, None, environment, None)
+        self.open_session(cwd, cols, rows, None, environment, None, None)
     }
 
     /// Explicit shell override (tests use `/bin/sh`).
@@ -227,7 +227,7 @@ impl Terminals {
         shell: Option<&str>,
         environment: &HashMap<String, String>,
     ) -> Result<TerminalSession, EngineError> {
-        self.open_session(cwd, cols, rows, shell, environment, None)
+        self.open_session(cwd, cols, rows, shell, environment, None, None)
     }
 
     /// Run an exact command in a fresh interactive login shell. On Unix, only a
@@ -240,7 +240,61 @@ impl Terminals {
         environment: &HashMap<String, String>,
         command: &str,
     ) -> Result<TerminalSession, EngineError> {
-        self.open_session(cwd, cols, rows, None, environment, Some(command))
+        self.open_session(cwd, cols, rows, None, environment, Some(command), None)
+    }
+
+    pub fn open_program(
+        &self,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        program: &zeron_harness::native_cli::NativeCliCommand,
+    ) -> Result<TerminalSession, EngineError> {
+        let mut env = HashMap::new();
+        let mut command = zeron_harness::process::Command::new(&program.executable);
+        zeron_harness::compose_child_path(&mut command, &program.executable);
+        for (key, value) in command.as_std_mut().get_envs() {
+            if let Some(value) = value {
+                env.insert(
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                );
+            }
+        }
+        self.open_session(cwd, cols, rows, None, &env, None, Some(program))
+    }
+
+    pub fn exited(&self, id: &str) -> bool {
+        self.session(id)
+            .map(|session| lock(&session).exited)
+            .unwrap_or(true)
+    }
+
+    /// Keep the session allocated until the output pump has drained and the
+    /// child wait has completed. A timeout leaves ownership with the caller.
+    pub async fn terminate_and_wait(&self, id: &str) -> Result<(), EngineError> {
+        let Ok(session) = self.session(id) else {
+            return Ok(());
+        };
+        {
+            let mut session = lock(&session);
+            if !session.exited {
+                session
+                    .killer
+                    .kill()
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !lock(&session).exited {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            EngineError::Other("The native CLI has not finished closing; try again".into())
+        })?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -252,6 +306,7 @@ impl Terminals {
         shell: Option<&str>,
         environment: &HashMap<String, String>,
         command: Option<&str>,
+        program: Option<&zeron_harness::native_cli::NativeCliCommand>,
     ) -> Result<TerminalSession, EngineError> {
         if lock(&self.inner.sessions).len() >= MAX_TERMINALS {
             return Err(EngineError::Other(format!(
@@ -264,7 +319,15 @@ impl Terminals {
             ));
         }
 
-        let shell = shell.map(str::to_string).unwrap_or_else(selected_shell);
+        #[cfg(windows)]
+        if program.is_some() {
+            return Err(EngineError::Other(
+                "Native CLI switching is not yet supported on Windows".into(),
+            ));
+        }
+        let shell = program
+            .map(|p| p.executable.to_string_lossy().into_owned())
+            .unwrap_or_else(|| shell.map(str::to_string).unwrap_or_else(selected_shell));
         let shell_name = std::path::Path::new(&shell)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -289,7 +352,9 @@ impl Terminals {
                 .openpty(clamp_size(cols, rows))
                 .map_err(|e| EngineError::Other(format!("could not open a pty: {e}")))?;
             let mut cmd = CommandBuilder::new(&shell);
-            if !cfg!(windows) {
+            if let Some(program) = program {
+                cmd.args(&program.args);
+            } else if !cfg!(windows) {
                 cmd.arg("-l"); // login shell — the user's real PATH/profile
             }
             cmd.cwd(cwd);
