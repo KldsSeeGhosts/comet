@@ -106,7 +106,7 @@ The macOS development and release bundles include the microphone purpose string;
 the hardened release signing path adds the audio-input entitlement. Linux builds
 need ALSA development headers, already installed by the UI/release workflows.
 
-Before taking the PR out of draft, run a real call with an API key and headphones:
+For a real-call smoke test, use an API key and headphones:
 verify microphone denial, simultaneous speech, local and remote session tools,
 queued sends, a declined native confirmation, file conflict handling, mute,
 rapid hangup/restart, device removal, and network loss. Automated checks do not

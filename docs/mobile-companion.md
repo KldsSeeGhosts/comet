@@ -307,6 +307,11 @@ xcodebuild -project Zeron.xcodeproj -scheme Zeron \
   approval responses, queued follow-ups, stopping, and appearance screens.
   The tests pass `-appearance.*` launch arguments, and
   `-companion-settings` opens the settings sheet on launch.
+  Keep simulator code signing enabled for these UI tests. Pairing writes to
+  Keychain, which fails in a build made with `CODE_SIGNING_ALLOWED=NO`.
+  `CODE_SIGN_IDENTITY=-` uses an ad-hoc simulator signature without a paid
+  developer account. Run with `-parallel-testing-enabled NO` because the
+  companion flows share fixture state.
 
 `testLivePairedHostWhenConfigured` is opt-in. Put an existing private pairing
 code in the installed simulator app's `Documents/companion-live.code`, run
