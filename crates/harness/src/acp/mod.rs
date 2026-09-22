@@ -1426,7 +1426,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
     // Family-alias catalog row: the claude adapter advertises bare aliases
     // (`opus`, `sonnet`, `haiku`) meaning "the current generation" — match
     // them to the first (flagship-ordered) catalog row of that family so
-    // the picker shows the curated label/ladder ("Opus 5") instead of the
+    // the picker shows the curated label/ladder ("Opus 5.5") instead of the
     // terse alias. Alphabetic-only ids ONLY: versioned ids
     // (`gpt-5.2-codex`) must never fuzzy-match a foreign row.
     let alias = |id: &str| {
@@ -2336,7 +2336,16 @@ fn handle_server_request_live(
     method: &str,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
+    session_id: &str,
 ) -> Vec<AgentEvent> {
+    if params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id != session_id)
+    {
+        client.respond(&id, json!({"outcome": {"outcome": "cancelled"}}));
+        return Vec::new();
+    }
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
     }
@@ -2581,7 +2590,13 @@ async fn request_draining(
     let mut config_updates = std::collections::HashMap::new();
     let mut handle_incoming = |inc| match inc {
         Incoming::Request { id, method, params } => {
-            handle_server_request(client, id, &method, &params);
+            if method == "session/request_permission"
+                && params.get("sessionId").and_then(Value::as_str) != requested_session.as_deref()
+            {
+                client.respond(&id, json!({"outcome": {"outcome": "cancelled"}}));
+            } else {
+                handle_server_request(client, id, &method, &params);
+            }
         }
         Incoming::Notification { method, params }
             if loading_session
@@ -2974,8 +2989,8 @@ async fn run_session(session: Session) {
     // one prompt is outstanding at a time, identified by `current_prompt_id`;
     // settled ids are remembered so a STALE `prompt_complete` (a late replay
     // of an already-settled prompt) can never settle a newer turn.
-    let mut prompt_seq: u64 = 0;
-    let mut current_prompt_id: Option<String> = None;
+    let mut prompt_seq: u64 = 1;
+    let mut current_prompt_id = prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
     let mut completed_prompts: VecDeque<String> = VecDeque::new();
     // `ZERON_ACP_PROMPT_STALL_MS` overrides the spec's bound; 0 disables.
     let prompt_stall: Option<Duration> = match std::env::var("ZERON_ACP_PROMPT_STALL_MS")
@@ -2988,16 +3003,12 @@ async fn run_session(session: Session) {
     };
     let mut prompt_stall_deadline: Option<tokio::time::Instant> =
         prompt_stall.map(|d| tokio::time::Instant::now() + d);
-    let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
-        prompt_seq += 1;
-        current_prompt_id = prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
-        prompt_turn(
-            client.clone(),
-            session_id.clone(),
-            prompt_transform(request.reasoning, &request.prompt),
-            current_prompt_id.clone(),
-        )
-    });
+    let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some(prompt_turn(
+        client.clone(),
+        session_id.clone(),
+        prompt_transform(request.reasoning, &request.prompt),
+        current_prompt_id.clone(),
+    ));
     // Steers waiting for the turn boundary (agents without the extension, or
     // extension steers that lost the turn-end race).
     let mut queued_steers: VecDeque<String> = VecDeque::new();
@@ -3133,6 +3144,7 @@ async fn run_session(session: Session) {
                                 &method,
                                 &params,
                                 &request_input,
+                                &session_id,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -3223,6 +3235,13 @@ async fn run_session(session: Session) {
 
             inc = incoming.recv() => match inc {
                 Some(Incoming::Notification { method, params }) => {
+                    if params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id != session_id)
+                    {
+                        continue;
+                    }
                     last_update_at = tokio::time::Instant::now();
                     // Wire traffic is a sign of life for the prompt-stall
                     // watchdog — EXCEPT session boilerplate: opencode emits
@@ -3305,6 +3324,7 @@ async fn run_session(session: Session) {
                         &method,
                         &params,
                         &request_input,
+                        &session_id,
                     ) {
                         if !send(&event_tx, ev).await {
                             break 'main;
@@ -3414,6 +3434,7 @@ async fn run_session(session: Session) {
                                         &method,
                                         &params,
                                         &request_input,
+                                        &session_id,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -3736,7 +3757,6 @@ async fn run_session(session: Session) {
             _ = tokio::time::sleep_until(
                 prompt_stall_deadline.unwrap_or_else(tokio::time::Instant::now),
             ), if prompt_stall_deadline.is_some() && turn.is_some() && !interrupted => {
-                prompt_stall_deadline = None;
                 let _ = send(
                     &event_tx,
                     AgentEvent::Error {
@@ -4423,7 +4443,7 @@ mod tests {
         let models = models_from_session(&response, &crate::claude::catalog::static_models());
         assert_eq!(
             models.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
-            vec!["Opus 5", "Fable 5.1", "Sonnet 5", "Haiku 4.5"]
+            vec!["Opus 5.5", "Fable 5.1", "Sonnet 5", "Haiku 4.5"]
         );
         // The alias rows carry the catalog's per-model ladders.
         assert!(

@@ -3560,6 +3560,7 @@ impl Transcript {
     /// previous reservation and drop the messages back down — user report).
     /// [`Self::step_own_turn`] sizes the reservation and eases the prompt to
     /// its top inset. Replacing a previous anchor starts a new glide.
+    #[cfg(test)]
     pub(crate) fn showing_chat(&self) -> Option<&str> {
         self.chat_id.as_deref()
     }
@@ -4122,7 +4123,7 @@ impl Transcript {
         // Read off the OLD list: a Top list's offset is always concrete.
         let previous = self.list.logical_scroll_top();
         let count = self.rows.len();
-        let mut list = ListState::new(count, ListAlignment::Bottom, px(OVERDRAW_PX));
+        let list = ListState::new(count, ListAlignment::Bottom, px(OVERDRAW_PX));
         let weak = cx.weak_entity();
         list.set_scroll_handler(move |event: &ListScrollEvent, _window, cx| {
             weak.update(cx, |this: &mut Transcript, cx| {
@@ -13115,7 +13116,7 @@ mod tests {
             visual.update(|window, cx| {
                 window.simulate_next_frame(cx);
             });
-            transcript.update(&mut visual.cx, |this, cx| {
+            transcript.update(&mut visual.cx, |this, _cx| {
                 assert!(this.is_top_anchored(), "a sparse pane session starts Top");
                 assert!(!this.pane_content_overflows());
                 let viewport = this.list.viewport_bounds();

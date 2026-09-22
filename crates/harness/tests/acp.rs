@@ -97,6 +97,32 @@ fn dones(events: &[AgentEvent]) -> Vec<(DoneStatus, Option<String>)> {
 }
 
 #[tokio::test]
+async fn foreign_permissions_cannot_approve_a_parent_turn() {
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&harness(), request("scenario:foreign-permission"), controls).await;
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "foreign permission rejected");
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn diagnostic_objects_cannot_settle_rpc_requests() {
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&harness(), request("scenario:rpc-noise"), controls).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TextDelta { text } if text == "valid reply"
+    )));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
 async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
     let (controls, _steer, _token) = controls();
     let events = run_to_end(&harness(), request("scenario:happy"), controls).await;

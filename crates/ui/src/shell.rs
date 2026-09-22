@@ -112,6 +112,7 @@ actions!(
 /// Restore a default focus only after an in-flight handoff has had a frame to
 /// claim the window. A synchronous focus-lost fallback can otherwise steal
 /// focus from controls that are mounting in response to the same input event.
+#[cfg(test)]
 pub(crate) fn restore_focus_if_empty_on_next_frame<T: 'static>(
     focus: FocusHandle,
     window: &mut Window,
@@ -13197,7 +13198,7 @@ mod workspace_persistence {
         let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
         window
             .update(cx, |shell, _, cx| {
-                shell.state.update(cx, |state, cx| {
+                shell.state.update(cx, |state, _cx| {
                     state.spaces = vec![serde_json::from_value(space("b")).unwrap()];
                     state.chats = vec![serde_json::from_value(chat("chat-b", "b")).unwrap()];
                     state.chats_synced = true;
@@ -13233,7 +13234,7 @@ mod workspace_persistence {
         window
             .update(cx, |shell, _, cx| {
                 // chat "gone" does NOT exist — it was deleted elsewhere.
-                shell.state.update(cx, |state, cx| {
+                shell.state.update(cx, |state, _cx| {
                     state.spaces = vec![serde_json::from_value(space("b")).unwrap()];
                     state.chats = vec![serde_json::from_value(chat("chat-b", "b")).unwrap()];
                     state.chats_synced = true;
@@ -13268,7 +13269,7 @@ mod workspace_persistence {
         let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
         window
             .update(cx, |shell, _, cx| {
-                shell.state.update(cx, |state, cx| {
+                shell.state.update(cx, |state, _cx| {
                     state.spaces_synced = true;
                     state.chats_synced = true;
                 });
@@ -13296,7 +13297,7 @@ mod workspace_persistence {
         let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
         window
             .update(cx, |shell, window, cx| {
-                shell.state.update(cx, |state, cx| {
+                shell.state.update(cx, |state, _cx| {
                     state.spaces_synced = true;
                     state.chats_synced = true;
                 });

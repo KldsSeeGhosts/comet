@@ -98,6 +98,22 @@ pid=$(rid "$promptline")
 
 case "$promptline" in
 
+*scenario:foreign-permission*)
+  emit '{"method":"session/update","params":{"sessionId":"other","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"foreign"}}}}'
+  emit '{"id":900,"method":"session/request_permission","params":{"sessionId":"other","options":[{"optionId":"allow","kind":"allow_once","name":"Allow"}]}}'
+  read -r reply || exit 1
+  has "$reply" '"id":900' && has "$reply" '"outcome":"cancelled"' || exit 1
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"foreign permission rejected"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:rpc-noise*)
+  emit "{\"id\":$pid,\"diagnostic\":\"not a response\"}"
+  emit "{\"jsonrpc\":\"other\",\"id\":$pid,\"result\":{}}"
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"valid reply"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:model-api*)
   if has "$MODEL_SETS" '"modelId":"grok-4.5"'; then
     update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"model switched"}}'
