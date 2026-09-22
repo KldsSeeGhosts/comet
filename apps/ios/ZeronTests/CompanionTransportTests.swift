@@ -16,6 +16,26 @@ final class CompanionTransportTests: XCTestCase {
             guard String(decoding: data, as: UTF8.self).contains("fixture") else { throw RelayError.notConnected }
         } catch { throw XCTSkip("Start scripts/fixtures/noches-mobile-host.mjs to run integration tests.") }
     }
+    /// Opt-in, read-only test. Place an existing pairing code in the simulator
+    /// app's Documents/companion-live.code; the test never saves it to Keychain.
+    func testLivePairedHostWhenConfigured() async throws {
+        let url = try XCTUnwrap(FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first)
+            .appendingPathComponent("companion-live.code")
+        guard FileManager.default.fileExists(atPath: url.path) else { throw XCTSkip("No live host configured.") }
+        let host = try ConnectionProfile.parse(String(contentsOf: url, encoding: .utf8))
+        let connection = DirectConnection()
+        defer { connection.close() }
+        try await connection.connect(host)
+        let info = try await connection.call("EngineInfo")
+        XCTAssertEqual(info.objectValue?["deviceId"]?.stringValue, host.deviceId)
+        let stream = try await connection.watch("WatchChats")
+        var iterator = stream.makeAsyncIterator()
+        let snapshot = try await iterator.next()
+        let value = try XCTUnwrap(snapshot)
+        let chats = try CompanionModel.decode([HostChat].self, value)
+        XCTAssertTrue(chats.allSatisfy { !$0.id.isEmpty })
+    }
+
     func testIdentityCatalogAndLiveSnapshot() async throws {
         try await requireFixture()
         let connection = DirectConnection()

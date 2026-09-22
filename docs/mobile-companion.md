@@ -68,7 +68,12 @@ and watch row counts for a code file.
 ## Pairing the phone
 
 Tap **Pair a computer** on the signed-out companion home, or pair from the
-toolbar sheet that also holds appearance settings. Paste the code:
+toolbar sheet that also holds appearance settings. Install Tailscale on the
+phone, join the same tailnet as the host, and leave its VPN enabled. The
+connection works across networks without exposing the engine to the public
+internet. Tailnet access rules must allow the phone to reach the gateway port.
+
+Paste the code or tap **Scan connection code**:
 `noches-connect:` followed by URL-safe base64 of the profile JSON, which holds
 the `id`, `name`, `endpoint`, `token`, and `deviceId`.
 
@@ -80,6 +85,19 @@ private addresses: Tailscale CGNAT `100.64.0.0/10`, the Tailscale ULA prefix
 endpoint must not carry a path, credentials, or a query. Several computers can
 be paired and switched in the same sheet. **Forget** removes one locally;
 `revoke` on the host disables its key everywhere.
+
+On macOS, generate the QR locally from the private code file:
+
+```sh
+swift scripts/pairing-qr.swift "$STORE/phone.code" "$STORE/phone.png"
+open "$STORE/phone.png"
+```
+
+The renderer writes a PNG with mode `0600`. The image contains the same key as
+the code, so keep it private and delete both after pairing. No QR service
+receives it. Camera scanning fills the pairing field; tap **Connect to
+computer** to validate and save it. Pasting remains available when the camera
+is unavailable. A simulator cannot validate physical camera scanning.
 
 ## What the phone supports today
 
@@ -101,27 +119,49 @@ ping every 8 seconds and a close after 24 seconds without a frame. A dropped
 link retries every 4 seconds while foregrounded; backgrounding closes it and
 the app reconnects on return.
 
-Sessions are scoped to the selected computer, and archived rows are hidden:
+The home screen groups sessions by project and puts sessions needing input
+first, followed by errors, working sessions, completed sessions, and idle
+sessions. Search matches titles, previews, branches, paths, and project names.
+The bottom filter switches between All, Needs you, Working, and Archived.
+Select a project or switch computers above the list.
+
+Sessions are scoped to the selected computer:
 
 - live catalogs from `WatchChats`, `WatchSpaces`, `WatchSessions`, and
   `ListHarnesses`, with installed and enabled agents only;
 - create via `Mutate {op: "createChat"}` against a project or the home folder,
-  with the chosen harness, sandbox `workspace-write`, and the agent's default
-  model;
+  with the chosen installed agent, sandbox `workspace-write`, and a model and
+  reasoning level from `ListModels`. The agent default remains available if
+  its catalog cannot load;
 - send: `QueueMessage` with `holdForTurnEnd` while a session is working or
   awaiting input, otherwise a `run` command carrying the prompt, working
   directory, sandbox, `autoApprove: false`, and the session's harness, model,
   and reasoning options. Queued rows render read-only above the composer;
+- rename, archive, and restore through host-confirmed `Mutate` operations.
+  Long-press a session for actions, use its chat menu, or swipe to archive.
+  Restore from the Archived filter;
+- unsent drafts stay scoped to the host and session during navigation and
+  computer switches. Drafts are in memory and do not survive app termination;
 - stop: `interrupt`;
 - approvals: `respondInput` with the question panel's `{questionId, labels}`
   answers.
 
 Transcript: `WatchDocMessages` frames apply incrementally as reset, upsert,
 append, or remove changes, with byte-length and row-count checks. Text parts
-reuse the app's markdown renderer, tool parts render as a labeled row that
-turns red on error, and a frame that fails verification surfaces "Transcript
-needs a refresh." before the view resubscribes. The host writes every entry;
-the phone never edits the transcript.
+use the same native table, incremental markdown parser, folding user bubbles,
+and expandable tool groups as the cloud app. Scrolling away from the latest
+message stops automatic following; the jump button returns to it. Input
+requests use the native question panel. A frame that fails verification
+surfaces "Transcript needs a refresh." before the view resubscribes. The host
+writes every entry; the phone never edits the transcript.
+
+The chat toolbar also opens **Files** and **Changes**. Files supports folder
+navigation, paginated listings, and selectable text with line numbers through
+`ListWorkspaceDirectory` and `ReadWorkspaceFile`. Changes reads the current
+checkout's working diff through `GetCheckoutDiff`, with additions/deletions
+and colored patch lines. These views are read-only. Previews stop at 200,000
+characters and label partial results; binary files must be opened on the host.
+The host enforces the workspace file boundaries.
 
 Not implemented today:
 
@@ -130,12 +170,17 @@ Not implemented today:
   the tailnet;
 - no attachments and no generated-image rendering: the composer has no picker,
   and `image` parts show "View generated image on your computer";
-- no terminal, diff, or file browser, and no PR badges;
+- no terminal or PR actions/badges;
 - queue rows cannot be edited, reordered, or removed from the phone;
-- no session archiving or renaming, and no space creation;
-- no QR pairing: the code is pasted or typed.
+- no space creation.
 
 ## Theme and appearance
+
+The companion uses the desktop's Geist and Geist Mono fonts, pixel mark,
+bot avatars, agent marks, and theme color roles. The native list keeps project
+labels and session metadata compact; search, filtering, and new-session
+controls sit at the bottom of the screen. Chat uses a glass composer and the
+shared native transcript renderer.
 
 The companion uses the desktop theme catalog.
 `apps/ios/Zeron/Theme/DesktopThemes.json` is generated from `crates/theme` and
@@ -189,13 +234,25 @@ and all state on the host.
 
 ## Build, run, and test
 
-Simulator validation on September 20, 2026 passed 21 companion and appearance
-tests and both companion UI tests. The transport run included the real Rust
-gateway over a fixture engine; it did not run a real agent or use a physical
-iPhone. Captured screens: [light dashboard](screenshots/mobile-companion/companion-zeron-light.png),
-[Catppuccin dashboard](screenshots/mobile-companion/companion-catppuccin-mocha.png),
-[appearance settings](screenshots/mobile-companion/appearance-catppuccin-mocha.png),
-and [transcript](screenshots/mobile-companion/companion-transcript-dark.png).
+Validation on September 22, 2026 includes iPhone 18 Pro and iPhone 17e
+simulators, a real Rust gateway over a fixture engine, and an opt-in read-only
+simulator connection to a running Linux Noches host over Tailscale. The live
+check verifies host identity and decodes its session catalog. It does not
+start an agent, and is not a physical-device or cellular-network test.
+
+The final iPhone 18 Pro run passed 26 unit/integration tests and four UI
+tests. The optional live-host test skipped after its private code was removed;
+it passed in a separate run. All four UI tests also passed on iPhone 17e.
+Debug and Release simulator builds passed. The QR image passed an exact
+encode/decode round-trip; camera capture still needs a physical iPhone.
+
+Screens from the fixture, which contains no private conversations:
+[dark home](screenshots/mobile-companion/companion-connected-dark.png),
+[light home](screenshots/mobile-companion/companion-zeron-light.png),
+[transcript](screenshots/mobile-companion/companion-transcript-dark.png),
+[approval](screenshots/mobile-companion/companion-approval.png),
+[file preview](screenshots/mobile-companion/companion-file-preview.png), and
+[changes](screenshots/mobile-companion/companion-changes.png).
 
 Xcode 27 with the iOS 27 simulator runtime; the project's deployment target is
 iOS 26.0. `iPhone 18 Pro` is the installed simulator destination on this
@@ -214,6 +271,8 @@ The companion subset:
 ```sh
 xcodebuild -project Zeron.xcodeproj -scheme Zeron \
   -destination 'platform=iOS Simulator,name=iPhone 18 Pro' \
+  -parallel-testing-enabled NO -collect-test-diagnostics never \
+  -only-testing:ZeronTests/CompanionDashboardTests \
   -only-testing:ZeronTests/CompanionConnectionTests \
   -only-testing:ZeronTests/CompanionTransportTests \
   -only-testing:ZeronTests/AppearanceSettingsTests \
@@ -221,6 +280,9 @@ xcodebuild -project Zeron.xcodeproj -scheme Zeron \
   -only-testing:ZeronUITests/CompanionUITests test
 ```
 
+- `CompanionDashboardTests` covers attention ordering, host isolation,
+  combined search/filtering, draft scoping, same-host reconnect, mutation
+  guards, and transcript adaptation for tools and approvals.
 - `CompanionConnectionTests` covers code round-trips, the accepted and rejected
   endpoint matrix, transcript frame application including UTF-8 byte lengths,
   and host catalog decoding. No fixture needed.
@@ -240,13 +302,20 @@ xcodebuild -project Zeron.xcodeproj -scheme Zeron \
   cleanup, id collisions, repair of persisted customs, clearing an unreadable
   blob, repairing selections that no longer resolve, and replacing a family
   that a selection points into.
-- `CompanionUITests` pairs, opens, and sends against the fixture and captures
-  appearance screens. The tests pass `-appearance.*` launch arguments, and
+- `CompanionUITests` pairs, opens, sends, and creates sessions against the
+  fixture. It covers files/diffs, rename/archive/restore, draft retention,
+  approval responses, queued follow-ups, stopping, and appearance screens.
+  The tests pass `-appearance.*` launch arguments, and
   `-companion-settings` opens the settings sheet on launch.
+
+`testLivePairedHostWhenConfigured` is opt-in. Put an existing private pairing
+code in the installed simulator app's `Documents/companion-live.code`, run
+that test, then remove the file. It never saves the code to Keychain or writes
+to the host. With no file it reports a skip.
 
 The fixture host is a Node script with no real host behind it. It emulates the
 gateway on `ws://127.0.0.1:28777` (`NOCHES_FIXTURE_PORT` overrides), answering
-`EngineInfo`, `ListHarnesses`, `BigReply`, and the watch methods, recording
+`EngineInfo`, model and agent catalogs, workspace reads, `BigReply`, and the watch methods, recording
 commands for `/commands`, and splitting replies into 32 KiB chunks with `end`
 flags. It closes the socket on a client frame without `end: true`, and serves a
 fixed profile: id `mobile-fixture`, key `a` repeated 64 times, device
@@ -301,8 +370,15 @@ lives only in the temp directory.
   reassembly, deadlines, heartbeats, and the never-replay failure path.
 - `apps/ios/Zeron/Companion/CompanionModel.swift`: catalogs, transcript
   frames, sessions, and commands.
-- `apps/ios/Zeron/Companion/CompanionView.swift`: companion home, pairing
-  sheet, session view, and composer.
+- `apps/ios/Zeron/Companion/CompanionView.swift`: navigation, pairing,
+  new-session sheet, session view, and composer.
+- `apps/ios/Zeron/Companion/CompanionHome.swift`: project list, session rows,
+  search/filtering, avatars, and session actions.
+- `apps/ios/Zeron/Companion/CompanionTranscript.swift`: host message adapter
+  and shared native transcript integration.
+- `apps/ios/Zeron/Companion/CompanionWorkspace.swift`: read-only files and diff.
+- `apps/ios/Zeron/Companion/CompanionScanner.swift`: camera QR scanning.
+- `scripts/pairing-qr.swift`: private local QR rendering on macOS.
 - `apps/ios/Zeron/Theme/AppearanceSettings.swift`: catalog, appearance and
   accent state, custom-family import.
 - `crates/rpc/src/bin/noches-connect.rs`: gateway `serve`, `pair`, `revoke`,

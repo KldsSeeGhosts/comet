@@ -37,6 +37,12 @@ struct HostHarness: Decodable, Identifiable {
     let enabled: Bool?
 }
 
+struct HostAgentModel: Decodable, Identifiable {
+    let id: String
+    let label: String
+    let reasoningLevels: [String]
+}
+
 struct HostPart: Codable, Identifiable, Equatable {
     var id: String
     var kind: String
@@ -52,6 +58,7 @@ struct HostPart: Codable, Identifiable, Equatable {
 struct HostMessage: Codable, Identifiable, Equatable {
     var id: String
     var role: String
+    var status: String?
     var parts: [HostPart]
 }
 
@@ -99,18 +106,46 @@ final class CompanionModel {
     var sessions: [HostSession] = []
     var harnesses: [HostHarness] = []
     var generation = 0
+    var connectionRevision = 0
+    var drafts: [String: String] = [:]
     var connection = DirectConnection()
     var selected: ConnectionProfile? { profiles.first { $0.id == selectedID } }
     var localChats: [HostChat] {
         chats.filter { !$0.archived && $0.deviceId == selected?.deviceId }
             .sorted { ($0.lastMessageAt ?? $0.createdAt) > ($1.lastMessageAt ?? $1.createdAt) }
     }
+    var archivedChats: [HostChat] {
+        chats.filter { $0.archived && $0.deviceId == selected?.deviceId }
+            .sorted { ($0.lastMessageAt ?? $0.createdAt) > ($1.lastMessageAt ?? $1.createdAt) }
+    }
+    func visibleChats(project: String = "", query: String = "", scope: CompanionScope = .all) -> [HostChat] {
+        let source = scope == .archived ? archivedChats : localChats
+        let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return source.filter { chat in
+            (project.isEmpty || chat.spaceId == project)
+                && (scope != .attention || ["awaitingInput", "errored"].contains(status(chat.id)))
+                && (scope != .working || status(chat.id) == "working")
+                && (search.isEmpty || [chat.displayTitle, chat.lastMessagePreview ?? "", chat.branch ?? "",
+                    chat.cwd ?? "", localSpaces.first { $0.id == chat.spaceId }?.displayName ?? ""]
+                    .contains { $0.localizedCaseInsensitiveContains(search) })
+        }.sorted {
+            let a = Self.attentionRank(status($0.id)), b = Self.attentionRank(status($1.id))
+            if scope != .archived && a != b { return a < b }
+            return ($0.lastMessageAt ?? $0.createdAt) > ($1.lastMessageAt ?? $1.createdAt)
+        }
+    }
+    private static func attentionRank(_ status: String) -> Int {
+        switch status { case "awaitingInput": 0; case "errored": 1; case "working": 2; case "completed": 3; default: 4 }
+    }
+    func draftKey(for chat: HostChat) -> String { "\(chat.deviceId)/\(chat.id)" }
+
     var localSpaces: [HostSpace] { spaces.filter { $0.deviceId == selected?.deviceId } }
 
     init() {
         do { profiles = try CompanionKeychain.load() }
         catch { self.error = error.localizedDescription }
-        selectedID = UserDefaults.standard.string(forKey: "companion.computer") ?? profiles.first?.id
+        let saved = UserDefaults.standard.string(forKey: "companion.computer")
+        selectedID = profiles.first { $0.id == saved }?.id ?? profiles.first?.id
     }
 
     func pair(_ code: String) throws {
@@ -127,6 +162,9 @@ final class CompanionModel {
         online = false
         chats = []; spaces = []; sessions = []; harnesses = []
         selectedID = id
+        error = nil
+        connectionMessage = "Connecting"
+        connectionRevision += 1
         generation += 1
     }
 
@@ -214,23 +252,54 @@ final class CompanionModel {
 
     func status(_ chatID: String) -> String { sessions.first { $0.chatId == chatID }?.status ?? "idle" }
 
-    func create(spaceID: String?, harness: String) async throws -> HostChat {
+    func create(spaceID: String?, harness: String, model: String? = nil, reasoning: String? = nil) async throws -> HostChat {
         guard online, let host = selected else { throw RelayError.notConnected }
         guard harnesses.contains(where: { $0.id == harness }),
               spaceID == nil || localSpaces.contains(where: { $0.id == spaceID }) else {
             throw RelayError.rpc("Refresh the computer's projects and agents before creating a session.")
         }
         let id = UUID().uuidString.lowercased()
-        let config: [String: Any] = ["harness": harness, "sandbox": "workspace-write", "modelOptions": [:]]
+        var config: [String: Any] = ["harness": harness, "sandbox": "workspace-write", "modelOptions": [:]]
+        config["model"] = model
+        config["reasoning"] = reasoning
         var params: [String: Any] = ["op": "createChat", "chatId": id, "deviceId": host.deviceId, "config": config]
         if let spaceID { params["spaceId"] = spaceID }
         _ = try await connection.call("Mutate", params)
         return HostChat(id: id, deviceId: host.deviceId, archived: false,
                         cwd: localSpaces.first { $0.id == spaceID }?.path ?? "~", spaceId: spaceID,
-                        config: ChatConfig(harness: harness, sandbox: "workspace-write"), createdAt: ISO8601DateFormatter().string(from: Date()))
+                        config: ChatConfig(harness: harness, model: model, reasoning: reasoning, sandbox: "workspace-write"), createdAt: ISO8601DateFormatter().string(from: Date()))
     }
 
-    func send(_ text: String, chat: HostChat) async throws {
+    func read(_ method: String, chat: HostChat, params: [String: Any]) async throws -> JSONValue {
+        guard online, chat.deviceId == selected?.deviceId else { throw RelayError.notConnected }
+        return try await connection.call(method, params)
+    }
+
+    func models(for harness: String) async throws -> [HostAgentModel] {
+        guard online else { throw RelayError.notConnected }
+        return try Self.decode([HostAgentModel].self, await connection.call("ListModels", ["harness": harness]))
+    }
+
+    func rename(_ chat: HostChat, title: String) async throws {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { throw RelayError.rpc("Enter a session name.") }
+        try await mutate(chat, values: ["op": "renameChat", "title": title])
+    }
+
+    func archive(_ chat: HostChat, archived: Bool) async throws {
+        try await mutate(chat, values: ["op": "setChatArchived", "archived": archived])
+    }
+
+    private func mutate(_ chat: HostChat, values: [String: Any]) async throws {
+        guard online, chat.deviceId == selected?.deviceId else { throw RelayError.notConnected }
+        var params = values
+        params["chatId"] = chat.id
+        // WatchChats owns local state. A failed or ambiguous write must never
+        // optimistically hide a session or get replayed after reconnecting.
+        _ = try await connection.call("Mutate", params)
+    }
+
+    func send(_ text: String, chat: HostChat, messageID: String = UUID().uuidString.lowercased()) async throws {
         guard online, chat.deviceId == selected?.deviceId else { throw RelayError.notConnected }
         if status(chat.id) == "working" || status(chat.id) == "awaitingInput" {
             _ = try await connection.call("QueueMessage", ["chatId": chat.id, "text": text, "holdForTurnEnd": true])
@@ -244,7 +313,7 @@ final class CompanionModel {
                 request["modelOptions"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(config.modelOptions))
             }
             _ = try await connection.call("QueueCommand", ["chatId": chat.id,
-                "command": ["kind": "run", "messageId": UUID().uuidString.lowercased(), "request": request]])
+                "command": ["kind": "run", "messageId": messageID, "request": request]])
         }
     }
 
@@ -263,4 +332,8 @@ final class CompanionModel {
     static func decode<T: Decodable>(_ type: T.Type, _ value: JSONValue) throws -> T {
         try JSONDecoder().decode(type, from: JSONEncoder().encode(value))
     }
+}
+
+enum CompanionScope: String, CaseIterable {
+    case all = "All", attention = "Needs you", working = "Working", archived = "Archived"
 }
