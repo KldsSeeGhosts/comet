@@ -17,10 +17,10 @@ on:
 permissions:
   contents: read
 
-# Serialize each channel including publication; never interrupt an asset upload.
+# Serialize published channels; obsolete PR builds can be cancelled safely.
 concurrency:
   group: noches-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   prepare:
