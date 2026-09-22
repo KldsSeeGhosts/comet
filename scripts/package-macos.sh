@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # macOS packaging: build the release binary for the host arch and produce
-#   target/package/zeron-<version>-macos-<arch>.dmg          (user download)
-#   target/package/zeron-<version>-macos-<arch>-app.tar.gz   (auto-updater)
-# containing Zeron.app (unsigned unless CODESIGN_IDENTITY is set).
+#   target/package/noches-<version>-macos-<arch>.dmg          (user download)
+#   target/package/noches-<version>-macos-<arch>-app.tar.gz   (auto-updater)
+# containing Noches.app or Noches Dev.app, ad-hoc signed by default.
 #
 # Usage: scripts/package-macos.sh
 # Env:   CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
@@ -14,20 +14,27 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
-VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
+source "$ROOT/scripts/release-config.sh"
 ARCH="$(uname -m)" # arm64 on Apple silicon runners
 OUT_DIR="$ROOT/target/package"
-APP="$OUT_DIR/Zeron.app"
-DMG="$OUT_DIR/zeron-$VERSION-macos-$ARCH.dmg"
-APP_TARBALL="$OUT_DIR/zeron-$VERSION-macos-$ARCH-app.tar.gz"
+APP="$OUT_DIR/$APP_NAME.app"
+DMG="$OUT_DIR/noches-$VERSION-macos-$ARCH.dmg"
+APP_TARBALL="$OUT_DIR/noches-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
-cargo build --release -p zeron
+cargo build --locked --release -p zeron
 
 rm -rf "$APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/zeron" "$APP/Contents/MacOS/zeron"
-sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
+python3 - "$ROOT/dist/macos/Info.plist" "$APP/Contents/Info.plist" <<'PLIST'
+import os, plistlib, sys
+with open(sys.argv[1], 'rb') as f: info = plistlib.load(f)
+info.update(CFBundleDisplayName=os.environ['APP_NAME'], CFBundleName=os.environ['APP_NAME'], CFBundleIdentifier=os.environ['BUNDLE_ID'],
+            CFBundleShortVersionString=os.environ['NOCHES_VERSION'].split('-')[0], CFBundleVersion=os.environ['NOCHES_VERSION'].split('-')[0])
+info['CFBundleURLTypes'] = [dict(CFBundleURLName=os.environ['BUNDLE_ID'] + '.conversation', CFBundleURLSchemes=[os.environ['APP_SLUG']])]
+with open(sys.argv[2], 'wb') as f: plistlib.dump(info, f)
+PLIST
 mkdir -p "$APP/Contents/Resources/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
 
@@ -77,7 +84,7 @@ if $NOTARIZE; then
 fi
 
 # The auto-updater artifact.
-tar -czf "$APP_TARBALL" -C "$OUT_DIR" Zeron.app
+tar -czf "$APP_TARBALL" -C "$OUT_DIR" "$APP_NAME.app"
 echo "packaged: $APP_TARBALL"
 
 # The dmg presents the classic drag-into-Applications layout over the
@@ -101,7 +108,7 @@ import dmgbuild
 app = os.environ["APP"]
 dmgbuild.build_dmg(
     filename=os.environ["DMG"],
-    volume_name="Zeron",
+    volume_name=os.environ["APP_NAME"],
     settings={
         "format": "UDZO",
         "files": [app],
@@ -118,7 +125,7 @@ dmgbuild.build_dmg(
         "window_rect": ((200, 120), (660, 400)),
         "icon_size": 104,
         "text_size": 12,
-        "icon_locations": {"Zeron.app": (165, 195), "Applications": (495, 195)},
+        "icon_locations": {os.path.basename(app): (165, 195), "Applications": (495, 195)},
     },
 )
 PY

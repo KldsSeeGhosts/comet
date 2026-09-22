@@ -13,8 +13,8 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "zeron",
-    version,
+    name = "noches",
+    version = zeron_update::current_version(),
     about = "Multi-device controller for coding agents"
 )]
 struct Cli {
@@ -240,7 +240,7 @@ fn main() -> anyhow::Result<()> {
                 ipc_port: std::env::var("ZERON_IPC_PORT")
                     .ok()
                     .and_then(|p| p.parse().ok())
-                    .unwrap_or(27654),
+                    .unwrap_or_else(zeron_update::identity::ipc_port),
                 edge_url: edge_url_from_env(),
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,
@@ -290,7 +290,7 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
         ipc_port: std::env::var("ZERON_IPC_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
-            .unwrap_or(27654),
+            .unwrap_or_else(zeron_update::identity::ipc_port),
         default_harness: harness_from_env(),
         // WorkOS mode: the signed-in session's org wins; ZERON_ORG_ID (dev
         // default "dev-org") scopes the workspace room otherwise.

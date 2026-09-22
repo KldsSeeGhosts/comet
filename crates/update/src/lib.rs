@@ -1,21 +1,19 @@
-//! zeron-update — release checking and self-update, shared by the engine (the
-//! background checker + `ApplyUpdate`), the CLI (`zeron update`), and the UI
-//! (the sidebar update strip + macOS bundle swap).
-//!
-//! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
-//! artifacts live in the `comet-native-releases` R2 bucket, served pre-auth at
-//! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
-//! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
-//! releases published before the manifest existed.
-//!
-//! Install kinds and their update paths:
-//! - **Managed** (`~/.zeron/app/<ver>` + `current` symlink — the curl|sh
-//!   installer): download the headless tarball into a new versioned dir, flip
-//!   the symlink, restart the service. Same flow the installer script performs,
-//!   natively.
-//! - **MacApp** (running out of an app bundle): download the app tarball, swap the
-//!   bundle directory, relaunch. Driven by the UI.
-//! - **Unmanaged** (source builds, hand-copied binaries): report only.
+//! Noches release discovery and installation shared by the desktop and CLI.
+//! Each distributed build has a compiled dev/stable channel. GitHub channel
+//! manifests reference immutable release artifacts with mandatory SHA-256 and
+//! size checks. Local source builds never install published updates.
+//! Linux uses versioned directories and an atomic current symlink; macOS
+//! stages and replaces an ad-hoc or Developer ID signed application bundle.
+
+pub mod identity;
+
+#[derive(Default)]
+pub struct DownloadProgress {
+    pub received: std::sync::atomic::AtomicU64,
+    pub total: std::sync::atomic::AtomicU64,
+}
+
+tokio::task_local! { static PROGRESS: Arc<DownloadProgress>; }
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,7 +31,10 @@ pub mod windows;
 
 /// The version compiled into this binary (the workspace version).
 pub const fn current_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    match option_env!("NOCHES_VERSION") {
+        Some(version) => version,
+        None => env!("CARGO_PKG_VERSION"),
+    }
 }
 
 /// Background check cadence.
@@ -50,12 +51,19 @@ const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60)
 // Release metadata
 // ---------------------------------------------------------------------------
 
-/// `{edge}/releases/manifest.json` — written by the release workflow.
+/// Noches channel manifest written only after all release assets are uploaded.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
-    /// Artifact file name → metadata. Empty for pre-manifest releases resolved
-    /// via `latest.txt` — downloads then skip checksum verification (with a log).
+    #[serde(default)]
+    pub product: String,
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub notes_url: String,
+    /// Artifact file name to mandatory verification metadata.
     #[serde(default)]
     pub files: BTreeMap<String, FileMeta>,
 }
@@ -64,6 +72,10 @@ pub struct Manifest {
 pub struct FileMeta {
     #[serde(default)]
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// Artifact-name platform pair matching the packaging scripts. Unsupported
@@ -104,33 +116,23 @@ fn require_mac_app_update_platform() -> anyhow::Result<()> {
 /// `zeron-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI builds).
 pub fn headless_artifact(version: &str) -> String {
     let (os, arch) = platform_key();
-    format!("zeron-{version}-{os}-{arch}.tar.gz")
+    format!("noches-{version}-{os}-{arch}.tar.gz")
 }
 
 /// `zeron-<ver>-macos-<arch>-app.tar.gz` — the macOS app update payload.
 pub fn mac_app_artifact(version: &str) -> String {
     let (_, arch) = platform_key();
-    format!("zeron-{version}-macos-{arch}-app.tar.gz")
+    format!("noches-{version}-macos-{arch}-app.tar.gz")
 }
 
-/// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
-/// Unparseable versions never count as newer — a garbage `latest.txt` must not
-/// trigger an update loop.
+/// SemVer precedence, including numeric development build components.
+/// Invalid versions and build-metadata-only changes never count as upgrades.
 pub fn version_newer(latest: &str, current: &str) -> bool {
-    fn parts(v: &str) -> Option<Vec<u64>> {
-        // Strip an optional leading `v` and any semver pre-release or build
-        // suffix (`-noches.1`, `+build`, etc.) so that `0.2.72-noches.1`
-        // compares as `0.2.72`.
-        let base = v
-            .trim()
-            .trim_start_matches('v');
-        let base = base.split_once('-').map_or(base, |(b, _)| b);
-        let base = base.split_once('+').map_or(base, |(b, _)| b);
-        let nums: Vec<u64> = base.split('.').map(|p| p.parse().ok()).collect::<Option<_>>()?;
-        (!nums.is_empty()).then_some(nums)
-    }
-    match (parts(latest), parts(current)) {
-        (Some(l), Some(c)) => l > c,
+    match (
+        semver::Version::parse(latest.trim().trim_start_matches('v')),
+        semver::Version::parse(current.trim().trim_start_matches('v')),
+    ) {
+        (Ok(latest), Ok(current)) => latest.cmp_precedence(&current).is_gt(),
         _ => false,
     }
 }
@@ -158,45 +160,70 @@ pub fn validate_version(version: &str) -> anyhow::Result<&str> {
     Ok(trimmed)
 }
 
-/// Fetch the newest release metadata: `manifest.json`, falling back to
-/// `latest.txt` (version only, no checksums) for pre-manifest releases.
+/// Fetch the compiled channel independently of the workspace sync endpoint.
 pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
+    anyhow::ensure!(
+        identity::distributed(),
+        "This is a local source build. Install Noches or Noches Dev to receive updates."
+    );
     let base = release_base(edge_url)?;
-    let client = http_client()?;
-    let manifest_url = format!("{base}/manifest.json");
-    match client.get(&manifest_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let manifest: Manifest = resp.json().await.context("parsing manifest.json")?;
-            if manifest.version.trim().is_empty() {
-                bail!("manifest.json has an empty version");
-            }
-            return Ok(manifest);
-        }
-        Ok(resp) => {
-            tracing::debug!(status = %resp.status(), "manifest.json unavailable; trying latest.txt")
-        }
-        Err(err) => tracing::debug!(error = %err, "manifest.json fetch failed; trying latest.txt"),
-    }
-    let latest_url = format!("{base}/latest.txt");
-    let version = client
-        .get(&latest_url)
+    let response = http_client()?
+        .get(format!("{base}/manifest.json"))
         .send()
         .await
-        .context("fetching latest.txt")?
-        .error_for_status()
-        .context("fetching latest.txt")?
-        .text()
-        .await
-        .context("reading latest.txt")?
-        .trim()
-        .to_string();
-    if version.is_empty() {
-        bail!("latest.txt is empty");
+        .context("checking for Noches updates")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!("No {} release has been published yet", identity::channel());
     }
-    Ok(Manifest {
-        version,
-        files: BTreeMap::new(),
-    })
+    let manifest: Manifest = response
+        .error_for_status()?
+        .json()
+        .await
+        .context("reading update manifest")?;
+    validate_manifest(&manifest, identity::channel())?;
+    Ok(manifest)
+}
+
+fn validate_manifest(manifest: &Manifest, channel: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        manifest.product == "noches",
+        "Update belongs to a different application"
+    );
+    anyhow::ensure!(
+        manifest.channel == channel,
+        "Update belongs to a different channel"
+    );
+    validate_version(&manifest.version)?;
+    let version = semver::Version::parse(&manifest.version)?;
+    anyhow::ensure!(
+        if channel == "stable" {
+            version.pre.is_empty()
+        } else {
+            channel == "dev" && version.pre.as_str().starts_with("dev.")
+        },
+        "Version does not match update channel"
+    );
+    anyhow::ensure!(!manifest.files.is_empty(), "Update contains no artifacts");
+    for meta in manifest.files.values() {
+        let hash = meta.sha256.as_deref().unwrap_or("");
+        anyhow::ensure!(
+            hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Update requires a SHA-256 checksum"
+        );
+        anyhow::ensure!(
+            meta.size.is_some_and(|size| size > 0),
+            "Update requires an artifact size"
+        );
+        let url = reqwest::Url::parse(meta.url.as_deref().unwrap_or(""))?;
+        anyhow::ensure!(
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none(),
+            "Update artifact requires an HTTPS URL without credentials"
+        );
+    }
+    Ok(())
 }
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
@@ -215,7 +242,7 @@ fn http_client_with_timeouts(
         // Inactivity timeout, not a total download cap: slow progressing
         // updates remain viable on constrained links.
         .read_timeout(read)
-        .user_agent(concat!("zeron/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("Noches/{}", current_version()))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 10 {
                 return attempt.error("too many update redirects");
@@ -247,17 +274,17 @@ fn validate_release_override(value: &str) -> anyhow::Result<String> {
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
-fn release_base(edge_url: &str) -> anyhow::Result<String> {
-    if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
+fn release_base(_edge_url: &str) -> anyhow::Result<String> {
+    if let Ok(url) = std::env::var("NOCHES_RELEASES_URL")
         && !url.trim().is_empty()
     {
         return validate_release_override(&url);
     }
-    #[cfg(windows)]
-    if let Some(url) = windows::release_url()? {
-        return Ok(url.trim_end_matches('/').to_owned());
-    }
-    Ok(format!("{}/releases", edge_url.trim_end_matches('/')))
+    Ok(format!(
+        "https://github.com/{}/releases/download/noches-{}",
+        identity::repository(),
+        identity::channel()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,8 +308,12 @@ pub enum InstallKind {
 
 impl InstallKind {
     pub fn supports_desktop_update(&self) -> bool {
+        if !identity::distributed() {
+            return false;
+        }
         match self {
             Self::MacApp { .. } => true,
+            Self::Managed { .. } => cfg!(target_os = "linux"),
             #[cfg(windows)]
             Self::WindowsPortable { .. } => true,
             _ => false,
@@ -297,6 +328,7 @@ impl InstallKind {
     ) -> anyhow::Result<PathBuf> {
         match self {
             Self::MacApp { .. } => stage_mac_app(edge_url, manifest, data_dir).await,
+            Self::Managed { app_root } => stage_headless(edge_url, manifest, app_root).await,
             #[cfg(windows)]
             Self::WindowsPortable { directory } => {
                 windows::stage(edge_url, manifest, directory).await
@@ -305,13 +337,52 @@ impl InstallKind {
         }
     }
 
+    pub async fn stage_with_progress(
+        &self,
+        edge_url: &str,
+        manifest: &Manifest,
+        data_dir: &Path,
+        progress: Arc<DownloadProgress>,
+    ) -> anyhow::Result<PathBuf> {
+        validate_manifest(manifest, identity::channel())?;
+        anyhow::ensure!(
+            version_newer(&manifest.version, current_version()),
+            "Update is not newer than this installation"
+        );
+        PROGRESS
+            .scope(progress, self.stage_desktop(edge_url, manifest, data_dir))
+            .await
+    }
+
     /// Install and arrange a relaunch. The UI must quit after this succeeds.
-    pub fn apply_desktop(&self, staged: &Path) -> anyhow::Result<()> {
+    pub fn apply_desktop(&self, staged: &Path, local_engine_checked: bool) -> anyhow::Result<()> {
         match self {
             Self::MacApp { bundle } => {
                 apply_mac_app(staged, bundle)?;
-                relaunch_app_after_exit(bundle);
+                relaunch_app_after_exit(bundle)?;
                 Ok(())
+            }
+            Self::Managed { app_root } if cfg!(target_os = "linux") => {
+                if !local_engine_checked
+                    && std::process::Command::new("systemctl")
+                        .args(["--user", "is-active", "--quiet", identity::service_name()])
+                        .status()
+                        .is_ok_and(|status| status.success())
+                {
+                    bail!(
+                        "Close the remote window and update from the local window so active local work can be checked"
+                    );
+                }
+                anyhow::ensure!(
+                    staged.parent() == Some(app_root.as_path()),
+                    "Update is outside this installation"
+                );
+                let version = staged
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("Invalid staged version")?;
+                apply_headless(app_root, version)?;
+                relaunch_linux_after_exit(&app_root.join("current/zeron"))
             }
             #[cfg(windows)]
             Self::WindowsPortable { directory } => windows::apply(staged, directory, true),
@@ -346,7 +417,7 @@ fn detect_install_from_for_os(exe: &Path, home: Option<&Path>, os: &str) -> Inst
     }
     if let Some(home) = home {
         // `current_exe` resolves the `current` symlink to the versioned dir.
-        let app_root = home.join(".zeron").join("app");
+        let app_root = identity::app_root(home);
         if exe.starts_with(&app_root) {
             return InstallKind::Managed { app_root };
         }
@@ -367,8 +438,8 @@ fn detect_install_from_for_os(exe: &Path, home: Option<&Path>, os: &str) -> Inst
 // Download + verify
 // ---------------------------------------------------------------------------
 
-/// Stream `{edge}/releases/<file>` to `dest`, verifying the manifest sha256 when
-/// present. Writes through a `.partial` sidecar so an interrupted download never
+/// Stream the manifest artifact to `dest`, verifying its mandatory SHA-256 and
+/// size. Writes through a `.partial` sidecar so an interrupted download never
 /// leaves a plausible-looking artifact behind.
 pub async fn download_release_file(
     edge_url: &str,
@@ -387,17 +458,31 @@ async fn download_release_file_verified(
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<String> {
-    let url = format!("{}/{file}", release_base(edge_url)?);
-    let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
-    if expected.is_none() {
-        tracing::warn!(
-            file,
-            "no checksum in release metadata; skipping verification"
-        );
-    }
+    let _ = edge_url;
+    let meta = manifest
+        .files
+        .get(file)
+        .context("No update artifact for this platform")?;
+    let url = meta.url.as_deref().context("Update artifact URL missing")?;
+    let expected = meta.sha256.as_deref().context("Update checksum missing")?;
+    anyhow::ensure!(
+        expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Invalid update checksum"
+    );
+    anyhow::ensure!(
+        reqwest::Url::parse(url)?.scheme() == "https"
+            || (cfg!(test) && url.starts_with("http://127.0.0.1:")),
+        "Update requires HTTPS"
+    );
+    let _ = PROGRESS.try_with(|progress| {
+        progress
+            .total
+            .store(meta.size.unwrap_or(0), std::sync::atomic::Ordering::Relaxed)
+    });
+    let mut received = 0u64;
     let partial = dest.with_extension("partial");
     let resp = http_client()?
-        .get(&url)
+        .get(url)
         .send()
         .await
         .with_context(|| format!("downloading {url}"))?
@@ -410,13 +495,23 @@ async fn download_release_file_verified(
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("reading download stream")?;
+        received += chunk.len() as u64;
+        let _ = PROGRESS.try_with(|progress| {
+            progress
+                .received
+                .store(received, std::sync::atomic::Ordering::Relaxed)
+        });
+        if let Some(size) = meta.size {
+            anyhow::ensure!(received <= size, "Update exceeds advertised size");
+        }
         hasher.update(&chunk);
         out.write_all(&chunk).await.context("writing download")?;
     }
     out.flush().await.context("flushing download")?;
     drop(out);
+    anyhow::ensure!(meta.size == Some(received), "Update size mismatch");
     let actual = format!("{:x}", hasher.finalize());
-    if let Some(expected) = expected {
+    if let Some(expected) = Some(expected) {
         if !actual.eq_ignore_ascii_case(expected.trim()) {
             tokio::fs::remove_file(&partial).await.ok();
             bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
@@ -481,7 +576,7 @@ fn staged_mac_app_valid(
             return false;
         }
     }
-    let staged = dir.join("Zeron.app");
+    let staged = dir.join(identity::bundle_name());
     staged.is_dir()
         && staged.join("Contents/MacOS/zeron").is_file()
         && staged.join("Contents/Info.plist").is_file()
@@ -502,10 +597,30 @@ pub async fn stage_headless(
     require_managed_update_platform()?;
     let version = validate_version(&manifest.version)?;
     let dest = app_root.join(version);
-    if dest.join("zeron").exists() {
+    let file = headless_artifact(version);
+    let expected = manifest
+        .files
+        .get(&file)
+        .and_then(|meta| meta.sha256.as_deref())
+        .context("Missing update checksum")?;
+    let record = StageRecord {
+        version: version.to_owned(),
+        artifact: file.clone(),
+        sha256: expected.to_owned(),
+    };
+    if dest.join("zeron").is_file()
+        && std::fs::read(dest.join(STAGE_COMPLETE_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StageRecord>(&bytes).ok())
+            .as_ref()
+            == Some(&record)
+    {
         return Ok(dest);
     }
-    let file = headless_artifact(version);
+    anyhow::ensure!(
+        !dest.exists(),
+        "An incomplete or different version already occupies the update directory"
+    );
     let stage = app_root.join(format!(".stage-{version}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
@@ -529,10 +644,20 @@ pub async fn stage_headless(
         if !unpacked.join("zeron").is_file() {
             bail!("tarball {file} did not contain a zeron binary");
         }
+        std::fs::write(
+            unpacked.join(STAGE_COMPLETE_FILE),
+            serde_json::to_vec(&record)?,
+        )?;
         match std::fs::rename(&unpacked, &dest) {
             Ok(()) => {}
             // Lost a race with another stager — the staged copy is equivalent.
-            Err(_) if dest.join("zeron").exists() => {}
+            Err(_)
+                if dest.join("zeron").exists()
+                    && std::fs::read(dest.join(STAGE_COMPLETE_FILE))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<StageRecord>(&bytes).ok())
+                        .as_ref()
+                        == Some(&record) => {}
             Err(err) => {
                 return Err(err).with_context(|| format!("moving {} into place", dest.display()));
             }
@@ -553,6 +678,12 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
         let target = app_root.join(version);
         if !target.join("zeron").exists() {
             bail!("{} is not a staged install", target.display());
+        }
+        if let Ok(previous) = std::fs::read_link(app_root.join("current")) {
+            let backup = app_root.join(format!(".previous-{}", std::process::id()));
+            let _ = std::fs::remove_file(&backup);
+            std::os::unix::fs::symlink(previous, &backup)?;
+            std::fs::rename(backup, app_root.join("previous"))?;
         }
         let tmp = app_root.join(format!(".current-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
@@ -578,10 +709,17 @@ pub fn restart_service() -> anyhow::Result<()> {
         let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
         run(
             "launchctl",
-            &["kickstart", "-k", &format!("gui/{uid}/sh.zeron.app")],
+            &[
+                "kickstart",
+                "-k",
+                &format!("gui/{uid}/{}", identity::launchd_label()),
+            ],
         )
     } else {
-        run("systemctl", &["--user", "restart", "zeron.service"])
+        run(
+            "systemctl",
+            &["--user", "restart", identity::service_name()],
+        )
     }
 }
 
@@ -601,7 +739,7 @@ pub async fn stage_mac_app(
     let version = validate_version(&manifest.version)?;
     let updates_dir = data_dir.join("updates");
     let dir = updates_dir.join(version);
-    let staged = dir.join("Zeron.app");
+    let staged = dir.join(identity::bundle_name());
     let file = mac_app_artifact(version);
     let expected_sha256 = manifest.files.get(&file).and_then(|m| m.sha256.as_deref());
 
@@ -647,7 +785,7 @@ pub async fn stage_mac_app(
     )?;
     std::fs::remove_file(&tarball).ok();
 
-    let temp_staged = temp_stage.path().join("Zeron.app");
+    let temp_staged = temp_stage.path().join(identity::bundle_name());
     if !temp_staged.join("Contents/MacOS/zeron").is_file()
         || !temp_staged.join("Contents/Info.plist").is_file()
     {
@@ -691,6 +829,23 @@ pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
     {
         bail!("staged application is incomplete");
     }
+    if identity::distributed() {
+        run(
+            "codesign",
+            &["--verify", "--deep", "--strict", &staged.to_string_lossy()],
+        )?;
+        let identifier = std::process::Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Print :CFBundleIdentifier"])
+            .arg(staged.join("Contents/Info.plist"))
+            .output()?;
+        anyhow::ensure!(
+            identifier.status.success()
+                && String::from_utf8_lossy(&identifier.stdout).trim() == identity::bundle_id(),
+            "Staged app has the wrong bundle identity"
+        );
+        // Ad-hoc signed personal builds do not have a paid Developer ID.
+        // Integrity and bundle identity are checked without requiring notarization.
+    }
     let parent = bundle
         .parent()
         .context("app bundle has no parent directory")?;
@@ -712,35 +867,61 @@ pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(&fresh);
         return Err(err).context("installing the new app bundle");
     }
-    let _ = std::fs::remove_dir_all(&old);
+    // Keep the previous bundle for manual recovery if the new process fails to launch.
     Ok(())
 }
 
 /// Detached relauncher: waits for THIS process to exit, then `open`s the bundle.
 /// (Opening before exit would race the single-instance engine lock and the IPC
 /// port.) The caller quits the app after this returns.
-pub fn relaunch_app_after_exit(bundle: &Path) {
+pub fn relaunch_app_after_exit(bundle: &Path) -> anyhow::Result<()> {
+    spawn_relauncher(
+        "while /bin/kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; target=$2; shift 2; exec /usr/bin/open \"$target\" --args \"$@\"",
+        bundle,
+        false,
+    )
+}
+
+fn relaunch_linux_after_exit(executable: &Path) -> anyhow::Result<()> {
+    spawn_relauncher(
+        "pid=$1; executable=$2; service=$3; shift 3; while kill -0 \"$pid\" 2>/dev/null; do sleep 0.2; done; if command -v systemctl >/dev/null && systemctl --user is-active --quiet \"$service\"; then systemctl --user restart \"$service\" || exit 1; fi; exec \"$executable\" \"$@\"",
+        executable,
+        true,
+    )
+}
+
+fn spawn_relauncher(script: &str, target: &Path, linux: bool) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        let pid = std::process::id();
-        let script = format!(
-            "while /bin/kill -0 {pid} 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"{}\"",
-            bundle.display()
-        );
         let mut command = std::process::Command::new("/bin/sh");
+        // Paths are positional arguments, never interpolated into shell code.
         command
-            .args(["-c", &script])
+            .args([
+                "-c",
+                script,
+                "noches-relaunch",
+                &std::process::id().to_string(),
+            ])
+            .arg(target);
+        if linux {
+            command.arg(identity::service_name());
+        }
+        command.args(std::env::args_os().skip(1));
+        command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .process_group(0);
-        if let Err(err) = command.spawn() {
-            tracing::error!(error = %err, "failed to spawn the relauncher");
-        }
+            .process_group(0)
+            .spawn()
+            .context("starting update relauncher")?;
+        Ok(())
     }
     #[cfg(not(unix))]
-    let _ = bundle;
+    {
+        let _ = (script, target, linux);
+        bail!("Unix relaunch unavailable")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +1137,10 @@ impl Updater {
     /// then restart the service after a short delay so the caller's RPC reply
     /// flushes before systemd/launchd kills this process.
     pub async fn apply(&self) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.quiescent_now(),
+            "Close active sessions and terminals before updating the engine"
+        );
         let InstallKind::Managed { app_root } = detect_install() else {
             bail!(
                 "this install is not update-managed — the desktop app updates from its UI; \
@@ -988,6 +1173,84 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_manifest() -> Manifest {
+        serde_json::from_value(serde_json::json!({
+            "product": "noches", "channel": "dev", "version": "0.3.1-dev.1",
+            "files": {"noches.tar.gz": {"sha256": "a".repeat(64), "size": 7,
+                "url": "https://github.com/owner/noches/releases/download/v0.3.1-dev.1/noches.tar.gz"}}
+        })).unwrap()
+    }
+
+    #[test]
+    fn manifest_rejects_cross_product_channel_and_unverified_payloads() {
+        let good = valid_manifest();
+        assert!(validate_manifest(&good, "dev").is_ok());
+        assert!(validate_manifest(&good, "stable").is_err());
+        let mut wrong = good.clone();
+        wrong.product = "zeron".into();
+        assert!(validate_manifest(&wrong, "dev").is_err());
+        let mut wrong = good.clone();
+        wrong.files.values_mut().next().unwrap().sha256 = None;
+        assert!(validate_manifest(&wrong, "dev").is_err());
+        let mut wrong = good.clone();
+        wrong.files.values_mut().next().unwrap().url = Some("http://example.com/app".into());
+        assert!(validate_manifest(&wrong, "dev").is_err());
+        let mut wrong = good;
+        wrong.channel = "stable".into();
+        assert!(validate_manifest(&wrong, "stable").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_swap_retains_previous_and_rejects_unstaged_versions() {
+        let root = tempfile::tempdir().unwrap();
+        for version in ["0.3.1", "0.3.2"] {
+            std::fs::create_dir(root.path().join(version)).unwrap();
+            std::fs::write(root.path().join(version).join("zeron"), b"fixture").unwrap();
+        }
+        apply_headless(root.path(), "0.3.1").unwrap();
+        apply_headless(root.path(), "0.3.2").unwrap();
+        assert_eq!(
+            std::fs::read_link(root.path().join("previous")).unwrap(),
+            root.path().join("0.3.1")
+        );
+        assert!(apply_headless(root.path(), "0.3.3").is_err());
+        assert_eq!(
+            std::fs::read_link(root.path().join("current")).unwrap(),
+            root.path().join("0.3.2")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn corrupt_payload_never_replaces_a_download_destination() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            socket.read(&mut buffer).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncorrupt",
+                )
+                .await
+                .unwrap();
+        });
+        let mut manifest = valid_manifest();
+        manifest.files.values_mut().next().unwrap().url = Some(format!("http://{address}/app"));
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download");
+        std::fs::write(&dest, b"previous").unwrap();
+        let error = download_release_file("", &manifest, "noches.tar.gz", &dest)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+        assert_eq!(std::fs::read(dest).unwrap(), b"previous");
+        server.await.unwrap();
+    }
 
     #[test]
     fn release_versions_cannot_escape_stage_directories() {
@@ -1037,7 +1300,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let version = "0.2.999";
         let dir = root.path().join("updates").join(version);
-        let binary = dir.join("Zeron.app/Contents/MacOS/zeron");
+        let binary = dir
+            .join(identity::bundle_name())
+            .join("Contents/MacOS/zeron");
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
         std::fs::write(&binary, b"partial").unwrap();
         let mut manifest: Manifest =
@@ -1049,7 +1314,7 @@ mod tests {
         assert_eq!(std::fs::read(&binary).unwrap(), b"partial");
 
         let source = tempfile::tempdir().unwrap();
-        let contents = source.path().join("Zeron.app/Contents");
+        let contents = source.path().join(identity::bundle_name()).join("Contents");
         std::fs::create_dir_all(contents.join("MacOS")).unwrap();
         std::fs::write(contents.join("MacOS/zeron"), b"complete").unwrap();
         std::fs::write(contents.join("Info.plist"), b"plist fixture").unwrap();
@@ -1061,7 +1326,7 @@ mod tests {
                 &archive.to_string_lossy(),
                 "-C",
                 &source.path().to_string_lossy(),
-                "Zeron.app",
+                &identity::bundle_name(),
             ],
         )
         .unwrap();
@@ -1070,7 +1335,11 @@ mod tests {
         manifest = serde_json::from_value(serde_json::json!({"version": version,
             "files": { (mac_app_artifact(version)): {"sha256": digest} }}))
         .unwrap();
+        let size = bytes.len() as u64;
         let (url, server, requests) = serve_archive(bytes).await;
+        let meta = manifest.files.get_mut(&mac_app_artifact(version)).unwrap();
+        meta.url = Some(format!("{url}/artifact"));
+        meta.size = Some(size);
         let (a, b) = tokio::join!(
             stage_mac_app(&url, &manifest, root.path()),
             stage_mac_app(&url, &manifest, root.path())
@@ -1211,15 +1480,17 @@ mod tests {
         assert!(version_newer("0.2.0", "0.1.9"));
         assert!(version_newer("0.1.10", "0.1.9"));
         assert!(version_newer("v0.1.1", "0.1.0"));
-        assert!(version_newer("0.1.0.1", "0.1.0"));
+        assert!(!version_newer("0.1.0.1", "0.1.0"));
         assert!(!version_newer("0.1.0", "0.1.0"));
         assert!(!version_newer("0.1.0", "0.1.1"));
         // Garbage never counts as newer.
         assert!(!version_newer("", "0.1.0"));
         assert!(!version_newer("nightly", "0.1.0"));
-        // Pre-release / fork suffixes: the numeric base is what matters.
+        // SemVer prerelease ordering is significant.
         assert!(version_newer("0.2.81", "0.2.72-noches.1"));
-        assert!(!version_newer("0.2.72", "0.2.72-noches.1"));
+        assert!(version_newer("0.2.72", "0.2.72-noches.1"));
+        assert!(version_newer("0.3.0-dev.10", "0.3.0-dev.9"));
+        assert!(!version_newer("0.3.0-dev.9", "0.3.0-dev.10"));
         assert!(!version_newer("0.2.71", "0.2.72-noches.1"));
         assert!(version_newer("0.2.73-beta1", "0.2.72-noches.1"));
         // Build metadata (`+`) is also stripped.
@@ -1267,10 +1538,10 @@ mod tests {
     #[test]
     fn artifact_names_match_packaging() {
         let (os, arch) = platform_key();
-        assert!(headless_artifact("0.2.0").starts_with("zeron-0.2.0-"));
+        assert!(headless_artifact("0.2.0").starts_with("noches-0.2.0-"));
         assert_eq!(
             headless_artifact("0.2.0"),
-            format!("zeron-0.2.0-{os}-{arch}.tar.gz")
+            format!("noches-0.2.0-{os}-{arch}.tar.gz")
         );
         assert!(mac_app_artifact("0.2.0").ends_with("-app.tar.gz"));
     }
@@ -1300,6 +1571,7 @@ mod tests {
         let manifest = Manifest {
             version: "9.9.9".into(),
             files: BTreeMap::new(),
+            ..Default::default()
         };
         let app_root = tmp.path().join("app");
         let data_dir = tmp.path().join("data");
@@ -1323,10 +1595,13 @@ mod tests {
                 .contains("not supported on windows")
         );
         assert!(
-            apply_mac_app(&data_dir.join("Zeron.app"), &data_dir.join("Installed.app"))
-                .unwrap_err()
-                .to_string()
-                .contains("not supported on windows")
+            apply_mac_app(
+                &data_dir.join(identity::bundle_name()),
+                &data_dir.join("Installed.app")
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not supported on windows")
         );
         assert!(
             restart_service()

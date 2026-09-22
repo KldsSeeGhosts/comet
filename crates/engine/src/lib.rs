@@ -803,7 +803,7 @@ impl Engine {
         core.previews.start(projects, preview_signaling).await;
         // Portable Windows packages explicitly configure an update feed; users
         // should not need to enable workspace sync to receive application updates.
-        let check_updates = edge_enabled;
+        let check_updates = zeron_update::identity::distributed();
         #[cfg(windows)]
         let check_updates = check_updates
             || matches!(

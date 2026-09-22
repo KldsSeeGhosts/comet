@@ -1763,6 +1763,12 @@ impl RpcService for EngineRpc {
                     move |cx| rx.poll_recv(cx),
                 ))))
             }
+            methods::CHECK_UPDATE_READY => {
+                if self.sessions.any_active() || self.terminals.any_open() {
+                    return Err(RpcError::Failed("Finish active runs and close terminals before installing the update. The download is saved.".into()));
+                }
+                RpcReply::value(&true)
+            }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
                 let version = self

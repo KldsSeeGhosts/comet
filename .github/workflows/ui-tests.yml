@@ -11,9 +11,14 @@ on:
       - 'scripts/run-macos-browser-fixture.sh'
       - 'dist/macos/Info.plist'
       - 'apps/ios/**'
+      - 'apps/zeron/**'
+      - 'scripts/*release*'
+      - 'scripts/package-*.sh'
+      - 'scripts/install-linux.sh'
+      - '.github/workflows/release.yml'
       - '.github/workflows/ui-tests.yml'
   push:
-    branches: [main]
+    branches: [main, dev]
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -23,6 +28,11 @@ on:
       - 'scripts/run-macos-browser-fixture.sh'
       - 'dist/macos/Info.plist'
       - 'apps/ios/**'
+      - 'apps/zeron/**'
+      - 'scripts/*release*'
+      - 'scripts/package-*.sh'
+      - 'scripts/install-linux.sh'
+      - '.github/workflows/release.yml'
       - '.github/workflows/ui-tests.yml'
   workflow_dispatch:
 
