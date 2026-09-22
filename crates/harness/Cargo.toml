@@ -15,6 +15,7 @@ path = "tests/fixtures/native_agent.rs"
 required-features = ["native-fixture"]
 
 [dependencies]
+zeron-browser.workspace = true
 zeron-proto.workspace = true
 base64 = "0.22"
 reqwest.workspace = true

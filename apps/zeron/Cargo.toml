@@ -10,6 +10,8 @@ name = "zeron"
 path = "src/main.rs"
 
 [dependencies]
+zeron-browser.workspace = true
+base64 = "0.22"
 zeron-engine.workspace = true
 zeron-rpc.workspace = true
 zeron-ui.workspace = true

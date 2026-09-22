@@ -5,6 +5,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod auth_cli;
+#[cfg(unix)]
+mod browser_cli;
 mod daemon;
 mod paths;
 mod update_cli;
@@ -33,6 +35,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[cfg(unix)]
+    /// Control this conversation's integrated Chromium browser with JSON.
+    Browser {
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        #[arg(long)]
+        session: String,
+        /// Save a screenshot as PNG instead of printing its base64 payload.
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+        request: String,
+    },
+    #[cfg(unix)]
+    /// Serve conversation-scoped browser tools over MCP stdio.
+    BrowserMcp {
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        #[arg(long)]
+        session: String,
+    },
     /// Run the engine without a UI (local-only unless a saved session enables sync).
     Headless,
     /// Sign in and enable sync on the next engine start.
@@ -120,6 +142,18 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     attach_parent_console();
     let cli = Cli::parse();
+    // Keep MCP stdout strictly protocol-only, even with RUST_LOG set.
+    #[cfg(unix)]
+    match &cli.command {
+        Some(Command::Browser {
+            socket,
+            session,
+            output,
+            request,
+        }) => return browser_cli::command(socket, session, output.as_deref(), request),
+        Some(Command::BrowserMcp { socket, session }) => return browser_cli::mcp(socket, session),
+        _ => {}
+    }
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {
         zeron_update::windows::wait_for_exit(pid)?;
@@ -184,6 +218,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
+        #[cfg(unix)]
+        Some(Command::Browser { .. } | Command::BrowserMcp { .. }) => unreachable!(),
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {

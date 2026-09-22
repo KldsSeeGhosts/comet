@@ -1,0 +1,25 @@
+[package]
+name = "noches-chromium"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+runtime = ["dep:cef"]
+
+[[bin]]
+name = "noches-chromium"
+required-features = ["runtime"]
+
+[dependencies]
+cef = { version = "=152.4.0", default-features = false, features = ["sandbox"], optional = true }
+serde_json.workspace = true
+url = "2"
+tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"

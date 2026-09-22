@@ -8,6 +8,9 @@ on:
       - 'rust-toolchain.toml'
       - 'crates/**'
       - 'scripts/test-linux-browser.sh'
+      - 'scripts/build-chromium.sh'
+      - 'scripts/test-chromium-runtime.py'
+      - 'dist/browser/**'
       - 'scripts/run-macos-browser-fixture.sh'
       - 'dist/macos/Info.plist'
       - 'apps/ios/**'
@@ -20,6 +23,9 @@ on:
       - 'rust-toolchain.toml'
       - 'crates/**'
       - 'scripts/test-linux-browser.sh'
+      - 'scripts/build-chromium.sh'
+      - 'scripts/test-chromium-runtime.py'
+      - 'dist/browser/**'
       - 'scripts/run-macos-browser-fixture.sh'
       - 'dist/macos/Info.plist'
       - 'apps/ios/**'
@@ -101,7 +107,7 @@ jobs:
         run: |
           cargo test --release --locked -p zeron-ui --lib notify::tests:: -- --test-threads=1
       - name: Build native browser fixture
-        run: cargo build --release --locked -p zeron-ui --example browser-fixture --example preview-fixture --features browser-fixture
+        run: cargo build --release --locked -p zeron-ui --example browser-fixture --example preview-fixture --features browser-fixture,webkit-browser
       - name: Native browser regression and screenshots
         timeout-minutes: 3
         env:
@@ -190,7 +196,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Build browser fixture
-        run: cargo build --release --locked -p zeron-ui --example browser-fixture --features browser-fixture
+        run: cargo build --release --locked -p zeron-ui --example browser-fixture --features browser-fixture,webkit-browser
       - name: X11 and Wayland browser regressions
         timeout-minutes: 5
         env:
@@ -204,4 +210,53 @@ jobs:
         with:
           name: linux-browser
           path: ${{ runner.temp }}/linux-browser
+          if-no-files-found: warn
+
+  chromium-browser:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxcb1-dev libx11-xcb-dev libfontconfig1-dev libfreetype-dev libasound2-dev libvulkan-dev libnss3 libatk-bridge2.0-0 libgtk-3-0 pkg-config cmake ninja-build xvfb xdotool imagemagick
+      - name: macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew list cmake ninja >/dev/null 2>&1 || brew install cmake ninja
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Chromium and shared-page fixture
+        run: |
+          scripts/build-chromium.sh "$RUNNER_TEMP/chromium" debug
+          cargo test --locked -p zeron-browser
+          cargo build --locked -p zeron-ui --example chromium-fixture --features browser-fixture
+      - name: macOS browser checks
+        if: runner.os == 'macOS'
+        run: |
+          export NOCHES_CHROMIUM_HELPER="$RUNNER_TEMP/chromium/Noches Browser.app/Contents/MacOS/noches-chromium"
+          codesign --force --deep --sign - "$RUNNER_TEMP/chromium/Noches Browser.app"
+          python3 scripts/test-chromium-runtime.py "$NOCHES_CHROMIUM_HELPER" "$RUNNER_TEMP/chromium-results/runtime"
+          bash scripts/run-macos-browser-fixture.sh target/debug/examples/chromium-fixture "$RUNNER_TEMP/chromium-results/gpui"
+      - name: Linux browser checks
+        if: runner.os == 'Linux'
+        run: |
+          export NOCHES_CHROMIUM_HELPER="$RUNNER_TEMP/chromium/browser/noches-chromium"
+          # Ubuntu 24.04 restricts user namespaces to named AppArmor profiles.
+          # Grant this CI binary userns access while retaining Chromium's sandbox.
+          printf 'abi <abi/4.0>,\nprofile noches-ci-browser %s flags=(unconfined) { userns, }\n' "$NOCHES_CHROMIUM_HELPER" | sudo tee /etc/apparmor.d/noches-ci-browser >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/noches-ci-browser
+          xvfb-run -a python3 scripts/test-chromium-runtime.py "$NOCHES_CHROMIUM_HELPER" "$RUNNER_TEMP/chromium-results/runtime"
+          xvfb-run -a target/debug/examples/chromium-fixture "$RUNNER_TEMP/chromium-results/gpui"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chromium-${{ runner.os }}
+          path: ${{ runner.temp }}/chromium-results
           if-no-files-found: warn

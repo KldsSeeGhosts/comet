@@ -53,6 +53,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        browser: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -1282,4 +1283,29 @@ async fn antigravity_auth_path_subprocess() {
     .await
     .expect("sign-in timed out")
     .expect("configured business sign-in");
+}
+
+#[tokio::test]
+async fn registers_browser_mcp_in_session_new() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = temp.path().join("browser-acp.sh");
+    let source = std::fs::read_to_string(fixture_path()).unwrap().replace("has \"$line\" '\"mcpServers\":[]' || exit 1", "has \"$line\" '\"name\":\"noches_browser\"' || exit 1\nhas \"$line\" 'session-browser' || exit 1\nhas \"$line\" 'browser-mcp' || exit 1");
+    assert!(source.contains("session-browser"));
+    std::fs::write(&fixture, source).unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut controls, _steer, _token) = controls();
+    controls.browser = Some(zeron_browser::Connection {
+        executable: "/Applications/Noches App/zeron".into(),
+        socket: "/tmp/browser-test/control.sock".into(),
+        session: "session-browser".into(),
+    });
+    let provider = AcpHarness::grok().with_executable(fixture);
+    let events = run_to_end(&provider, request("scenario:happy"), controls).await;
+    assert!(
+        dones(&events)
+            .iter()
+            .any(|(status, _)| *status == DoneStatus::Completed),
+        "{events:?}"
+    );
 }

@@ -2694,6 +2694,7 @@ async fn run_session(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
+        browser,
         request_input,
         mut steering,
         interrupt,
@@ -2708,7 +2709,8 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
+        let servers = browser.as_ref().map(|browser| json!({"name":"noches_browser","command":browser.executable,"args":browser.args(),"env":[]})).into_iter().collect::<Vec<_>>();
+        let session_params = json!({ "cwd": request.cwd, "mcpServers": servers });
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());

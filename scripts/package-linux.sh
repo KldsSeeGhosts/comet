@@ -30,6 +30,7 @@ fi
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/zeron"
+"$ROOT/scripts/build-chromium.sh" "$STAGE" "$PROFILE"
 install -m 644 "$ROOT/dist/zeron.desktop" "$STAGE/zeron.desktop"
 install -m 644 "$ROOT/dist/zeron.png" "$STAGE/zeron.png"
 mkdir -p "$STAGE/licenses/fonts"
@@ -40,7 +41,12 @@ cat >"$STAGE/install.sh" <<'INSTALL'
 # Install Zeron into ~/.local (no root needed).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-install -Dm755 "$HERE/zeron" "$HOME/.local/bin/zeron"
+# Keep the browser next to the real executable, including when launched via a symlink.
+mkdir -p "$HOME/.local/lib/noches"
+install -m755 "$HERE/zeron" "$HOME/.local/lib/noches/zeron"
+cp -a "$HERE/browser" "$HOME/.local/lib/noches/"
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$HOME/.local/lib/noches/zeron" "$HOME/.local/bin/zeron"
 install -Dm644 "$HERE/zeron.desktop" "$HOME/.local/share/applications/zeron.desktop"
 install -Dm644 "$HERE/zeron.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/zeron.png"
 command -v update-desktop-database >/dev/null 2>&1 \

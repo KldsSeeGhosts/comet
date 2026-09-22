@@ -154,6 +154,7 @@ struct Inner {
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
+    browser_root: OnceLock<std::path::PathBuf>,
     generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
@@ -194,6 +195,7 @@ impl SessionsEngine {
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
+                browser_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
             }),
         }
@@ -214,6 +216,11 @@ impl SessionsEngine {
     /// already treats a missing doc host as "not wired".
     pub fn clear_doc_host(&self) {
         lock(&self.inner.doc_host).take();
+    }
+
+    /// Discover the desktop browser endpoint in this device's profile.
+    pub fn set_browser_root(&self, root: std::path::PathBuf) {
+        let _ = self.inner.browser_root.set(root);
     }
 
     /// Bind generated-image intake to the same profile store used by attachment RPCs.
@@ -479,6 +486,7 @@ impl SessionsEngine {
         };
         let interrupt_token = CancellationToken::new();
         let controls = RunControls {
+            browser: None,
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
@@ -1481,7 +1489,7 @@ async fn drive_run(
     harness: Arc<dyn Harness>,
     mut request: RunRequest,
     doc: Arc<SessionDoc>,
-    controls: RunControls,
+    mut controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
@@ -1516,6 +1524,20 @@ async fn drive_run(
     } else {
         Ok(())
     };
+    if let Some(root) = inner.browser_root.get() {
+        let socket = zeron_browser::socket_path(root);
+        if socket.exists() && harness_id != HarnessId::Mock {
+            if let Ok(executable) = std::env::current_exe() {
+                let connection = zeron_browser::Connection {
+                    executable,
+                    socket,
+                    session: chat_id.clone(),
+                };
+                request.prompt = format!("{}\n\n{}", connection.instructions(), request.prompt);
+                controls.browser = Some(connection);
+            }
+        }
+    }
     let started = match prepared {
         Ok(()) => harness.run(request, controls).await,
         Err(error) => Err(error),

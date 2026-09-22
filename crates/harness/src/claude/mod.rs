@@ -421,6 +421,11 @@ impl ClaudeHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = self.build_command(&exe, &request);
+        if !title_only && let Some(browser) = &controls.browser {
+            cmd.arg("--mcp-config").arg(
+                serde_json::json!({"mcpServers":{"noches_browser":browser.config()}}).to_string(),
+            );
+        }
         if title_only {
             cmd.args([
                 "--system-prompt",
@@ -633,6 +638,7 @@ async fn run_session(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
+        browser: _,
         request_input,
         mut steering,
         interrupt,

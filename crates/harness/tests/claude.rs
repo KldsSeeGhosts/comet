@@ -59,6 +59,7 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        browser: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -289,6 +290,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
+        browser: None,
         request_input: Box::new(move |questions| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
@@ -692,5 +694,49 @@ async fn title_run_disables_tools_and_denies_unexpected_permissions() {
             }
         )),
         "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn registers_conversation_browser_mcp_at_process_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let capture = temp.path().join("arguments");
+    let wrapper = temp.path().join("provider.sh");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexec {} \"$@\"\n",
+            zeron_browser::shell_quote(capture.to_str().unwrap()),
+            zeron_browser::shell_quote(fixture_path().to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut controls, _steer, _token) = controls("Yes");
+    controls.browser = Some(zeron_browser::Connection {
+        executable: "/Applications/Noches App/zeron".into(),
+        socket: "/tmp/browser-test/control.sock".into(),
+        session: "session-browser".into(),
+    });
+    let provider = ClaudeHarness::new().with_executable(wrapper);
+    let events = run_to_end(&provider, request("scenario:happy"), controls).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    let args = std::fs::read_to_string(capture).unwrap();
+    assert!(args.contains("noches_browser"), "{args}");
+    assert!(
+        args.contains("browser-mcp")
+            && args.contains("session-browser")
+            && args.contains("/Applications/Noches App/zeron"),
+        "{args}"
     );
 }

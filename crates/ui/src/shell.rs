@@ -11,6 +11,9 @@
 //! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
 //! dock. Double-clicking a handle resets that pane to its default width.
 
+#[cfg(all(unix, not(feature = "webkit-browser")))]
+mod browser_agent;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -1465,6 +1468,10 @@ pub struct Shell {
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
     browser_context: crate::browser::BrowserContext,
+    #[cfg(all(unix, not(feature = "webkit-browser")))]
+    browser_control: Option<(zeron_browser::transport::Server, gpui::Task<()>)>,
+    #[cfg(all(unix, not(feature = "webkit-browser")))]
+    browser_control_started: bool,
     browser_profile: Option<String>,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
@@ -1888,6 +1895,10 @@ impl Shell {
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
             browser_context: crate::browser::BrowserContext::default(),
+            #[cfg(all(unix, not(feature = "webkit-browser")))]
+            browser_control: None,
+            #[cfg(all(unix, not(feature = "webkit-browser")))]
+            browser_control_started: false,
             browser_profile: None,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
@@ -2866,12 +2877,28 @@ impl Shell {
         if self.active_chat.is_empty() {
             return;
         }
-        let key = self.panel_key(cx);
+        self.add_browser_for_session(self.active_chat.clone(), url, window, cx);
+    }
+
+    fn add_browser_for_session(
+        &mut self,
+        chat_id: String,
+        url: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = chat_id.clone();
+        let foreground = self.active_chat == chat_id;
+        let previous_focus = window.focused(cx);
         let remote = {
             let state = self.state.read(cx);
-            state.selected_chat_row().is_some_and(|chat| {
-                Some(chat.device_id.as_str()) != state.local_device_id.as_deref()
-            })
+            state
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .is_some_and(|chat| {
+                    Some(chat.device_id.as_str()) != state.local_device_id.as_deref()
+                })
         };
         self.browser_seq += 1;
         let id = self.browser_seq;
@@ -2879,7 +2906,7 @@ impl Shell {
             crate::browser::BrowserSurface::new(self.browser_context.clone(), remote, window, cx)
         });
         if let Some(handle) = self.state.read(cx).engine().cloned() {
-            let chat_id = self.active_chat.clone();
+            let chat_id = chat_id.clone();
             browser.update(cx, |browser, cx| {
                 browser.watch_previews(handle, chat_id, cx)
             });
@@ -2890,10 +2917,8 @@ impl Shell {
                 crate::browser::BrowserEvent::Changed => cx.notify(),
                 crate::browser::BrowserEvent::NewTab(url) => {
                     // A background page cannot open a tab in the wrong session.
-                    if this.panel_key(cx) == owner
-                        && this.resolved_right_active(cx) == RightSurface::Browser(id)
-                    {
-                        this.add_browser_surface(url.clone(), window, cx);
+                    if this.right_tabs.get(&owner).is_some_and(|tabs| tabs.contains(&RightSurface::Browser(id))) {
+                        this.add_browser_for_session(owner.clone(), url.clone(), window, cx);
                     }
                 }
                 crate::browser::BrowserEvent::Close => {
@@ -2907,7 +2932,13 @@ impl Shell {
             .entry(key)
             .or_default()
             .push(RightSurface::Browser(id));
-        self.set_right_active(RightSurface::Browser(id), cx);
+        if foreground {
+            self.set_right_active(RightSurface::Browser(id), cx);
+        } else {
+            self.panels.update(&chat_id, |panel| {
+                panel.right_active = RightSurface::Browser(id)
+            });
+        }
         browser.update(cx, |browser, cx| {
             if let Some(url) = url {
                 browser.navigate(&url, window, cx);
@@ -2915,6 +2946,10 @@ impl Shell {
                 browser.focus_address(window, cx);
             }
         });
+        if !foreground && let Some(focus) = previous_focus {
+            window.focus(&focus, cx);
+        }
+        cx.notify();
     }
 
     /// The picker's Diffs card / the `+` menu's Diff row: every click opens a
@@ -10088,6 +10123,8 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(all(unix, not(feature = "webkit-browser")))]
+        self.ensure_browser_control(window, cx);
         self.render_time = Some(std::time::Instant::now());
         if self.all_file_edits_flushed(cx)
             && let Some(action) = self.pending_exit.take()

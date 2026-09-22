@@ -221,6 +221,7 @@ impl EngineCore {
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        sessions.set_browser_root(data_dir.to_path_buf());
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {

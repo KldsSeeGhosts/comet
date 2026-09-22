@@ -9,6 +9,7 @@ publish.workspace = true
 project-palette-fixture = []
 
 browser-fixture = []
+webkit-browser = []
 windows-render-fixture = []
 appshots-fixture = ["gpui_platform/test-support"]
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
@@ -19,11 +20,15 @@ required-features = ["resource-profile"]
 
 [[example]]
 name = "preview-fixture"
+required-features = ["browser-fixture", "webkit-browser"]
+
+[[example]]
+name = "chromium-fixture"
 required-features = ["browser-fixture"]
 
 [[example]]
 name = "browser-fixture"
-required-features = ["browser-fixture"]
+required-features = ["browser-fixture", "webkit-browser"]
 
 [[example]]
 name = "windows-render-fixture"
@@ -38,6 +43,7 @@ name = "new-project-fixture"
 required-features = ["project-palette-fixture"]
 
 [dependencies]
+zeron-browser.workspace = true
 url = "2"
 zeron-proto.workspace = true
 similar.workspace = true
