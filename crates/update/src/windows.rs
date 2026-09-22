@@ -89,7 +89,7 @@ pub async fn stage(
     ensure!(
         output.status.success()
             && String::from_utf8_lossy(&output.stdout).trim()
-                == format!("zeron {}", manifest.version),
+                == format!("noches {}", manifest.version),
         "staged executable has the wrong version or cannot run"
     );
     let _ = temporary.keep();
