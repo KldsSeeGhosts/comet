@@ -12,7 +12,8 @@ The app is also a Noches companion: pair it with a running Mac or Linux host
 over Tailscale and drive that host's sessions with no account and no edge.
 Signed out, the root is the companion home; signing in with **Connect a cloud
 account** in Settings switches back to the mesh described below. Host setup,
-pairing, the supported command surface, theming, and the companion test rigs
+QR pairing, session search and management, model selection, native transcripts,
+read-only files/diffs, theming, and the companion test rigs
 are in [docs/mobile-companion.md](../../docs/mobile-companion.md).
 
 ## Build & run
