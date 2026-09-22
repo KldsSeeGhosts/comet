@@ -4228,6 +4228,11 @@ impl Composer {
         &self.pickers
     }
 
+    /// Snapshot the same resolved defaults used by a normal composer send.
+    pub(crate) fn voice_config(&self, cx: &App) -> Option<zeron_proto::ChatConfig> {
+        self.pickers.read(cx).resolved(cx).chat_config()
+    }
+
     /// Feed the stable conversation-column width into responsive composer
     /// controls.
     pub fn set_available_width(&mut self, width: f32, cx: &mut Context<Self>) {

@@ -34,6 +34,8 @@
         <key>ZERON_IPC_PORT</key>
         <string>__IPC_PORT__</string>
     </dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Noches uses your microphone during voice calls with GPT-Live.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
