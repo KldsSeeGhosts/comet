@@ -47,8 +47,16 @@ impl Shell {
     /// Whether the content area renders the workspace tree: any split, extra
     /// tab, or extra pane beyond the untouched default. False = today's exact
     /// single-chat code path (the parity gate).
+    ///
+    /// The per-pane `chat_surfaces` cache is deliberately NOT part of this
+    /// gate. It keeps a survivor composer (and unsent draft) alive when a
+    /// split collapses, but routing on that inventory latched the opaque
+    /// pane-island surface after every split→close cycle (issue #8). The
+    /// collapse handoff in [`Self::promote_trivial_chat_surface_to_dock`]
+    /// moves that draft into the shared dock and clears the cache so a
+    /// single session always takes the glass path.
     pub(super) fn workspace_mode(&self) -> bool {
-        !self.workspace.is_trivial() || !self.workspace.chat_surfaces.is_empty()
+        !self.workspace.is_trivial()
     }
 
     /// Whether the shell's transcript-underlay fade may take a TOP ramp.
@@ -1490,16 +1498,87 @@ impl Shell {
     /// pane via [`Self::sync_workspace_selection`]. Every mutation path
     /// funnels here, which is also where the WS5 save arms.
     fn retarget_to_focused_pane(&mut self, cx: &mut Context<Self>) {
-        // Adopt the original input before selecting the newly split canvas.
         if self.workspace_mode() {
+            // Adopt the original input before selecting the newly split canvas.
             self.ensure_pane_chat_surfaces(cx);
+            self.sync_selection_to_focused_pane(cx);
+        } else {
+            // Selection first: promote re-seats the dock composer on Selected
+            // and restores the survivor draft under that key.
+            self.sync_selection_to_focused_pane(cx);
+            self.promote_trivial_chat_surface_to_dock(cx);
         }
-        self.sync_selection_to_focused_pane(cx);
         // Keyboard focus follows the focused pane's own composer; a no-op
         // while an input the user chose keeps focus.
         self.focus_composer(cx);
         cx.notify();
         self.note_workspace_mutation(cx);
+    }
+
+    /// Collapse-to-single-session handoff. `chat_surfaces` keeps a survivor
+    /// composer (and unsent draft) alive while a split exists; once the
+    /// layout is trivial again that entity is adopted as the shared dock
+    /// composer so the glass single-session route keeps the same live state.
+    /// The cache is then dropped — it must never pin `workspace_mode`.
+    ///
+    /// Never rebuild from [`crate::composer::ComposerDraftState`]: that
+    /// snapshot is intentionally lossy (no in-flight send/interrupt tasks,
+    /// no queue-edit lease) and `restore_draft_state` merges maps, so a
+    /// closed neighbor's attachments could leak into the dock.
+    ///
+    /// The pane transcript is deliberately NOT adopted: `Transcript::for_session`
+    /// pins `doc_override`, so `Transcript::sync()` ignores selection changes
+    /// and the glass route would stay welded to the survivor session. The
+    /// primary `Transcript::new` already tracks selection and is kept.
+    fn promote_trivial_chat_surface_to_dock(&mut self, cx: &mut Context<Self>) {
+        if !self.workspace.is_trivial() {
+            return;
+        }
+        self.workspace.prune_caches();
+        let survivor = self
+            .workspace
+            .focused_pane()
+            .and_then(|pane| self.workspace.chat_surfaces.remove(&pane));
+        self.workspace.chat_surfaces.clear();
+        let Some(surface) = survivor else {
+            return;
+        };
+        // Preserve the survivor entity itself (in-flight sends, queue-edit
+        // lease, failure banners, staged attachments all live on it).
+        if surface.composer.entity_id() != self.composer.entity_id() {
+            self.composer = surface.composer;
+        }
+        self.reseat_composer_as_dock(cx);
+        self._composer_events =
+            Self::dock_composer_events(&self.composer, self.transcript.clone(), cx);
+    }
+
+    /// Flip the adopted composer onto `ChatTarget::Selected` so the dock
+    /// event stream and the next first-split adopt see a normal dock
+    /// composer — without dropping a still-valid queue-edit lease across the
+    /// Fixed→Selected projection flip.
+    fn reseat_composer_as_dock(&self, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            let key = ChatTarget::Selected.key(composer.state.read(cx));
+            if composer.current_key == key {
+                composer.target = ChatTarget::Selected;
+                composer
+                    .pickers()
+                    .clone()
+                    .update(cx, |pickers, cx| pickers.set_target(ChatTarget::Selected, cx));
+                cx.notify();
+                return;
+            }
+            // Key changes: park the live queue-edit lease, run the normal
+            // navigation swap, then put the lease back if hygiene dropped it.
+            let editing_queued = composer.editing_queued.take();
+            let queue_edit_draft = composer.queue_edit_draft.take();
+            composer.set_target(ChatTarget::Selected, cx);
+            if composer.editing_queued.is_none() {
+                composer.editing_queued = editing_queued;
+                composer.queue_edit_draft = queue_edit_draft;
+            }
+        });
     }
 
     /// Search the current workspace layout for a pane already bound to
