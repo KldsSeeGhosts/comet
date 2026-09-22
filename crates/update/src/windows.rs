@@ -89,7 +89,7 @@ pub async fn stage(
     ensure!(
         output.status.success()
             && String::from_utf8_lossy(&output.stdout).trim()
-                == format!("zeron {}", manifest.version),
+                == format!("noches {}", manifest.version),
         "staged executable has the wrong version or cannot run"
     );
     let _ = temporary.keep();
@@ -440,9 +440,12 @@ mod tests {
                 artifact("1.2.3"),
                 super::super::FileMeta {
                     sha256: Some(format!("{:x}", Sha256::digest(b"expected"))),
+                    url: Some(format!("{base}/artifact")),
+                    size: Some(7),
                 },
             )]
             .into(),
+            ..Default::default()
         };
         let error = stage(&base, &manifest, dir.path()).await.unwrap_err();
         server.join().unwrap();

@@ -23,6 +23,11 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    // A running desktop should use its own save/restart flow. Never swap its
+    // bundle or restart its service from an unrelated CLI process.
+    let data_dir = super::paths::data_dir();
+    let _lock = zeron_engine::InstanceLock::acquire(&data_dir)
+        .map_err(|error| anyhow::anyhow!("{error}: quit Noches and stop its daemon before a CLI update, or use Settings > Updates"))?;
     match zeron_update::detect_install() {
         InstallKind::Managed { app_root } => {
             println!(
@@ -52,7 +57,7 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             let data_dir = super::paths::data_dir();
             let staged = zeron_update::stage_mac_app(edge_url, &manifest, &data_dir).await?;
             zeron_update::apply_mac_app(&staged, &bundle)?;
-            println!("updated {} — relaunch Zeron to finish.", bundle.display());
+            println!("updated {} — relaunch Noches to finish.", bundle.display());
             Ok(())
         }
         #[cfg(windows)]
@@ -60,7 +65,7 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             let staged = zeron_update::windows::stage(edge_url, &manifest, &directory).await?;
             zeron_update::windows::apply(&staged, &directory, false)?;
             println!(
-                "updated to {} — relaunch Zeron to finish.",
+                "updated to {} — relaunch Noches to finish.",
                 manifest.version
             );
             Ok(())
@@ -68,8 +73,8 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\
-                 Linux: curl -fsSL https://zeron.sh/install.sh | sh\n\
-                 macOS: download the new Zeron.app dmg, or rebuild from source.\n\
+                 Linux: install a Noches release tarball with its bundled install.sh\n\
+                 macOS: download the Noches dmg, or rebuild from source.\n\
                  Windows: use an update-enabled portable package, or rebuild from source."
             )
         }

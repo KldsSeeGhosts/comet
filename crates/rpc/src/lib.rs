@@ -194,6 +194,8 @@ pub mod methods {
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
+    /// Refuse a local application restart while agents or terminals are active.
+    pub const CHECK_UPDATE_READY: &str = "CheckUpdateReady";
     pub const UPDATE_STATUS: &str = "UpdateStatus";
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).

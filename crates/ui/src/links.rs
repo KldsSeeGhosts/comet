@@ -43,7 +43,8 @@ pub fn workspace_locator(
 
 pub fn zeron_conversation_link(chat_id: &str, workspace: &str) -> String {
     format!(
-        "zeron://open/chat/{}?workspace={}",
+        "{}://open/chat/{}?workspace={}",
+        zeron_update::identity::slug(),
         encode_component(chat_id),
         encode_component(workspace)
     )
@@ -51,8 +52,9 @@ pub fn zeron_conversation_link(chat_id: &str, workspace: &str) -> String {
 
 pub fn parse_zeron_conversation_link(url: &str) -> Result<ConversationDeepLink, &'static str> {
     let rest = url
-        .strip_prefix("zeron://open/chat/")
-        .ok_or("not a Zeron conversation link")?;
+        .strip_prefix(&format!("{}://open/chat/", zeron_update::identity::slug()))
+        .or_else(|| url.strip_prefix("zeron://open/chat/"))
+        .ok_or("not a Noches conversation link")?;
     let (chat_id, query) = rest.split_once('?').ok_or("missing workspace locator")?;
     if chat_id.is_empty() || chat_id.contains('/') {
         return Err("invalid conversation id");

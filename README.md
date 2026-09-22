@@ -1,4 +1,8 @@
-# Zeron
+# Noches
+
+Noches is the macOS and Linux desktop fork of [Zeron](https://github.com/zeronsh/zeron), with an iOS companion in development.
+
+**Installers and in-app updates:** see [desktop installation and update channels](docs/desktop-updates.md). Noches Dev follows `dev`; Noches follows `main`. macOS builds work without a paid Apple Developer account.
 
 Control your coding agents (Claude Code, Codex, Cursor, Devin, Grok, Hermes, Pi, Antigravity) locally by default, with optional multi-device sync.
 
@@ -8,7 +12,9 @@ Control your coding agents (Claude Code, Codex, Cursor, Devin, Grok, Hermes, Pi,
 
 Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
 
-## Install and run locally (Linux)
+## Legacy source/daemon setup
+
+The upstream instructions below describe the retained Zeron daemon tooling. The `zeron.sh` installer installs upstream Zeron, not Noches. Use the [Noches desktop packages](docs/desktop-updates.md) for this fork and its update channels.
 
 ```bash
 curl -fsSL https://zeron.sh/install.sh | sh

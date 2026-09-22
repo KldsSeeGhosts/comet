@@ -1,69 +1,80 @@
-name: release
-
-# Build release artifacts and publish them:
-#   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
-#   - macOS dmg (Apple silicon) via scripts/package-macos.sh
-#   - Windows portable zip (x86_64) via scripts/package-windows.ps1
-# then create a GitHub Release AND upload everything to the
-# `comet-native-releases` R2 bucket (served at zeron.sh/releases/* for
-# `curl -fsSL https://zeron.sh/install.sh | sh`), bumping latest.txt.
-#
-# Trigger: push a tag `v<version>` matching the workspace version in
-# Cargo.toml (bump it in the same commit), or run manually via
-# workflow_dispatch (builds + uploads artifacts, no release/R2 publish).
+name: Noches releases
 
 on:
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/*release*'
+      - 'scripts/package-*.sh'
+      - 'scripts/install-linux.sh'
+      - 'crates/update/**'
+      - 'dist/macos/**'
   push:
-    tags: ["v*"]
+    branches: [dev, main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+# Serialize published channels; obsolete PR builds can be cancelled safely.
+concurrency:
+  group: noches-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  cursor-compatibility:
-    uses: ./.github/workflows/cursor-compatibility.yml
+  prepare:
+    if: github.repository_owner == 'KldsSeeGhosts' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    outputs:
+      channel: ${{ steps.identity.outputs.channel }}
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: identity
+        env:
+          NOCHES_SOURCE_BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: python3 scripts/noches-release.py prepare
+      - name: Release configuration tests
+        run: python3 scripts/test-noches-release.py
 
   linux:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-24.04 # x86_64
-          - runner: ubuntu-24.04-arm # aarch64
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - name: gpui system deps
+      - name: System dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libx11-dev libxcb1-dev libx11-xcb-dev \
-            libfontconfig1-dev libfreetype-dev libasound2-dev \
-            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
-      - name: rust toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+          sudo apt-get install -y -qq libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev libfontconfig1-dev libfreetype-dev \
+            libasound2-dev libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+      - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: package
-        run: scripts/package-linux.sh
+      - name: Application and updater tests
+        run: cargo test --locked -p zeron-update -p zeron
+      - name: UI regression tests
+        run: cargo test --release --locked -p zeron-ui --lib -- --test-threads=1
+      - name: Package
+        env:
+          NOCHES_CHANNEL: ${{ needs.prepare.outputs.channel }}
+          NOCHES_VERSION: ${{ needs.prepare.outputs.version }}
+          NOCHES_REPOSITORY: ${{ github.repository }}
+          NOCHES_COMMIT: ${{ github.sha }}
+        run: bash scripts/package-linux.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ runner.arch }}
-          path: target/package/*.tar.gz
+          path: target/package/noches-*.tar.gz
           if-no-files-found: error
 
-  # Every platform must build before publishing the release and updater manifest.
-  #
-  # Signing/notarization (both optional — absent secrets fall back to an
-  # ad-hoc-signed build):
-  #   MACOS_CERT_P12 / MACOS_CERT_PASSWORD — base64 "Developer ID Application"
-  #     certificate + private key (.p12) and its export password.
-  #   AC_API_KEY_P8 / AC_API_KEY_ID / AC_API_ISSUER_ID — App Store Connect API
-  #     key (raw .p8 contents), for notarytool. All three present → the package
-  #     script notarizes and staples the app + dmg (no Gatekeeper warning).
   macos:
-    runs-on: macos-latest # Apple silicon
+    needs: prepare
+    runs-on: macos-15
     env:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -72,9 +83,10 @@ jobs:
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
     steps:
       - uses: actions/checkout@v4
-      - name: rust toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Application and updater tests
+        run: cargo test --locked -p zeron-update -p zeron
       - name: import Developer ID certificate
         if: env.MACOS_CERT_P12 != ''
         run: |
@@ -104,95 +116,36 @@ jobs:
             echo "NOTARY_KEY_ID=$AC_API_KEY_ID"
             echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID"
           } >>"$GITHUB_ENV"
-      - name: package dmg
-        run: scripts/package-macos.sh
+      - name: Package macOS application
+        env:
+          NOCHES_CHANNEL: ${{ needs.prepare.outputs.channel }}
+          NOCHES_VERSION: ${{ needs.prepare.outputs.version }}
+          NOCHES_REPOSITORY: ${{ github.repository }}
+          NOCHES_COMMIT: ${{ github.sha }}
+        run: bash scripts/package-macos.sh
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ runner.arch }}
           path: |
-            target/package/*.dmg
-            target/package/*.tar.gz
-          if-no-files-found: error
-
-  windows:
-    runs-on: windows-2022
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v4
-      - name: rust toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
-      - name: Locate Windows SDK shader compiler
-        run: |
-          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
-          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
-      - uses: Swatinem/rust-cache@v2
-      - name: package portable app
-        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-${{ runner.arch }}
-          path: |
-            target/package/*.zip
-            target/package/*.exe
+            target/package/noches-*.dmg
+            target/package/noches-*.tar.gz
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [cursor-compatibility, linux, macos, windows]
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    needs: [prepare, linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     env:
-      # `secrets` is not a valid context in step `if:` expressions — surface
-      # the token through job env and gate on that instead.
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: b57dde68ee5964dccc025437b5478a5b
+      GH_TOKEN: ${{ github.token }}
+      NOCHES_CHANNEL: ${{ needs.prepare.outputs.channel }}
+      NOCHES_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: artifacts
           merge-multiple: true
-      - name: version guard (tag == artifact version)
-        run: |
-          ver="${GITHUB_REF_NAME#v}"
-          ls dist/
-          for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
-              macos-arm64.dmg macos-arm64-app.tar.gz \
-              windows-x86_64.zip windows-x86_64.exe; do
-            test -f "dist/zeron-$ver-$platform" \
-              || { echo "missing artifact for tag v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
-          done
-          echo "VERSION=$ver" >> "$GITHUB_ENV"
-      - name: updater manifest
-        run: |
-          manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
-          for f in dist/*; do
-            sha=$(sha256sum "$f" | cut -d' ' -f1)
-            manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
-              '.files[$name] = {sha256: $sha}' <<<"$manifest")
-          done
-          printf '%s' "$manifest" > manifest.json
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*
-            manifest.json
-          generate_release_notes: true
-      - name: upload to R2 (zeron.sh/releases/*)
-        if: env.CLOUDFLARE_API_TOKEN != ''
-        run: |
-          for f in dist/*; do
-            npx wrangler@4 r2 object put "comet-native-releases/$(basename "$f")" \
-              --file "$f" --remote
-          done
-          # manifest.json: version + per-artifact sha256 — the auto-updater
-          # (crates/update) verifies downloads against it. Published before
-          # latest.txt so no client ever sees a version without its checksums.
-          npx wrangler@4 r2 object put comet-native-releases/manifest.json \
-            --file manifest.json --remote
-          printf '%s' "$VERSION" > latest.txt
-          npx wrangler@4 r2 object put comet-native-releases/latest.txt \
-            --file latest.txt --remote
+      - name: Publish version and channel manifest
+        run: python3 scripts/noches-release.py publish

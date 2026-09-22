@@ -11,6 +11,8 @@
 //! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
 //! dock. Double-clicking a handle resets that pane to its default width.
 
+mod updates;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -80,6 +82,7 @@ actions!(
         OpenModelPicker,
         NewSession,
         OpenSettings,
+        CheckForUpdates,
         NextSession,
         PrevSession,
         ArchiveSession
@@ -475,10 +478,11 @@ pub enum SettingsSection {
     Shortcuts,
     Appshots,
     Archived,
+    Updates,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 10] = [
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::Connections,
         SettingsSection::Devices,
         SettingsSection::Harnesses,
@@ -489,6 +493,7 @@ impl SettingsSection {
         SettingsSection::Shortcuts,
         SettingsSection::Appshots,
         SettingsSection::Archived,
+        SettingsSection::Updates,
     ];
 
     /// Sidebar + header label (zeron settings-sidebar.tsx SECTIONS / __root.tsx
@@ -505,6 +510,7 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
+            SettingsSection::Updates => "Updates",
         }
     }
 }
@@ -996,6 +1002,7 @@ struct RenameChatDialog {
 enum UpdateFlow {
     Idle,
     Downloading,
+    Installing,
     /// Staged bundle ready to swap in — one click restarts into it.
     Ready(PathBuf),
     Failed(SharedString),
@@ -1537,6 +1544,14 @@ pub struct Shell {
     /// download/stage of it has come in this process.
     update_flow: UpdateFlow,
     update_task: Option<Task<()>>,
+    update_check_task: Option<Task<()>>,
+    _update_poll: Task<()>,
+    update_progress_task: Option<Task<()>>,
+    update_progress: std::sync::Arc<zeron_update::DownloadProgress>,
+    update_manifest: Option<zeron_update::Manifest>,
+    update_checking: bool,
+    update_status: SharedString,
+    update_checked_at: Option<String>,
     /// Version whose update strip the user dismissed (advisory installs only —
     /// a newer release shows the strip again).
     update_dismissed: Option<String>,
@@ -1834,6 +1849,13 @@ impl Shell {
             shell.transcript.update(cx, |_, cx| cx.notify());
         });
         let shell = cx.entity();
+        let update_poll = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(20)).await;
+            loop {
+                if this.update(cx, |shell, cx| shell.check_for_updates(false, cx)).is_err() { break; }
+                cx.background_executor().timer(Duration::from_secs(6 * 60 * 60)).await;
+            }
+        });
         let sidebar_pane = cx.new(|cx| SidebarPane {
             shell: shell.downgrade(),
             _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
@@ -1929,6 +1951,14 @@ impl Shell {
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
+            update_check_task: None,
+            _update_poll: update_poll,
+            update_progress_task: None,
+            update_progress: Default::default(),
+            update_manifest: None,
+            update_checking: false,
+            update_status: "Check for a new version of this application.".into(),
+            update_checked_at: None,
             update_dismissed: None,
             install: zeron_update::detect_install(),
             org: None,
@@ -3873,6 +3903,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match section {
+            SettingsSection::Updates => self.render_updates_page(cx),
             SettingsSection::Connections => {
                 if self.connections_page.is_none() {
                     let state = self.state.clone();
@@ -5600,6 +5631,7 @@ impl Shell {
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
+            SettingsSection::Updates => icons::RESTART,
         };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
@@ -6494,142 +6526,6 @@ impl Shell {
                     .child(user_menu),
             )
             .into_any_element()
-    }
-
-    /// Update strip: shown above the user menu whenever the engine's
-    /// UpdateStatus stream reports a newer release. On a macOS bundle install
-    /// it drives the whole flow — click to download, then click to restart into
-    /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`zeron update`); click dismisses it for that version.
-    fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.boot.remote.is_some() { return None; }
-        let status = self.state.read(cx).update.clone()?;
-        if !status.update_available {
-            return None;
-        }
-        let latest = status.latest_version.clone()?;
-        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
-            return None;
-        }
-        let desktop_update = self.install.supports_desktop_update();
-
-        let (label, clickable): (SharedString, bool) = if desktop_update {
-            match &self.update_flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
-                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
-            }
-        } else {
-            (
-                format!("Update available — v{latest} · run `zeron update`").into(),
-                true,
-            )
-        };
-        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
-        let tone = if failed { theme.danger } else { theme.accent };
-        // Follow the selected spectrum with a low-emphasis glass tint rather
-        // than painting the bright text accent as a solid slab.
-        let (chip_bg, chip_bg_hover) = if failed {
-            (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
-        } else {
-            (theme.accent_wash, theme.accent.opacity(0.16))
-        };
-
-        let mut strip = div()
-            .id("update-strip")
-            .mx(px(Theme::SPACE_SM))
-            // No bottom margin: the user-menu block below carries its own
-            // SPACE_SM padding — doubling it read as a hole (user report).
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
-            .bg(chip_bg)
-            .flex()
-            .flex_row()
-            .items_center()
-            .text_size(crate::typography::ui_rems(11.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(tone)
-            .child(div().flex_1().min_w_0().child(label));
-        if clickable {
-            strip = strip
-                .cursor_pointer()
-                .hover(move |s| s.bg(chip_bg_hover))
-                .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
-        }
-        Some(strip.into_any_element())
-    }
-
-    /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
-    /// installs → dismiss for this version.
-    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
-        if !self.install.supports_desktop_update() {
-            self.update_dismissed = self
-                .state
-                .read(cx)
-                .update
-                .as_ref()
-                .and_then(|s| s.latest_version.clone());
-            cx.notify();
-            return;
-        }
-        match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
-            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
-            UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
-            UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
-        }
-    }
-
-    /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
-    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
-    fn begin_update_download(&mut self, cx: &mut Context<Self>) {
-        let edge_url = self.boot.edge_url.clone();
-        let data_dir = self.data_dir.clone();
-        let install = self.install.clone();
-        self.update_flow = UpdateFlow::Downloading;
-        let download = Tokio::spawn(cx, async move {
-            let manifest = zeron_update::fetch_latest(&edge_url).await?;
-            install.stage_desktop(&edge_url, &manifest, &data_dir).await
-        });
-        self.update_task = Some(cx.spawn(async move |this, cx| {
-            let outcome = match download.await {
-                Ok(Ok(staged)) => Ok(staged),
-                Ok(Err(err)) => Err(format!("{err:#}")),
-                Err(join_err) => Err(join_err.to_string()),
-            };
-            this.update(cx, |shell, cx| {
-                shell.update_flow = match outcome {
-                    Ok(staged) => UpdateFlow::Ready(staged),
-                    Err(message) => {
-                        tracing::warn!(%message, "update download failed");
-                        UpdateFlow::Failed(message.into())
-                    }
-                };
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// Swap the staged bundle over the installed one, arm the detached
-    /// relauncher, and quit — the relauncher `open`s the new bundle once this
-    /// process (and its engine lock / IPC port) is gone.
-    fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
-        if !self.prepare_exit(PendingExit::InstallUpdate(staged.clone()), cx) {
-            return;
-        }
-        match self.install.apply_desktop(&staged) {
-            Ok(()) => {
-                crate::app_menus::quit_after_save(cx);
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "update apply failed");
-                self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
-                cx.notify();
-            }
-        }
     }
 
     /// Scope-aware sidebar identity and account menu. Local runtimes advertise
@@ -10310,6 +10206,10 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
             // Native Settings menu item and the platform convention (Cmd+, on
             // macOS, Ctrl+, elsewhere) always land on the default section.
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| {
+                this.open_settings(SettingsSection::Updates, cx);
+                this.check_for_updates(true, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 this.open_settings(SettingsSection::Devices, cx)
             }))

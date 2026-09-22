@@ -12,10 +12,10 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
-const LAUNCHD_LABEL: &str = "sh.zeron.app";
+const LAUNCHD_LABEL: &str = zeron_update::identity::LAUNCHD_LABEL;
 /// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
 /// `zeron daemon …` manages that installation rather than a competing copy.
-const SYSTEMD_UNIT: &str = "zeron.service";
+const SYSTEMD_UNIT: &str = zeron_update::identity::SERVICE_NAME;
 
 /// Environment captured into the unit file. `PATH` is always included (the
 /// engine spawns harness CLIs like `claude`, which service managers' minimal
@@ -23,6 +23,8 @@ const SYSTEMD_UNIT: &str = "zeron.service";
 const CAPTURED_ENV: &[&str] = &[
     "PATH",
     "ZERON_DATA_DIR",
+    "NOCHES_DATA_DIR",
+    "NOCHES_RELEASES_URL",
     "ZERON_EDGE_URL",
     "ZERON_EDGE_TOKEN",
     "ZERON_RELEASES_URL",
@@ -236,8 +238,8 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
         unit.push_str(&format!("Environment=\"{key}={value}\"\n"));
     }
     unit.push_str(&format!(
-        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.zeron/env\n\n[Install]\nWantedBy=default.target\n",
-        systemd_exec_path(exe)
+        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/{}/env\n\n[Install]\nWantedBy=default.target\n",
+        systemd_exec_path(exe), zeron_update::identity::data_folder()
     ));
     unit
 }
@@ -251,6 +253,9 @@ fn systemd_exec_path(exe: &Path) -> String {
 }
 
 fn exec_path_for(exe: &Path, home: Option<&Path>) -> String {
+    if zeron_update::identity::distributed() && home.is_some_and(|home| exe.starts_with(zeron_update::identity::app_root(home))) {
+        return format!("%h/.local/share/{}/app/current/zeron", zeron_update::identity::slug());
+    }
     let installed = home
         .map(|home| home.join(".zeron/app"))
         .is_some_and(|app_root| exe.starts_with(app_root));

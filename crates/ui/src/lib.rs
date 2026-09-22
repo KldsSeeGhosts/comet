@@ -197,7 +197,7 @@ pub fn run_app(config: UiConfig) {
         appshots::set_enabled(ui_settings.appshots_enabled);
         terminal::panel::init(cx);
         app_menus::init(cx);
-        cx.register_url_scheme("zeron").detach();
+        cx.register_url_scheme(zeron_update::identity::slug()).detach();
 
         let state = cx.new(|_| state::AppState::new());
         let url_state = state.clone();
@@ -391,7 +391,7 @@ fn open_main_window(
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: Some(boot.remote.as_ref().map_or_else(|| "Noches".into(), |host| format!("Noches · {}", host.name).into())),
+                    title: Some(boot.remote.as_ref().map_or_else(|| zeron_update::identity::app_name().into(), |host| format!("{} · {}", zeron_update::identity::app_name(), host.name).into())),
                     appears_transparent: true,
                     // Native lights are 14px tall: top 14 → center 21, matching
                     // the 38px titlebar row with 4px top-only content padding.
@@ -421,7 +421,7 @@ fn open_main_window(
                 // — if these two ever disagree, vibrancy dies on the first theme
                 // change and never comes back.
                 window_background: theme::Theme::of(cx).window_background_appearance(),
-                app_id: Some("zeron".into()),
+                app_id: Some(zeron_update::identity::slug().into()),
                 ..Default::default()
             },
             move |window, cx| {
