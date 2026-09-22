@@ -66,12 +66,16 @@ mod command_palette;
 mod panes;
 mod spaces;
 mod tabs;
+mod voice;
+mod voice_actions;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(
     shell,
     [
+        ToggleVoice,
+        MuteVoice,
         SaveFile,
         ToggleSidebar,
         ToggleChanges,
@@ -339,6 +343,22 @@ pub fn apply_keymap(
     // close, ⌘M minimize, ⌘H hide on macOS) — these back the native menu
     // key equivalents and must survive keymap re-application.
     crate::app_menus::bind_keys(cx);
+    for binding in [
+        KeyBinding::new(&platform_combo("mod-shift-h"), ToggleVoice, None),
+        KeyBinding::new(&platform_combo("mod-shift-u"), MuteVoice, None),
+    ] {
+        let combo = if binding.action().name() == ToggleVoice.name() {
+            "mod-shift-h"
+        } else {
+            "mod-shift-u"
+        };
+        if !ShortcutId::ALL.iter().any(|id| {
+            Keystroke::parse(&platform_combo(keymap.get(*id))).ok()
+                == Keystroke::parse(&platform_combo(combo)).ok()
+        }) {
+            cx.bind_keys([binding]);
+        }
+    }
     cx.bind_keys([
         KeyBinding::new(
             &valid_or_default(&keymap.save_file, "mod-s"),
@@ -1348,6 +1368,7 @@ enum PendingExit {
 }
 
 pub struct Shell {
+    voice: voice::VoiceUi,
     state: Entity<AppState>,
     sidebar_pane: Entity<SidebarPane>,
     transcript: Entity<Transcript>,
@@ -1839,6 +1860,7 @@ impl Shell {
             _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
         });
         Self {
+            voice: voice::VoiceUi::default(),
             state,
             sidebar_pane,
             transcript,
@@ -2056,6 +2078,7 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        self.sync_voice_context(cx);
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.sidebar_notice = Some(notice.into());
         }
@@ -4311,6 +4334,7 @@ impl Shell {
     }
 
     fn start_local_runtime_transition(&mut self, sign_out: bool, cx: &mut Context<Self>) {
+        self.stop_voice(cx);
         if self.runtime_change_task.is_some() {
             return;
         }
@@ -5675,6 +5699,7 @@ impl Shell {
                         ),
                     ),
             )
+            .child(self.render_voice_bar(theme, cx))
             // Back pinned to the bottom (zeron settings-sidebar.tsx).
             .child(
                 div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
@@ -6453,6 +6478,7 @@ impl Shell {
             .child(side_brand)
             .child(filter_row)
             .child(sidebar_lists)
+            .child(self.render_voice_bar(theme, cx))
             // Global connection pill (durable-by-design UI truth): appears
             // whenever the edge posture is degraded; hidden while healthy —
             // appearing IS the signal.
@@ -7354,6 +7380,9 @@ impl Shell {
         if self.pane_menu.get().is_some() {
             return true;
         }
+        if self.dismiss_voice_panel(cx) {
+            return true;
+        }
         self.active_changes(cx)
             .is_some_and(|changes| changes.update(cx, |changes, cx| changes.handle_escape(cx)))
     }
@@ -7648,6 +7677,9 @@ impl Shell {
             overlays.push(popover::modal("rename-chat-dialog", viewport, card));
         }
 
+        if let Some(overlay) = self.render_voice_overlay(viewport, cx) {
+            overlays.push(overlay);
+        }
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         overlays.extend(self.render_workspace_overlays(cx));
         if let Some(overlay) = self.render_command_palette(viewport, window, cx) {
@@ -10287,6 +10319,10 @@ impl Render for Shell {
             // no-ops (zeron __root.tsx gates the hotkey on `!isSettings`, and
             // the terminal panel is only mounted on session routes). The
             // sidebar toggle stays live everywhere, as in the original.
+            .on_action(
+                cx.listener(|this, _: &ToggleVoice, window, cx| this.toggle_voice(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &MuteVoice, _, cx| this.mute_voice(cx)))
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_terminal(window, cx)

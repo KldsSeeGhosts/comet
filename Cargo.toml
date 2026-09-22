@@ -13,6 +13,7 @@ members = [
     "crates/ui",
     "crates/syntax",
     "crates/workspace",
+    "crates/voice",
     "apps/zeron",
 ]
 

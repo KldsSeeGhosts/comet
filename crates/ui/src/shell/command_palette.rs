@@ -38,6 +38,7 @@ impl EnterPress {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Entry {
+    Voice,
     NewChat,
     NewProject,
     Settings,
@@ -48,6 +49,7 @@ enum Entry {
 impl Entry {
     fn action(&self) -> Option<(&'static str, &'static str)> {
         match self {
+            Self::Voice => Some(("Open voice controls", icons::VOLUME_LOUD)),
             Self::NewChat => Some(("New chat", icons::PEN_NEW_SQUARE)),
             Self::NewProject => Some(("New project", icons::FOLDER)),
             Self::Settings => Some(("Open settings", icons::SETTINGS_MINIMALISTIC)),
@@ -79,6 +81,7 @@ fn actions_for(query: &str, is_dark: bool) -> Vec<Entry> {
         } else {
             AppearanceMode::Dark
         }),
+        Entry::Voice,
     ]
     .into_iter()
     .filter(|entry| matches_query(query, entry.action().unwrap().0))
@@ -191,6 +194,10 @@ impl Shell {
         }
         self.close_command_palette(window, cx);
         match entry {
+            Entry::Voice => {
+                self.voice.panel = true;
+                cx.notify();
+            }
             Entry::NewChat => self.open_new_session(cx),
             Entry::NewProject => self.open_add_space(cx),
             Entry::Settings => self.open_settings(SettingsSection::Devices, cx),
@@ -540,7 +547,8 @@ mod tests {
                 Entry::NewChat,
                 Entry::NewProject,
                 Entry::Settings,
-                Entry::Theme(AppearanceMode::Light)
+                Entry::Theme(AppearanceMode::Light),
+                Entry::Voice,
             ]
         );
         assert_eq!(
