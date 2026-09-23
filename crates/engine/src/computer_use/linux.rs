@@ -648,8 +648,11 @@ impl ComputerUseManager {
         Ok((
             socket,
             RunBridge {
+                lifecycle: Arc::new(RunBridgeLifecycle {
+                    stop: state.stop.clone(),
+                    task: Mutex::new(Some(task)),
+                }),
                 state,
-                task: Arc::new(Mutex::new(Some(task))),
             },
         ))
     }
@@ -734,15 +737,27 @@ impl BridgeState {
     }
 }
 
-/// Cheap to clone: `state` is shared with the run task's bridge (the owner of
-/// the serve task and the final `finish`), so a caller holding only a clone
-/// can arm or disarm the same turn slot. The task handle lives behind a shared
-/// slot so every clone reaches the same join handle — whichever clone `finish`es
-/// first awaits the serve task; the rest observe it already taken.
+/// Shared lifecycle for every clone of one run bridge. This object is dropped
+/// exactly once, after the final RunBridge handle disappears, so abandoned-run
+/// cleanup cannot race between clones.
+struct RunBridgeLifecycle {
+    stop: CancellationToken,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for RunBridgeLifecycle {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+/// Cheap to clone: routing handles can re-arm the same turn without owning the
+/// bridge lifetime. Explicit `finish` still cancels and joins the serve task;
+/// otherwise the shared lifecycle cancels it when the final handle disappears.
 #[derive(Clone)]
 pub struct RunBridge {
+    lifecycle: Arc<RunBridgeLifecycle>,
     state: Arc<BridgeState>,
-    task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl RunBridge {
@@ -767,21 +782,9 @@ impl RunBridge {
 
     pub async fn finish(self) {
         self.state.stop.cancel();
-        let task = { lock(&self.task).take() };
+        let task = { lock(&self.lifecycle.task).take() };
         if let Some(task) = task {
             let _ = task.await;
-        }
-    }
-}
-
-impl Drop for RunBridge {
-    fn drop(&mut self) {
-        // Session routing keeps cheap RunBridge clones only to re-arm turns.
-        // Dropping one of those temporary handles must not cancel the shared
-        // bridge. Preserve the old abandoned-owner cleanup only for the final
-        // RunBridge handle.
-        if Arc::strong_count(&self.task) == 1 {
-            self.state.stop.cancel();
         }
     }
 }
