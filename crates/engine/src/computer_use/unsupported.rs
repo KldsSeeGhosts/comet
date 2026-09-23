@@ -30,6 +30,11 @@ impl ComputerUseManager {
     }
 }
 
+/// No managed driver on this platform. Still `Clone` so a session can share the
+/// handle the way Linux does: `steer` re-arms the turn before the next prompt.
+/// `start_bridge` never succeeds here, so the handle stays `None` and these
+/// methods are not called.
+#[derive(Clone)]
 pub struct RunBridge;
 
 impl RunBridge {
