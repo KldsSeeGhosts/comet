@@ -29,6 +29,12 @@ foreach ($argument in @('--help', '--version', '--invalid-startup-test-option'))
             if ($process.ExitCode -eq 0 -or $stderr.Result -notmatch 'unexpected argument') {
                 throw 'Argument error did not reach stderr with a failing exit code'
             }
+        } elseif ($argument -eq '--version') {
+            # Clap prints the command name: `noches <version>`, exit 0.
+            # --help still mentions the zeron binary; --version does not.
+            if ($process.ExitCode -ne 0 -or $stdout.Result.Trim() -notmatch '^noches \d+\.\d+\.\d+') {
+                throw "CLI output or exit code failed: $argument"
+            }
         } elseif ($process.ExitCode -ne 0 -or $stdout.Result -notmatch 'zeron') {
             throw "CLI output or exit code failed: $argument"
         }
