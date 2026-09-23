@@ -234,6 +234,42 @@ fn request_count(dir: &Path, method: &str) -> usize {
 }
 
 #[tokio::test]
+async fn dropping_a_routing_clone_does_not_cancel_the_shared_bridge() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path());
+    let (socket, bridge) = manager
+        .start_bridge(
+            "clone-lifetime",
+            "clone-lifetime",
+            approval(false, Arc::new(AtomicUsize::new(0))),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let routing_handle = bridge.clone();
+    routing_handle.turn_started();
+    drop(routing_handle);
+
+    assert!(
+        !bridge.state.stop.is_cancelled(),
+        "dropping a temporary routing clone must not stop the live bridge"
+    );
+    assert!(
+        socket.exists(),
+        "the bridge socket must remain available after a routing clone is dropped"
+    );
+
+    let help = call(&socket, "help", json!({})).await;
+    assert_ne!(
+        help["isError"], true,
+        "the live bridge must still accept requests after the clone is dropped: {help}"
+    );
+
+    bridge.finish().await;
+}
+
+#[tokio::test]
 async fn full_results_permissions_and_turn_lease() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(dir.path());
