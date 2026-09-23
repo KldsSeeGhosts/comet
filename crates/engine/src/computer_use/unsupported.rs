@@ -33,5 +33,9 @@ impl ComputerUseManager {
 pub struct RunBridge;
 
 impl RunBridge {
+    pub fn turn_started(&self) {}
+
+    pub async fn turn_ended(&self) {}
+
     pub async fn finish(self) {}
 }

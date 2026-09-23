@@ -95,6 +95,11 @@ class ReleaseTests(unittest.TestCase):
         harness = (ROOT / 'crates/harness/src/acp/mod.rs').read_text()
         self.assertIn('noches-cua.ts', harness)
         self.assertIn('PI_ACP_PI_COMMAND', harness)
+        self.assertNotIn('join("noches-cua-launch")', harness)
+        self.assertNotIn('computer_use_socket.is_some()', harness)
+        unsupported = (ROOT / 'crates/engine/src/computer_use/unsupported.rs').read_text()
+        self.assertIn('fn turn_started', unsupported)
+        self.assertIn('fn turn_ended', unsupported)
 
 
 if __name__ == '__main__': unittest.main()

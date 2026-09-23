@@ -1211,12 +1211,16 @@ impl AcpHarness {
 
     /// Point pi-acp at a wrapper that loads the managed computer-use extension.
     /// The real `pi` binary stays the user's (or `PI_ACP_PI_COMMAND`); the wrapper
-    /// only adds `-e`.
+    /// only adds `-e`. The extension is loaded even when no bridge socket exists,
+    /// so the direct `cua` tool stays disabled.
+    ///
+    /// Files are written next to `bridge.sock` when the engine started a bridge.
+    /// That parent is already a unique mode `0700` directory for this run. Without
+    /// a socket, a new private directory is created instead of a shared temp path.
     fn prepare_pi_cua(socket: Option<&Path>) -> Result<Vec<(&'static str, String)>, HarnessError> {
-        let dir = std::env::temp_dir().join("noches-cua-launch");
-        std::fs::create_dir_all(&dir).map_err(HarnessError::Io)?;
+        let dir = Self::cua_launch_dir(socket)?;
         let extension = dir.join("noches-cua.ts");
-        std::fs::write(&extension, Self::CUA_EXTENSION).map_err(HarnessError::Io)?;
+        Self::write_new_file(&extension, Self::CUA_EXTENSION.as_bytes(), false)?;
         let configured = std::env::var_os("PI_ACP_PI_COMMAND")
             .map(PathBuf::from)
             .filter(|path| {
@@ -1238,16 +1242,7 @@ impl AcpHarness {
             Self::shell_quote(&real),
             Self::shell_quote(&extension),
         );
-        std::fs::write(&wrapper, script).map_err(HarnessError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&wrapper)
-                .map_err(HarnessError::Io)?
-                .permissions();
-            perms.set_mode(0o700);
-            std::fs::set_permissions(&wrapper, perms).map_err(HarnessError::Io)?;
-        }
+        Self::write_new_file(&wrapper, script.as_bytes(), true)?;
         let mut env = vec![
             ("PI_ACP_PI_COMMAND", wrapper.display().to_string()),
             ("NOCHES_CUA_EXTENSION", extension.display().to_string()),
@@ -1256,6 +1251,68 @@ impl AcpHarness {
             env.push(("NOCHES_CUA_SOCKET", socket.display().to_string()));
         }
         Ok(env)
+    }
+
+    /// Directory that holds this run's wrapper and extension.
+    fn cua_launch_dir(socket: Option<&Path>) -> Result<PathBuf, HarnessError> {
+        if let Some(socket) = socket {
+            let parent = socket.parent().ok_or_else(|| {
+                HarnessError::Protocol("computer-use socket has no parent directory".into())
+            })?;
+            Self::ensure_private_dir(parent)?;
+            return Ok(parent.to_path_buf());
+        }
+        let dir = tempfile::Builder::new()
+            .prefix("noches-cua-launch-")
+            .tempdir()
+            .map_err(HarnessError::Io)?;
+        let path = dir.keep();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .map_err(HarnessError::Io)?;
+        }
+        Self::ensure_private_dir(&path)?;
+        Ok(path)
+    }
+
+    fn ensure_private_dir(dir: &Path) -> Result<(), HarnessError> {
+        let meta = std::fs::symlink_metadata(dir).map_err(HarnessError::Io)?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return Err(HarnessError::Protocol(
+                "computer-use launch directory must be a real directory".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o077 != 0 {
+                return Err(HarnessError::Protocol(
+                    "computer-use launch directory is group- or world-accessible".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a new file. `create_new` fails if the name already exists, including
+    /// as a symlink, so a planted link is not followed.
+    fn write_new_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(), HarnessError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(HarnessError::Io)?;
+        std::io::Write::write_all(&mut file, bytes).map_err(HarnessError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if executable { 0o700 } else { 0o600 };
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(HarnessError::Io)?;
+        }
+        Ok(())
     }
 
     fn shell_quote(path: &Path) -> String {
@@ -1787,13 +1844,10 @@ impl Harness for AcpHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         // `with_executable` is used by tests and embedders that supply a
-        // complete ACP server. Also skip wrapper setup when the engine could
-        // not start a CUA bridge; neither case needs the user's real `pi`
-        // binary or the extension.
-        let cua_env = if self.spec.id == HarnessId::Pi
-            && self.executable.is_none()
-            && controls.computer_use_socket.is_some()
-        {
+        // complete ACP server. Every other Pi run loads the managed extension,
+        // including when the Linux bridge is unavailable, so the direct `cua`
+        // tool cannot remain active.
+        let cua_env = if self.spec.id == HarnessId::Pi && self.executable.is_none() {
             Self::prepare_pi_cua(controls.computer_use_socket.as_deref())?
         } else {
             Vec::new()
@@ -3917,6 +3971,45 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cua_launch_files_use_the_bridge_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let socket = dir.path().join("bridge.sock");
+        std::fs::write(&socket, b"").unwrap();
+        let launch = AcpHarness::cua_launch_dir(Some(socket.as_path())).unwrap();
+        assert_eq!(launch, dir.path());
+        let extension = launch.join("noches-cua.ts");
+        AcpHarness::write_new_file(&extension, b"export {}", false).unwrap();
+        assert!(extension.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cua_launch_refuses_a_shared_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = dir.path().join("bridge.sock");
+        let err = AcpHarness::cua_launch_dir(Some(socket.as_path())).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("group- or world-accessible"), "{message}");
+    }
+
+    #[test]
+    fn cua_launch_without_a_socket_is_a_private_directory() {
+        let launch = AcpHarness::cua_launch_dir(None).unwrap();
+        let name = launch.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("noches-cua-launch-"), "{name}");
+        assert_ne!(name, "noches-cua-launch");
+        AcpHarness::ensure_private_dir(&launch).unwrap();
+        let _ = std::fs::remove_dir_all(launch);
+    }
 
     fn all_antigravity_auth_methods() -> Value {
         json!({
