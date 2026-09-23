@@ -1243,6 +1243,8 @@ impl AcpHarness {
             ("PI_ACP_PI_COMMAND", wrapper.display().to_string()),
             ("NOCHES_CUA_EXTENSION", extension.display().to_string()),
         ];
+        #[cfg(windows)]
+        env.push(("NOCHES_CUA_PI_COMMAND", real.display().to_string()));
         if let Some(socket) = socket {
             env.push(("NOCHES_CUA_SOCKET", socket.display().to_string()));
         }
@@ -1323,14 +1325,19 @@ impl AcpHarness {
     }
 
     #[cfg(windows)]
-    fn pi_cua_wrapper(dir: &Path, real: &Path, extension: &Path) -> (PathBuf, String, bool) {
+    fn pi_cua_wrapper(
+        dir: &Path,
+        _real: &Path,
+        _extension: &Path,
+    ) -> (PathBuf, String, bool) {
         (
             dir.join("pi-with-noches-cua.cmd"),
-            format!(
-                "@echo off\r\n\"{}\" -e \"{}\" %*\r\n",
-                Self::batch_path(real),
-                Self::batch_path(extension),
-            ),
+            concat!(
+                "@echo off\r\n",
+                "setlocal DisableDelayedExpansion\r\n",
+                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" %*\r\n",
+            )
+            .to_string(),
             false,
         )
     }
@@ -1338,13 +1345,6 @@ impl AcpHarness {
     #[cfg(unix)]
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
-    }
-
-    #[cfg(windows)]
-    fn batch_path(path: &Path) -> String {
-        // Percent signs are expanded while parsing batch source. Doubling them
-        // preserves a literal percent in either the Pi or extension path.
-        path.display().to_string().replace('%', "%%")
     }
 
     async fn spawn_agent(
@@ -1365,9 +1365,15 @@ impl AcpHarness {
         if self.spec.id == HarnessId::Antigravity {
             cmd.env("GEMINI_HOME", antigravity_paths::home()?);
         }
-        // A parent shell may export a stale bridge socket. Pi sets a fresh one
-        // through extra_env; every other agent must not inherit it.
-        cmd.env_remove("NOCHES_CUA_SOCKET");
+        // A parent shell may export stale computer-use launch variables. Pi
+        // sets fresh values through extra_env; every other agent must not inherit them.
+        for key in [
+            "NOCHES_CUA_SOCKET",
+            "NOCHES_CUA_EXTENSION",
+            "NOCHES_CUA_PI_COMMAND",
+        ] {
+            cmd.env_remove(key);
+        }
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -4064,10 +4070,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn pi_cua_windows_wrapper_is_a_batch_launcher_and_escapes_percent_paths() {
+    fn pi_cua_windows_wrapper_uses_environment_paths_and_disables_delayed_expansion() {
         let dir = PathBuf::from(r"C:\Temp\Noches");
-        let real = PathBuf::from(r"C:\Users\100%\AppData\Roaming\npm\pi.cmd");
-        let extension = dir.join("100%-noches-cua.ts");
+        let real = PathBuf::from(r"C:\Users\100%!\AppData\Roaming\npm\pi.cmd");
+        let extension = dir.join("日本語 100%!-noches-cua.ts");
         let (wrapper, script, executable) =
             AcpHarness::pi_cua_wrapper(&dir, &real, &extension);
 
@@ -4075,8 +4081,14 @@ mod tests {
         assert!(!executable);
         assert_eq!(
             script,
-            "@echo off\r\n\"C:\\Users\\100%%\\AppData\\Roaming\\npm\\pi.cmd\" -e \"C:\\Temp\\Noches\\100%%-noches-cua.ts\" %*\r\n"
+            concat!(
+                "@echo off\r\n",
+                "setlocal DisableDelayedExpansion\r\n",
+                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" %*\r\n",
+            )
         );
+        assert!(!script.contains(real.to_string_lossy().as_ref()));
+        assert!(!script.contains(extension.to_string_lossy().as_ref()));
     }
 
     #[cfg(unix)]
