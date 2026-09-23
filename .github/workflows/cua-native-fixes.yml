@@ -102,6 +102,7 @@ jobs:
             target
           key: ${{ steps.native-cache.outputs.cache-primary-key }}
   publish-vendor:
+    if: github.event_name != 'pull_request'
     needs: native
     runs-on: ubuntu-24.04
     permissions:
