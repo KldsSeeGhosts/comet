@@ -71,5 +71,16 @@ class ReleaseTests(unittest.TestCase):
             desktop = (home / '.local/share/applications/noches.desktop').read_text()
             self.assertIn(f'Exec="{home}/.local/share/noches/app/current/zeron" %u', desktop)
 
+    def test_linux_input_repair_is_in_the_shared_tree(self):
+        cargo = (ROOT / 'Cargo.toml').read_text()
+        self.assertIn('[patch."https://github.com/zeronsh/zui"]', cargo)
+        self.assertIn('gpui_linux = { path = "vendor/gpui_linux" }', cargo)
+        client = (ROOT / 'vendor/gpui_linux/src/linux/wayland/client.rs').read_text()
+        self.assertIn('mod agent_seat;', client)
+        self.assertIn('noches_seats.insert', client)
+        self.assertNotIn('state.wl_seat.release()', client)
+        for name in ('agent_seat.rs', 'seat_selection.rs', 'zui_seat_runtime.rs'):
+            self.assertTrue((ROOT / 'vendor/gpui_linux/src/linux/wayland' / name).is_file())
+
 
 if __name__ == '__main__': unittest.main()

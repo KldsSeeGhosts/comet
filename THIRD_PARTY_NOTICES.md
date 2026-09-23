@@ -21,6 +21,8 @@ Zeron also uses the following editor foundations from the pinned `zeronsh/gpui-c
 | mermaid-rs-renderer | 0.3.1 | MIT | https://github.com/1jehuang/mermaid-rs-renderer |
 | Ropey | 2.0.0-beta.1 | MIT | https://github.com/cessen/ropey |
 
+The Linux windowing crate is vendored at `vendor/gpui_linux` from `zeronsh/zui` revision `c2d273dc3dadcb260b0fa7c35fc2fe02a14f5add`, with the Noches input repair described in `vendor/gpui_linux/NOCHES-PATCH.md`. That crate remains Apache-2.0; its upstream license is `vendor/gpui_linux/LICENSE-APACHE`.
+
 Zeron's own source code is licensed under the terms in `LICENSE`. Bundled third-party components retain their respective licenses and notices.
 
 ## Symbols

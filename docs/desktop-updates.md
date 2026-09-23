@@ -32,6 +32,12 @@ To bring existing local data into one channel, quit all applications and stop th
 
 `NOCHES_DATA_DIR` overrides the data location. `ZERON_DATA_DIR` remains a compatibility fallback for existing scripts. Internal Rust crate and executable names still use `zeron`; public installer, launcher, menu, and bundle names use Noches.
 
+## One source tree
+
+macOS and Linux packages are built from the same commit. The Linux Wayland input repair lives in `vendor/gpui_linux` and is Cargo-patched onto the pinned `zeronsh/zui` revision. A push to `dev` or `main` publishes that tree; a Linux machine does not need a local `gpui_linux` overlay, and a MacBook push contains the same Linux crate. See `vendor/gpui_linux/NOCHES-PATCH.md`.
+
+The external Cua driver checkout is not part of this application package. Its older source patches remain on the `legacy` branch (`scripts/cua/`). Installing a Noches update does not replace that driver.
+
 ## Release cadence
 
 1. Merge a feature or fix into `dev`. The Noches releases workflow tests and packages Linux on both architectures and macOS on Apple silicon. It publishes a numbered prerelease, then advances the dev feed only when the complete platform set is available.
