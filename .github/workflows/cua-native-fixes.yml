@@ -9,6 +9,15 @@ on:
       - 'vendor/gpui_linux/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+  pull_request:
+    branches: [dev]
+    paths:
+      - '.cargo/**'
+      - '.github/workflows/cua-native-fixes.yml'
+      - 'scripts/cua/native/**'
+      - 'vendor/gpui_linux/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
   workflow_dispatch:
 permissions:
   contents: read

@@ -649,7 +649,7 @@ impl ComputerUseManager {
             socket,
             RunBridge {
                 state,
-                task: Some(task),
+                task: Arc::new(Mutex::new(Some(task))),
             },
         ))
     }
@@ -734,9 +734,15 @@ impl BridgeState {
     }
 }
 
+/// Cheap to clone: `state` is shared with the run task's bridge (the owner of
+/// the serve task and the final `finish`), so a caller holding only a clone
+/// can arm or disarm the same turn slot. The task handle lives behind a shared
+/// slot so every clone reaches the same join handle — whichever clone `finish`es
+/// first awaits the serve task; the rest observe it already taken.
+#[derive(Clone)]
 pub struct RunBridge {
     state: Arc<BridgeState>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl RunBridge {
@@ -759,9 +765,10 @@ impl RunBridge {
         self.state.cleanup(true).await;
     }
 
-    pub async fn finish(mut self) {
+    pub async fn finish(self) {
         self.state.stop.cancel();
-        if let Some(task) = self.task.take() {
+        let task = { lock(&self.task).take() };
+        if let Some(task) = task {
             let _ = task.await;
         }
     }

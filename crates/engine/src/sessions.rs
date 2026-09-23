@@ -107,6 +107,13 @@ struct RunHandle {
     steerable: bool,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
+    /// Shared handle to the live run's computer-use bridge (Pi only). The run
+    /// task owns the bridge lifecycle; this clone exists so `steer`/`dispatch`
+    /// can re-arm the turn slot BEFORE the harness can emit `Steered` and fire
+    /// its next `session/prompt` — otherwise Pi's first `noches_cua` call of
+    /// the new turn can land while the bridge still reports the previous turn
+    /// parked and get refused.
+    cua_bridge: Option<crate::computer_use::RunBridge>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
     /// Engine-level cancel: arms the run task's grace deadline so a harness that
@@ -389,9 +396,10 @@ impl SessionsEngine {
                 h.runtime_config.can_route(harness_id, &request),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
+                h.cua_bridge.clone(),
             )
         });
-        if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
+        if let Some((run_id, steerable, same_runtime, steer_tx, ledger, cua_bridge)) = routed {
             let user_id = message_id.clone().unwrap_or_else(new_id);
             let accepted = if steerable && same_runtime {
                 // Warm dispatch uses the same mailbox as explicit steering.
@@ -402,6 +410,14 @@ impl SessionsEngine {
                     message_id: Some(user_id.clone()),
                 };
                 if steer_tx.try_send(message).is_ok() {
+                    // Same race as `steer`: the harness can consume this and
+                    // launch the next prompt before the consumer sees the
+                    // `Steered` boundary, so the bridge must be armed now —
+                    // not downstream — or Pi's first `noches_cua` call of the
+                    // turn can be refused as parked.
+                    if let Some(bridge) = &cua_bridge {
+                        bridge.turn_started();
+                    }
                     pending.push_back(RoutedSteer {
                         prompt: request.prompt.clone(),
                         message_id: user_id.clone(),
@@ -535,6 +551,7 @@ impl SessionsEngine {
                 steerable: harness.supports_steering(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
+                cua_bridge: cua_bridge.clone(),
                 interrupt_token,
                 cancel: cancel_tx,
                 engine_tx,
@@ -592,9 +609,10 @@ impl SessionsEngine {
                     h.run_id.clone(),
                     h.steer_tx.clone(),
                     h.routed_steers.clone(),
+                    h.cua_bridge.clone(),
                 )
             });
-        let Some((run_id, steer_tx, ledger)) = target else {
+        let Some((run_id, steer_tx, ledger, cua_bridge)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
         let user_id = message_id.unwrap_or_else(new_id);
@@ -608,6 +626,17 @@ impl SessionsEngine {
             let mut pending = lock(&ledger);
             if steer_tx.try_send(message).is_err() {
                 return Ok(SteerOutcome::NotSteerable);
+            }
+            // Re-arm the bridge BEFORE the steer can reach the harness: the ACP
+            // adapter emits `Steered` and immediately launches `prompt_turn`,
+            // so syncing on that downstream event raced Pi's first `noches_cua`
+            // call against a still-parked turn slot. Arming at acceptance — the
+            // same point that registers the ledger entry — closes the gap; the
+            // consumer's later `turn_started` is then a harmless no-op. Only an
+            // accepted send does this: a NotSteerable return either re-dispatches
+            // (fresh bridge, armed at start) or leaves the run parked.
+            if let Some(bridge) = &cua_bridge {
+                bridge.turn_started();
             }
             pending.push_back(RoutedSteer {
                 prompt: prompt.to_string(),

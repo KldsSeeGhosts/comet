@@ -544,6 +544,11 @@ impl WaylandClientStatePtr {
         {
             state.cursor_hidden_window = Some(window);
         }
+        // Focus reconciliation above may also have flipped `agent_primary_busy`:
+        // publish after it so external readers never hold a stale marker —
+        // neither `ready/ready` after the last eligible window closed nor a
+        // busy state whose focused surface just went away.
+        state.agent_publish();
     }
 }
 
@@ -999,7 +1004,17 @@ impl LinuxClient for WaylandClient {
         let appearance = state.common.appearance;
         let compositor_gpu = state.compositor_gpu.take();
 
-        let agent_window = params.app_id.as_deref() == Some("zeron-dev");
+        // Noches windows carry `identity::slug()` as their Wayland app id
+        // (`noches` stable / `noches-dev` dev). The gate accepts the slug
+        // family rather than one hard-coded value so both channels — and the
+        // local build, which also reports `noches` — can host an agent seat.
+        // Matching is exact-or-`noches-` prefixed so an unrelated client that
+        // merely contains the name (e.g. `noches-helper` is still ours, but
+        // `my-noches` is not) cannot register a seat.
+        let agent_window = params
+            .app_id
+            .as_deref()
+            .is_some_and(|id| id == "noches" || id.starts_with("noches-"));
         let (window, surface_id) = WaylandWindow::new(
             handle,
             state.globals.clone(),

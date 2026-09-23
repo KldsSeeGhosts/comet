@@ -9,6 +9,15 @@ on:
       - 'scripts/cua/test_native_installers.py'
       - 'scripts/cua/build_native.sh'
       - 'scripts/cua/native/**'
+  pull_request:
+    branches: [dev]
+    paths:
+      - '.github/workflows/cua-installer-tests.yml'
+      - 'scripts/cua/test_native_patches.py'
+      - 'scripts/cua/test_hyprland_runtime_patch.py'
+      - 'scripts/cua/test_native_installers.py'
+      - 'scripts/cua/build_native.sh'
+      - 'scripts/cua/native/**'
   workflow_dispatch:
 permissions:
   contents: read
