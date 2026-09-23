@@ -776,7 +776,13 @@ impl RunBridge {
 
 impl Drop for RunBridge {
     fn drop(&mut self) {
-        self.state.stop.cancel();
+        // Session routing keeps cheap RunBridge clones only to re-arm turns.
+        // Dropping one of those temporary handles must not cancel the shared
+        // bridge. Preserve the old abandoned-owner cleanup only for the final
+        // RunBridge handle.
+        if Arc::strong_count(&self.task) == 1 {
+            self.state.stop.cancel();
+        }
     }
 }
 
