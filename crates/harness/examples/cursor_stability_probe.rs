@@ -28,6 +28,7 @@ async fn turn(
             let _ = tx.send(vec![]);
             rx
         }),
+        computer_use_socket: None,
     };
     let request = RunRequest {
         prompt,
@@ -146,6 +147,7 @@ async fn parked(harness: &CursorHarness, count: usize) {
             let _ = tx.send(vec![]);
             rx
         }),
+        computer_use_socket: None,
     };
     let request = RunRequest {
         prompt: format!(
@@ -256,6 +258,7 @@ async fn burst(harness: &CursorHarness, count: usize, cancel: bool) {
             let _ = tx.send(vec![]);
             rx
         }),
+        computer_use_socket: None,
     };
     let request = RunRequest {
         prompt: if cancel {
@@ -392,6 +395,7 @@ async fn history(harness: &CursorHarness, count: usize) {
             let _ = tx.send(vec![]);
             rx
         }),
+        computer_use_socket: None,
     };
     let request = RunRequest {
         prompt: format!(

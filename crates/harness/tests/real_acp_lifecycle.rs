@@ -22,6 +22,7 @@ async fn live_run(cancel: bool) {
             let _ = tx.send(Vec::new());
             rx
         }),
+        computer_use_socket: None,
     };
     let request = RunRequest {
         prompt: "Run the shell command `printf ACP-TOOL-OK` exactly once using bash. After seeing its result, reply exactly FIRST-DONE. Do not call any other tools.".into(),

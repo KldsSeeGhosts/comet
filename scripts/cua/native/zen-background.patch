@@ -1,0 +1,28 @@
+diff --git a/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_compatibility.rs b/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_compatibility.rs
+index 5d14aeb..40c6921 100644
+--- a/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_compatibility.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_compatibility.rs
+@@ -12,6 +12,11 @@ struct QualifiedPackage {
+ }
+ 
+ const PACKAGES: &[QualifiedPackage] = &[
++    QualifiedPackage {
++        name: "zen-browser-bin",
++        version: "1.22b-1",
++        executable: "/opt/zen-browser-bin/zen-bin",
++    },
+     QualifiedPackage {
+         name: "libreoffice-fresh",
+         version: "26.2.5-3",
+@@ -97,4 +102,11 @@ mod tests {
+     fn nonexistent_process_cannot_be_qualified() {
+         assert!(qualify(u32::MAX).is_err());
+     }
++
++    #[test]
++    fn zen_admission_is_pinned_to_the_tested_package() {
++        let zen = PACKAGES.iter().find(|package| package.name == "zen-browser-bin").unwrap();
++        assert_eq!(zen.version, "1.22b-1");
++        assert_eq!(zen.executable, "/opt/zen-browser-bin/zen-bin");
++    }
+ }

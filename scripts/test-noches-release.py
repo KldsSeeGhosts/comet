@@ -82,5 +82,19 @@ class ReleaseTests(unittest.TestCase):
         for name in ('agent_seat.rs', 'seat_selection.rs', 'zui_seat_runtime.rs'):
             self.assertTrue((ROOT / 'vendor/gpui_linux/src/linux/wayland' / name).is_file())
 
+    def test_cua_driver_patches_ship_with_the_app_bridge(self):
+        script = (ROOT / 'scripts/cua/build_native.sh').read_text()
+        self.assertNotIn('branch --show-current', script)
+        self.assertNotIn('zui-c2d273d-cua', script)
+        self.assertIn('.local/bin/cua-driver', script)
+        self.assertTrue((ROOT / 'scripts/cua/native/apply_cua.py').is_file())
+        self.assertTrue((ROOT / 'crates/harness/src/pi/noches-cua.ts').is_file())
+        self.assertTrue((ROOT / 'crates/engine/src/computer_use/linux.rs').is_file())
+        sessions = (ROOT / 'crates/engine/src/sessions.rs').read_text()
+        self.assertIn('start_bridge', sessions)
+        harness = (ROOT / 'crates/harness/src/acp/mod.rs').read_text()
+        self.assertIn('noches-cua.ts', harness)
+        self.assertIn('PI_ACP_PI_COMMAND', harness)
+
 
 if __name__ == '__main__': unittest.main()

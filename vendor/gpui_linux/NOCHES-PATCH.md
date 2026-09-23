@@ -19,4 +19,4 @@ The same files also keep an opaque client-decorated window opaque to the composi
 
 ## Provenance
 
-The repair was previously a local Cargo patch (`zui-c2d273d-cua`) and, before that, a vendor tree on the `legacy` branch against ZUI `07fd941`. Neither was what `dev` or `main` compiled, so packaged updates did not include it. This directory is that repair on the current pin, in the tree both macOS and Linux release jobs build.
+The repair was previously a local Cargo patch (`zui-c2d273d-cua`) and, before that, a vendor tree on the `legacy` branch. Neither was what `dev` compiled. This directory is that repair on the current pin. Cua's own driver patches are `scripts/cua/` in this same tree; they apply to a Cua checkout and are not a second gpui overlay.

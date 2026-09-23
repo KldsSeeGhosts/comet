@@ -909,7 +909,7 @@ impl AcpHarness {
     /// sign-in stored.
     pub async fn sign_out(&self) -> Result<(), HarnessError> {
         let home = std::env::var("HOME").ok();
-        let (mut child, _stderr) = self.spawn_agent(home.as_deref(), false, &[]).await?;
+        let (mut child, _stderr) = self.spawn_agent(home.as_deref(), false, &[], &[]).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1207,11 +1207,67 @@ impl AcpHarness {
         }
     }
 
+    const CUA_EXTENSION: &str = include_str!("../pi/noches-cua.ts");
+
+    /// Point pi-acp at a wrapper that loads the managed computer-use extension.
+    /// The real `pi` binary stays the user's (or `PI_ACP_PI_COMMAND`); the wrapper
+    /// only adds `-e`.
+    fn prepare_pi_cua(socket: Option<&Path>) -> Result<Vec<(&'static str, String)>, HarnessError> {
+        let dir = std::env::temp_dir().join("noches-cua-launch");
+        std::fs::create_dir_all(&dir).map_err(HarnessError::Io)?;
+        let extension = dir.join("noches-cua.ts");
+        std::fs::write(&extension, Self::CUA_EXTENSION).map_err(HarnessError::Io)?;
+        let configured = std::env::var_os("PI_ACP_PI_COMMAND")
+            .map(PathBuf::from)
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name != "pi-with-noches-cua")
+            });
+        let real = configured
+            .or_else(|| find_on_paths("pi", npm_global_bins("pi")))
+            .ok_or_else(|| {
+                HarnessError::NotInstalled(
+                    "pi (install @earendil-works/pi-coding-agent, or set PI_ACP_PI_COMMAND)".into(),
+                )
+            })?;
+        let wrapper = dir.join("pi-with-noches-cua");
+        let script = format!(
+            "#!/bin/sh\nexec {} -e {} \"$@\"\n",
+            Self::shell_quote(&real),
+            Self::shell_quote(&extension),
+        );
+        std::fs::write(&wrapper, script).map_err(HarnessError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&wrapper)
+                .map_err(HarnessError::Io)?
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&wrapper, perms).map_err(HarnessError::Io)?;
+        }
+        let mut env = vec![
+            ("PI_ACP_PI_COMMAND", wrapper.display().to_string()),
+            ("NOCHES_CUA_EXTENSION", extension.display().to_string()),
+        ];
+        if let Some(socket) = socket {
+            env.push(("NOCHES_CUA_SOCKET", socket.display().to_string()));
+        }
+        Ok(env)
+    }
+
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
     async fn spawn_agent(
         &self,
         cwd: Option<&str>,
         block_on_install: bool,
         extra_args: &[String],
+        extra_env: &[(&str, String)],
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
@@ -1223,6 +1279,12 @@ impl AcpHarness {
         }
         if self.spec.id == HarnessId::Antigravity {
             cmd.env("GEMINI_HOME", antigravity_paths::home()?);
+        }
+        // A parent shell may export a stale bridge socket. Pi sets a fresh one
+        // through extra_env; every other agent must not inherit it.
+        cmd.env_remove("NOCHES_CUA_SOCKET");
+        for (key, value) in extra_env {
+            cmd.env(key, value);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1255,7 +1317,7 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[], &[]).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1319,7 +1381,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[]).await?;
+        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[], &[]).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1724,7 +1786,14 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(Some(&request.cwd), true, &[]).await?;
+        let cua_env = if self.spec.id == HarnessId::Pi {
+            Self::prepare_pi_cua(controls.computer_use_socket.as_deref())?
+        } else {
+            Vec::new()
+        };
+        let (mut child, stderr_tail) = self
+            .spawn_agent(Some(&request.cwd), true, &[], &cua_env)
+            .await?;
         let stdin = child
             .stdin
             .take()
@@ -2713,6 +2782,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        computer_use_socket: _,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
 

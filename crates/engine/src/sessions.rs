@@ -160,6 +160,9 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// Device-wide computer-use lease and session approvals. Pi runs open a
+    /// private bridge against this; other harnesses ignore it.
+    computer_use: crate::computer_use::ComputerUseManager,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -181,6 +184,7 @@ impl SessionsEngine {
         registry: Arc<HarnessRegistry>,
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
+        let computer_use = crate::computer_use::ComputerUseManager::new(device_id.clone());
         Self {
             inner: Arc::new(Inner {
                 device_id,
@@ -197,6 +201,7 @@ impl SessionsEngine {
                 generated_images: OnceLock::new(),
                 browser_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                computer_use,
             }),
         }
     }
@@ -216,6 +221,13 @@ impl SessionsEngine {
     /// already treats a missing doc host as "not wired".
     pub fn clear_doc_host(&self) {
         lock(&self.inner.doc_host).take();
+    }
+
+    /// Revoke this chat's computer-use approval. The next Pi turn asks again.
+    pub fn forget_computer_use_approval(&self, chat_id: &str) -> bool {
+        self.inner
+            .computer_use
+            .forget_computer_use_approval(chat_id)
     }
 
     /// Discover the desktop browser endpoint in this device's profile.
@@ -468,12 +480,10 @@ impl SessionsEngine {
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
 
-        // Input bridge: the harness asks questions; we mint the request id, park the
-        // resolver for `respond_input`, and surface the event through the run pipeline.
-        let request_input = {
+        let request_input_for_cua: crate::computer_use::RequestInput = Arc::new({
             let pending = pending_inputs.clone();
             let engine_tx = engine_tx.clone();
-            Box::new(move |questions: Vec<UserInputQuestion>| {
+            move |questions: Vec<UserInputQuestion>| {
                 let (tx, rx) = oneshot::channel();
                 let request_id = new_id();
                 lock(&pending).insert(request_id.clone(), tx);
@@ -482,14 +492,40 @@ impl SessionsEngine {
                     questions,
                 });
                 rx
-            })
+            }
+        });
+        let request_input = {
+            let request_input_for_cua = request_input_for_cua.clone();
+            Box::new(move |questions: Vec<UserInputQuestion>| request_input_for_cua(questions))
         };
         let interrupt_token = CancellationToken::new();
+        let (cua_socket, cua_bridge) = if harness_id == HarnessId::Pi {
+            match self
+                .inner
+                .computer_use
+                .start_bridge(
+                    chat_id,
+                    &run_id,
+                    request_input_for_cua,
+                    interrupt_token.clone(),
+                )
+                .await
+            {
+                Ok((socket, bridge)) => (Some(socket), Some(bridge)),
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "computer-use bridge unavailable");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
         let controls = RunControls {
             browser: None,
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
+            computer_use_socket: cua_socket,
         };
 
         lock(&self.inner.runs).insert(
@@ -535,6 +571,7 @@ impl SessionsEngine {
                 resume_injected,
                 startup_retry,
             },
+            cua_bridge,
         ));
         Ok(run_id)
     }
@@ -1493,6 +1530,7 @@ async fn drive_run(
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
+    mut cua_bridge: Option<crate::computer_use::RunBridge>,
 ) {
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
@@ -1563,6 +1601,9 @@ async fn drive_run(
             );
             inner.remove_run(&chat_id, &run_id);
             inner.set_status(&chat_id, SessionStatus::Errored, false);
+            if let Some(bridge) = cua_bridge.take() {
+                bridge.finish().await;
+            }
             return;
         }
     };
@@ -2197,6 +2238,9 @@ async fn drive_run(
                 "run died before session start; retrying once (resume kept)"
             );
             inner.remove_run(&chat_id, &run_id);
+            if let Some(bridge) = cua_bridge.take() {
+                bridge.finish().await;
+            }
             let engine = SessionsEngine {
                 inner: inner.clone(),
             };
@@ -2431,6 +2475,9 @@ async fn drive_run(
         .filter(|h| h.run_id == run_id)
         .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
         .unwrap_or_default();
+    if let Some(bridge) = cua_bridge.take() {
+        bridge.finish().await;
+    }
     inner.remove_run(&chat_id, &run_id);
     inner.set_status_with_completion(&chat_id, final_status, false, final_completed_turn);
     if !interrupted && !orphans.is_empty() {
