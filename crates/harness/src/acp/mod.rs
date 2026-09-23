@@ -1220,7 +1220,7 @@ impl AcpHarness {
             .filter(|path| {
                 path.is_file()
                     && path
-                        .file_name()
+                        .file_stem()
                         .is_some_and(|name| name != "pi-with-noches-cua")
             });
         let real = configured.or_else(|| find_on_paths("pi", npm_global_bins("pi")));
@@ -1237,13 +1237,8 @@ impl AcpHarness {
         let (dir, launch_dir) = Self::pi_cua_launch_dir(socket)?;
         let extension = dir.join("noches-cua.ts");
         Self::write_private_file(&extension, Self::CUA_EXTENSION, false)?;
-        let wrapper = dir.join("pi-with-noches-cua");
-        let script = format!(
-            "#!/bin/sh\nexec {} -e {} \"$@\"\n",
-            Self::shell_quote(&real),
-            Self::shell_quote(&extension),
-        );
-        Self::write_private_file(&wrapper, &script, true)?;
+        let (wrapper, script, executable) = Self::pi_cua_wrapper(&dir, &real, &extension);
+        Self::write_private_file(&wrapper, &script, executable)?;
         let mut env = vec![
             ("PI_ACP_PI_COMMAND", wrapper.display().to_string()),
             ("NOCHES_CUA_EXTENSION", extension.display().to_string()),
@@ -1305,6 +1300,8 @@ impl AcpHarness {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(if executable { 0o700 } else { 0o600 });
         }
+        #[cfg(not(unix))]
+        let _ = executable;
         use std::io::Write;
         options
             .open(path)
@@ -1312,8 +1309,42 @@ impl AcpHarness {
             .map_err(HarnessError::Io)
     }
 
+    #[cfg(unix)]
+    fn pi_cua_wrapper(dir: &Path, real: &Path, extension: &Path) -> (PathBuf, String, bool) {
+        (
+            dir.join("pi-with-noches-cua"),
+            format!(
+                "#!/bin/sh\nexec {} -e {} \"$@\"\n",
+                Self::shell_quote(real),
+                Self::shell_quote(extension),
+            ),
+            true,
+        )
+    }
+
+    #[cfg(windows)]
+    fn pi_cua_wrapper(dir: &Path, real: &Path, extension: &Path) -> (PathBuf, String, bool) {
+        (
+            dir.join("pi-with-noches-cua.cmd"),
+            format!(
+                "@echo off\r\n\"{}\" -e \"{}\" %*\r\n",
+                Self::batch_path(real),
+                Self::batch_path(extension),
+            ),
+            false,
+        )
+    }
+
+    #[cfg(unix)]
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
+    #[cfg(windows)]
+    fn batch_path(path: &Path) -> String {
+        // Percent signs are expanded while parsing batch source. Doubling them
+        // preserves a literal percent in either the Pi or extension path.
+        path.display().to_string().replace('%', "%%")
     }
 
     async fn spawn_agent(
@@ -4029,6 +4060,40 @@ mod tests {
 
         assert!(AcpHarness::write_private_file(&link, "replacement", false).is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "untouched");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pi_cua_windows_wrapper_is_a_batch_launcher_and_escapes_percent_paths() {
+        let dir = PathBuf::from(r"C:\Temp\Noches");
+        let real = PathBuf::from(r"C:\Users\100%\AppData\Roaming\npm\pi.cmd");
+        let extension = dir.join("100%-noches-cua.ts");
+        let (wrapper, script, executable) =
+            AcpHarness::pi_cua_wrapper(&dir, &real, &extension);
+
+        assert_eq!(wrapper, dir.join("pi-with-noches-cua.cmd"));
+        assert!(!executable);
+        assert_eq!(
+            script,
+            "@echo off\r\n\"C:\\Users\\100%%\\AppData\\Roaming\\npm\\pi.cmd\" -e \"C:\\Temp\\Noches\\100%%-noches-cua.ts\" %*\r\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_cua_unix_wrapper_remains_an_executable_shell_launcher() {
+        let dir = PathBuf::from("/tmp/noches-private");
+        let real = PathBuf::from("/opt/pi agent/bin/pi");
+        let extension = dir.join("noches-cua.ts");
+        let (wrapper, script, executable) =
+            AcpHarness::pi_cua_wrapper(&dir, &real, &extension);
+
+        assert_eq!(wrapper, dir.join("pi-with-noches-cua"));
+        assert!(executable);
+        assert_eq!(
+            script,
+            "#!/bin/sh\nexec '/opt/pi agent/bin/pi' -e '/tmp/noches-private/noches-cua.ts' \"$@\"\n"
+        );
     }
 
     fn all_antigravity_auth_methods() -> Value {
