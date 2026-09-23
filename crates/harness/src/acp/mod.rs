@@ -1786,7 +1786,14 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let cua_env = if self.spec.id == HarnessId::Pi {
+        // `with_executable` is used by tests and embedders that supply a
+        // complete ACP server. Also skip wrapper setup when the engine could
+        // not start a CUA bridge; neither case needs the user's real `pi`
+        // binary or the extension.
+        let cua_env = if self.spec.id == HarnessId::Pi
+            && self.executable.is_none()
+            && controls.computer_use_socket.is_some()
+        {
             Self::prepare_pi_cua(controls.computer_use_socket.as_deref())?
         } else {
             Vec::new()

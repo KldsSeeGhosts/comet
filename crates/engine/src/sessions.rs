@@ -1850,6 +1850,9 @@ async fn drive_run(
                         "turn quiesced: stream silent after completed output with no \
                          turn-end; parking (suspected missing harness Done)"
                     );
+                    if let Some(bridge) = cua_bridge.as_ref() {
+                        bridge.turn_ended().await;
+                    }
                     // Some adapters close a completed response through this
                     // engine watchdog instead of a native Done. Preserve that
                     // completion notice, but never notify for an empty boundary
@@ -2130,6 +2133,9 @@ async fn drive_run(
                     chat = %chat_id,
                     "parked session resumed by self-continued agent output"
                 );
+                if let Some(bridge) = cua_bridge.as_ref() {
+                    bridge.turn_started();
+                }
                 idle_since = None;
                 self_continued_turn = true;
                 // The park cleared the fold; rotate to a fresh entry and
@@ -2140,6 +2146,9 @@ async fn drive_run(
             } else {
                 match &event {
                     AgentEvent::Steered { .. } => {
+                        if let Some(bridge) = cua_bridge.as_ref() {
+                            bridge.turn_started();
+                        }
                         idle_since = None;
                         inner.set_status(&chat_id, SessionStatus::Working, true);
                     }
@@ -2347,6 +2356,9 @@ async fn drive_run(
         }
 
         if let AgentEvent::Done { status, .. } = &event {
+            if let Some(bridge) = cua_bridge.as_ref() {
+                bridge.turn_ended().await;
+            }
             // A question still pending at turn end can never be legitimately
             // answered (its turn is over): drain the resolvers NOW, or a late
             // `respond_input` finds one, emits InputResolved, and un-parks
