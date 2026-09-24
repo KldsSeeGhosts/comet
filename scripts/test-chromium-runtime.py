@@ -58,6 +58,15 @@ def main():
         result=cdp('Runtime.evaluate',dict(expression=expression,returnByValue=True,awaitPromise=True),tab)
         assert 'exceptionDetails' not in result,result
         return result['result'].get('value')
+    def settle(expression,expected,timeout=3):
+        # Native input reaches the renderer asynchronously; poll instead of sleeping.
+        deadline=time.monotonic()+timeout
+        while True:
+            value=evaluate(expression)
+            if value==expected or time.monotonic()>=deadline:return value
+            time.sleep(.05)
+    def click(rect):
+        send('move',**rect);send('down',**rect,button=1);send('up',**rect,button=1)
     def loaded(tab,title):return wait(lambda k,t,v:k==b'S' and t==tab and not v['loading'] and v['title']==title)
     try:
         send('create');send('load',url=url);loaded(1,'Noches browser fixture')
@@ -76,9 +85,8 @@ def main():
         stale=json.loads(evaluate('JSON.stringify(('+page_script+')('+json.dumps(dict(kind='click',reference=old))+'))'));assert 'error' in stale
         # Exercise native CEF input, independent of DOM-based agent actions.
         rect=evaluate("(()=>{const r=document.querySelector('input').getBoundingClientRect();return {x:r.x+10,y:r.y+10}})()")
-        send('down',**rect,button=1);send('up',**rect,button=1)
-        time.sleep(.15)
-        assert evaluate("document.activeElement.id")=='name'
+        click(rect)
+        assert settle("document.activeElement.id",'name')=='name'
         send('select-all');time.sleep(.1);send('commit',text='Native input');time.sleep(.1)
         assert evaluate("document.querySelector('input').value")=='Native input'
         send('key_down',key='BackSpace');send('key_up',key='BackSpace');time.sleep(.1)
@@ -86,9 +94,8 @@ def main():
         send('preedit',text='語');time.sleep(.1);send('commit',text='語');time.sleep(.1)
         assert evaluate("document.querySelector('input').value").endswith('語')
         rect=evaluate("(()=>{const r=document.querySelector('button').getBoundingClientRect();return {x:r.x+10,y:r.y+10}})()")
-        send('down',**rect,button=1);send('up',**rect,button=1)
-        time.sleep(.1)
-        assert evaluate('window.count')==2
+        click(rect)
+        assert settle('window.count',2)==2
         evaluate("document.title='Edited by agent'")
         png=base64.b64decode(cdp('Page.captureScreenshot',dict(format='png'))['data']);assert png.startswith(b'\x89PNG');(output/'page.png').write_bytes(png)
         send('resize',width=800,height=500,scale=1)
