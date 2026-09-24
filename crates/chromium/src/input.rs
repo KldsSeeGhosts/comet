@@ -69,7 +69,7 @@ pub fn dispatch(cmd: &str, v: &Value, browser: &Browser, host: &BrowserHost) {
                     | u32::from(mods & 4 != 0) * 2
                     | u32::from(mods & (1 << 26) != 0) * 4
                     | u32::from(mods & 1 != 0) * 8;
-                let message = serde_json::json!({"id":0,"method":"Input.dispatchMouseEvent","params":{
+                let message = serde_json::json!({"id":if cmd == "down" {1000000001} else {1000000002},"method":"Input.dispatchMouseEvent","params":{
                     "type":if cmd == "down" {"mousePressed"} else {"mouseReleased"},
                     "x":mouse.x,"y":mouse.y,"button":button_name,"clickCount":1,"modifiers":cdp_mods
                 }});

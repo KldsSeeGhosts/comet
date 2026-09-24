@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the actual bundled CEF process, using only a loopback fixture."""
-import argparse, base64, http.server, json, pathlib, queue, struct, subprocess, threading, time
+import argparse, base64, http.server, json, pathlib, queue, struct, subprocess, sys, threading, time
 
 HTML = b'''<!doctype html><meta charset="utf-8"><title>Noches browser fixture</title>
 <style>body{font:20px sans-serif;background:#162b39;color:#fff;padding:40px}button,input,select{font:inherit;margin:12px;padding:12px}</style>
@@ -67,6 +67,10 @@ def main():
             time.sleep(.05)
     def click(rect):
         send('move',**rect);send('down',**rect,button=1);send('up',**rect,button=1)
+        if sys.platform == 'linux':
+            for ident in (1000000001,1000000002):
+                response=wait(lambda k,t,v:k==b'A' and t==1 and v.get('id')==ident)
+                assert 'error' not in response,response
     def loaded(tab,title):return wait(lambda k,t,v:k==b'S' and t==tab and not v['loading'] and v['title']==title)
     try:
         send('create');send('load',url=url);loaded(1,'Noches browser fixture')
