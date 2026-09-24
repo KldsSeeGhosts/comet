@@ -8,7 +8,7 @@ HTML = b'''<!doctype html><meta charset="utf-8"><title>Noches browser fixture</t
 <button id="count" onclick="this.textContent='Clicked '+(++window.count)">Click me</button>
 <select aria-label="Choice"><option value="a">Alpha</option><option value="b">Beta</option></select>
 <a href="/next">Next page</a><div style="height:1400px">Scroll fixture</div>
-<script>window.count=0;document.querySelector('input').addEventListener('input',e=>document.title=e.target.value);console.log('fixture ready')</script>'''
+<script>window.count=0;window.inputLog=[];for(const t of ['pointermove','mousedown','mouseup','click','focusin'])addEventListener(t,e=>inputLog.push([t,e.clientX,e.clientY,e.target.id||e.target.tagName]),true);document.querySelector('input').addEventListener('input',e=>document.title=e.target.value);console.log('fixture ready')</script>'''
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         body = HTML if self.path != '/next' else b'<title>Next page</title><h1>Next page</h1>'
@@ -86,7 +86,7 @@ def main():
         # Exercise native CEF input, independent of DOM-based agent actions.
         rect=evaluate("(()=>{const r=document.querySelector('input').getBoundingClientRect();return {x:r.x+10,y:r.y+10}})()")
         click(rect)
-        assert settle("document.activeElement.id",'name')=='name'
+        assert settle("document.activeElement.id",'name')=='name',evaluate('JSON.stringify({log:inputLog,focus:document.hasFocus(),dpr:devicePixelRatio,w:innerWidth,h:innerHeight})')
         send('select-all');time.sleep(.1);send('commit',text='Native input');time.sleep(.1)
         assert evaluate("document.querySelector('input').value")=='Native input'
         send('key_down',key='BackSpace');send('key_up',key='BackSpace');time.sleep(.1)
