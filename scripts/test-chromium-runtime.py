@@ -66,11 +66,22 @@ def main():
             if value==expected or time.monotonic()>=deadline:return value
             time.sleep(.05)
     def click(rect):
-        send('move',**rect);send('down',**rect,button=1);send('up',**rect,button=1)
+        # CEF processes pipe commands before pumping Chromium's event loop. Give
+        # each input phase a renderer round trip so press/release cannot overtake
+        # the preceding move (or each other) in the windowless Linux host.
+        target=evaluate(f"document.elementFromPoint({rect['x']},{rect['y']}).id")
+        send('move',**rect)
+        assert settle(f"inputLog.some(([type,x,y,id])=>type==='pointermove'&&x==={int(rect['x'])}&&y==={int(rect['y'])}&&id==={json.dumps(target)})",True),evaluate('JSON.stringify(inputLog)')
+        send('down',**rect,button=1)
         if sys.platform == 'linux':
-            for ident in (1000000001,1000000002):
-                response=wait(lambda k,t,v:k==b'A' and t==1 and v.get('id')==ident)
-                assert 'error' not in response,response
+            response=wait(lambda k,t,v:k==b'A' and t==1 and v.get('id')==1000000001)
+            assert 'error' not in response,response
+        assert settle(f"inputLog.some(([type,,,id])=>type==='mousedown'&&id==={json.dumps(target)})",True),evaluate('JSON.stringify(inputLog)')
+        send('up',**rect,button=1)
+        if sys.platform == 'linux':
+            response=wait(lambda k,t,v:k==b'A' and t==1 and v.get('id')==1000000002)
+            assert 'error' not in response,response
+        assert settle(f"inputLog.some(([type,,,id])=>type==='mouseup'&&id==={json.dumps(target)})",True),evaluate('JSON.stringify(inputLog)')
     def loaded(tab,title):return wait(lambda k,t,v:k==b'S' and t==tab and not v['loading'] and v['title']==title)
     try:
         send('create');send('load',url=url);loaded(1,'Noches browser fixture')
