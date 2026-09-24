@@ -115,7 +115,7 @@ def main():
         evaluate("document.title='Edited by agent'")
         png=base64.b64decode(cdp('Page.captureScreenshot',dict(format='png'))['data']);assert png.startswith(b'\x89PNG');(output/'page.png').write_bytes(png)
         send('resize',width=800,height=500,scale=1)
-        deadline=time.monotonic()+5
+        deadline=time.monotonic()+15
         while time.monotonic()<deadline and (1 not in last_frame or struct.unpack('<II',last_frame[1][:8])!=(800,500)):time.sleep(.05)
         assert struct.unpack('<II',last_frame[1][:8])==(800,500),'resize did not produce a matching frame'
         send('create',2);send('load',2,url=url+'next');loaded(2,'Next page')

@@ -420,6 +420,7 @@ fn command_page(
             drop(d);
             host.notify_screen_info_changed();
             host.was_resized();
+            host.invalidate(PaintElementType::VIEW);
         }
         "cdp" => {
             let value = &command["message"];
