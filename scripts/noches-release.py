@@ -9,6 +9,13 @@ import re
 import subprocess
 
 
+# Version-series epoch. Bump when the version scheme is re-keyed (the 0.1.x
+# series supersedes the older 0.3.x numbers). Manifests written before the
+# field existed count as epoch 0; a higher epoch always orders above any
+# lower-epoch release regardless of the numbers.
+EPOCH = 1
+
+
 def build_identity(branch, run, attempt):
     if branch not in ("dev", "main"):
         raise ValueError("Noches releases must build dev or main")
@@ -30,7 +37,7 @@ def manifest_for(directory, repository, channel, version, commit):
     if not all((directory / name).is_file() for name in required):
         raise ValueError("Cannot publish an incomplete platform release")
     root = f"https://github.com/{repository}/releases"
-    return dict(product="noches", channel=channel, version=version, commit=commit,
+    return dict(product="noches", channel=channel, version=version, epoch=EPOCH, commit=commit,
                 notes_url=f"{root}/tag/v{version}", files={
                     name: dict(sha256=hashlib.sha256((directory / name).read_bytes()).hexdigest(),
                                size=(directory / name).stat().st_size,
@@ -92,7 +99,7 @@ def publish(directory):
     feed_release = release_for(repo, feed)
     if feed_release and any(asset["name"] == "manifest.json" for asset in feed_release["assets"]):
         current = json.loads(gh("release", "download", feed, "--repo", repo, "--pattern", "manifest.json", "--output", "-"))
-        if version_order(current['version']) > version_order(version):
+        if (current.get("epoch", 0), version_order(current["version"])) > (EPOCH, version_order(version)):
             print("A newer build is already published; leaving the channel unchanged.")
             return
     if gh("api", f"repos/{repo}/git/ref/heads/{os.environ['GITHUB_REF_NAME']}", "--jq", ".object.sha") != commit:
