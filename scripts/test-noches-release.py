@@ -5,10 +5,14 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
+# Loading the module must not drop __pycache__ into the worktree; build scripts
+# refuse to build from a dirty one.
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("release", ROOT / "scripts/noches-release.py")
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
