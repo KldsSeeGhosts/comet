@@ -698,8 +698,10 @@ mod windows_tests {
 
     use super::Terminals;
 
-    const EVENT_TIMEOUT: Duration = Duration::from_secs(15);
-    const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+    // Windows hosted runners load a full PowerShell profile right after a long
+    // compile; generous ceilings only lengthen failures, never healthy passes.
+    const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+    const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[test]
     fn conpty_close_joins_natural_cleanup_without_blocking_pool_capacity() {
