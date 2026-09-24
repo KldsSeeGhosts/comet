@@ -51,6 +51,8 @@ Each channel uses a GitHub release containing `manifest.json`:
 - `https://github.com/KldsSeeGhosts/noches/releases/download/noches-dev/manifest.json`
 - `https://github.com/KldsSeeGhosts/noches/releases/download/noches-stable/manifest.json`
 
+Manifests carry `epoch`, the version-series epoch (currently `1`): re-keying the version scheme - the `0.1.x` series supersedes the older `0.3.x` numbers - bumps it, and manifests written before the field existed count as epoch `0`. A higher epoch always orders above every lower-epoch release regardless of the numbers, so clients ignore feeds from an older series and accept feeds from a newer one. Publication will not move a feed to a lower `(epoch, version)`.
+
 Manifests point to assets under immutable version tags. Publication is serialized per branch, rejects stale branch builds and older feed versions, and uploads all artifacts before advancing the feed. A workflow interrupted during replacement of a channel manifest may temporarily make checks fail; retrying the workflow repairs it. The installed app remains unchanged when a check fails.
 
 The updater requires the Noches product ID, matching channel, valid newer version, HTTPS asset URL, exact size, and SHA-256 digest. There is no legacy upstream-feed fallback. HTTPS and the GitHub repository's access controls authenticate publication; manifests do not have a separate cryptographic signature. macOS verifies the staged bundle's code signature and bundle identifier, including ad-hoc signatures. This does not give an ad-hoc build a Developer ID identity or notarization ticket.

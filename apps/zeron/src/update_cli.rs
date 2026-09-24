@@ -4,14 +4,14 @@
 //! are report-only.
 
 use anyhow::bail;
-use zeron_update::{InstallKind, current_version, version_newer};
+use zeron_update::{InstallKind, current_version};
 
 /// `--check` prints the verdict and exits (nonzero when an update is available,
 /// so scripts can gate on it).
 pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
     let manifest = zeron_update::fetch_latest(edge_url).await?;
     let current = current_version();
-    if !version_newer(&manifest.version, current) {
+    if !manifest.newer_than(current) {
         println!(
             "zeron {current} is up to date (latest: {}).",
             manifest.version

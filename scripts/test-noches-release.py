@@ -20,6 +20,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(release.build_identity('dev', 12, 2), ('dev', '0.1.12-dev.2'))
         with self.assertRaises(ValueError): release.build_identity('feature/test', 12, 1)
         self.assertGreater(release.version_order('0.3.12-dev.10'), release.version_order('0.3.12-dev.9'))
+        self.assertGreater((release.EPOCH, release.version_order('0.1.1')), (0, release.version_order('0.3.35-dev.1')))
 
     def test_pr_prepare_uses_explicit_target_branch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -36,6 +37,7 @@ class ReleaseTests(unittest.TestCase):
             for target in ('linux-x86_64.tar.gz', 'linux-aarch64.tar.gz', 'macos-arm64.dmg', 'macos-arm64-app.tar.gz'):
                 (directory / f'noches-0.3.1-dev.1-{target}').write_bytes(b'fixture')
             manifest = release.manifest_for(directory, 'owner/noches', 'dev', '0.3.1-dev.1', 'abc')
+            self.assertEqual(manifest['epoch'], 1)
             for artifact in manifest['files'].values():
                 self.assertIn('/download/v0.3.1-dev.1/', artifact['url'])
                 self.assertEqual(artifact['size'], 7)

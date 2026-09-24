@@ -32,10 +32,7 @@ impl Shell {
                 shell.update_checked_at = Some(Utc::now().format("%Y-%m-%d %H:%M UTC").to_string());
                 match result {
                     Ok(Ok(manifest)) => {
-                        let newer = zeron_update::version_newer(
-                            &manifest.version,
-                            zeron_update::current_version(),
-                        );
+                        let newer = manifest.newer_than(zeron_update::current_version());
                         shell.update_status = if newer {
                             format!("Version {} is available.", manifest.version).into()
                         } else {

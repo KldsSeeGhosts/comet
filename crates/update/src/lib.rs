@@ -37,6 +37,12 @@ pub const fn current_version() -> &'static str {
     }
 }
 
+/// Version-series epoch compiled into this binary. Bump when the version
+/// scheme is re-keyed (for example the `0.1.x` series superseding `0.3.x`) so
+/// a later series orders above every older release regardless of SemVer.
+/// Manifests written before the field existed count as epoch 0.
+pub const VERSION_EPOCH: u32 = 1;
+
 /// Background check cadence.
 const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 /// Retry sooner after a failed check (offline boot, transient edge error).
@@ -55,6 +61,9 @@ const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60)
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
+    /// Version-series epoch; absent in manifests from before the field existed.
+    #[serde(default)]
+    pub epoch: u32,
     #[serde(default)]
     pub product: String,
     #[serde(default)]
@@ -134,6 +143,19 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     ) {
         (Ok(latest), Ok(current)) => latest.cmp_precedence(&current).is_gt(),
         _ => false,
+    }
+}
+
+impl Manifest {
+    /// Whether the manifest offers an update over `current`: a higher
+    /// version-series epoch always wins, otherwise SemVer precedence decides
+    /// within the series.
+    pub fn newer_than(&self, current: &str) -> bool {
+        match self.epoch.cmp(&VERSION_EPOCH) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => version_newer(&self.version, current),
+            std::cmp::Ordering::Less => false,
+        }
     }
 }
 
@@ -346,7 +368,7 @@ impl InstallKind {
     ) -> anyhow::Result<PathBuf> {
         validate_manifest(manifest, identity::channel())?;
         anyhow::ensure!(
-            version_newer(&manifest.version, current_version()),
+            manifest.newer_than(current_version()),
             "Update is not newer than this installation"
         );
         PROGRESS
@@ -1074,7 +1096,7 @@ impl Updater {
     async fn auto_apply_when_idle(&self) {
         if let InstallKind::Managed { app_root } = detect_install() {
             match fetch_latest(&self.edge_url).await {
-                Ok(manifest) if version_newer(&manifest.version, current_version()) => {
+                Ok(manifest) if manifest.newer_than(current_version()) => {
                     if let Err(err) = stage_headless(&self.edge_url, &manifest, &app_root).await {
                         tracing::warn!(error = %err, "auto-update staging failed");
                         return;
@@ -1109,7 +1131,7 @@ impl Updater {
             Ok(manifest) => {
                 let status = UpdateStatus {
                     current_version: current_version().to_string(),
-                    update_available: version_newer(&manifest.version, current_version()),
+                    update_available: manifest.newer_than(current_version()),
                     latest_version: Some(manifest.version),
                     checked_at: Some(now_ms()),
                     error: None,
@@ -1148,7 +1170,7 @@ impl Updater {
             );
         };
         let manifest = fetch_latest(&self.edge_url).await?;
-        if !version_newer(&manifest.version, current_version()) {
+        if !manifest.newer_than(current_version()) {
             bail!("already up to date ({})", current_version());
         }
         stage_headless(&self.edge_url, &manifest, &app_root).await?;
@@ -1472,6 +1494,27 @@ mod tests {
         ] {
             assert!(validate_release_override(url).is_err(), "accepted {url}");
         }
+    }
+
+    #[test]
+    fn version_series_epoch_orders_rekeyed_feeds() {
+        // The 0.1.x series re-keys below the 0.3.x numbers; the epoch keeps a
+        // 0.1.x build from offering old-series feeds and lets new-series feeds
+        // through regardless of the numbers.
+        let legacy: Manifest = serde_json::from_value(serde_json::json!({
+            "version": "0.3.35-dev.1", "product": "noches", "channel": "dev",
+            "files": {}
+        }))
+        .unwrap();
+        assert!(!legacy.newer_than("0.1.0-dev.1"));
+        let mut series = legacy.clone();
+        series.epoch = 1;
+        series.version = "0.1.36-dev.1".into();
+        assert!(series.newer_than("0.1.0-dev.1"));
+        assert!(!series.newer_than("0.1.37-dev.1"));
+        let mut future = series.clone();
+        future.epoch = 2;
+        assert!(future.newer_than("0.1.37-dev.1"));
     }
 
     #[test]
