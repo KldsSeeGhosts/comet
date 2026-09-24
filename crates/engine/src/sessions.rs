@@ -107,6 +107,13 @@ struct RunHandle {
     steerable: bool,
     runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
+    /// Shared handle to the live run's computer-use bridge (Pi only). The run
+    /// task owns the bridge lifecycle; this clone exists so `steer`/`dispatch`
+    /// can re-arm the turn slot BEFORE the harness can emit `Steered` and fire
+    /// its next `session/prompt` — otherwise Pi's first `noches_cua` call of
+    /// the new turn can land while the bridge still reports the previous turn
+    /// parked and get refused.
+    cua_bridge: Option<crate::computer_use::RunBridge>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
     /// Engine-level cancel: arms the run task's grace deadline so a harness that
@@ -160,6 +167,9 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// Device-wide computer-use lease and session approvals. Pi runs open a
+    /// private bridge against this; other harnesses ignore it.
+    computer_use: crate::computer_use::ComputerUseManager,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -181,6 +191,7 @@ impl SessionsEngine {
         registry: Arc<HarnessRegistry>,
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
+        let computer_use = crate::computer_use::ComputerUseManager::new(device_id.clone());
         Self {
             inner: Arc::new(Inner {
                 device_id,
@@ -197,6 +208,7 @@ impl SessionsEngine {
                 generated_images: OnceLock::new(),
                 browser_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                computer_use,
             }),
         }
     }
@@ -216,6 +228,13 @@ impl SessionsEngine {
     /// already treats a missing doc host as "not wired".
     pub fn clear_doc_host(&self) {
         lock(&self.inner.doc_host).take();
+    }
+
+    /// Revoke this chat's computer-use approval. The next Pi turn asks again.
+    pub fn forget_computer_use_approval(&self, chat_id: &str) -> bool {
+        self.inner
+            .computer_use
+            .forget_computer_use_approval(chat_id)
     }
 
     /// Discover the desktop browser endpoint in this device's profile.
@@ -377,9 +396,10 @@ impl SessionsEngine {
                 h.runtime_config.can_route(harness_id, &request),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
+                h.cua_bridge.clone(),
             )
         });
-        if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
+        if let Some((run_id, steerable, same_runtime, steer_tx, ledger, cua_bridge)) = routed {
             let user_id = message_id.clone().unwrap_or_else(new_id);
             let accepted = if steerable && same_runtime {
                 // Warm dispatch uses the same mailbox as explicit steering.
@@ -390,6 +410,14 @@ impl SessionsEngine {
                     message_id: Some(user_id.clone()),
                 };
                 if steer_tx.try_send(message).is_ok() {
+                    // Same race as `steer`: the harness can consume this and
+                    // launch the next prompt before the consumer sees the
+                    // `Steered` boundary, so the bridge must be armed now —
+                    // not downstream — or Pi's first `noches_cua` call of the
+                    // turn can be refused as parked.
+                    if let Some(bridge) = &cua_bridge {
+                        bridge.turn_started();
+                    }
                     pending.push_back(RoutedSteer {
                         prompt: request.prompt.clone(),
                         message_id: user_id.clone(),
@@ -468,12 +496,10 @@ impl SessionsEngine {
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
 
-        // Input bridge: the harness asks questions; we mint the request id, park the
-        // resolver for `respond_input`, and surface the event through the run pipeline.
-        let request_input = {
+        let request_input_for_cua: crate::computer_use::RequestInput = Arc::new({
             let pending = pending_inputs.clone();
             let engine_tx = engine_tx.clone();
-            Box::new(move |questions: Vec<UserInputQuestion>| {
+            move |questions: Vec<UserInputQuestion>| {
                 let (tx, rx) = oneshot::channel();
                 let request_id = new_id();
                 lock(&pending).insert(request_id.clone(), tx);
@@ -482,14 +508,40 @@ impl SessionsEngine {
                     questions,
                 });
                 rx
-            })
+            }
+        });
+        let request_input = {
+            let request_input_for_cua = request_input_for_cua.clone();
+            Box::new(move |questions: Vec<UserInputQuestion>| request_input_for_cua(questions))
         };
         let interrupt_token = CancellationToken::new();
+        let (cua_socket, cua_bridge) = if harness_id == HarnessId::Pi {
+            match self
+                .inner
+                .computer_use
+                .start_bridge(
+                    chat_id,
+                    &run_id,
+                    request_input_for_cua,
+                    interrupt_token.clone(),
+                )
+                .await
+            {
+                Ok((socket, bridge)) => (Some(socket), Some(bridge)),
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "computer-use bridge unavailable");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
         let controls = RunControls {
             browser: None,
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
+            computer_use_socket: cua_socket,
         };
 
         lock(&self.inner.runs).insert(
@@ -499,6 +551,7 @@ impl SessionsEngine {
                 steerable: harness.supports_steering(),
                 runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
+                cua_bridge: cua_bridge.clone(),
                 interrupt_token,
                 cancel: cancel_tx,
                 engine_tx,
@@ -535,6 +588,7 @@ impl SessionsEngine {
                 resume_injected,
                 startup_retry,
             },
+            cua_bridge,
         ));
         Ok(run_id)
     }
@@ -555,9 +609,10 @@ impl SessionsEngine {
                     h.run_id.clone(),
                     h.steer_tx.clone(),
                     h.routed_steers.clone(),
+                    h.cua_bridge.clone(),
                 )
             });
-        let Some((run_id, steer_tx, ledger)) = target else {
+        let Some((run_id, steer_tx, ledger, cua_bridge)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
         let user_id = message_id.unwrap_or_else(new_id);
@@ -571,6 +626,17 @@ impl SessionsEngine {
             let mut pending = lock(&ledger);
             if steer_tx.try_send(message).is_err() {
                 return Ok(SteerOutcome::NotSteerable);
+            }
+            // Re-arm the bridge BEFORE the steer can reach the harness: the ACP
+            // adapter emits `Steered` and immediately launches `prompt_turn`,
+            // so syncing on that downstream event raced Pi's first `noches_cua`
+            // call against a still-parked turn slot. Arming at acceptance — the
+            // same point that registers the ledger entry — closes the gap; the
+            // consumer's later `turn_started` is then a harmless no-op. Only an
+            // accepted send does this: a NotSteerable return either re-dispatches
+            // (fresh bridge, armed at start) or leaves the run parked.
+            if let Some(bridge) = &cua_bridge {
+                bridge.turn_started();
             }
             pending.push_back(RoutedSteer {
                 prompt: prompt.to_string(),
@@ -1493,6 +1559,7 @@ async fn drive_run(
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
+    mut cua_bridge: Option<crate::computer_use::RunBridge>,
 ) {
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
@@ -1563,6 +1630,9 @@ async fn drive_run(
             );
             inner.remove_run(&chat_id, &run_id);
             inner.set_status(&chat_id, SessionStatus::Errored, false);
+            if let Some(bridge) = cua_bridge.take() {
+                bridge.finish().await;
+            }
             return;
         }
     };
@@ -1809,6 +1879,9 @@ async fn drive_run(
                         "turn quiesced: stream silent after completed output with no \
                          turn-end; parking (suspected missing harness Done)"
                     );
+                    if let Some(bridge) = cua_bridge.as_ref() {
+                        bridge.turn_ended().await;
+                    }
                     // Some adapters close a completed response through this
                     // engine watchdog instead of a native Done. Preserve that
                     // completion notice, but never notify for an empty boundary
@@ -2089,6 +2162,9 @@ async fn drive_run(
                     chat = %chat_id,
                     "parked session resumed by self-continued agent output"
                 );
+                if let Some(bridge) = cua_bridge.as_ref() {
+                    bridge.turn_started();
+                }
                 idle_since = None;
                 self_continued_turn = true;
                 // The park cleared the fold; rotate to a fresh entry and
@@ -2099,6 +2175,9 @@ async fn drive_run(
             } else {
                 match &event {
                     AgentEvent::Steered { .. } => {
+                        if let Some(bridge) = cua_bridge.as_ref() {
+                            bridge.turn_started();
+                        }
                         idle_since = None;
                         inner.set_status(&chat_id, SessionStatus::Working, true);
                     }
@@ -2197,6 +2276,9 @@ async fn drive_run(
                 "run died before session start; retrying once (resume kept)"
             );
             inner.remove_run(&chat_id, &run_id);
+            if let Some(bridge) = cua_bridge.take() {
+                bridge.finish().await;
+            }
             let engine = SessionsEngine {
                 inner: inner.clone(),
             };
@@ -2303,6 +2385,9 @@ async fn drive_run(
         }
 
         if let AgentEvent::Done { status, .. } = &event {
+            if let Some(bridge) = cua_bridge.as_ref() {
+                bridge.turn_ended().await;
+            }
             // A question still pending at turn end can never be legitimately
             // answered (its turn is over): drain the resolvers NOW, or a late
             // `respond_input` finds one, emits InputResolved, and un-parks
@@ -2431,6 +2516,9 @@ async fn drive_run(
         .filter(|h| h.run_id == run_id)
         .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
         .unwrap_or_default();
+    if let Some(bridge) = cua_bridge.take() {
+        bridge.finish().await;
+    }
     inner.remove_run(&chat_id, &run_id);
     inner.set_status_with_completion(&chat_id, final_status, false, final_completed_turn);
     if !interrupted && !orphans.is_empty() {

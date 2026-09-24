@@ -141,7 +141,8 @@ impl TurnWire {
                 }),
                 steering,
                 interrupt: interrupt.clone(),
-            },
+                            computer_use_socket: None,
+},
             request: serde_json::from_value(
                 json!({"prompt":"first", "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"}),
             )

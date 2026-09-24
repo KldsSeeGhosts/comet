@@ -48,6 +48,9 @@ pub struct SteerMessage {
 pub struct RunControls {
     /// Host-provided connection to this conversation’s integrated browser.
     pub browser: Option<zeron_browser::Connection>,
+    /// Private engine socket for the managed `noches_cua` Pi tool. Absent
+    /// when this run is not Pi, or when the Linux bridge could not start.
+    pub computer_use_socket: Option<std::path::PathBuf>,
     /// The run sends questions and awaits answers (blocks the agent, mirrors zeron).
     pub request_input: Box<
         dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,

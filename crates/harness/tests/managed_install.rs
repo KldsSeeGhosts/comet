@@ -33,6 +33,7 @@ async fn managed_install_reaches_session_started() {
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: interrupt.clone(),
+        computer_use_socket: None,
     };
     let request = RunRequest {
         prompt: "say the word ok and stop".into(),

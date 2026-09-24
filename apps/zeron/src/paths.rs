@@ -67,7 +67,7 @@ mod tests {
     fn explorer_launch_without_home_uses_local_app_data() {
         assert_eq!(
             resolve(&[("LOCALAPPDATA", r"C:\Users\Test User\AppData\Local")]),
-            PathBuf::from(r"C:\Users\Test User\AppData\Local\Zeron"),
+            PathBuf::from(r"C:\Users\Test User\AppData\Local\Noches"),
         );
     }
 
@@ -76,7 +76,7 @@ mod tests {
     fn windows_profile_fallback_handles_unicode_and_apostrophes() {
         assert_eq!(
             resolve(&[("USERPROFILE", r"C:\Users\O'Brien 日本語")]),
-            PathBuf::from(r"C:\Users\O'Brien 日本語\AppData\Local\Zeron"),
+            PathBuf::from(r"C:\Users\O'Brien 日本語\AppData\Local\Noches"),
         );
     }
 
@@ -85,7 +85,7 @@ mod tests {
     fn windows_default_does_not_depend_on_shell_home() {
         assert_eq!(
             resolve(&[("HOME", r"D:\msys-home"), ("LOCALAPPDATA", r"C:\Local")]),
-            PathBuf::from(r"C:\Local\Zeron"),
+            PathBuf::from(r"C:\Local\Noches"),
         );
     }
 }

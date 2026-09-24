@@ -1,0 +1,131 @@
+name: Cua native fixes
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.cargo/**'
+      - '.github/workflows/cua-native-fixes.yml'
+      - 'scripts/cua/native/**'
+      - 'vendor/gpui_linux/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    branches: [dev]
+    paths:
+      - '.cargo/**'
+      - '.github/workflows/cua-native-fixes.yml'
+      - 'scripts/cua/native/**'
+      - 'vendor/gpui_linux/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: cua-native-fixes-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zeronsh/zui
+          ref: 07fd941ad72e7edc812fed317aab66adb69fa8cc
+          path: .native/zui
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: trycua/cua
+          ref: 4af83697b8425944d668c543851ef6ae3639a130
+          path: .native/cua
+          sparse-checkout: libs/cua-driver
+          persist-credentials: false
+      - uses: actions/cache/restore@v4
+        id: native-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .native/cua/libs/cua-driver/rust/target
+            .native/zui/target
+            target
+          key: cua-native-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: cua-native-v2-${{ runner.os }}-
+      - name: Apply and verify native patches
+        run: bash scripts/cua/native/verify.sh .native/zui .native/cua
+      - name: Verify Noches consumes the patched crate
+        env:
+          CARGO_BUILD_JOBS: 2
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_DEV_OPT_LEVEL: 0
+        run: |
+          set -euo pipefail
+          test -f vendor/gpui_linux/src/linux/wayland/agent_seat.rs
+          test -f vendor/gpui_linux/src/linux/wayland/seat_selection.rs
+          cargo metadata --format-version 1 --filter-platform x86_64-unknown-linux-gnu > native-test-results/metadata.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('native-test-results/metadata.json').read_text())
+          for name in ('gpui', 'gpui_linux'):
+              packages = [p for p in data['packages'] if p['name'] == name]
+              assert len(packages) == 1, (name, packages)
+              p = packages[0]
+              if name == 'gpui_linux':
+                  assert p['source'] is None and '/vendor/gpui_linux/' in p['manifest_path'], p
+              else:
+                  assert 'c2d273dc3dadcb260b0fa7c35fc2fe02a14f5add' in p['source'], p
+              print(name, p['source'], p['manifest_path'])
+          PY
+          cargo check -p zeron -p gpui_linux 2>&1 | tee native-test-results/noches-check.log
+          tar -czf native-test-results/zui-vendor-integration.tar.gz Cargo.toml Cargo.lock vendor/gpui_linux
+      - name: Save verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-test-results
+          path: native-test-results
+          retention-days: 7
+      - uses: actions/cache/save@v4
+        if: always() && !cancelled()
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .native/cua/libs/cua-driver/rust/target
+            .native/zui/target
+            target
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
+  publish-vendor:
+    if: github.event_name != 'pull_request'
+    needs: native
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-test-results
+          path: native-test-results
+      - name: Commit verified vendor integration on a new branch
+        run: |
+          set -euo pipefail
+          tar -xzf native-test-results/zui-vendor-integration.tar.gz
+          git add -- Cargo.toml Cargo.lock vendor/gpui_linux
+          if git diff --cached --quiet; then
+            echo 'Vendored integration already committed.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          BRANCH="fix/noches-native-vendor-${GITHUB_RUN_ID}"
+          git switch -c "$BRANCH"
+          git commit -m 'Use verified vendored GPUI Linux primary-seat repair'
+          git push origin "HEAD:refs/heads/$BRANCH"
+          echo "Verified integration branch: $BRANCH" >> "$GITHUB_STEP_SUMMARY"

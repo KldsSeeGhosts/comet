@@ -47,6 +47,7 @@ async fn main() {
                 request_input: Box::new(|_| panic!("probe must not ask for input")),
                 steering,
                 interrupt: CancellationToken::new(),
+                computer_use_socket: None,
             },
         )
         .await

@@ -3581,7 +3581,6 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
-source = "git+https://github.com/zeronsh/zui?rev=c2d273dc3dadcb260b0fa7c35fc2fe02a14f5add#c2d273dc3dadcb260b0fa7c35fc2fe02a14f5add"
 dependencies = [
  "accesskit",
  "accesskit_unix",
