@@ -44,12 +44,14 @@ Cua driver patches live in `scripts/cua/` on the same branch. They apply to a se
 2. Promote through a `dev` → `main` PR. The same workflow publishes a stable build and advances only the stable feed.
 3. In the installed app, open Settings → Updates. Checks also run after startup and every six hours, independently of account sign-in or remote-host connections.
 
-Versions are CI-owned: stable `0.3.<workflow-run-number>` and development `0.3.<workflow-run-number>-dev.<attempt>`. The source commit appears on the Updates page and in the release manifest. A stable rerun may resume an unpublished draft but refuses to replace a completed release with different artifacts. Start a new workflow run for a new stable build.
+Versions are CI-owned: stable `0.1.<workflow-run-number>` and development `0.1.<workflow-run-number>-dev.<attempt>`. The source commit appears on the Updates page and in the release manifest. A stable rerun may resume an unpublished draft but refuses to replace a completed release with different artifacts. Start a new workflow run for a new stable build.
 
 Each channel uses a GitHub release containing `manifest.json`:
 
 - `https://github.com/KldsSeeGhosts/noches/releases/download/noches-dev/manifest.json`
 - `https://github.com/KldsSeeGhosts/noches/releases/download/noches-stable/manifest.json`
+
+Manifests carry `epoch`, the version-series epoch (currently `1`): re-keying the version scheme - the `0.1.x` series supersedes the older `0.3.x` numbers - bumps it, and manifests written before the field existed count as epoch `0`. A higher epoch always orders above every lower-epoch release regardless of the numbers, so clients ignore feeds from an older series and accept feeds from a newer one. Publication will not move a feed to a lower `(epoch, version)`.
 
 Manifests point to assets under immutable version tags. Publication is serialized per branch, rejects stale branch builds and older feed versions, and uploads all artifacts before advancing the feed. A workflow interrupted during replacement of a channel manifest may temporarily make checks fail; retrying the workflow repairs it. The installed app remains unchanged when a check fails.
 
@@ -62,9 +64,9 @@ All release jobs use the normal GitHub Actions token. Apple credentials are opti
 For a local build that can join the development update channel after installation:
 
 ```bash
-NOCHES_CHANNEL=dev NOCHES_VERSION=0.3.0-dev.0 bash scripts/package-macos.sh
+NOCHES_CHANNEL=dev NOCHES_VERSION=0.1.0-dev.0 bash scripts/package-macos.sh
 # Or on Linux:
-NOCHES_CHANNEL=dev NOCHES_VERSION=0.3.0-dev.0 bash scripts/package-linux.sh
+NOCHES_CHANNEL=dev NOCHES_VERSION=0.1.0-dev.0 bash scripts/package-linux.sh
 ```
 
 Install the resulting package from `target/package`. Future published dev versions will sort newer than this bootstrap version. `NOCHES_REPOSITORY` and `NOCHES_COMMIT` are compiled into packaged builds. `NOCHES_RELEASES_URL` is a runtime feed override for controlled testing; it must be an HTTPS base URL containing a valid channel manifest.

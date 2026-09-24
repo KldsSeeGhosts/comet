@@ -1,5 +1,6 @@
 use cef::*;
 use serde_json::Value;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 fn flags(mods: u64) -> u32 {
     u32::from(mods & 1 != 0) * 2
@@ -9,6 +10,26 @@ fn flags(mods: u64) -> u32 {
         | u32::from(mods & (1 << 8) != 0) * 16
         | u32::from(mods & (1 << 9) != 0) * 32
         | u32::from(mods & (1 << 10) != 0) * 64
+}
+
+/// CDP modifier bitmask (Alt=1, Ctrl=2, Meta=4, Shift=8).
+fn cdp_flags(mods: u64) -> u32 {
+    u32::from(mods & 8 != 0)
+        | u32::from(mods & 4 != 0) * 2
+        | u32::from(mods & (1 << 26) != 0) * 4
+        | u32::from(mods & 1 != 0) * 8
+}
+
+/// CDP button bitmask of the currently held mouse buttons (Left=1, Right=2,
+/// Middle=4); moves must report it so drags survive the CDP input path.
+static BUTTONS: AtomicU8 = AtomicU8::new(0);
+
+fn cdp_button_bit(button_id: u64) -> u8 {
+    match button_id {
+        2 => 4,
+        3 => 2,
+        _ => 1,
+    }
 }
 fn key_code(key: &str) -> i32 {
     match key {
@@ -54,6 +75,12 @@ pub fn dispatch(cmd: &str, v: &Value, browser: &Browser, host: &BrowserHost) {
                 browser.go_forward();
                 return;
             }
+            let held = cdp_button_bit(button_id);
+            if cmd == "down" {
+                BUTTONS.fetch_or(held, Ordering::Relaxed);
+            } else {
+                BUTTONS.fetch_and(!held, Ordering::Relaxed);
+            }
             #[cfg(target_os = "linux")]
             {
                 // CEF's windowless mouse-click API loses press/release events on Linux
@@ -65,13 +92,9 @@ pub fn dispatch(cmd: &str, v: &Value, browser: &Browser, host: &BrowserHost) {
                     _ => "left",
                 };
                 let mods = v["mods"].as_u64().unwrap_or(0);
-                let cdp_mods = u32::from(mods & 8 != 0)
-                    | u32::from(mods & 4 != 0) * 2
-                    | u32::from(mods & (1 << 26) != 0) * 4
-                    | u32::from(mods & 1 != 0) * 8;
                 let message = serde_json::json!({"id":if cmd == "down" {1000000001} else {1000000002},"method":"Input.dispatchMouseEvent","params":{
                     "type":if cmd == "down" {"mousePressed"} else {"mouseReleased"},
-                    "x":mouse.x,"y":mouse.y,"button":button_name,"clickCount":1,"modifiers":cdp_mods
+                    "x":mouse.x,"y":mouse.y,"button":button_name,"clickCount":1,"buttons":BUTTONS.load(Ordering::Relaxed),"modifiers":cdp_flags(mods)
                 }});
                 host.send_dev_tools_message(Some(&serde_json::to_vec(&message).unwrap()));
             }
@@ -85,7 +108,26 @@ pub fn dispatch(cmd: &str, v: &Value, browser: &Browser, host: &BrowserHost) {
                 host.send_mouse_click_event(Some(&mouse), button, i32::from(cmd == "up"), 1);
             }
         }
-        "move" => host.send_mouse_move_event(Some(&mouse), 0),
+        "move" => {
+            #[cfg(target_os = "linux")]
+            {
+                // Windowless mouse moves are unreliable on Linux, exactly as
+                // clicks were above: moves can be dropped entirely, which also
+                // breaks the move-before-press ordering. Deliver them through
+                // Chromium's input dispatcher alongside clicks and keys.
+                let message = serde_json::json!({"id":1000000000,"method":"Input.dispatchMouseEvent","params":{
+                    "type":"mouseMoved",
+                    "x":mouse.x,"y":mouse.y,"button":"none","clickCount":0,
+                    "buttons":BUTTONS.load(Ordering::Relaxed),
+                    "modifiers":cdp_flags(v["mods"].as_u64().unwrap_or(0))
+                }});
+                host.send_dev_tools_message(Some(&serde_json::to_vec(&message).unwrap()));
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                host.send_mouse_move_event(Some(&mouse), 0);
+            }
+        }
         "scroll" => host.send_mouse_wheel_event(
             Some(&mouse),
             (-v["dx"].as_f64().unwrap_or(0.) * 40.) as i32,

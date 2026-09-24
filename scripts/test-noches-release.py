@@ -5,10 +5,14 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
+# Loading the module must not drop __pycache__ into the worktree; build scripts
+# refuse to build from a dirty one.
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("release", ROOT / "scripts/noches-release.py")
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
@@ -16,10 +20,11 @@ spec.loader.exec_module(release)
 
 class ReleaseTests(unittest.TestCase):
     def test_branch_and_ordering(self):
-        self.assertEqual(release.build_identity('main', 12, 1), ('stable', '0.3.12'))
-        self.assertEqual(release.build_identity('dev', 12, 2), ('dev', '0.3.12-dev.2'))
+        self.assertEqual(release.build_identity('main', 12, 1), ('stable', '0.1.12'))
+        self.assertEqual(release.build_identity('dev', 12, 2), ('dev', '0.1.12-dev.2'))
         with self.assertRaises(ValueError): release.build_identity('feature/test', 12, 1)
         self.assertGreater(release.version_order('0.3.12-dev.10'), release.version_order('0.3.12-dev.9'))
+        self.assertGreater((release.EPOCH, release.version_order('0.1.1')), (0, release.version_order('0.3.35-dev.1')))
 
     def test_pr_prepare_uses_explicit_target_branch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -27,7 +32,7 @@ class ReleaseTests(unittest.TestCase):
             env = dict(os.environ, GITHUB_REF_NAME='10/merge', NOCHES_SOURCE_BRANCH='dev',
                        GITHUB_RUN_NUMBER='12', GITHUB_RUN_ATTEMPT='1', GITHUB_OUTPUT=str(output))
             subprocess.run(['python3', str(ROOT / 'scripts/noches-release.py'), 'prepare'], env=env, check=True)
-            self.assertEqual(output.read_text(), 'channel=dev\nversion=0.3.12-dev.1\n')
+            self.assertEqual(output.read_text(), 'channel=dev\nversion=0.1.12-dev.1\n')
 
     def test_complete_manifest_uses_immutable_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -36,6 +41,7 @@ class ReleaseTests(unittest.TestCase):
             for target in ('linux-x86_64.tar.gz', 'linux-aarch64.tar.gz', 'macos-arm64.dmg', 'macos-arm64-app.tar.gz'):
                 (directory / f'noches-0.3.1-dev.1-{target}').write_bytes(b'fixture')
             manifest = release.manifest_for(directory, 'owner/noches', 'dev', '0.3.1-dev.1', 'abc')
+            self.assertEqual(manifest['epoch'], 1)
             for artifact in manifest['files'].values():
                 self.assertIn('/download/v0.3.1-dev.1/', artifact['url'])
                 self.assertEqual(artifact['size'], 7)

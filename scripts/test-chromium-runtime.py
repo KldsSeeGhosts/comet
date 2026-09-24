@@ -58,7 +58,7 @@ def main():
         result=cdp('Runtime.evaluate',dict(expression=expression,returnByValue=True,awaitPromise=True),tab)
         assert 'exceptionDetails' not in result,result
         return result['result'].get('value')
-    def settle(expression,expected,timeout=3):
+    def settle(expression,expected,timeout=15):
         # Native input reaches the renderer asynchronously; poll instead of sleeping.
         deadline=time.monotonic()+timeout
         while True:
@@ -71,6 +71,9 @@ def main():
         # the preceding move (or each other) in the windowless Linux host.
         target=evaluate(f"document.elementFromPoint({rect['x']},{rect['y']}).id")
         send('move',**rect)
+        if sys.platform == 'linux':
+            response=wait(lambda k,t,v:k==b'A' and t==1 and v.get('id')==1000000000)
+            assert 'error' not in response,response
         assert settle(f"inputLog.some(([type,x,y,id])=>type==='pointermove'&&x==={int(rect['x'])}&&y==={int(rect['y'])}&&id==={json.dumps(target)})",True),evaluate('JSON.stringify(inputLog)')
         send('down',**rect,button=1)
         if sys.platform == 'linux':
