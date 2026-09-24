@@ -5,7 +5,10 @@ use zeron_browser::{Action, Request};
 
 impl Shell {
     pub(super) fn ensure_browser_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.browser_control_started || self.state.read(cx).remote_host.is_some() {
+        // Unit-test shells must not bind a real socket: its accept thread
+        // wakes the deterministic test scheduler from a foreign thread when
+        // the shell drops, failing whichever test is running in parallel.
+        if cfg!(test) || self.browser_control_started || self.state.read(cx).remote_host.is_some() {
             return;
         }
         self.browser_control_started = true;

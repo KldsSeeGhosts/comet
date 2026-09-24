@@ -124,6 +124,7 @@ icon_assets![
     (ALT_ARROW_LEFT, "alt-arrow-left"),
     (ALT_ARROW_RIGHT, "alt-arrow-right"),
     (SMARTPHONE, "smartphone"),
+    (MICROPHONE, "microphone"),
     (ARCHIVE_UP_MINIMALISTIC, "archive-up-minimalistic"),
     (REFRESH, "refresh"),
     (RESTART, "restart"),

@@ -116,6 +116,8 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 7] = [
 // (well over 2x the intra-list gap). Disclosure content gets a small 4px
 // handoff from its header without leaving dead space while collapsed.
 const SIDEBAR_SECTION_GAP: f32 = 12.0;
+/// Height of the project filter row and its view-options button.
+const SIDEBAR_FILTER_HEIGHT: f32 = 26.0;
 const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
@@ -163,19 +165,20 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.0))
+        .gap(px(6.0))
         .h(px(SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
         .px(px(Theme::SPACE_SM))
         .cursor_pointer()
+        .rounded(px(8.0))
+        .hover(|el| el.bg(theme.glass_hover()))
         .child(
             div()
                 .flex_none()
                 .text_size(crate::typography::ui_rems(12.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text_muted.opacity(0.5))
+                .text_color(theme.text_muted)
                 .child(label),
         )
-        .child(sidebar_separator(theme).flex_1())
         .child(chevron)
 }
 
@@ -800,18 +803,18 @@ impl Shell {
             .id("spaces-filter")
             .flex_1()
             .min_w_0()
-            .h(px(29.0))
+            .h(px(SIDEBAR_FILTER_HEIGHT))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(Theme::SPACE_SM))
+            .gap(px(super::SIDEBAR_ROW_ICON_GAP))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .text_size(crate::typography::ui_rems(13.0))
+            .text_size(crate::typography::ui_rems(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(motion::hover_blend(
                 "spaces-filter",
-                theme.text.opacity(0.8),
+                theme.text_muted,
                 theme.text,
             ))
             .bg(if open {
@@ -839,17 +842,22 @@ impl Shell {
                 }
             }))
             .child(
-                icon(icons::FOLDER)
-                    .size(px(16.0))
+                div()
+                    .size(px(super::SIDEBAR_BUDDY_SIZE))
                     .flex_none()
-                    .text_color(theme.text_muted),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        icon(icons::FOLDER)
+                            .size(px(15.0))
+                            .text_color(theme.text_muted),
+                    ),
             )
-            // flex_1 pushes the caret to the trigger's right edge and gives
-            // long space names a bound to truncate against; the "@ device"
-            // tag hugs the name inside it rather than sitting by the caret.
+            // The label hugs its caret (a menu title, not a form field); the
+            // "@ device" tag trails it when a single project is scoped.
             .child(
                 div()
-                    .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_row()
@@ -860,9 +868,9 @@ impl Shell {
                         el.child(
                             div()
                                 .flex_none()
-                                .text_size(crate::typography::ui_rems(10.0))
+                                .text_size(crate::typography::ui_rems(11.0))
                                 .font_weight(gpui::FontWeight::NORMAL)
-                                .text_color(theme.text_muted.opacity(0.45))
+                                .text_color(theme.text_faint.opacity(0.7))
                                 .child(tag),
                         )
                         // Disconnected glyph, not the word (user request).
@@ -877,19 +885,22 @@ impl Shell {
                     }),
             )
             .child(
-                div()
-                    .flex_none()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(crate::typography::ui_rems(10.0))
-                    .text_color(theme.text_muted.opacity(0.6))
-                    .child(session_count.to_string()),
-            )
-            .child(
                 icon(icons::ALT_ARROW_DOWN)
-                    .size(px(14.0))
+                    .size(px(12.0))
                     .flex_none()
-                    .text_color(theme.text_muted.opacity(0.6)),
-            );
+                    .text_color(theme.text_faint),
+            )
+            .child(div().flex_1())
+            .when(session_count > 0, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .font_weight(gpui::FontWeight::NORMAL)
+                        .text_color(theme.text_faint.opacity(0.7))
+                        .child(session_count.to_string()),
+                )
+            });
         let trigger = if self.spaces_menu.get().is_some() {
             let closing = self.spaces_menu.closing_since();
             let menu = self.render_spaces_menu(theme, cx);
@@ -910,7 +921,7 @@ impl Shell {
             .aria_label("Sidebar view options")
             .aria_expanded(view_open)
             .track_focus(&view_focus)
-            .size(px(29.0))
+            .size(px(SIDEBAR_FILTER_HEIGHT))
             .flex_none()
             .flex()
             .items_center()
@@ -957,8 +968,8 @@ impl Shell {
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(icons::SORT)
-                    .size(px(16.0))
-                    .text_color(theme.text_muted),
+                    .size(px(14.0))
+                    .text_color(theme.text_faint),
             );
         let view_trigger = if self.sidebar_view_menu.get().is_some() {
             let closing = self.sidebar_view_menu.closing_since();
@@ -979,10 +990,10 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(4.0))
+            .gap(px(2.0))
             .px(px(Theme::SPACE_SM))
-            .pt(px(8.0))
-            .pb(px(4.0))
+            .pt(px(4.0))
+            .pb(px(2.0))
             .child(trigger)
             .child(view_trigger)
             .into_any_element()
@@ -1429,15 +1440,19 @@ impl Shell {
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let toggle_key = collapse_key.clone();
             let toggle_motion_key = motion_key.clone();
+            let group_name = SharedString::from(format!("sidebar-group-hover-{collapse_key}"));
             let header = div()
                 .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
+                .group(group_name.clone())
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
                 .h(px(SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
                 .px(px(Theme::SPACE_SM))
+                .rounded(px(8.0))
                 .cursor_pointer()
+                .hover(|el| el.bg(theme.glass_hover()))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
                     this.begin_sidebar_disclosure_motion(
@@ -1457,9 +1472,9 @@ impl Shell {
                         .flex_none()
                         .min_w_0()
                         .truncate()
-                        .font_family(theme.font_mono.clone())
-                        .text_size(crate::typography::ui_rems(10.5))
-                        .text_color(theme.text_muted.opacity(0.75))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted)
                         .child(label),
                 )
                 .when_some(device_label, |el, device_label| {
@@ -1468,13 +1483,13 @@ impl Shell {
                             .flex_none()
                             .min_w_0()
                             .truncate()
-                            .font_family(theme.font_mono.clone())
-                            .text_size(crate::typography::ui_rems(10.5))
-                            .text_color(theme.text_muted.opacity(0.45))
-                            .child(format!("· {device_label}")),
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_faint.opacity(0.7))
+                            .child(device_label),
                     )
                 })
-                .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6)))
+                .child(chevron)
+                .child(div().flex_1())
                 .when_some(target_space, |el, space_id| {
                     let button_id = format!("sidebar-group-new-session-{space_id}");
                     el.child(
@@ -1489,6 +1504,8 @@ impl Shell {
                             .cursor_pointer()
                             .role(gpui::Role::Button)
                             .aria_label("New session in project")
+                            .opacity(0.0)
+                            .group_hover(group_name.clone(), |el| el.opacity(1.0))
                             .hover(|el| el.bg(theme.glass_hover()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
@@ -1496,8 +1513,7 @@ impl Shell {
                             }))
                             .child(icon(icons::PLUS).size(px(12.0)).text_color(theme.text_muted)),
                     )
-                })
-                .child(chevron);
+                });
             let body = self.render_sidebar_disclosure_body(
                 &motion_key,
                 !collapsed,
