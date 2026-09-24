@@ -86,7 +86,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: UI and headless layout regressions
-        run: cargo test --release --locked -p zeron-ui --lib -- --test-threads=1
+        run: cargo test --release --locked -p zeron-ui --lib
 
   macos-frame-recovery:
     runs-on: macos-latest
@@ -235,7 +235,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxcb1-dev libx11-xcb-dev libfontconfig1-dev libfreetype-dev libasound2-dev libvulkan-dev libnss3 libatk-bridge2.0-0 libgtk-3-0 pkg-config cmake ninja-build xvfb xdotool imagemagick
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxcb1-dev libx11-xcb-dev libfontconfig1-dev libfreetype-dev libasound2-dev libvulkan-dev mesa-vulkan-drivers libnss3 libatk-bridge2.0-0 libgtk-3-0 pkg-config cmake ninja-build xvfb xdotool imagemagick
       - name: macOS dependencies
         if: runner.os == 'macOS'
         run: brew list cmake ninja >/dev/null 2>&1 || brew install cmake ninja

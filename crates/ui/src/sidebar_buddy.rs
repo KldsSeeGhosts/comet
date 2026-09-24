@@ -1,8 +1,8 @@
 use std::time::Instant;
 
 use gpui::{
-    App, AppContext, Context, Entity, Hsla, IntoElement, ParentElement, Render, RenderOnce,
-    SharedString, Styled, Window, div, img, px,
+    App, AppContext, Context, Entity, Hsla, IntoElement, ParentElement,
+    Render, RenderOnce, SharedString, Styled, Window, div, img, prelude::FluentBuilder as _, px,
 };
 
 use crate::motion::{self, EASE, EASE_IN_OUT, MotionSpec};
@@ -205,6 +205,9 @@ impl Render for SidebarBuddyView {
         };
 
         let scale = self.size / 36.0;
+        // Idle is the resting state, not a status: no badge, so a list of
+        // settled sessions reads clean instead of dotted with grey specks.
+        let show_badge = self.status != zeron_proto::ChatIndicator::Idle;
         div()
             .relative()
             .size(px(self.size))
@@ -215,7 +218,7 @@ impl Render for SidebarBuddyView {
                     .top(px(top * scale))
                     .left(px(left * scale)),
             )
-            .child(
+            .when(show_badge, |el| el.child(
                 div()
                     .absolute()
                     .right(px(-scale))
@@ -233,7 +236,7 @@ impl Render for SidebarBuddyView {
                             .bg(self.status_color)
                             .opacity(dot_opacity),
                     ),
-            )
+            ))
     }
 }
 

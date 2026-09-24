@@ -767,9 +767,125 @@ fn sidebar_key_order_changed(old: &[(String, f32)], new: &[(String, f32)]) -> bo
 
 /// Exact active-session row height. Open Design's 36px buddy row sits above a
 /// full-width metadata footer with the same stable geometry in every state.
-pub(super) fn chat_row_height(_shows_branch: bool, _shows_pull_request: bool) -> f32 {
-    68.0
+pub(super) fn chat_row_height(shows_branch: bool, shows_pull_request: bool) -> f32 {
+    if shows_branch || shows_pull_request {
+        CHAT_ROW_HEIGHT_TWO_LINE
+    } else {
+        CHAT_ROW_HEIGHT
+    }
 }
+/// A Codex-style sidebar nav row: 20px icon column aligned with the session
+/// avatars, a 13px label, and the shortcut hint pinned right.
+fn sidebar_nav_row(
+    id: &'static str,
+    glyph: &'static str,
+    label: &'static str,
+    shortcut: String,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let motion_key = format!("{id}-motion");
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .h(px(30.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(SIDEBAR_ROW_ICON_GAP))
+        .px(px(Theme::SPACE_SM))
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .text_size(crate::typography::ui_rems(13.0))
+        .text_color(motion::hover_blend(&motion_key, theme.text.opacity(0.8), theme.text))
+        .bg(motion::hover_blend(
+            &motion_key,
+            crate::theme::wash(0.0),
+            theme.glass_hover(),
+        ))
+        .on_hover(motion::hover_listener(motion_key.clone()))
+        .child(
+            div()
+                .size(px(SIDEBAR_BUDDY_SIZE))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(glyph).size(px(16.0)).text_color(theme.text_muted)),
+        )
+        .child(div().flex_1().min_w_0().truncate().child(SharedString::from(label)))
+        .child(
+            div()
+                .flex_none()
+                .text_size(crate::typography::ui_rems(11.5))
+                .text_color(theme.text_faint.opacity(0.7))
+                .child(SharedString::from(shortcut)),
+        )
+}
+
+/// Square icon button for the sidebar footer strip.
+fn sidebar_footer_button(
+    id: &'static str,
+    glyph: &'static str,
+    label: &'static str,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let motion_key = format!("{id}-motion");
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .flex_none()
+        .size(px(26.0))
+        .rounded(px(7.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .bg(motion::hover_blend(
+            &motion_key,
+            crate::theme::wash(0.0),
+            theme.glass_hover(),
+        ))
+        .on_hover(motion::hover_listener(motion_key.clone()))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .tooltip(move |_, cx| cx.new(|_| SidebarTooltip(label)).into())
+        .tooltip_show_delay(std::time::Duration::from_millis(350))
+        .child(
+            icon(glyph)
+                .size(px(15.0))
+                .text_color(motion::hover_blend(&motion_key, theme.text_muted, theme.text)),
+        )
+}
+
+/// Plain one-line tooltip for sidebar icon buttons.
+struct SidebarTooltip(&'static str);
+
+impl Render for SidebarTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(crate::typography::ui_rems(11.0))
+            .text_color(theme.text)
+            .child(self.0)
+    }
+}
+
+/// One-line session row: avatar + title + status/time.
+const CHAT_ROW_HEIGHT: f32 = 32.0;
+/// Session row with a branch / pull-request line under the title.
+const CHAT_ROW_HEIGHT_TWO_LINE: f32 = 48.0;
+/// Session avatar edge; also the leading icon column of the nav rows.
+const SIDEBAR_BUDDY_SIZE: f32 = 20.0;
+/// Gap between a row's leading icon column and its label.
+const SIDEBAR_ROW_ICON_GAP: f32 = 8.0;
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
 /// Harness marks live in the active row footer and the archived shelf.
@@ -5766,7 +5882,7 @@ impl Shell {
                         ),
                     ),
             )
-            .child(self.render_voice_bar(theme, cx))
+            .when_some(self.render_voice_bar(theme, cx), |el, bar| el.child(bar))
             // Back pinned to the bottom (zeron settings-sidebar.tsx).
             .child(
                 div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
@@ -5970,9 +6086,11 @@ impl Shell {
                         )
                         .into_any_element()
                 }
+                // Settled rows: the time is tertiary information — faint,
+                // regular weight, never competing with the title.
                 None => div()
-                    .text_size(crate::typography::ui_rems(10.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(crate::typography::ui_rems(11.5))
+                    .text_color(theme.text_faint.opacity(0.8))
                     .child(time_ago.clone())
                     .into_any_element(),
             }
@@ -6035,22 +6153,31 @@ impl Shell {
         } else {
             text.opacity(0.8)
         };
-        let row_height = chat_row_height(branch.is_some(), change_request.is_some());
+        // Codex/Cursor density: one 32px line by default. A second, muted
+        // line only exists when it carries information the title can't —
+        // the branch or PR (and the folder context in palette results).
+        let meta_text = if search_query.is_some() {
+            Some(branch.clone().unwrap_or_else(|| space_name.clone()))
+        } else {
+            branch.clone()
+        };
+        let two_line = meta_text.is_some() || change_request.is_some();
+        let row_height = chat_row_height(meta_text.is_some(), change_request.is_some());
         let (avatar_icon, avatar_blink_icon) = crate::sidebar_buddy::avatar_for_session(&id);
-        let worktree = branch.clone().unwrap_or_else(|| space_name.clone());
+        let harness_mark = harness.map(crate::pickers::harness_brand_icon);
         div()
             .id(SharedString::from(row_id.clone()))
             .h(px(row_height))
             .flex()
             .flex_col()
+            .justify_center()
             .gap(px(2.0))
             .rounded(px(if search_query.is_some() {
                 popover::PALETTE_ITEM_RADIUS
             } else {
-                10.0
+                8.0
             }))
             .px(px(Theme::SPACE_SM))
-            .py(px(Theme::SPACE_SM))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
             // No selection ring (user request) — the wash alone marks the
@@ -6117,87 +6244,86 @@ impl Shell {
             )
             .child(
                 div()
-                    .h(px(36.0))
+                    .h(px(SIDEBAR_BUDDY_SIZE))
                     .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .gap(px(10.0))
-                    .child(crate::sidebar_buddy::buddy(
-                        format!("{row_id}-buddy"),
-                        avatar_icon,
-                        avatar_blink_icon,
-                        status,
-                        corner_hovered,
-                        avatar_status_color,
-                        theme.surface,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .pt(px(2.0))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(Theme::SPACE_SM))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(crate::typography::ui_rems(12.5))
-                                    .line_height(px(17.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .child(popover::search_highlight(
-                                        title.clone(),
-                                        search_query,
-                                        theme,
-                                    )),
-                            )
-                            .child(corner),
-                    ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .h(px(14.0))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(4.0))
+                    .gap(px(SIDEBAR_ROW_ICON_GAP))
+                    .child(
+                        crate::sidebar_buddy::buddy(
+                            format!("{row_id}-buddy"),
+                            avatar_icon,
+                            avatar_blink_icon,
+                            status,
+                            corner_hovered,
+                            avatar_status_color,
+                            theme.surface,
+                        )
+                        .size(SIDEBAR_BUDDY_SIZE),
+                    )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(crate::typography::ui_rems(10.0))
-                            .line_height(px(14.0))
-                            .font_family(theme.font_mono.clone())
-                            .text_color(subline)
-                            .child(popover::search_highlight(worktree, search_query, theme)),
+                            .text_size(crate::typography::ui_rems(13.0))
+                            .line_height(px(18.0))
+                            .child(popover::search_highlight(title.clone(), search_query, theme)),
                     )
-                    .when_some(change_request, |el, summary| {
-                        el.child(crate::change_requests::pull_request_badge_with_query(
-                            format!("{row_id}-pr").into(),
-                            summary,
-                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
-                            search_query,
-                            theme,
-                        ))
-                    })
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
+                    .child(corner),
+            )
+            .when(two_line, |row| {
+                row.child(
+                    div()
+                        .w_full()
+                        .h(px(14.0))
+                        // Hang the metadata under the title, not the avatar.
+                        .pl(px(SIDEBAR_BUDDY_SIZE + SIDEBAR_ROW_ICON_GAP))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_color(subline)
+                        .when_some(meta_text, |el, meta| {
+                            el.when(branch.is_some(), |el| {
+                                el.child(
+                                    icon(icons::GIT_BRANCH)
+                                        .size(px(11.0))
+                                        .flex_none()
+                                        .text_color(subline),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(11.5))
+                                    .line_height(px(14.0))
+                                    .child(popover::search_highlight(meta, search_query, theme)),
+                            )
+                        })
+                        .child(div().flex_1().min_w_0())
+                        .when_some(change_request, |el, summary| {
+                            el.child(crate::change_requests::pull_request_badge_with_query(
+                                format!("{row_id}-pr").into(),
+                                summary,
+                                crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                                search_query,
+                                theme,
+                            ))
+                        })
+                        .when_some(harness_mark, |el, (path, tint)| {
                             el.child(
                                 icon(path)
                                     .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
                                     .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
+                                    .text_color(tint.unwrap_or(subline).opacity(0.7)),
                             )
-                        },
-                    ),
-            )
+                        }),
+                )
+            })
             .into_any_element()
     }
 
@@ -6369,120 +6495,54 @@ impl Shell {
         } };
         let user_menu = self.render_user_menu(
             local_device_name,
-            Some(SharedString::from(if self.boot.remote.is_some() { crate::settings::connections::status_label(self.state.read(cx).remote_connection.as_ref()) } else { "online" })),
+            // The dot already says "online"; words only for remote states
+            // that need attention.
+            self.boot
+                .remote
+                .is_some()
+                .then(|| self.state.read(cx).remote_connection.clone())
+                .filter(|status| !matches!(status, Some(zeron_rpc::remote::ConnectionState::Connected)))
+                .map(|status| {
+                    SharedString::from(crate::settings::connections::status_label(status.as_ref()))
+                }),
             menu_identity,
             theme,
             cx,
         );
 
-        let brand_hover = motion::hover_t("sidebar-brand-home-motion");
-        let (brand_degrees, brand_scale) = if brand_hover < 0.35 {
-            let t = brand_hover / 0.35;
-            (-7.0 * t, 1.0 + 0.07 * t)
-        } else if brand_hover < 0.70 {
-            let t = (brand_hover - 0.35) / 0.35;
-            (-7.0 + 13.0 * t, 1.07)
-        } else {
-            let t = (brand_hover - 0.70) / 0.30;
-            (6.0 * (1.0 - t), 1.07 - 0.07 * t)
-        };
-        let brand_mark_transform =
-            gpui::Transformation::rotate(gpui::radians(brand_degrees.to_radians()))
-                .with_scaling(gpui::size(brand_scale, brand_scale));
-
-        let side_brand = div()
-            .id("sidebar-brand")
+        // Top of the column: primary verbs as plain nav rows (Codex/Cursor),
+        // not a brand card — the window already says which app this is.
+        let keymap = self.settings.keymap.clone();
+        let side_nav = div()
+            .id("sidebar-nav")
             .flex_none()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(10.0))
-            .px(px(10.0))
-            .pt(px(Theme::SPACE_MD))
-            .pb(px(8.0))
+            .flex_col()
+            .gap(px(1.0))
+            .px(px(Theme::SPACE_SM))
+            .pt(px(6.0))
+            .pb(px(Theme::SPACE_SM))
             .child(
-                div()
-                    .id("sidebar-brand-home")
-                    .role(gpui::Role::Button)
-                    .aria_label("All runs")
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .rounded(px(8.0))
-                    .px(px(6.0))
-                    .py(px(4.0))
-                    .cursor_pointer()
-                    .bg(motion::hover_blend(
-                        "sidebar-brand-home-motion",
-                        crate::theme::wash(0.0),
-                        theme.glass_hover(),
-                    ))
-                    .on_hover(motion::hover_listener("sidebar-brand-home-motion"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_space_filter(None, cx);
-                    }))
-                    .child(
-                        div()
-                            .size(px(30.0))
-                            .flex_none()
-                            .rounded(px(8.0))
-                            .bg(theme.text)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                icon(icons::ZERON_LOGO)
-                                    .size(px(19.0))
-                                    .with_transformation(brand_mark_transform)
-                                    .text_color(theme.bg),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(crate::typography::ui_rems(14.0))
-                                    .line_height(px(17.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(theme.text)
-                                    .child(SharedString::from("noches")),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(crate::typography::ui_rems(9.5))
-                                    .line_height(px(12.0))
-                                    .font_family(theme.font_mono.clone())
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from(self.boot.remote.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "LOCAL PROFILE".into()))),
-                            ),
-                    ),
+                sidebar_nav_row(
+                    "sidebar-new-session",
+                    icons::PEN_NEW_SQUARE,
+                    "New session",
+                    badge_combo(keymap.get(ShortcutId::NewSession)),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.open_new_session(cx))),
             )
             .child(
-                div()
-                    .id("sidebar-all-runs")
-                    .role(gpui::Role::Button)
-                    .aria_label("All runs")
-                    .flex_none()
-                    .rounded(px(6.0))
-                    .px(px(6.0))
-                    .py(px(4.0))
-                    .text_size(crate::typography::ui_rems(10.0))
-                    .font_family(theme.font_mono.clone())
-                    .text_color(theme.text_muted)
-                    .cursor_pointer()
-                    .hover(|el| el.bg(theme.glass_hover()).text_color(theme.text))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_space_filter(None, cx);
-                    }))
-                    .child(SharedString::from("all runs")),
+                sidebar_nav_row(
+                    "sidebar-search",
+                    icons::MAGNIFER,
+                    "Search",
+                    badge_combo("mod-k"),
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_command_palette(window, cx)
+                })),
             );
 
         // The space filter lives ABOVE the scroll region (fixed) so its
@@ -6542,10 +6602,10 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
-            .child(side_brand)
+            .child(side_nav)
             .child(filter_row)
             .child(sidebar_lists)
-            .child(self.render_voice_bar(theme, cx))
+            .when_some(self.render_voice_bar(theme, cx), |el, bar| el.child(bar))
             // Global connection pill (durable-by-design UI truth): appears
             // whenever the edge posture is degraded; hidden while healthy —
             // appearing IS the signal.
@@ -6580,9 +6640,9 @@ impl Shell {
             })
             .child(
                 div()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .p(px(Theme::SPACE_SM))
+                    .px(px(Theme::SPACE_SM))
+                    .pt(px(4.0))
+                    .pb(px(Theme::SPACE_SM))
                     .flex_none()
                     .child(user_menu),
             )
@@ -6602,32 +6662,20 @@ impl Shell {
         let theme = &theme.for_popup();
         let open = self.user_menu.is_open();
         let action = if self.boot.remote.is_some() { None } else { account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow) };
-        let remote_hover = motion::hover_t("remote-control-motion");
-        let remote_degrees = if remote_hover < 0.30 {
-            -11.0 * (remote_hover / 0.30)
-        } else if remote_hover < 0.65 {
-            -11.0 + 19.0 * ((remote_hover - 0.30) / 0.35)
-        } else {
-            8.0 * (1.0 - (remote_hover - 0.65) / 0.35)
-        };
-        let remote_transform =
-            gpui::Transformation::rotate(gpui::radians(remote_degrees.to_radians()));
-        let settings_transform = gpui::Transformation::rotate(gpui::radians(
-            (45.0 * motion::hover_t("sidebar-settings-motion")).to_radians(),
-        ));
         // Bottom-of-sidebar device strip. The left side remains the account
         // menu trigger, while the two compact actions expose device control
         // and Settings without making the profile menu the whole footer.
         let mut trigger = div()
             .id("user-menu")
             .flex_none()
+            .h(px(32.0))
             .rounded(px(8.0))
-            .px(px(6.0))
-            .py(px(5.0))
+            .pl(px(Theme::SPACE_SM))
+            .pr(px(3.0))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.0))
+            .gap(px(2.0))
             .cursor_pointer()
             // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
             // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
@@ -6663,17 +6711,24 @@ impl Shell {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(7.0))
+                    .gap(px(SIDEBAR_ROW_ICON_GAP))
                     .child(
                         div()
-                            .size(px(6.0))
+                            .size(px(SIDEBAR_BUDDY_SIZE))
                             .flex_none()
-                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .size(px(7.0))
+                                    .rounded_full()
                             .bg(match self.state.read(cx).remote_connection.as_ref() {
                                 Some(zeron_rpc::remote::ConnectionState::Unauthorized) => theme.danger,
                                 Some(zeron_rpc::remote::ConnectionState::Connecting | zeron_rpc::remote::ConnectionState::Reconnecting) => theme.text_muted,
                                 _ => theme.success,
                             }),
+                            ),
                     )
                     .child(
                         div()
@@ -6697,71 +6752,26 @@ impl Shell {
                     }),
             )
             .child(
-                div()
-                    .id("remote-control")
-                    .role(gpui::Role::Button)
-                    .aria_label("Remote control")
-                    .flex_none()
-                    .h(px(26.0))
-                    .px(px(7.0))
-                    .rounded(px(7.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .text_size(crate::typography::ui_rems(10.0))
-                    .text_color(theme.text_muted)
-                    .cursor_pointer()
-                    .bg(motion::hover_blend(
-                        "remote-control-motion",
-                        crate::theme::wash(0.0),
-                        theme.glass_hover(),
-                    ))
-                    .on_hover(motion::hover_listener("remote-control-motion"))
-                    .hover(|el| el.text_color(theme.text))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                sidebar_footer_button("sidebar-voice", icons::MICROPHONE, "Voice", theme)
+                    .when(self.voice_active(), |el| el.bg(theme.glass_hover()))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.toggle_voice(window, cx);
+                    })),
+            )
+            .child(
+                sidebar_footer_button("remote-control", icons::SMARTPHONE, "Remote control", theme)
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
                         this.open_settings(SettingsSection::Connections, cx);
-                    }))
-                    .child(
-                        icon(icons::SMARTPHONE)
-                            .size(px(13.0))
-                            .with_transformation(remote_transform)
-                            .text_color(theme.text_muted),
-                    )
-                    .child(SharedString::from("Remote")),
+                    })),
             )
             .child(
-                div()
-                    .id("sidebar-settings")
-                    .role(gpui::Role::Button)
-                    .aria_label("Settings")
-                    .flex_none()
-                    .size(px(26.0))
-                    .rounded(px(7.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .bg(motion::hover_blend(
-                        "sidebar-settings-motion",
-                        crate::theme::wash(0.0),
-                        theme.glass_hover(),
-                    ))
-                    .on_hover(motion::hover_listener("sidebar-settings-motion"))
-                    .hover(|el| el.text_color(theme.text))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                sidebar_footer_button("sidebar-settings", icons::SETTINGS_GEAR, "Settings", theme)
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
                         this.open_settings(SettingsSection::Devices, cx);
-                    }))
-                    .child(
-                        icon(icons::SETTINGS_GEAR)
-                            .size(px(14.0))
-                            .with_transformation(settings_transform)
-                            .text_color(theme.text_muted),
-                    ),
+                    })),
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
@@ -11545,11 +11555,11 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_chat_height_is_stable_for_avatar_cards() {
-        assert_eq!(chat_row_height(false, false), 68.0);
-        assert_eq!(chat_row_height(true, false), 68.0);
-        assert_eq!(chat_row_height(false, true), 68.0);
-        assert_eq!(chat_row_height(true, true), 68.0);
+    fn sidebar_chat_row_grows_only_for_metadata() {
+        assert_eq!(chat_row_height(false, false), 32.0);
+        assert_eq!(chat_row_height(true, false), 48.0);
+        assert_eq!(chat_row_height(false, true), 48.0);
+        assert_eq!(chat_row_height(true, true), 48.0);
     }
 
     #[test]

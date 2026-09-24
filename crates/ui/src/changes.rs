@@ -5720,6 +5720,28 @@ rename to new_name.rs
     /// Uses the native font backend, not TestAppContext's simulated metrics.
     #[test]
     fn native_diff_font_geometry() {
+        // MacPlatform reads the keyboard input source through HIToolbox,
+        // which aborts the process when other test threads are live. Run
+        // the native half in an isolated single-threaded child so a parallel
+        // `cargo test` doesn't take down the whole suite.
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("ZERON_NATIVE_FONT_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "changes::tests::native_diff_font_geometry",
+                    "--test-threads=1",
+                    "--quiet",
+                ])
+                .env("ZERON_NATIVE_FONT_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "native_diff_font_geometry child failed: {status}"
+            );
+            return;
+        }
         // Windows headless mode uses NoopTextSystem. This regression needs
         // actual DirectWrite metrics, as it does CoreText/fontconfig elsewhere.
         let platform = gpui_platform::current_platform(!cfg!(windows));

@@ -799,61 +799,90 @@ impl Shell {
             _ => Err("Action is not implemented".into()),
         }
     }
-    pub(super) fn render_voice_bar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.voice.live || self.voice.call.is_some() || self.voice.connecting;
-        div()
-            .id("voice-bar")
-            .flex_none()
-            .mx(px(8.))
-            .my(px(4.))
-            .px(px(8.))
-            .py(px(6.))
-            .rounded(px(8.))
-            .bg(crate::theme::wash(if busy { 0.08 } else { 0.03 }))
-            .flex()
-            .items_center()
-            .justify_between()
-            .text_size(crate::typography::ui_rems(12.))
-            .text_color(theme.text)
-            .child(
-                div()
-                    .id("voice-controls")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.voice.panel = !this.voice.panel;
-                        cx.notify();
-                    }))
-                    .child(if self.voice.pending.is_some() {
-                        "Voice · confirm action"
-                    } else if self.voice.live {
-                        if self.voice.muted {
-                            "Voice · muted"
-                        } else {
-                            "Voice · live"
-                        }
-                    } else if busy {
-                        "Voice · connecting"
-                    } else {
-                        "Voice"
-                    }),
-            )
-            .when(self.voice.live, |el| {
-                el.child(
+    /// Whether a voice call is live, connecting, or awaiting confirmation —
+    /// the only states that earn the sidebar's live strip.
+    pub(super) fn voice_active(&self) -> bool {
+        self.voice.live
+            || self.voice.call.is_some()
+            || self.voice.connecting
+            || self.voice.pending.is_some()
+    }
+
+    /// Live call strip above the sidebar footer. Idle voice lives in the
+    /// footer's mic button instead of a permanent placeholder card.
+    pub(super) fn render_voice_bar(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.voice_active() {
+            return None;
+        }
+        let (label, dot) = if self.voice.pending.is_some() {
+            ("Confirm action", theme.warning)
+        } else if self.voice.live && self.voice.muted {
+            ("Muted", theme.text_muted)
+        } else if self.voice.live {
+            ("Voice live", theme.success)
+        } else {
+            ("Connecting…", theme.text_muted)
+        };
+        let pill = |id: &'static str, text: &'static str| {
+            div()
+                .id(id)
+                .h(px(22.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_size(crate::typography::ui_rems(11.5))
+                .text_color(theme.text_muted)
+                .hover(|el| el.bg(crate::theme::wash(0.08)).text_color(theme.text))
+                .child(text)
+        };
+        Some(
+            div()
+                .id("voice-bar")
+                .flex_none()
+                .mx(px(8.))
+                .mb(px(6.))
+                .h(px(34.))
+                .pl(px(10.))
+                .pr(px(4.))
+                .rounded(px(8.))
+                .bg(crate::theme::wash(0.05))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().size(px(6.)).flex_none().rounded_full().bg(dot))
+                .child(
                     div()
-                        .id("voice-mute")
+                        .id("voice-controls")
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
                         .cursor_pointer()
-                        .child(if self.voice.muted { "Unmute" } else { "Mute" })
-                        .on_click(cx.listener(|this, _, _, cx| this.mute_voice(cx))),
+                        .text_size(crate::typography::ui_rems(12.5))
+                        .text_color(theme.text)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.voice.panel = !this.voice.panel;
+                            cx.notify();
+                        }))
+                        .child(label),
                 )
-            })
-            .child(
-                div()
-                    .id("voice-toggle")
-                    .cursor_pointer()
-                    .child(if busy { "End" } else { "Start" })
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_voice(window, cx))),
-            )
-            .into_any_element()
+                .when(self.voice.live, |el| {
+                    el.child(
+                        pill("voice-mute", if self.voice.muted { "Unmute" } else { "Mute" })
+                            .on_click(cx.listener(|this, _, _, cx| this.mute_voice(cx))),
+                    )
+                })
+                .child(
+                    pill("voice-toggle", "End")
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_voice(window, cx))),
+                )
+                .into_any_element(),
+        )
     }
     pub(super) fn render_voice_overlay(
         &mut self,

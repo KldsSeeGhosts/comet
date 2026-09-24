@@ -70,7 +70,7 @@ jobs:
           # real-font assertion and the complete headless suite mandatory.
           cargo test --release --locked -p zeron-ui --lib native_diff_font_geometry -- --test-threads=1 --nocapture
           $nativeResult = $LASTEXITCODE
-          cargo test --release --locked -p zeron-ui --lib -- --test-threads=1 --skip native_diff_font_geometry --nocapture
+          cargo test --release --locked -p zeron-ui --lib -- --skip native_diff_font_geometry --nocapture
           $headlessResult = $LASTEXITCODE
           if ($nativeResult -ne 0 -or $headlessResult -ne 0) { exit 1 }
       - name: Build application

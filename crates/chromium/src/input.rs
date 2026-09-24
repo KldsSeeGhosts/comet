@@ -42,21 +42,48 @@ pub fn dispatch(cmd: &str, v: &Value, browser: &Browser, host: &BrowserHost) {
     };
     match cmd {
         "down" | "up" => {
-            host.set_focus(1);
-            let button = match v["button"].as_u64().unwrap_or(1) {
-                2 => MouseButtonType::MIDDLE,
-                3 => MouseButtonType::RIGHT,
-                8 => {
-                    browser.go_back();
-                    return;
-                }
-                9 => {
-                    browser.go_forward();
-                    return;
-                }
-                _ => MouseButtonType::LEFT,
-            };
-            host.send_mouse_click_event(Some(&mouse), button, i32::from(cmd == "up"), 1);
+            if cmd == "down" {
+                host.set_focus(1);
+            }
+            let button_id = v["button"].as_u64().unwrap_or(1);
+            if button_id == 8 {
+                browser.go_back();
+                return;
+            }
+            if button_id == 9 {
+                browser.go_forward();
+                return;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // CEF's windowless mouse-click API loses press/release events on Linux
+                // even though mouse moves arrive. Deliver real input via Chromium's
+                // input dispatcher, as we already do for keyboard events below.
+                let button_name = match button_id {
+                    2 => "middle",
+                    3 => "right",
+                    _ => "left",
+                };
+                let mods = v["mods"].as_u64().unwrap_or(0);
+                let cdp_mods = u32::from(mods & 8 != 0)
+                    | u32::from(mods & 4 != 0) * 2
+                    | u32::from(mods & (1 << 26) != 0) * 4
+                    | u32::from(mods & 1 != 0) * 8;
+                let message = serde_json::json!({"id":if cmd == "down" {1000000001} else {1000000002},"method":"Input.dispatchMouseEvent","params":{
+                    "type":if cmd == "down" {"mousePressed"} else {"mouseReleased"},
+                    "x":mouse.x,"y":mouse.y,"button":button_name,"clickCount":1,"modifiers":cdp_mods
+                }});
+                host.send_dev_tools_message(Some(&serde_json::to_vec(&message).unwrap()));
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let button = match button_id {
+                    2 => MouseButtonType::MIDDLE,
+                    3 => MouseButtonType::RIGHT,
+                    _ => MouseButtonType::LEFT,
+                };
+                host.send_mouse_click_event(Some(&mouse), button, i32::from(cmd == "up"), 1);
+            }
         }
         "move" => host.send_mouse_move_event(Some(&mouse), 0),
         "scroll" => host.send_mouse_wheel_event(

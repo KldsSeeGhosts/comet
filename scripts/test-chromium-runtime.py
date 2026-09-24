@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the actual bundled CEF process, using only a loopback fixture."""
-import argparse, base64, http.server, json, pathlib, queue, struct, subprocess, threading, time
+import argparse, base64, http.server, json, pathlib, queue, struct, subprocess, sys, threading, time
 
 HTML = b'''<!doctype html><meta charset="utf-8"><title>Noches browser fixture</title>
 <style>body{font:20px sans-serif;background:#162b39;color:#fff;padding:40px}button,input,select{font:inherit;margin:12px;padding:12px}</style>
@@ -66,7 +66,22 @@ def main():
             if value==expected or time.monotonic()>=deadline:return value
             time.sleep(.05)
     def click(rect):
-        send('move',**rect);send('down',**rect,button=1);send('up',**rect,button=1)
+        # CEF processes pipe commands before pumping Chromium's event loop. Give
+        # each input phase a renderer round trip so press/release cannot overtake
+        # the preceding move (or each other) in the windowless Linux host.
+        target=evaluate(f"document.elementFromPoint({rect['x']},{rect['y']}).id")
+        send('move',**rect)
+        assert settle(f"inputLog.some(([type,x,y,id])=>type==='pointermove'&&x==={int(rect['x'])}&&y==={int(rect['y'])}&&id==={json.dumps(target)})",True),evaluate('JSON.stringify(inputLog)')
+        send('down',**rect,button=1)
+        if sys.platform == 'linux':
+            response=wait(lambda k,t,v:k==b'A' and t==1 and v.get('id')==1000000001)
+            assert 'error' not in response,response
+        assert settle(f"inputLog.some(([type,,,id])=>type==='mousedown'&&id==={json.dumps(target)})",True),evaluate('JSON.stringify(inputLog)')
+        send('up',**rect,button=1)
+        if sys.platform == 'linux':
+            response=wait(lambda k,t,v:k==b'A' and t==1 and v.get('id')==1000000002)
+            assert 'error' not in response,response
+        assert settle(f"inputLog.some(([type,,,id])=>type==='mouseup'&&id==={json.dumps(target)})",True),evaluate('JSON.stringify(inputLog)')
     def loaded(tab,title):return wait(lambda k,t,v:k==b'S' and t==tab and not v['loading'] and v['title']==title)
     try:
         send('create');send('load',url=url);loaded(1,'Noches browser fixture')
@@ -87,6 +102,7 @@ def main():
         rect=evaluate("(()=>{const r=document.querySelector('input').getBoundingClientRect();return {x:r.x+10,y:r.y+10}})()")
         click(rect)
         assert settle("document.activeElement.id",'name')=='name',evaluate('JSON.stringify({log:inputLog,focus:document.hasFocus(),dpr:devicePixelRatio,w:innerWidth,h:innerHeight})')
+        assert evaluate("inputLog.some(([type,,,target])=>type==='mousedown'&&target==='name') && inputLog.some(([type,,,target])=>type==='mouseup'&&target==='name')"),evaluate('JSON.stringify(inputLog)')
         send('select-all');time.sleep(.1);send('commit',text='Native input');time.sleep(.1)
         assert evaluate("document.querySelector('input').value")=='Native input'
         send('key_down',key='BackSpace');send('key_up',key='BackSpace');time.sleep(.1)
@@ -99,7 +115,7 @@ def main():
         evaluate("document.title='Edited by agent'")
         png=base64.b64decode(cdp('Page.captureScreenshot',dict(format='png'))['data']);assert png.startswith(b'\x89PNG');(output/'page.png').write_bytes(png)
         send('resize',width=800,height=500,scale=1)
-        deadline=time.monotonic()+5
+        deadline=time.monotonic()+15
         while time.monotonic()<deadline and (1 not in last_frame or struct.unpack('<II',last_frame[1][:8])!=(800,500)):time.sleep(.05)
         assert struct.unpack('<II',last_frame[1][:8])==(800,500),'resize did not produce a matching frame'
         send('create',2);send('load',2,url=url+'next');loaded(2,'Next page')
