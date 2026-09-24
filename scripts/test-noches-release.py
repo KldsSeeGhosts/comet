@@ -16,8 +16,8 @@ spec.loader.exec_module(release)
 
 class ReleaseTests(unittest.TestCase):
     def test_branch_and_ordering(self):
-        self.assertEqual(release.build_identity('main', 12, 1), ('stable', '0.3.12'))
-        self.assertEqual(release.build_identity('dev', 12, 2), ('dev', '0.3.12-dev.2'))
+        self.assertEqual(release.build_identity('main', 12, 1), ('stable', '0.1.12'))
+        self.assertEqual(release.build_identity('dev', 12, 2), ('dev', '0.1.12-dev.2'))
         with self.assertRaises(ValueError): release.build_identity('feature/test', 12, 1)
         self.assertGreater(release.version_order('0.3.12-dev.10'), release.version_order('0.3.12-dev.9'))
 
@@ -27,7 +27,7 @@ class ReleaseTests(unittest.TestCase):
             env = dict(os.environ, GITHUB_REF_NAME='10/merge', NOCHES_SOURCE_BRANCH='dev',
                        GITHUB_RUN_NUMBER='12', GITHUB_RUN_ATTEMPT='1', GITHUB_OUTPUT=str(output))
             subprocess.run(['python3', str(ROOT / 'scripts/noches-release.py'), 'prepare'], env=env, check=True)
-            self.assertEqual(output.read_text(), 'channel=dev\nversion=0.3.12-dev.1\n')
+            self.assertEqual(output.read_text(), 'channel=dev\nversion=0.1.12-dev.1\n')
 
     def test_complete_manifest_uses_immutable_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:

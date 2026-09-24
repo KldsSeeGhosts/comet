@@ -17,7 +17,7 @@ def build_identity(branch, run, attempt):
     channel = "stable" if branch == "main" else "dev"
     # Workflow run numbers increase across both branches. Stable patch numbers
     # are CI-owned; a rerun gets its own version rather than replacing assets.
-    version = f"0.3.{int(run)}" if channel == "stable" else f"0.3.{int(run)}-dev.{int(attempt)}"
+    version = f"0.1.{int(run)}" if channel == "stable" else f"0.1.{int(run)}-dev.{int(attempt)}"
     return channel, version
 
 
