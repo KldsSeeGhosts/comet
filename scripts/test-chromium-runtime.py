@@ -87,6 +87,7 @@ def main():
         rect=evaluate("(()=>{const r=document.querySelector('input').getBoundingClientRect();return {x:r.x+10,y:r.y+10}})()")
         click(rect)
         assert settle("document.activeElement.id",'name')=='name',evaluate('JSON.stringify({log:inputLog,focus:document.hasFocus(),dpr:devicePixelRatio,w:innerWidth,h:innerHeight})')
+        assert evaluate("inputLog.some(([type,,,target])=>type==='mousedown'&&target==='name') && inputLog.some(([type,,,target])=>type==='mouseup'&&target==='name')"),evaluate('JSON.stringify(inputLog)')
         send('select-all');time.sleep(.1);send('commit',text='Native input');time.sleep(.1)
         assert evaluate("document.querySelector('input').value")=='Native input'
         send('key_down',key='BackSpace');send('key_up',key='BackSpace');time.sleep(.1)
