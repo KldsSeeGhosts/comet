@@ -5555,7 +5555,7 @@ dependencies = [
 
 [[package]]
 name = "noches-chromium"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "cef",
  "objc2 0.6.4",
@@ -5568,7 +5568,7 @@ dependencies = [
 
 [[package]]
 name = "noches-voice"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -12121,7 +12121,7 @@ dependencies = [
 
 [[package]]
 name = "zeron"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -12144,7 +12144,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-browser"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -12155,7 +12155,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-doc"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "chrono",
  "loro",
@@ -12169,7 +12169,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-engine"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12208,7 +12208,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-harness"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12234,7 +12234,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-preview"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12262,7 +12262,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-proto"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "chrono",
  "serde",
@@ -12272,7 +12272,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-rpc"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12293,7 +12293,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-sync"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "block2 0.6.2",
  "chrono",
@@ -12317,7 +12317,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-syntax"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "thiserror 2.0.20",
  "tree-sitter",
@@ -12351,7 +12351,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-theme"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -12366,7 +12366,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-ui"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -12435,7 +12435,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-update"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "anyhow",
  "futures",
@@ -12452,7 +12452,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-workspace"
-version = "0.3.0-dev.1"
+version = "0.1.0-dev.1"
 dependencies = [
  "serde",
  "serde_json",
