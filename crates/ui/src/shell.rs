@@ -1565,10 +1565,14 @@ pub struct Shell {
     right_plus: popover::Popup<()>,
     /// Host-owned project Actions cached per (device, space).
     project_actions: crate::project_actions::ProjectActionsController,
-    /// Repository favicons/app icons by (profile, device, checkout, space),
-    /// refreshed after 5 minutes (`shell::project_icon`).
+    /// Repository favicons/app icons by (profile, source, engine, device,
+    /// checkout, space), refreshed after 5 minutes (`shell::project_icon`).
     project_icons:
         std::cell::RefCell<std::collections::HashMap<String, Entity<project_icon::ProjectIcon>>>,
+    /// Last full sweep of `project_icons`. Lookups refresh their own stale
+    /// entry, so the sweep only drops projects that left the sidebar and runs
+    /// at most once per interval, never once per card.
+    project_icons_pruned: std::cell::Cell<std::time::Instant>,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
     diffs: std::collections::HashMap<u64, Entity<Changes>>,
@@ -2022,6 +2026,7 @@ impl Shell {
             right_plus: popover::Popup::default(),
             project_actions: crate::project_actions::ProjectActionsController::default(),
             project_icons: Default::default(),
+            project_icons_pruned: std::cell::Cell::new(std::time::Instant::now()),
             diffs: std::collections::HashMap::new(),
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
@@ -5904,7 +5909,7 @@ impl Shell {
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
-        id: String,
+        badge: project_icon::ProjectIconRequest,
         title: SharedString,
         time_ago: SharedString,
         project: SharedString,
@@ -5924,6 +5929,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let id = badge.chat_id.clone();
         // Activity, not position: live rows put the state icon and label in
         // the top-right slot; settled rows show relative time. Hovering the
         // ROW swaps the slot for the ARCHIVE button (UNARCHIVE on rows in the
@@ -6248,7 +6254,7 @@ impl Shell {
                     .items_center()
                     .gap(px(6.0))
                     .child(self.render_project_icon(
-                        &id,
+                        badge,
                         SIDEBAR_PROJECT_BADGE_SIZE,
                         selected,
                         cx,

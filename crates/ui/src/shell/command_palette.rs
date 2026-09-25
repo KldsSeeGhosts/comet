@@ -1,4 +1,5 @@
 //! Global action and conversation search, using the sidebar's conversation rows.
+use super::project_icon::ProjectIconRequest;
 use super::*;
 use crate::appearance::AppearanceMode;
 
@@ -285,11 +286,13 @@ impl Shell {
             } else if let Entry::Chat(id) = entry {
                 let state = self.state.read(cx);
                 let chat = state.chats.iter().find(|chat| &chat.id == id)?;
-                let project = match (state.space_for_chat(chat), chat.space_id.as_deref()) {
+                let space = state.space_for_chat(chat);
+                let project = match (space, chat.space_id.as_deref()) {
                     (Some(space), _) => space.display_name().to_string(),
                     (None, None) => "~".to_string(),
                     _ => "?".to_string(),
                 };
+                let badge = ProjectIconRequest::resolve(state, chat, space);
                 let remote_device = (state.local_device_id.as_deref()
                     != Some(chat.device_id.as_str()))
                 .then(|| state.device_name(&chat.device_id))
@@ -314,7 +317,7 @@ impl Shell {
                     .then(|| chat.config.as_ref().map(|c| c.harness))
                     .flatten();
                 self.render_chat_row(
-                    id.clone(),
+                    badge,
                     transcript::single_line(chat.title.as_deref().unwrap_or("New session")).into(),
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), Utc::now())
                         .into(),

@@ -8,6 +8,7 @@
 //! management (add via the palette; rename/delete via row context menus).
 //! Child module of `shell` so it renders straight off `Shell`'s private state.
 
+use super::project_icon::ProjectIconRequest;
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
 use crate::status_palette::SessionState;
@@ -17,6 +18,7 @@ use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing
 struct ActiveChatRow {
     status: ChatIndicator,
     chat: zeron_proto::Chat,
+    badge: ProjectIconRequest,
     project: String,
     branch: Option<String>,
     /// The session's host device name, only when it is NOT this machine.
@@ -1389,6 +1391,7 @@ impl Shell {
                     // session; project-less sessions read as their home-dir
                     // cwd `~`.
                     let space = state.space_for_chat(&chat);
+                    let badge = ProjectIconRequest::resolve(state, &chat, space);
                     let project = match (space, chat.space_id.as_deref()) {
                         (Some(space), _) => space.display_name().to_string(),
                         (None, None) => "~".to_string(),
@@ -1423,6 +1426,7 @@ impl Shell {
                     ActiveChatRow {
                         status,
                         chat: chat.clone(),
+                        badge,
                         project,
                         branch,
                         remote_device,
@@ -1712,6 +1716,7 @@ impl Shell {
         let ActiveChatRow {
             status,
             chat,
+            badge,
             project,
             branch,
             remote_device,
@@ -1736,7 +1741,7 @@ impl Shell {
             None
         };
         let element = self.render_chat_row(
-            chat.id.clone(),
+            badge,
             transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
                 .into(),
             time_ago,
