@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, SubsecRound, TimeDelta, Utc};
 use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
@@ -751,7 +751,11 @@ pub struct AppState {
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
-    pub sessions: Vec<Session>,
+    sessions: Vec<Session>,
+    /// chat id -> slot in `sessions`, rebuilt wherever the list is replaced
+    /// ([`Self::replace_sessions`]) so [`Self::session_for`] is O(1) on the
+    /// render path. The field is private so no caller can bypass the rebuild.
+    session_index: HashMap<String, usize>,
     session_presentation: Option<Vec<Session>>,
     /// The project the new-session canvas mints into. Healed by
     /// [`Self::apply_spaces`] when the row vanishes; selecting a chat implies
@@ -861,10 +865,20 @@ fn is_text_append(frame: &TranscriptFrame) -> bool {
 
 /// The next wall-clock minute boundary: the coarse tick relative timestamps
 /// ([`format_time_ago`]) and anything not enumerated in
-/// [`AppState::next_display_refresh`] ride on. Pure.
+/// [`AppState::next_display_refresh`] ride on. Anchored to the wall clock
+/// (sub-seconds truncate), so it is a pure function of `now`, not of when a
+/// caller happened to ask. Pure.
 fn next_minute_boundary(now: DateTime<Utc>) -> DateTime<Utc> {
     let second = now.timestamp().rem_euclid(60);
-    now + TimeDelta::seconds(60 - second)
+    now.trunc_subsecs(0) + TimeDelta::seconds(60 - second)
+}
+
+/// The next whole-second boundary strictly after `now`: the tick the
+/// transcript trailer's timer and the connection pill's retry countdown
+/// advance on. Anchored to the wall clock rather than `now + 1s`, so a wake
+/// just before the boundary cannot push the deadline forward forever. Pure.
+fn next_second_boundary(now: DateTime<Utc>) -> DateTime<Utc> {
+    now.trunc_subsecs(0) + TimeDelta::seconds(1)
 }
 
 /// The instant the Working elapsed label for a turn started at `started` next
@@ -904,6 +918,7 @@ impl AppState {
             spaces: Vec::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
+            session_index: HashMap::new(),
             session_presentation: None,
             selected_space: None,
             no_project: false,
@@ -1091,8 +1106,28 @@ impl AppState {
             || self.session_presence_presentation != presence;
         self.session_presentation = Some(presentation);
         self.session_presence_presentation = presence;
-        self.sessions = sessions;
+        self.replace_sessions(sessions);
         changed
+    }
+
+    /// Replace the session list wholesale, keeping the id -> slot index in
+    /// step. Every write funnels through here; tests use `set_sessions`.
+    fn replace_sessions(&mut self, sessions: Vec<Session>) {
+        self.session_index = sessions.iter().enumerate().fold(
+            HashMap::with_capacity(sessions.len()),
+            |mut index, (slot, s)| {
+                // First wins, matching the linear scan this replaces.
+                index.entry(s.chat_id.clone()).or_insert(slot);
+                index
+            },
+        );
+        self.sessions = sessions;
+    }
+
+    /// Test-only wholesale replace that keeps the index coherent.
+    #[cfg(test)]
+    pub(crate) fn set_sessions(&mut self, sessions: Vec<Session>) {
+        self.replace_sessions(sessions);
     }
 
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
@@ -1141,7 +1176,7 @@ impl AppState {
     /// (a queued command executes on this device even fully offline). Remote
     /// chats degrade when the OS says offline, when the chat's own edge room
     /// is down, or when the host device has gone presence-dark.
-    pub fn chat_delivery_degraded(&self, chat_id: &str) -> bool {
+    pub fn chat_delivery_degraded(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
         use zeron_proto::ConnectivityState as S;
         if self.connectivity.state == S::Disabled {
             return false;
@@ -1166,13 +1201,13 @@ impl AppState {
             Some(net) => !net.connected,
             None => self.connectivity.state != S::Connected,
         };
-        room_down || !self.device_online(&chat.device_id, Utc::now())
+        room_down || !self.device_online(&chat.device_id, now)
     }
 
     /// A send is queued: in flight AND its delivery path is degraded — the
     /// honest badge is "Queued", not a Working spinner.
     pub fn send_queued(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
-        self.send_pending(chat_id, now) && self.chat_delivery_degraded(chat_id)
+        self.send_pending(chat_id, now) && self.chat_delivery_degraded(chat_id, now)
     }
 
     pub fn apply_devices(&mut self, devices: Vec<Device>) -> bool {
@@ -1648,7 +1683,7 @@ impl AppState {
     pub fn send_pending(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
         self.pending_sends.get(chat_id).is_some_and(|p| {
             now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
-                || self.chat_delivery_degraded(chat_id)
+                || self.chat_delivery_degraded(chat_id, now)
         })
     }
 
@@ -1679,7 +1714,7 @@ impl AppState {
             .get(chat_id)
             .filter(|p| {
                 now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
-                    || self.chat_delivery_degraded(chat_id)
+                    || self.chat_delivery_degraded(chat_id, now)
             })
             .map(|p| p.started)
     }
@@ -1888,8 +1923,24 @@ impl AppState {
             .collect()
     }
 
+    /// Live session rows (read-only). The sidebar, the notification detector
+    /// and the display-deadline sweep read them here.
+    pub fn sessions(&self) -> &[Session] {
+        &self.sessions
+    }
+
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
-        self.sessions.iter().find(|s| s.chat_id == chat_id)
+        // O(1): the index is rebuilt wherever `sessions` is replaced, and the
+        // field is private so no caller can bypass that.
+        let session = self
+            .session_index
+            .get(chat_id)
+            .and_then(|slot| self.sessions.get(*slot));
+        debug_assert!(
+            session.is_none_or(|session| session.chat_id == chat_id),
+            "session index out of step with the sessions list"
+        );
+        session
     }
 
     /// Staleness-checked status dot for a chat row. A send in flight reads as
@@ -1915,13 +1966,17 @@ impl AppState {
     /// - each device's presence deadline, when it drops offline (the Queued
     ///   send badge and the space tag's disconnected glyph read it);
     /// - each row that resolves to Working: its elapsed label's next change;
-    /// - `now + 1s` while the selected chat has a live indicator or the
-    ///   connection is degraded (the transcript trailer's timer and flavour
-    ///   word, the connection pill's retry countdown).
+    /// - the next whole-second boundary while the selected chat has a live
+    ///   indicator or the connection is degraded (the transcript trailer's
+    ///   timer and flavour word, the connection pill's retry countdown).
     ///
-    /// Always strictly after `now`: callers keep the instant they last slept
-    /// toward and notify once it has passed, so a deadline that lapsed while
-    /// the heartbeat was asleep still redraws exactly once.
+    /// Every deadline is anchored to state plus wall time, never `now +
+    /// delta`, so asking at a slightly different instant returns the same
+    /// instant. Always strictly after `now`: the heartbeat keeps a
+    /// `last_checked` watermark and redraws when
+    /// [`Self::display_changed_between`] reports a change in
+    /// `(last_checked, now]`, so a deadline that appeared and lapsed inside
+    /// one sleep still redraws exactly once.
     pub fn next_display_refresh(&self, now: DateTime<Utc>) -> DateTime<Utc> {
         use zeron_proto::ConnectivityState as S;
         let mut next = next_minute_boundary(now);
@@ -1983,9 +2038,18 @@ impl AppState {
             .is_some_and(|id| self.indicator_for(id, now) != Indicator::None);
         let degraded = matches!(self.connectivity.state, S::Offline | S::Reconnecting);
         if live_selected || degraded {
-            next = next.min(now + TimeDelta::seconds(1));
+            next = next.min(next_second_boundary(now));
         }
         next
+    }
+
+    /// Did a time-derived display value change in `(from, to]`? The
+    /// heartbeat's due check: [`Self::next_display_refresh`]`(from)` arms the
+    /// soonest deadline strictly after `from`, so a deadline that appeared
+    /// and lapsed inside one sleep window still reads as due even though the
+    /// instant is already past. Pure.
+    pub fn display_changed_between(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> bool {
+        self.next_display_refresh(from) <= to
     }
 
     pub fn selected_chat_row(&self) -> Option<&Chat> {
@@ -2038,7 +2102,7 @@ impl AppState {
         self.session_presence_presentation.clear();
         self.spaces.clear();
         self.chats.clear();
-        self.sessions.clear();
+        self.replace_sessions(Vec::new());
         self.session_presentation = None;
         self.selected_space = None;
         self.no_project = false;
@@ -4140,7 +4204,7 @@ mod tests {
         assert!(state.apply_sessions_at(vec![row.clone()], now));
         row.updated_at = now + TimeDelta::seconds(30);
         assert!(!state.apply_sessions_at(vec![row.clone()], now + TimeDelta::seconds(30)));
-        assert_eq!(state.sessions[0].updated_at, row.updated_at);
+        assert_eq!(state.sessions()[0].updated_at, row.updated_at);
         assert_eq!(
             state.indicator_for("chat", now + TimeDelta::seconds(60)),
             Indicator::Working
@@ -4160,14 +4224,14 @@ mod tests {
     fn unchanged_device_heartbeat_still_retires_stale_session_indicators() {
         let mut state = AppState::new();
         let now = Utc::now();
-        state.sessions = vec![Session {
+        state.set_sessions(vec![Session {
             last_completed_turn: None,
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,
             started_at: Some(now),
             updated_at: now,
-        }];
+        }]);
         let mut row = device("host", "Host");
         row.last_seen_at = Some(now);
         assert!(state.apply_devices_at(vec![row.clone()], now));
@@ -4179,7 +4243,7 @@ mod tests {
             state.indicator_for("chat", now + TimeDelta::seconds(46)),
             Indicator::None
         );
-        let mut recovered = state.sessions.clone();
+        let mut recovered = state.sessions().to_vec();
         recovered[0].updated_at = now + TimeDelta::seconds(47);
         assert!(
             state.apply_sessions_at(recovered, now + TimeDelta::seconds(47)),
@@ -4376,18 +4440,85 @@ mod tests {
         // A live session retires to its settled state when the host stops
         // heartbeating (`SESSION_STALE_MS`), not on the next minute.
         state.chats.clear();
-        state.sessions = vec![Session {
+        state.set_sessions(vec![Session {
             last_completed_turn: None,
             chat_id: "c".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,
             started_at: Some(probe - TimeDelta::seconds(30)),
             updated_at: probe - TimeDelta::seconds(30),
-        }];
+        }]);
         assert_eq!(
             state.next_display_refresh(probe),
             probe + TimeDelta::milliseconds(SESSION_STALE_MS + 1 - 30_000)
         );
+    }
+
+    #[test]
+    fn live_selected_display_refresh_is_anchored_to_whole_seconds() {
+        // Sample sub-second offsets: a `now + 1s` deadline would drift with
+        // the caller, an anchored one lands on the same whole second either
+        // way. The first wake must also never be in the past.
+        for offset_ms in [0_i64, 1, 250, 999] {
+            let now = DateTime::<Utc>::UNIX_EPOCH
+                + TimeDelta::seconds(1_700_000_000)
+                + TimeDelta::milliseconds(offset_ms);
+            let mut state = AppState::new();
+            state.selected_chat = Some("c".into());
+            state.set_sessions(vec![Session {
+                last_completed_turn: None,
+                chat_id: "c".into(),
+                device_id: "host".into(),
+                status: SessionStatus::Working,
+                started_at: Some(now),
+                updated_at: now,
+            }]);
+            let deadline = state.next_display_refresh(now);
+            assert!(
+                deadline > now,
+                "offset {offset_ms}ms must arm a future wake"
+            );
+            assert_eq!(
+                deadline,
+                now.trunc_subsecs(0) + TimeDelta::seconds(1),
+                "offset {offset_ms}ms must land on the next whole second"
+            );
+            // A second call a hair later inside the same second re-arms the
+            // same instant instead of sliding forward.
+            let later = now + TimeDelta::milliseconds(200);
+            if later < deadline {
+                assert_eq!(state.next_display_refresh(later), deadline);
+            }
+        }
+    }
+
+    #[test]
+    fn display_changed_between_catches_a_deadline_that_lapses_inside_one_sleep() {
+        // Whole-second anchor so the minute backstop is a known 40s out.
+        let t0 = DateTime::<Utc>::UNIX_EPOCH + TimeDelta::seconds(1_700_000_000);
+        let mut state = AppState::new();
+        // At t0 nothing live is armed but the minute boundary, which is more
+        // than a sleep window away.
+        assert!(state.next_display_refresh(t0) > t0 + TimeDelta::seconds(1));
+        // Mid-sleep a Working session syncs in already 29.5s into its
+        // staleness lease, so it retires at t0 + 500ms - inside the window.
+        let mut sessions = state.sessions().to_vec();
+        sessions.push(Session {
+            last_completed_turn: None,
+            chat_id: "c".into(),
+            device_id: "host".into(),
+            status: SessionStatus::Working,
+            started_at: Some(t0 - TimeDelta::seconds(30)),
+            updated_at: t0 + TimeDelta::milliseconds(500)
+                - TimeDelta::milliseconds(SESSION_STALE_MS + 1),
+        });
+        state.set_sessions(sessions);
+        let wake = t0 + TimeDelta::seconds(1);
+        // A stored-deadline check would have nothing to see; the watermark
+        // sees the deadline that lapsed inside `(t0, wake]`.
+        assert!(state.display_changed_between(t0, wake));
+        // The change is consumed once the watermark moves past it.
+        assert!(!state.display_changed_between(wake, wake + TimeDelta::milliseconds(1)));
     }
 
     #[test]
@@ -5202,28 +5333,28 @@ mod tests {
         }];
 
         // Healthy: nothing degraded.
-        assert!(!s.chat_delivery_degraded("c-remote"));
-        assert!(!s.chat_delivery_degraded("c-local"));
+        assert!(!s.chat_delivery_degraded("c-remote", now));
+        assert!(!s.chat_delivery_degraded("c-local", now));
 
         // The chat's own room down → degraded even while globally Connected.
         s.connectivity.chats[0].connected = false;
-        assert!(s.chat_delivery_degraded("c-remote"));
+        assert!(s.chat_delivery_degraded("c-remote", now));
         s.connectivity.chats[0].connected = true;
 
         // Host gone presence-dark → degraded (a send would queue at best).
         s.devices[0].last_seen_at = Some(now - TimeDelta::minutes(10));
-        assert!(s.chat_delivery_degraded("c-remote"));
+        assert!(s.chat_delivery_degraded("c-remote", now));
         s.devices[0].last_seen_at = Some(now);
 
         // OS offline: remote degrades; a locally-hosted chat NEVER does (the
         // queued command executes on this device even fully offline).
         s.connectivity.state = ConnectivityState::Offline;
-        assert!(s.chat_delivery_degraded("c-remote"));
-        assert!(!s.chat_delivery_degraded("c-local"));
+        assert!(s.chat_delivery_degraded("c-remote", now));
+        assert!(!s.chat_delivery_degraded("c-local", now));
 
         // Local profile (Disabled): nothing degrades.
         s.connectivity.state = ConnectivityState::Disabled;
-        assert!(!s.chat_delivery_degraded("c-remote"));
+        assert!(!s.chat_delivery_degraded("c-remote", now));
 
         // Queued = pending send + degraded path — and degradation HOLDS the
         // overlay past the grace window instead of silently expiring (the

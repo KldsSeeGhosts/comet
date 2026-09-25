@@ -7525,9 +7525,10 @@ impl Render for Composer {
         // reconnect) instead of letting the button imply instant delivery.
         let queue_notice: Option<(SharedString, bool)> = {
             use zeron_proto::ConnectivityState as S;
+            let now = chrono::Utc::now();
             let state = self.state.read(cx);
             let degraded = match self.target.chat_id(state) {
-                Some(id) => state.chat_delivery_degraded(id),
+                Some(id) => state.chat_delivery_degraded(id, now),
                 None => {
                     // New-chat canvas: judge by the picked target device.
                     let target_device = Self::target_device_id(&self.target, state);
@@ -7538,7 +7539,7 @@ impl Render for Composer {
                         && (matches!(state.connectivity.state, S::Offline | S::Reconnecting)
                             || target_device
                                 .as_deref()
-                                .is_some_and(|id| !state.device_online(id, chrono::Utc::now())))
+                                .is_some_and(|id| !state.device_online(id, now)))
                 }
             };
             let offline = state.connectivity.state == S::Offline;

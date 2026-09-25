@@ -2100,7 +2100,7 @@ mod pane_meta_tests {
             chat("awaiting", "local", None),
             chat("errored", "local", None),
         ];
-        state.sessions = vec![
+        state.set_sessions(vec![
             Session {
                 last_completed_turn: None,
                 chat_id: "working".into(),
@@ -2125,7 +2125,7 @@ mod pane_meta_tests {
                 started_at: None,
                 updated_at: Utc::now(),
             },
-        ];
+        ]);
 
         // The engine's indicator reaches the header verbatim; working is a
         // live (chromatic) state, idle stays quiet.
@@ -2143,7 +2143,7 @@ mod pane_meta_tests {
         );
         // No session row: the unseen chat settles to Completed, which still
         // carries a label (idle is the only label-less state).
-        state.sessions.clear();
+        state.set_sessions(Vec::new());
         let settled = pane_meta(Some("working"), &state);
         assert_eq!(settled.state, SessionState::Completed);
         assert_eq!(settled.state.label(), Some("Completed"));

@@ -18,7 +18,7 @@ mod browser_agent;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable as _,
     IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
@@ -1888,32 +1888,49 @@ impl Shell {
         // The sleep never exceeds a second, so a state change that starts a
         // new clock or pending send folds into the next deadline promptly.
         let ticker = cx.spawn(async move |this, cx| {
-            // Never tighter than a quarter second (a deadline can land
-            // arbitrarily close to a wake), never looser than a second.
-            const MIN_SLEEP_MS: i64 = 250;
+            // One frame is the floor (a deadline can land arbitrarily close
+            // to a wake); a second is the ceiling (keeps mid-sleep state
+            // changes prompt).
+            const MIN_SLEEP_MS: i64 = 16;
             const MAX_SLEEP_MS: i64 = 1_000;
-            // `None` until the first wake arms it: the shell entity cannot be
-            // read before `new` has returned.
-            let mut deadline: Option<DateTime<Utc>> = None;
+            // Watermark: display changes through this instant have already
+            // been drawn. A wake is due iff something changed in
+            // `(last_checked, now]`; because every deadline is anchored to
+            // state plus wall time (never `now + delta`), a deadline that
+            // appeared and lapsed inside one sleep still reads as due here
+            // instead of sliding forward unobserved.
+            let mut last_checked = Utc::now();
             loop {
-                let wait_ms = deadline
-                    .map(|deadline| (deadline - Utc::now()).num_milliseconds())
-                    .unwrap_or(MAX_SLEEP_MS)
-                    .clamp(MIN_SLEEP_MS, MAX_SLEEP_MS);
-                cx.background_executor()
-                    .timer(Duration::from_millis(wait_ms as u64))
-                    .await;
-                let due = deadline.is_some_and(|deadline| Utc::now() >= deadline);
+                let now = Utc::now();
                 let updated = this.update(cx, |shell: &mut Shell, cx| {
+                    let (due, next) = {
+                        let state = shell.state.read(cx);
+                        (
+                            state.display_changed_between(last_checked, now),
+                            state.next_display_refresh(now),
+                        )
+                    };
                     if due {
                         cx.notify();
                     }
-                    shell.state.read(cx).next_display_refresh(Utc::now())
+                    next
                 });
-                match updated {
-                    Ok(next) => deadline = Some(next),
+                let next = match updated {
+                    Ok(next) => next,
                     Err(_) => break,
-                }
+                };
+                last_checked = now;
+                // Round up to whole ms: a truncated wait can wake just before
+                // an anchored deadline and burn an extra frame re-arming.
+                let wait_ms = ((next - now)
+                    .num_microseconds()
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(999))
+                    / 1_000;
+                let wait_ms = wait_ms.clamp(MIN_SLEEP_MS, MAX_SLEEP_MS);
+                cx.background_executor()
+                    .timer(Duration::from_millis(wait_ms as u64))
+                    .await;
             }
         });
         let data_dir = boot.data_dir.clone();
@@ -2348,7 +2365,7 @@ impl Shell {
             let (sessions, connectivity, connectivity_observed) = {
                 let state = state.read(cx);
                 let sessions: Vec<Ping> = state
-                    .sessions
+                    .sessions()
                     .iter()
                     .map(|s| {
                         let status = crate::sound::SessionNotificationState::new(s, now);
