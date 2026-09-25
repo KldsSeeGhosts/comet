@@ -93,10 +93,10 @@ jobs:
         run: cargo test --release --locked -p zeron-ui --lib
 
   macos-frame-recovery:
-    # Self-hosted: same-repo PRs and trusted pushes only - fork PRs skip this
-    # job rather than executing unreviewed code on a personal machine.
+    # Run the desktop-sensitive suite on an isolated GitHub-hosted Mac.
+    # Fork PRs skip this longer native integration job.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
