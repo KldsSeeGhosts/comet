@@ -88,16 +88,6 @@ const SKY: (u32, u32) = (0x7dd3fc, 0x0284c7);
 const INDIGO: (u32, u32) = (0xa5b4fc, 0x4f46e5);
 const EMERALD: (u32, u32) = (0x6ee7b7, 0x059669);
 
-/// Diff counts: additions and deletions, as in every code review tool.
-pub fn diff_colors(theme: &Theme) -> (Hsla, Hsla) {
-    let dark = theme.appearance == crate::theme::Appearance::Dark;
-    if dark {
-        (gpui::rgb(0x6ee7b7).into(), gpui::rgb(0xfca5a5).into())
-    } else {
-        (gpui::rgb(0x15803d).into(), gpui::rgb(0xb91c1c).into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
