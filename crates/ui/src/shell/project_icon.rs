@@ -28,6 +28,42 @@ pub(super) const ICON_PATHS: &[&str] = &[
     "src/assets/icon.png",
 ];
 
+/// A cached badge is refreshed this long after it loaded.
+const ICON_TTL: Duration = Duration::from_secs(300);
+/// Full-cache sweep interval. Individual lookups refresh their own stale
+/// entry, so the sweep only drops projects that left the sidebar and never
+/// runs once per card.
+const ICON_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Where a badge's bytes come from. `targetDeviceId` only routes a request
+/// through the engine; it does not say whether this process shares the
+/// engine's disk, so the local/RPC choice stays explicit instead of being
+/// inferred from `target_device_id.is_none()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectIconSource {
+    /// The engine runs in this process, so its project roots are on this disk.
+    LocalFs,
+    /// Everything else reads through `WorkspaceFilesClient`, including a
+    /// space on the engine's own device when that engine is remote.
+    WorkspaceRpc,
+}
+
+/// Direct `std::fs` is only correct when the engine shares this process's
+/// filesystem and the space lives on that engine's device. A remote engine's
+/// `local_device_id` names the engine host, not this machine.
+fn icon_source(
+    engine_mode: Option<&EngineMode>,
+    local_device_id: Option<&str>,
+    device_id: &str,
+) -> ProjectIconSource {
+    match engine_mode {
+        Some(EngineMode::InProcess) if local_device_id == Some(device_id) => {
+            ProjectIconSource::LocalFs
+        }
+        _ => ProjectIconSource::WorkspaceRpc,
+    }
+}
+
 fn load_local_icon(root: &std::path::Path) -> Option<MediaImage> {
     // A project can point at a subdirectory; match the remote workspace RPC's
     // checkout-root resolution, including linked worktrees with a .git file.
@@ -168,6 +204,7 @@ impl ProjectIcon {
         name: String,
         seed: String,
         context: FilesRequestContext,
+        source: ProjectIconSource,
         engine: Option<crate::state::EngineHandle>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -176,7 +213,7 @@ impl ProjectIcon {
         let task = cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
             let load = async {
-                if context.target_device_id.is_none() {
+                if source == ProjectIconSource::LocalFs {
                     let root = std::path::PathBuf::from(context.cwd);
                     return executor.spawn(async move { load_local_icon(&root) }).await;
                 }
@@ -317,30 +354,55 @@ fn project_icon_frame(
         .into_any_element()
 }
 
-impl Shell {
-    /// The project badge for a chat's space: the repository favicon when one
-    /// is found, else a colored monogram. `size` is the square edge in px.
-    pub(super) fn render_project_icon(
-        &self,
-        chat_id: &str,
-        size: f32,
-        selected: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let state = self.state.read(cx);
-        let chat = state.chats.iter().find(|chat| chat.id == chat_id);
-        let space = chat.and_then(|chat| state.space_for_chat(chat));
+/// A session's badge inputs, resolved where the space is already known.
+/// Carrying owned data keeps the per-card path from scanning `state.chats`
+/// and keeps borrowed state out of the call that needs `&mut Context`.
+pub(super) struct ProjectIconRequest {
+    pub(super) chat_id: String,
+    name: String,
+    seed: String,
+    device: String,
+    context: Option<FilesRequestContext>,
+    source: ProjectIconSource,
+}
+
+impl ProjectIconRequest {
+    /// A monogram-only request for tests that build sidebar rows by hand.
+    #[cfg(test)]
+    pub(super) fn monogram_only(chat_id: &str, name: &str) -> Self {
+        Self {
+            chat_id: chat_id.into(),
+            name: name.into(),
+            seed: name.into(),
+            device: "Unknown device".into(),
+            context: None,
+            source: ProjectIconSource::WorkspaceRpc,
+        }
+    }
+
+    pub(super) fn resolve(
+        state: &AppState,
+        chat: &zeron_proto::Chat,
+        space: Option<&zeron_proto::Space>,
+    ) -> Self {
         let name = space
             .map(|space| space.display_name().to_string())
             .unwrap_or_else(|| "Home".into());
         // Same fallback as the row's "@ device" fragment.
-        let device = chat
-            .and_then(|chat| state.device_name(&chat.device_id))
+        let device = state
+            .device_name(&chat.device_id)
             .unwrap_or("Unknown device")
             .to_string();
         let seed = space
             .map(|space| space.path.clone())
             .unwrap_or_else(|| "home".into());
+        let source = space.map_or(ProjectIconSource::WorkspaceRpc, |space| {
+            icon_source(
+                state.engine().map(|engine| engine.mode()).as_ref(),
+                state.local_device_id.as_deref(),
+                &space.device_id,
+            )
+        });
         let context = space.map(|space| FilesRequestContext {
             target: zeron_proto::WorkspaceTarget {
                 chat_id: None,
@@ -352,28 +414,66 @@ impl Shell {
             cwd: space.path.clone(),
             checkout_id: space.checkout_id.clone(),
         });
+        Self {
+            chat_id: chat.id.clone(),
+            name,
+            seed,
+            device,
+            context,
+            source,
+        }
+    }
+}
+
+impl Shell {
+    /// The project badge for a session: the repository favicon when one is
+    /// found, else a colored monogram. `size` is the square edge in px.
+    pub(super) fn render_project_icon(
+        &self,
+        request: ProjectIconRequest,
+        size: f32,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ProjectIconRequest {
+            chat_id,
+            name,
+            seed,
+            device,
+            context,
+            source,
+        } = request;
         let Some(context) = context else {
             return project_icon_frame(
-                chat_id,
+                &chat_id,
                 &name,
                 &device,
                 size,
                 monogram(&name, &seed, selected, Theme::of(cx)),
             );
         };
-        let key = format!(
-            "{:?}:{:?}:{}:{:?}:{}",
-            profile_key(state, self.boot.org_id.as_deref()),
-            context.target_device_id,
-            context.cwd,
-            context.checkout_id,
-            name
-        );
-        let engine = state.engine().cloned();
+        let (engine, key) = {
+            let state = self.state.read(cx);
+            // The engine's device is part of the cache identity: two remote
+            // profiles under the same account can otherwise reuse each
+            // other's badge when both spaces route to the engine's own
+            // device (`None`).
+            let key = format!(
+                "{:?}:{:?}:{:?}:{:?}:{}:{:?}:{}",
+                profile_key(state, self.boot.org_id.as_deref()),
+                source,
+                state.local_device_id,
+                context.target_device_id,
+                context.cwd,
+                context.checkout_id,
+                name
+            );
+            (state.engine().cloned(), key)
+        };
         // Don't cache a remote miss before a connection exists.
-        if context.target_device_id.is_some() && engine.is_none() {
+        if source == ProjectIconSource::WorkspaceRpc && engine.is_none() {
             return project_icon_frame(
-                chat_id,
+                &chat_id,
                 &name,
                 &device,
                 size,
@@ -381,12 +481,25 @@ impl Shell {
             );
         }
         let mut cache = self.project_icons.borrow_mut();
-        cache.retain(|_, entity| entity.read(cx).refreshed.elapsed() < Duration::from_secs(300));
+        // A stale entry is refreshed on its own lookup; the sweep only drops
+        // projects that no longer render, so it can run at most once per
+        // interval instead of once per card.
+        if self.project_icons_pruned.get().elapsed() >= ICON_PRUNE_INTERVAL {
+            self.project_icons_pruned.set(std::time::Instant::now());
+            cache.retain(|_, entity| entity.read(cx).refreshed.elapsed() < ICON_TTL);
+        }
+        if cache
+            .get(&key)
+            .is_some_and(|entity| entity.read(cx).refreshed.elapsed() >= ICON_TTL)
+        {
+            cache.remove(&key);
+        }
         let entity = cache
             .entry(key)
             .or_insert_with(|| {
-                let entity =
-                    cx.new(|cx| ProjectIcon::new(name.clone(), seed.clone(), context, engine, cx));
+                let entity = cx.new(|cx| {
+                    ProjectIcon::new(name.clone(), seed.clone(), context, source, engine, cx)
+                });
                 // The monogram below is drawn by the shell (it needs the row's
                 // selected state, which the shared entity can't hold), so the
                 // shell must redraw when artwork lands.
@@ -397,20 +510,42 @@ impl Shell {
         drop(cache);
         if entity.read(cx).media.is_none() {
             return project_icon_frame(
-                chat_id,
+                &chat_id,
                 &name,
                 &device,
                 size,
                 monogram(&name, &seed, selected, Theme::of(cx)),
             );
         }
-        project_icon_frame(chat_id, &name, &device, size, entity)
+        project_icon_frame(&chat_id, &name, &device, size, entity)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_the_in_process_engine_on_its_own_device_reads_local_disk() {
+        let remote = EngineMode::Remote {
+            url: "ws://127.0.0.1:1".into(),
+        };
+        assert_eq!(
+            icon_source(Some(&EngineMode::InProcess), Some("studio"), "studio"),
+            ProjectIconSource::LocalFs
+        );
+        assert_eq!(
+            icon_source(Some(&remote), Some("studio"), "studio"),
+            ProjectIconSource::WorkspaceRpc
+        );
+        assert_eq!(
+            icon_source(Some(&EngineMode::InProcess), Some("studio"), "server"),
+            ProjectIconSource::WorkspaceRpc
+        );
+        assert_eq!(
+            icon_source(None, None, "server"),
+            ProjectIconSource::WorkspaceRpc
+        );
+    }
     fn png(path: &std::path::Path, width: u32) {
         image::RgbaImage::new(width, 2).save(path).unwrap();
     }

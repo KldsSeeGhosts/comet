@@ -10,6 +10,7 @@
 //! This lives in the shell module tree (like `tabs.rs`/`spaces.rs`) because it
 //! reads Shell's private fields; everything structural sits in `crate::pane`.
 
+use super::project_icon::ProjectIconRequest;
 use super::*;
 
 use std::cell::RefCell;
@@ -176,7 +177,11 @@ impl Shell {
             .chat_pane_sessions()
             .into_iter()
             .filter_map(|(pane, session)| {
-                session.map(|chat_id| (pane, self.render_project_icon(&chat_id, 14.0, false, cx)))
+                let chat_id = session?;
+                let state = self.state.read(cx);
+                let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
+                let badge = ProjectIconRequest::resolve(state, chat, state.space_for_chat(chat));
+                Some((pane, self.render_project_icon(badge, 14.0, false, cx)))
             })
             .collect();
         Rc::new(RefCell::new(badges))
@@ -195,7 +200,7 @@ impl Shell {
         let Some(pane) = self.workspace.focused_pane() else {
             return Empty.into_any_element();
         };
-        let (title, chat_id, meta, mark) = {
+        let (title, chat_id, meta, mark, badge) = {
             let state = self.state.read(cx);
             let row = state.selected_chat_row();
             let title = row
@@ -205,12 +210,12 @@ impl Shell {
             let chat_id = row.map(|chat| chat.id.clone());
             let meta = pane_meta(chat_id.as_deref(), state);
             let mark = header_mark(row, PaneMode::Chat, None);
-            (title, chat_id, meta, mark)
+            let badge = row
+                .map(|chat| ProjectIconRequest::resolve(state, chat, state.space_for_chat(chat)));
+            (title, chat_id, meta, mark, badge)
         };
         let has_selection = chat_id.is_some();
-        let badge = chat_id
-            .as_deref()
-            .map(|chat_id| self.render_project_icon(chat_id, 14.0, false, cx));
+        let badge = badge.map(|badge| self.render_project_icon(badge, 14.0, false, cx));
         let available =
             (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0);
         let action_control =

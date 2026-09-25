@@ -8,6 +8,7 @@
 //! management (add via the palette; rename/delete via row context menus).
 //! Child module of `shell` so it renders straight off `Shell`'s private state.
 
+use super::project_icon::ProjectIconRequest;
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
 use crate::status_palette::SessionState;
@@ -17,6 +18,7 @@ use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing
 struct ActiveChatRow {
     status: ChatIndicator,
     chat: zeron_proto::Chat,
+    badge: ProjectIconRequest,
     project: String,
     branch: Option<String>,
     /// The session's host device name, only when it is NOT this machine.
@@ -152,6 +154,7 @@ fn sidebar_rows(
             // Line 2 is "project:branch" + " · device" for a remote session;
             // project-less sessions read as their home-dir cwd `~`.
             let space = state.space_for_chat(&chat);
+            let badge = ProjectIconRequest::resolve(state, &chat, space);
             let project = match (space, chat.space_id.as_deref()) {
                 (Some(space), _) => space.display_name().to_string(),
                 (None, None) => "~".to_string(),
@@ -186,6 +189,7 @@ fn sidebar_rows(
             ActiveChatRow {
                 status,
                 chat: chat.clone(),
+                badge,
                 project,
                 branch,
                 remote_device,
@@ -227,10 +231,13 @@ fn project_sidebar(
     // order, so a project whose rows were all lifted still keeps its header in
     // the slot its top session occupied.
     let mut group_keys: Vec<(String, String)> = Vec::new();
+    let mut group_index: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
     for row in order_sidebar_sections(rows, |row| row.section) {
         if let Some(key) = &row.group
-            && !group_keys.contains(key)
+            && !group_index.contains_key(key)
         {
+            group_index.insert(key.clone(), group_keys.len());
             group_keys.push(key.clone());
         }
         match row.section {
@@ -266,16 +273,14 @@ fn project_sidebar(
 
     // ByDevice: each (device, project) keeps its disclosure, even with zero
     // settled rows, so its scoped "New session" action never disappears.
-    let mut groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = group_keys
+    let mut groups: SidebarGroups<ActiveChatRow> = group_keys
         .into_iter()
         .map(|key| (Some(key), Vec::new()))
         .collect();
     for row in rest {
-        if let Some((_, group_rows)) = groups
-            .iter_mut()
-            .find(|(group, _)| group.as_ref() == row.group.as_ref())
-        {
-            group_rows.push(row);
+        // Indexed, so grouping stays linear in the session count.
+        if let Some(&index) = row.group.as_ref().and_then(|key| group_index.get(key)) {
+            groups[index].1.push(row);
         }
     }
     promote_local_device_group(&mut groups, local_device_id);
@@ -383,10 +388,10 @@ pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
 
 /// Put this machine's device groups first without disturbing the recency-based
 /// order within local or remote groups.
-fn promote_local_device_group<T>(
-    groups: &mut Vec<(Option<(String, String)>, Vec<T>)>,
-    local_device_id: Option<&str>,
-) {
+/// `(device_id, space_id)` disclosure groups with their rows, in draw order.
+type SidebarGroups<T> = Vec<(Option<(String, String)>, Vec<T>)>;
+
+fn promote_local_device_group<T>(groups: &mut SidebarGroups<T>, local_device_id: Option<&str>) {
     let Some(local_device_id) = local_device_id else {
         return;
     };
@@ -1773,6 +1778,7 @@ impl Shell {
         let ActiveChatRow {
             status,
             chat,
+            badge,
             project,
             branch,
             remote_device,
@@ -1797,7 +1803,7 @@ impl Shell {
             None
         };
         let element = self.render_chat_row(
-            chat.id.clone(),
+            badge,
             transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
                 .into(),
             time_ago,
@@ -2324,11 +2330,10 @@ impl Shell {
         };
         if rows.is_empty() {
             let text = flow.search.read(cx).text().to_string();
-            if text.starts_with('/') || text.starts_with('~') {
-                if let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref())
-                {
-                    self.add_space_descend(target, false, cx);
-                }
+            if (text.starts_with('/') || text.starts_with('~'))
+                && let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref())
+            {
+                self.add_space_descend(target, false, cx);
             }
             return;
         }
@@ -2623,7 +2628,7 @@ impl Shell {
             return;
         };
         match flow.step {
-            ProjectStep::Devices => return,
+            ProjectStep::Devices => {}
             ProjectStep::Locations => self.add_space_back_to(ProjectStep::Devices, cx),
             ProjectStep::Folders => {
                 let listing = flow.browser.ready();
@@ -3469,6 +3474,7 @@ mod tests {
                 space_id: Some(space.into()),
                 ..chat(id)
             },
+            badge: super::ProjectIconRequest::monogram_only(id, space),
             project: space.into(),
             branch: None,
             remote_device: None,
