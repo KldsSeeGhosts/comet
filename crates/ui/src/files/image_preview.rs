@@ -13,7 +13,7 @@ pub(super) fn is_image(path: &str) -> bool {
     path.rsplit_once('.').is_some_and(|(_, extension)| {
         matches!(
             extension.to_ascii_lowercase().as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "tif" | "tiff"
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "tif" | "tiff" | "ico"
         )
     })
 }
@@ -240,6 +240,7 @@ mod tests {
     fn recognizes_only_supported_workspace_formats() {
         for path in [
             "a.PNG", "a.jpeg", "a.JPG", "a.gif", "a.webp", "a.svg", "a.bmp", "a.tif", "a.tiff",
+            "a.ico",
         ] {
             assert!(is_image(path));
         }

@@ -1210,6 +1210,7 @@ fn read_image_blocking(
         "svg" => "image/svg+xml",
         "bmp" => "image/bmp",
         "tif" | "tiff" => "image/tiff",
+        "ico" => "image/x-icon",
         _ => {
             return Err(WorkspaceFilesError::Unsupported(
                 "Unsupported workspace image format".into(),
@@ -2799,6 +2800,14 @@ mod image_tests {
         request.expected_content_hash = None;
         request.offset = usize::MAX;
         assert!(read_image_blocking(&root, &path, &request).is_err());
+
+        std::fs::write(root.join("favicon.ico"), [0, 0, 1, 0]).unwrap();
+        let ico_path = WorkspaceRelativePath::file("favicon.ico").unwrap();
+        request.path = "favicon.ico".into();
+        request.offset = 0;
+        let ico = read_image_blocking(&root, &ico_path, &request).unwrap();
+        assert_eq!(ico.mime_type, "image/x-icon");
+        assert!(ico.done);
     }
     #[test]
     fn workspace_images_reject_large_files_and_symlinks() {
