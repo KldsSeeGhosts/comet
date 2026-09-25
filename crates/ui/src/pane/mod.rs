@@ -54,8 +54,11 @@ use crate::transcript::Transcript;
 
 pub use zeron_workspace::MIN_RATIO;
 
-/// A divider's logical hit-area size, straddling the node line (§1: ~8px
-/// logical; the visual hairline stays a thin centered 1px line).
+/// A split seam's layout size: a 1px hairline between the two children.
+pub(crate) const DIVIDER_SEAM_PX: f32 = 1.0;
+
+/// A divider's logical hit-area size, straddling the 1px seam (§1: ~8px
+/// logical, overlapping each neighboring pane by 3.5px).
 pub(crate) const DIVIDER_HIT_PX: f32 = 8.0;
 
 /// Double-click equalize target for a split node (§1: equalize to 0.5/0.5).
@@ -192,9 +195,9 @@ pub(crate) struct DragSplitState {
 }
 
 /// Ratio from a pointer sample during a divider drag: the pointer position
-/// along the container's axis, minus half the divider's hit width (the line
-/// sits at the CENTER of the straddling hit area), normalized over the
-/// children's combined span (container length minus the divider itself).
+/// along the container's axis, minus half the divider's layout seam width (the
+/// hairline sits at the center of the seam), normalized over the children's
+/// combined span (container length minus the seam itself).
 /// Clamped to the engine's `MIN_RATIO..=MAX_RATIO` band here so a wild
 /// pointer can never produce an engine rejection mid-drag. `None` when the
 /// container is too small to host children beside the divider.
@@ -400,7 +403,10 @@ impl PaneHost {
 
     /// The focused pane's last painted window bounds.
     pub(crate) fn focused_pane_bounds(&self) -> Option<Bounds<Pixels>> {
-        self.pane_bounds.borrow().get(&self.focused_pane()?).copied()
+        self.pane_bounds
+            .borrow()
+            .get(&self.focused_pane()?)
+            .copied()
     }
 
     // ---- focus / structure queries ----
@@ -690,7 +696,11 @@ impl PaneHost {
         // `promote_trivial_chat_surface_to_dock` handoff moves that draft
         // into the shared dock; only remove dead/tool panes here.
         let live = live_pane_ids(&self.layout.views);
-        let chat_live = self.chat_pane_sessions().into_iter().map(|(pane, _)| pane).collect();
+        let chat_live = self
+            .chat_pane_sessions()
+            .into_iter()
+            .map(|(pane, _)| pane)
+            .collect();
         let stale = stale_cache_keys(&chat_live, self.chat_surfaces.keys().copied());
         for pane in stale {
             self.chat_surfaces.remove(&pane);
@@ -726,12 +736,12 @@ pub fn is_trivial_layout(layout: &WorkspaceLayout) -> bool {
     if layout.views.len() != 1 {
         return false;
     }
-    layout
-        .views
-        .values()
-        .all(|view| view.tabs.len() == 1 && view.tabs.values().all(|tab| {
-            tab.panes.len() == 1 && tab.panes.values().all(|pane| pane.mode == PaneMode::Chat)
-        }))
+    layout.views.values().all(|view| {
+        view.tabs.len() == 1
+            && view.tabs.values().all(|tab| {
+                tab.panes.len() == 1 && tab.panes.values().all(|pane| pane.mode == PaneMode::Chat)
+            })
+    })
 }
 
 /// Every pane id reachable from a workspace (leaves of every tab's pane
@@ -1062,25 +1072,26 @@ mod tests {
 
     #[test]
     fn ratio_from_pointer_tracks_the_divider_center() {
-        let hit = DIVIDER_HIT_PX;
-        // Geometry: the divider line sits at first_span + hit/2, and the
-        // children span (L - hit). An equal split's line is at the middle.
-        let ratio = ratio_from_pointer(500.0, 0.0, 1000.0, hit).unwrap();
+        let seam = DIVIDER_SEAM_PX;
+        // Geometry: the 1px seam center sits at first_span + seam/2, and the
+        // children span (L - seam). An equal split's center is at the middle.
+        let ratio = ratio_from_pointer(500.0, 0.0, 1000.0, seam).unwrap();
         assert!((ratio - 0.5).abs() < 1e-9);
-        // A ratio of 0.3 puts the line at 0.3 * 992 + 4 = 301.6 (f32 drag
-        // math — tolerance is sub-pixel, not ulp).
-        let ratio = ratio_from_pointer(0.3 * (1000.0 - hit) + hit / 2.0, 0.0, 1000.0, hit).unwrap();
+        // A ratio of 0.3 puts the seam center at 0.3 * 999 + 0.5 = 300.2
+        // (f32 drag math - tolerance is sub-pixel, not ulp).
+        let ratio =
+            ratio_from_pointer(0.3 * (1000.0 - seam) + seam / 2.0, 0.0, 1000.0, seam).unwrap();
         assert!((ratio - 0.3).abs() < 1e-4);
-        // The left edge of the hit strip (pointer at hit/2) reads ratio 0 —
-        // clamped up to the engine's floor.
-        let ratio = ratio_from_pointer(4.0, 0.0, 1000.0, hit).unwrap();
+        // The seam center when first_span is zero (pointer at seam/2) reads
+        // ratio 0 - clamped up to the engine's floor.
+        let ratio = ratio_from_pointer(seam / 2.0, 0.0, 1000.0, seam).unwrap();
         assert_eq!(ratio, MIN_RATIO);
         // Origin offsets (nested containers) subtract cleanly.
         let ratio = ratio_from_pointer(
-            1000.0 + 0.3 * (1000.0 - hit) + hit / 2.0,
+            1000.0 + 0.3 * (1000.0 - seam) + seam / 2.0,
             1000.0,
             1000.0,
-            hit,
+            seam,
         )
         .unwrap();
         assert!((ratio - 0.3).abs() < 1e-4);
@@ -1090,23 +1101,23 @@ mod tests {
     fn ratio_from_pointer_clamps_and_degenerates() {
         // Way outside the children span clamps to the engine band.
         assert_eq!(
-            ratio_from_pointer(-500.0, 0.0, 1000.0, DIVIDER_HIT_PX),
+            ratio_from_pointer(-500.0, 0.0, 1000.0, DIVIDER_SEAM_PX),
             Some(MIN_RATIO)
         );
         assert_eq!(
-            ratio_from_pointer(5000.0, 0.0, 1000.0, DIVIDER_HIT_PX),
+            ratio_from_pointer(5000.0, 0.0, 1000.0, DIVIDER_SEAM_PX),
             Some(zeron_workspace::MAX_RATIO)
         );
-        // A container no wider than the divider cannot host children.
-        assert_eq!(ratio_from_pointer(4.0, 0.0, 8.0, DIVIDER_HIT_PX), None);
-        assert_eq!(ratio_from_pointer(4.0, 0.0, 7.0, DIVIDER_HIT_PX), None);
-        // Non-finite input is rejected, never panes.
+        // A container no wider than the seam cannot host children.
+        assert_eq!(ratio_from_pointer(0.5, 0.0, 1.0, DIVIDER_SEAM_PX), None);
+        assert_eq!(ratio_from_pointer(0.5, 0.0, 0.5, DIVIDER_SEAM_PX), None);
+        // Non-finite input is rejected, never panics.
         assert_eq!(
-            ratio_from_pointer(f32::NAN, 0.0, 1000.0, DIVIDER_HIT_PX),
+            ratio_from_pointer(f32::NAN, 0.0, 1000.0, DIVIDER_SEAM_PX),
             None
         );
         assert_eq!(
-            ratio_from_pointer(4.0, 0.0, f32::INFINITY, DIVIDER_HIT_PX),
+            ratio_from_pointer(4.0, 0.0, f32::INFINITY, DIVIDER_SEAM_PX),
             None
         );
     }

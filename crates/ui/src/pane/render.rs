@@ -19,10 +19,12 @@
 //! Sizing: every split child gets `flex_basis(0)` + `flex_grow(weight)` with
 //! weights from [`super::flex_weights`] (the markdown table trick), so nested
 //! ratios compose multiplicatively and the engine's clamped ratios map 1:1 to
-//! on-screen fractions. The divider between two children is a fixed
-//! [`super::DIVIDER_HIT_PX`] flex-none strip straddling the node line;
-//! children share the remaining span, which [`super::ratio_from_pointer`]
-//! accounts for (the engine op lives in `shell/panes.rs`).
+//! on-screen fractions. The seam between two children is a fixed
+//! [`super::DIVIDER_SEAM_PX`] (1px) flex-none hairline; children share the
+//! remaining span, which [`super::ratio_from_pointer`] accounts for (the
+//! engine op lives in `shell/panes.rs`). An [`super::DIVIDER_HIT_PX`] (8px)
+//! hit target overlaps both neighboring panes (3.5px each side) in an overlay
+//! painted after both children so it wins hit-testing over the second pane.
 //!
 //! Paths: a divider's [`DividerTarget`] carries the `Vec<Branch>` path from
 //! the tree root to ITS node - the first child recurses with `path+[First]`,
@@ -53,7 +55,13 @@ use crate::transcript::Transcript;
 use super::chrome::{self, TabChip};
 use super::flex_weights;
 use super::hit_test::PreviewKind;
-use super::{DIVIDER_HIT_PX, DividerDrag, DividerGhost, DividerTarget};
+use super::{DIVIDER_HIT_PX, DIVIDER_SEAM_PX, DividerDrag, DividerGhost, DividerTarget};
+
+/// Signed offset of the [`DIVIDER_HIT_PX`] hit strip relative to its
+/// [`DIVIDER_SEAM_PX`] anchor: `-3.5px`, so the 8px band straddles the 1px
+/// hairline evenly (`3.5px` over the first pane, `1px` over the seam, `3.5px`
+/// over the second pane).
+const DIVIDER_HIT_OFFSET_PX: f32 = -((DIVIDER_HIT_PX - DIVIDER_SEAM_PX) / 2.0);
 /// The workspace outlet's outer padding: zero - panes are flush with the
 /// content region and only the dividers separate them. Shared with
 /// `shell/panes.rs`'s drag geometry so the hit-test `content` region is
@@ -252,7 +260,6 @@ fn view_node(
                 *horizontal,
                 *ratio,
                 target,
-                &divider_id_of(path),
                 view_node(cx, theme, first, &joined(path, Branch::First), snap),
                 view_node(cx, theme, second, &joined(path, Branch::Second), snap),
             )
@@ -316,9 +323,14 @@ fn joined(path: &[Branch], branch: Branch) -> Vec<Branch> {
     next
 }
 
-/// A stable, path-derived element id for a divider (hover keys key off it).
-fn divider_id_of(path: &[Branch]) -> String {
-    let mut id = String::from("ws-div-");
+/// A stable, target-derived element id for a divider (hover keys key off it).
+fn divider_id_of(target: &DividerTarget) -> String {
+    let (mut id, path) = match target {
+        DividerTarget::View { path } => (String::from("ws-div-v-"), path.as_slice()),
+        DividerTarget::Pane { view, tab, path } => {
+            (format!("ws-div-p-{}-{}-", view.0, tab.0), path.as_slice())
+        }
+    };
     for branch in path {
         id.push(match branch {
             Branch::First => 'F',
@@ -354,7 +366,6 @@ fn pane_node(
                 *horizontal,
                 *ratio,
                 target,
-                &divider_id_of(path),
                 pane_node(cx, theme, first, &joined(path, Branch::First), view, snap),
                 pane_node(cx, theme, second, &joined(path, Branch::Second), view, snap),
             )
@@ -368,11 +379,12 @@ fn pane_node(
     }
 }
 
-/// A split's two children with a divider between them: weighted flex with
-/// zero basis so ratios map exactly to sizes regardless of content, and a
-/// fixed-width hit strip straddling the node line (§1: ~8px hit area; its
-/// centered 1px hairline is always visible and strengthens on hover).
-/// Dragging commits live ratio updates to THIS node only; double-click
+/// A split's two children with a 1px hairline seam between them and an 8px
+/// hit-target overlay straddling the seam. Weighted flex with zero basis maps
+/// ratios directly to child sizes (`container_length - 1px`), while the
+/// interactive hit strip is painted after both children so GPUI's reverse
+/// paint-order hit test reaches the divider over both the first and second
+/// panes. Dragging commits live ratio updates to THIS node only; double-click
 /// equalizes it.
 fn split_container(
     cx: &Context<'_, Shell>,
@@ -380,15 +392,16 @@ fn split_container(
     horizontal: bool,
     ratio: f64,
     target: DividerTarget,
-    id: &str,
     first: AnyElement,
     second: AnyElement,
 ) -> AnyElement {
     let (w_first, w_second) = flex_weights(ratio);
+    let id = divider_id_of(&target);
+    let hover_key = SharedString::from(format!("{id}-hover"));
     let container = if horizontal {
-        div().flex().flex_row()
+        div().relative().flex().flex_row()
     } else {
-        div().flex().flex_col()
+        div().relative().flex().flex_col()
     };
     // The divider consumes a clone for its drag payload; the container keeps
     // one for the ownership filter below.
@@ -398,8 +411,11 @@ fn split_container(
         .min_w_0()
         .min_h_0()
         .child(split_child(w_first, first))
-        .child(divider(cx, theme, id, horizontal, target))
+        .child(divider_seam(theme, &hover_key, horizontal))
         .child(split_child(w_second, second))
+        .child(divider_hit_overlay(
+            cx, &id, hover_key, horizontal, w_first, w_second, target,
+        ))
         // Drag samples arrive here (the container owns the bounds the ratio
         // math needs - `DragMoveEvent::bounds`). Ancestor containers also
         // receive the event during capture; each filters by the drag
@@ -416,72 +432,54 @@ fn split_container(
         .into_any_element()
 }
 
-/// The divider strip: a [`DIVIDER_HIT_PX`] hit area straddling the node line,
-/// painted `theme.bg` so the workspace stays one opaque surface, with a
-/// centered 1px `theme.border` hairline that is ALWAYS visible and blends to
-/// `theme.border_strong` on hover (the hover fade is latched while a drag is
-/// live so it never flickers mid-drag). Starts a GPUI drag ([`DividerDrag`])
-/// so the container's `on_drag_move` receives pointer samples; mouse-up (or
-/// double-click) resolves here. `.occlude()` keeps the click that starts a
-/// drag from reaching anything under the strip - a divider press never
-/// focuses a pane.
-fn divider(
+/// The 1px visual seam in flex flow between two split children: `theme.border`
+/// at rest, blending to `theme.border_strong` while its hit strip is hovered
+/// (or latched during a live divider drag).
+fn divider_seam(theme: &Theme, hover_key: &SharedString, horizontal: bool) -> AnyElement {
+    let color = crate::motion::hover_blend(hover_key, theme.border, theme.border_strong);
+    div()
+        .flex_none()
+        .when(horizontal, |el| el.w(px(DIVIDER_SEAM_PX)).h_full())
+        .when(!horizontal, |el| el.h(px(DIVIDER_SEAM_PX)).w_full())
+        .bg(color)
+        .into_any_element()
+}
+
+/// Transparent overlay painted after both split children so the [`DIVIDER_HIT_PX`]
+/// hit strip sits above the second pane in GPUI's hit-test and event order.
+/// The outer flex container and its two weighted spacers carry no interactivity
+/// (`should_insert_hitbox` is false), so only the 8px `.occlude()` strip
+/// registers a hitbox (~3.5px over each adjacent pane).
+fn divider_hit_overlay(
     cx: &Context<'_, Shell>,
-    theme: &Theme,
     id: &str,
+    hover_key: SharedString,
     horizontal: bool,
+    w_first: f32,
+    w_second: f32,
     target: DividerTarget,
 ) -> AnyElement {
-    let hover_key = SharedString::from(format!("{}-hover", id));
-    let line = div()
-        .absolute()
-        .top_0()
-        .bottom_0()
-        .left_0()
-        .right_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(if horizontal {
-            // Side-by-side panes: a vertical 1px line, hairline at rest.
-            div()
-                .w(px(1.0))
-                .h_full()
-                .bg(crate::motion::hover_blend(
-                    &hover_key,
-                    theme.border,
-                    theme.border_strong,
-                ))
-                .into_any_element()
-        } else {
-            // Stacked panes: a horizontal 1px line, hairline at rest.
-            div()
-                .h(px(1.0))
-                .w_full()
-                .bg(crate::motion::hover_blend(
-                    &hover_key,
-                    theme.border,
-                    theme.border_strong,
-                ))
-                .into_any_element()
-        });
     let drag = DividerDrag {
         target: target.clone(),
         horizontal,
     };
-    div()
-        .id(SharedString::from(format!("{}", id)))
-        .flex_none()
-        .relative()
-        // Opaque `theme.bg` across the whole strip: with no island borders
-        // and no outlet gutter, this strip IS the seam between two panes.
-        .bg(theme.bg)
+    let hit_strip = div()
+        .id(SharedString::from(id.to_owned()))
+        .absolute()
         .occlude()
         .when(horizontal, |el| {
-            el.w(px(DIVIDER_HIT_PX)).cursor_col_resize()
+            el.left(px(DIVIDER_HIT_OFFSET_PX))
+                .top_0()
+                .bottom_0()
+                .w(px(DIVIDER_HIT_PX))
+                .cursor_col_resize()
         })
         .when(!horizontal, |el| {
-            el.h(px(DIVIDER_HIT_PX)).cursor_row_resize()
+            el.top(px(DIVIDER_HIT_OFFSET_PX))
+                .left_0()
+                .right_0()
+                .h(px(DIVIDER_HIT_PX))
+                .cursor_row_resize()
         })
         // Hover feedback pauses while any divider drag is live so the strip
         // never re-fades mid-drag (hover churn reads as flicker). The shell
@@ -490,7 +488,6 @@ fn divider(
         .on_hover(cx.listener(move |this, hovered: &bool, _, _| {
             this.note_divider_hover(&hover_key, *hovered);
         }))
-        .child(line)
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
@@ -514,6 +511,33 @@ fn divider(
         .on_mouse_up_out(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| this.end_divider_drag(cx)),
+        );
+    let anchor = div()
+        .flex_none()
+        .relative()
+        .when(horizontal, |el| el.w(px(DIVIDER_SEAM_PX)).h_full())
+        .when(!horizontal, |el| el.h(px(DIVIDER_SEAM_PX)).w_full())
+        .child(hit_strip);
+    let overlay = if horizontal {
+        div().absolute().inset_0().flex().flex_row()
+    } else {
+        div().absolute().inset_0().flex().flex_col()
+    };
+    overlay
+        .child(
+            div()
+                .flex_basis(px(0.0))
+                .flex_grow(w_first)
+                .min_w_0()
+                .min_h_0(),
+        )
+        .child(anchor)
+        .child(
+            div()
+                .flex_basis(px(0.0))
+                .flex_grow(w_second)
+                .min_w_0()
+                .min_h_0(),
         )
         .into_any_element()
 }
@@ -531,7 +555,7 @@ fn split_child(weight: f32, child: AnyElement) -> AnyElement {
         .into_any_element()
 }
 
-/// One pane: click-to-focus container, its header (the chat identity row - 
+/// One pane: click-to-focus container, its header (the chat identity row -
 /// `closable` only gates the ×), and the pane's own transcript + composer
 /// body. Each leaf is a flush, opaque `theme.bg` surface (no radius, no
 /// island border): panes tile the content region and the dividers carry the
@@ -714,5 +738,36 @@ mod tests {
         assert!(show_tab_strip(&view(2, false)));
         // A closable view keeps the strip - it carries the ×.
         assert!(show_tab_strip(&view(1, true)));
+    }
+
+    #[test]
+    fn divider_hit_strip_straddles_the_one_pixel_seam_and_ids_stay_unique() {
+        assert_eq!(DIVIDER_SEAM_PX, 1.0);
+        assert_eq!(DIVIDER_HIT_PX, 8.0);
+        assert_eq!(DIVIDER_HIT_OFFSET_PX, -3.5);
+        assert_eq!(
+            DIVIDER_HIT_PX + 2.0 * DIVIDER_HIT_OFFSET_PX,
+            DIVIDER_SEAM_PX
+        );
+
+        let root_view = DividerTarget::View { path: vec![] };
+        let root_pane_a = DividerTarget::Pane {
+            view: ViewId(1),
+            tab: TabId(2),
+            path: vec![],
+        };
+        let root_pane_b = DividerTarget::Pane {
+            view: ViewId(2),
+            tab: TabId(3),
+            path: vec![],
+        };
+        let nested_pane = DividerTarget::Pane {
+            view: ViewId(1),
+            tab: TabId(2),
+            path: vec![Branch::First, Branch::Second],
+        };
+        assert_ne!(divider_id_of(&root_view), divider_id_of(&root_pane_a));
+        assert_ne!(divider_id_of(&root_pane_a), divider_id_of(&root_pane_b));
+        assert_eq!(divider_id_of(&nested_pane), "ws-div-p-1-2-FS");
     }
 }
