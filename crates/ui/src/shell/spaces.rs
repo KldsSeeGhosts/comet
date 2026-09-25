@@ -90,6 +90,205 @@ pub(super) fn compare_sidebar_chats(
     primary.then_with(|| left.id.cmp(&right.id))
 }
 
+/// One ordered entry in the sidebar's session list: the shape both
+/// [`Shell::render_active_rows`] and [`Shell::sidebar_visible_order`] consume,
+/// so the drawn list and the keyboard order cannot drift.
+enum SidebarEntry {
+    /// A non-collapsible heading: a state section (needs you / running) or the
+    /// InOneList "Recent" divider ([`SidebarSection::Rest`]).
+    Heading(SidebarSection),
+    /// One session drawn flat under its heading.
+    Row(Box<ActiveChatRow>),
+    /// A ByDevice disclosure: the project header and the settled rows under it.
+    /// `rows` is empty when every session was lifted into a state section - the
+    /// header stays so the project's scoped "New session" action survives.
+    Group {
+        device_id: String,
+        space_id: String,
+        rows: Vec<ActiveChatRow>,
+    },
+}
+
+/// The sidebar's ordered entries as plain data, built once per render. The
+/// renderer iterates it and the jump/cycle shortcuts flatten it, which makes
+/// the documented keyboard-order invariant structural.
+struct SidebarProjection {
+    entries: Vec<SidebarEntry>,
+}
+
+impl SidebarProjection {
+    /// Flat chat ids in the exact order the entries draw.
+    fn visible_chat_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        for entry in &self.entries {
+            match entry {
+                SidebarEntry::Heading(_) => {}
+                SidebarEntry::Row(row) => ids.push(row.chat.id.clone()),
+                SidebarEntry::Group { rows, .. } => {
+                    ids.extend(rows.iter().map(|row| row.chat.id.clone()));
+                }
+            }
+        }
+        ids
+    }
+}
+
+/// Every visible session in the user's sort, decorated with the fields a row
+/// draws. The shared input to [`project_sidebar`].
+fn sidebar_rows(
+    state: &AppState,
+    settings: &UiSettings,
+    now: chrono::DateTime<Utc>,
+) -> Vec<ActiveChatRow> {
+    let mut chats: Vec<_> = state
+        .sidebar_chats(now, settings.space_filter.as_deref())
+        .into_iter()
+        .map(|(status, chat)| (status, chat.clone()))
+        .collect();
+    chats.sort_by(|left, right| compare_sidebar_chats(settings.sidebar_sort, &left.1, &right.1));
+    let mut rows: Vec<ActiveChatRow> = chats
+        .into_iter()
+        .map(|(status, chat)| {
+            // Line 2 is "project:branch" + " · device" for a remote session;
+            // project-less sessions read as their home-dir cwd `~`.
+            let space = state.space_for_chat(&chat);
+            let project = match (space, chat.space_id.as_deref()) {
+                (Some(space), _) => space.display_name().to_string(),
+                (None, None) => "~".to_string(),
+                (None, Some(_)) => "?".to_string(),
+            };
+            let local_device_id = state.local_device_id.as_deref();
+            let remote_device = (local_device_id != Some(chat.device_id.as_str()))
+                .then(|| state.device_name(&chat.device_id))
+                .flatten()
+                .map(str::to_string);
+            // The branch shows whenever the engine has stamped one - main
+            // checkout sessions included, not just worktrees.
+            let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(str::to_string);
+            let change_request = state.change_request_for_chat(&chat).cloned();
+            let group = match settings.sidebar_organization {
+                SidebarOrganization::ByDevice => Some((
+                    chat.device_id.clone(),
+                    space
+                        .filter(|space| space.device_id == chat.device_id)
+                        .map(|space| space.id.clone())
+                        .unwrap_or_default(),
+                )),
+                SidebarOrganization::ByProject | SidebarOrganization::InOneList => None,
+            };
+            // Send truth decides the section: an undelivered send needs you, a
+            // queued one is running.
+            let undelivered = state.send_undelivered(&chat.id, now);
+            let queued = state.send_queued(&chat.id, now);
+            ActiveChatRow {
+                status,
+                chat: chat.clone(),
+                project,
+                branch,
+                remote_device,
+                change_request,
+                group,
+                section: sidebar_section(status, queued, undelivered),
+            }
+        })
+        .collect();
+    if !settings.sidebar_show_branch {
+        for row in &mut rows {
+            row.branch = None;
+        }
+    }
+    if !settings.sidebar_show_pull_request {
+        for row in &mut rows {
+            row.change_request = None;
+        }
+    }
+    rows
+}
+
+/// Partition the sorted rows into the floating state sections and the user's
+/// chosen organization, without touching GPUI: the ordered projection both the
+/// renderer and the keyboard order consume.
+fn project_sidebar(
+    rows: Vec<ActiveChatRow>,
+    organization: SidebarOrganization,
+    local_device_id: Option<&str>,
+) -> SidebarProjection {
+    // State sections float above the chosen organization: needs-you and
+    // running always come first, flat and non-collapsible; everything else
+    // keeps the user's organization (and InOneList gains a "Recent" header
+    // only when a section above it is non-empty).
+    let mut needs: Vec<ActiveChatRow> = Vec::new();
+    let mut running: Vec<ActiveChatRow> = Vec::new();
+    let mut rest: Vec<ActiveChatRow> = Vec::new();
+    // Group order follows the first row of each (device, project) in draw
+    // order, so a project whose rows were all lifted still keeps its header in
+    // the slot its top session occupied.
+    let mut group_keys: Vec<(String, String)> = Vec::new();
+    for row in order_sidebar_sections(rows, |row| row.section) {
+        if let Some(key) = &row.group
+            && !group_keys.contains(key)
+        {
+            group_keys.push(key.clone());
+        }
+        match row.section {
+            SidebarSection::NeedsYou => needs.push(row),
+            SidebarSection::Running => running.push(row),
+            SidebarSection::Rest => rest.push(row),
+        }
+    }
+
+    let mut entries: Vec<SidebarEntry> = Vec::new();
+    for (section, rows) in [
+        (SidebarSection::NeedsYou, needs),
+        (SidebarSection::Running, running),
+    ] {
+        if rows.is_empty() {
+            continue;
+        }
+        entries.push(SidebarEntry::Heading(section));
+        entries.extend(rows.into_iter().map(|row| SidebarEntry::Row(Box::new(row))));
+    }
+
+    if organization != SidebarOrganization::ByDevice {
+        // InOneList (and the legacy ByProject, which draws the same flat
+        // list): the rest is one flat list, with a "Recent" divider only when
+        // a state section is on screen above it.
+        if organization == SidebarOrganization::InOneList && !rest.is_empty() && !entries.is_empty()
+        {
+            entries.push(SidebarEntry::Heading(SidebarSection::Rest));
+        }
+        entries.extend(rest.into_iter().map(|row| SidebarEntry::Row(Box::new(row))));
+        return SidebarProjection { entries };
+    }
+
+    // ByDevice: each (device, project) keeps its disclosure, even with zero
+    // settled rows, so its scoped "New session" action never disappears.
+    let mut groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = group_keys
+        .into_iter()
+        .map(|key| (Some(key), Vec::new()))
+        .collect();
+    for row in rest {
+        if let Some((_, group_rows)) = groups
+            .iter_mut()
+            .find(|(group, _)| group.as_ref() == row.group.as_ref())
+        {
+            group_rows.push(row);
+        }
+    }
+    promote_local_device_group(&mut groups, local_device_id);
+    entries.extend(groups.into_iter().filter_map(|(key, rows)| {
+        key.map(|(device_id, space_id)| SidebarEntry::Group {
+            device_id,
+            space_id,
+            rows,
+        })
+    }));
+    SidebarProjection { entries }
+}
+
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
 /// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
@@ -1283,414 +1482,276 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Flat top-to-bottom chat ids exactly as [`Self::render_active_rows`]
-    /// draws them - the state sections (needs you, running) first, then the
-    /// user's sort, workspace/device grouping, and local-device promotion
-    /// applied. The jump shortcuts and session cycling read THIS order (not
-    /// the raw recency list) so keyboard order never drifts from the screen.
-    pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
-        /// One row's placement, computed exactly as the drawn list computes
-        /// it: its state section, and (for the rest) its device group.
-        struct VisibleChat {
-            section: SidebarSection,
-            group: Option<(String, String)>,
-            id: String,
-        }
-
-        let now = Utc::now();
-        let filter = self.settings.space_filter.clone();
-        let by_device = self.settings.sidebar_organization == SidebarOrganization::ByDevice;
+    /// The ordered sidebar entries as plain data, computed once per render.
+    /// Both the drawn list and the keyboard order consume it, so their order
+    /// cannot drift.
+    fn sidebar_projection(&self, cx: &Context<Self>) -> SidebarProjection {
         let state = self.state.read(cx);
-        let mut chats: Vec<(ChatIndicator, zeron_proto::Chat)> = state
-            .sidebar_chats(now, filter.as_deref())
-            .into_iter()
-            .map(|(status, chat)| (status, chat.clone()))
-            .collect();
-        chats.sort_by(|left, right| {
-            compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
-        });
-        let rows: Vec<VisibleChat> = chats
-            .into_iter()
-            .map(|(status, chat)| {
-                let undelivered = state.send_undelivered(&chat.id, now);
-                let queued = state.send_queued(&chat.id, now);
-                VisibleChat {
-                    section: sidebar_section(status, queued, undelivered),
-                    group: by_device.then(|| {
-                        let space_id = state
-                            .space_for_chat(&chat)
-                            .filter(|space| space.device_id == chat.device_id)
-                            .map(|space| space.id.clone())
-                            .unwrap_or_default();
-                        (chat.device_id.clone(), space_id)
-                    }),
-                    id: chat.id,
-                }
-            })
-            .collect();
-        // State sections stay flat above the organization, so only the rest
-        // rows carry a device group.
-        let mut flat: Vec<String> = Vec::new();
-        let mut rest = Vec::new();
-        for row in order_sidebar_sections(rows, |row| row.section) {
-            if row.section == SidebarSection::Rest {
-                rest.push(row);
-            } else {
-                flat.push(row.id);
-            }
-        }
-        if !by_device {
-            flat.extend(rest.into_iter().map(|row| row.id));
-            return flat;
-        }
-        let mut groups: Vec<(Option<(String, String)>, Vec<VisibleChat>)> = Vec::new();
-        for row in rest {
-            let key = row.group.clone();
-            if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
-                existing.push(row);
-            } else {
-                groups.push((key, vec![row]));
-            }
-        }
-        promote_local_device_group(&mut groups, state.local_device_id.as_deref());
-        flat.extend(
-            groups
-                .into_iter()
-                .flat_map(|(_, rows)| rows)
-                .map(|row| row.id),
-        );
-        flat
+        project_sidebar(
+            sidebar_rows(state, &self.settings, Utc::now()),
+            self.settings.sidebar_organization,
+            state.local_device_id.as_deref(),
+        )
+    }
+
+    /// Flat top-to-bottom chat ids exactly as [`Self::render_active_rows`]
+    /// draws them: the flattened [`Self::sidebar_projection`], so the jump
+    /// shortcuts and session cycling read the drawn order (not the raw recency
+    /// list) and keyboard order can never drift from the screen.
+    pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
+        self.sidebar_projection(cx).visible_chat_ids()
     }
 
     /// The sidebar's Sessions list: every session (idle included) of the
-    /// filter space — or all spaces under "All" — attention-sorted. Rows are
-    /// keyed for the FLIP resort glide.
+    /// filter space - or all spaces under "All" - attention-sorted. Rows are
+    /// keyed for the FLIP resort glide. Draws [`Self::sidebar_projection`]
+    /// entry for entry, so the jump chips and the drawn rows share one order.
     pub(super) fn render_active_rows(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
-        let filter = self.settings.space_filter.clone();
-        let mut rows: Vec<ActiveChatRow> = {
+        let projection = {
             let state = self.state.read(cx);
-            let mut chats: Vec<_> = state
-                .sidebar_chats(now, filter.as_deref())
-                .into_iter()
-                .map(|(status, chat)| (status, chat.clone()))
-                .collect();
-            chats.sort_by(|left, right| {
-                compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
-            });
-            chats
-                .into_iter()
-                .map(|(status, chat)| {
-                    // Line 2 is "project:branch" + " · device" for a remote
-                    // session; project-less sessions read as their home-dir
-                    // cwd `~`.
-                    let space = state.space_for_chat(&chat);
-                    let project = match (space, chat.space_id.as_deref()) {
-                        (Some(space), _) => space.display_name().to_string(),
-                        (None, None) => "~".to_string(),
-                        (None, Some(_)) => "?".to_string(),
-                    };
-                    let local_device_id = state.local_device_id.as_deref();
-                    let remote_device = (local_device_id != Some(chat.device_id.as_str()))
-                        .then(|| state.device_name(&chat.device_id))
-                        .flatten()
-                        .map(str::to_string);
-                    // The branch shows whenever the engine has stamped one —
-                    // main-checkout sessions included, not just worktrees.
-                    let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
-                        .map(str::trim)
-                        .filter(|b| !b.is_empty())
-                        .map(str::to_string);
-                    let change_request = state.change_request_for_chat(&chat).cloned();
-                    let group = match self.settings.sidebar_organization {
-                        SidebarOrganization::ByDevice => Some((
-                            chat.device_id.clone(),
-                            space
-                                .filter(|space| space.device_id == chat.device_id)
-                                .map(|space| space.id.clone())
-                                .unwrap_or_default(),
-                        )),
-                        SidebarOrganization::ByProject | SidebarOrganization::InOneList => None,
-                    };
-                    // Send truth decides the section: an undelivered send
-                    // needs you, a queued one is running.
-                    let undelivered = state.send_undelivered(&chat.id, now);
-                    let queued = state.send_queued(&chat.id, now);
-                    ActiveChatRow {
-                        status,
-                        chat: chat.clone(),
-                        project,
-                        branch,
-                        remote_device,
-                        change_request,
-                        group,
-                        section: sidebar_section(status, queued, undelivered),
-                    }
-                })
-                .collect()
+            project_sidebar(
+                sidebar_rows(state, &self.settings, now),
+                self.settings.sidebar_organization,
+                state.local_device_id.as_deref(),
+            )
         };
-        if !self.settings.sidebar_show_branch {
-            for row in &mut rows {
-                row.branch = None;
-            }
-        }
-        if !self.settings.sidebar_show_pull_request {
-            for row in &mut rows {
-                row.change_request = None;
-            }
-        }
-
-        // State sections float above the chosen organization: needs-you and
-        // running always come first, flat and non-collapsible; everything
-        // else keeps the user's organization (and InOneList gains a "Recent"
-        // header only when a section above it is non-empty).
-        let mut needs: Vec<ActiveChatRow> = Vec::new();
-        let mut running: Vec<ActiveChatRow> = Vec::new();
-        let mut rest: Vec<ActiveChatRow> = Vec::new();
-        for row in order_sidebar_sections(rows, |row| row.section) {
-            match row.section {
-                SidebarSection::NeedsYou => needs.push(row),
-                SidebarSection::Running => running.push(row),
-                SidebarSection::Rest => rest.push(row),
-            }
-        }
-
-        let mut groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = Vec::new();
-        let has_rest = !rest.is_empty();
-        for row in rest {
-            if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &row.group) {
-                existing.push(row);
-            } else {
-                groups.push((row.group.clone(), vec![row]));
-            }
-        }
-        if self.settings.sidebar_organization == SidebarOrganization::ByDevice {
-            let local_device_id = self.state.read(cx).local_device_id.clone();
-            promote_local_device_group(&mut groups, local_device_id.as_deref());
-        }
 
         let selected = self.state.read(cx).selected_chat.clone();
         // Re-checked at render so the chips drop the FRAME a popover opens,
-        // not on the next modifier event — the jumps are suppressed under it.
+        // not on the next modifier event - the jumps are suppressed under it.
         let jump_hints = self.jump_hints && !self.overlay_owns_keyboard(cx);
         let keymap = self.settings.keymap.clone();
-        // Flat top-to-bottom slot across sections and groups: the same order
+        // Flat top-to-bottom slot across headings and groups: the same order
         // `sidebar_visible_order` hands the jump shortcuts and cycling, so a
         // chip always names the key that opens its row.
         let mut slot = 0usize;
         let mut rendered = Vec::new();
-        for (key, label, dot, rows) in [
-            (
-                "s:needs",
-                "Needs you",
-                SessionState::AwaitingInput.color(theme),
-                needs,
-            ),
-            (
-                "s:running",
-                "Running",
-                SessionState::Working.color(theme),
-                running,
-            ),
-        ] {
-            if rows.is_empty() {
-                continue;
-            }
-            rendered.push((
-                key.to_string(),
-                SIDEBAR_SECTION_HEADER_HEIGHT,
-                sidebar_section_header(label, dot, theme),
-            ));
-            for row in rows {
-                rendered.push(self.render_active_chat_row(
-                    row,
-                    now,
-                    slot,
-                    jump_hints,
-                    &keymap,
-                    selected.as_deref(),
-                    theme,
-                    cx,
-                ));
-                slot += 1;
-            }
-        }
-        // The rest keeps the chosen organization. Only InOneList needs a
-        // header to separate it from the sections above, and only when one of
-        // them is on screen AND there are rows to head.
-        if self.settings.sidebar_organization == SidebarOrganization::InOneList
-            && has_rest
-            && !rendered.is_empty()
-        {
-            rendered.push((
-                "s:recent".to_string(),
-                SIDEBAR_SECTION_HEADER_HEIGHT,
-                sidebar_section_header("Recent", None, theme),
-            ));
-        }
-        for (group, rows) in groups {
-            let mut rendered_rows = Vec::with_capacity(rows.len());
-            for row in rows {
-                rendered_rows.push(self.render_active_chat_row(
-                    row,
-                    now,
-                    slot,
-                    jump_hints,
-                    &keymap,
-                    selected.as_deref(),
-                    theme,
-                    cx,
-                ));
-                slot += 1;
-            }
-
-            let Some((device_id, space_id)) = group else {
-                rendered.extend(rendered_rows);
-                continue;
-            };
-            let (label, device_label, target_space) = {
-                let state = self.state.read(cx);
-                let device_label = state.device_name(&device_id).map(str::to_string);
-                match state
-                    .space_row(&space_id)
-                    .filter(|space| space.device_id == device_id)
-                {
-                    Some(space) => (
-                        space.display_name().to_string(),
-                        device_label,
-                        Some(space.id.clone()),
-                    ),
-                    None => (
-                        device_label.unwrap_or_else(|| "Unknown device".to_string()),
-                        None,
-                        None,
-                    ),
+        for entry in projection.entries {
+            match entry {
+                SidebarEntry::Heading(section) => {
+                    let (key, label, dot) = match section {
+                        SidebarSection::NeedsYou => (
+                            "s:needs",
+                            "Needs you",
+                            SessionState::AwaitingInput.color(theme),
+                        ),
+                        SidebarSection::Running => {
+                            ("s:running", "Running", SessionState::Working.color(theme))
+                        }
+                        // The InOneList "Recent" divider; no state dot.
+                        SidebarSection::Rest => ("s:recent", "Recent", None),
+                    };
+                    rendered.push((
+                        key.to_string(),
+                        SIDEBAR_SECTION_HEADER_HEIGHT,
+                        sidebar_section_header(label, dot, theme),
+                    ));
                 }
-            };
-            let organization = match self.settings.sidebar_organization {
-                SidebarOrganization::ByDevice => "device",
-                SidebarOrganization::ByProject | SidebarOrganization::InOneList => "list",
-            };
-            let collapse_key = format!("{organization}:{device_id}:{space_id}");
-            let motion_key = format!("group:{collapse_key}");
-            let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
-            let row_count = rendered_rows.len();
-            let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
-                + rendered_rows
-                    .iter()
-                    .map(|(_, height, _)| *height)
-                    .sum::<f32>()
-                + SIDEBAR_LIST_GAP * row_count.saturating_sub(1) as f32;
-            let body = div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
-                .gap(px(SIDEBAR_LIST_GAP))
-                .children(rendered_rows.into_iter().map(|(_, _, row)| row));
-            let label = if collapsed {
-                format!("{label} ({row_count})")
-            } else {
-                label
-            };
-            let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
-            let toggle_key = collapse_key.clone();
-            let toggle_motion_key = motion_key.clone();
-            let group_name = SharedString::from(format!("sidebar-group-hover-{collapse_key}"));
-            let header = div()
-                .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
-                .group(group_name.clone())
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .h(px(SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
-                .px(px(Theme::SPACE_SM))
-                .rounded(px(8.0))
-                .cursor_pointer()
-                .hover(|el| el.bg(theme.glass_hover()))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
-                    this.begin_sidebar_disclosure_motion(
-                        &toggle_motion_key,
-                        if was_open { body_height } else { 0.0 },
-                        if was_open { 0.0 } else { body_height },
-                    );
-                    if was_open {
-                        this.sidebar_collapsed_groups.insert(toggle_key.clone());
-                    } else {
-                        this.sidebar_collapsed_groups.remove(&toggle_key);
+                SidebarEntry::Row(row) => {
+                    rendered.push(self.render_active_chat_row(
+                        *row,
+                        now,
+                        slot,
+                        jump_hints,
+                        &keymap,
+                        selected.as_deref(),
+                        theme,
+                        cx,
+                    ));
+                    slot += 1;
+                }
+                SidebarEntry::Group {
+                    device_id,
+                    space_id,
+                    rows,
+                } => {
+                    let mut rendered_rows = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        rendered_rows.push(self.render_active_chat_row(
+                            row,
+                            now,
+                            slot,
+                            jump_hints,
+                            &keymap,
+                            selected.as_deref(),
+                            theme,
+                            cx,
+                        ));
+                        slot += 1;
                     }
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .flex_none()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text_muted)
-                        .child(label),
-                )
-                .when_some(device_label, |el, device_label| {
-                    el.child(
+
+                    let (label, device_label, target_space) = {
+                        let state = self.state.read(cx);
+                        let device_label = state.device_name(&device_id).map(str::to_string);
+                        match state
+                            .space_row(&space_id)
+                            .filter(|space| space.device_id == device_id)
+                        {
+                            Some(space) => (
+                                space.display_name().to_string(),
+                                device_label,
+                                Some(space.id.clone()),
+                            ),
+                            None => (
+                                device_label.unwrap_or_else(|| "Unknown device".to_string()),
+                                None,
+                                None,
+                            ),
+                        }
+                    };
+                    // Groups only exist under ByDevice, so the collapse key is
+                    // always device-scoped.
+                    let collapse_key = format!("device:{device_id}:{space_id}");
+                    let motion_key = format!("group:{collapse_key}");
+                    // A group with no settled rows has nothing to disclose: its
+                    // header stays for the scoped "+", but it draws no chevron,
+                    // no toggle, and no body inset (so the section boundary
+                    // below it stays the ordinary 12px gap).
+                    let is_empty = rendered_rows.is_empty();
+                    let collapsed =
+                        !is_empty && self.sidebar_collapsed_groups.contains(&collapse_key);
+                    let row_count = rendered_rows.len();
+                    let body_height = SIDEBAR_DISCLOSURE_BODY_INSET
+                        + rendered_rows
+                            .iter()
+                            .map(|(_, height, _)| *height)
+                            .sum::<f32>()
+                        + SIDEBAR_LIST_GAP * row_count.saturating_sub(1) as f32;
+                    let label = if collapsed {
+                        format!("{label} ({row_count})")
+                    } else {
+                        label
+                    };
+                    let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
+                    let toggle_key = collapse_key.clone();
+                    let toggle_motion_key = motion_key.clone();
+                    let group_name =
+                        SharedString::from(format!("sidebar-group-hover-{collapse_key}"));
+                    let header = div()
+                        .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
+                        .group(group_name.clone())
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .h(px(SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
+                        .px(px(Theme::SPACE_SM))
+                        .rounded(px(8.0))
+                        .hover(|el| el.bg(theme.glass_hover()))
+                        .when(!is_empty, |el| {
+                            el.cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let was_open =
+                                        !this.sidebar_collapsed_groups.contains(&toggle_key);
+                                    this.begin_sidebar_disclosure_motion(
+                                        &toggle_motion_key,
+                                        if was_open { body_height } else { 0.0 },
+                                        if was_open { 0.0 } else { body_height },
+                                    );
+                                    if was_open {
+                                        this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                                    } else {
+                                        this.sidebar_collapsed_groups.remove(&toggle_key);
+                                    }
+                                    cx.notify();
+                                }))
+                        })
+                        .child(
+                            div()
+                                .flex_none()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text_muted)
+                                .child(label),
+                        )
+                        .when_some(device_label, |el, device_label| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .text_color(theme.text_faint.opacity(0.7))
+                                    .child(device_label),
+                            )
+                        })
+                        .when(!is_empty, |el| el.child(chevron))
+                        .child(div().flex_1())
+                        .when_some(target_space, |el, space_id| {
+                            let button_id = format!("sidebar-group-new-session-{space_id}");
+                            el.child(
+                                div()
+                                    .id(SharedString::from(button_id))
+                                    .size(px(20.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .role(gpui::Role::Button)
+                                    .aria_label("New session in project")
+                                    .opacity(0.0)
+                                    .group_hover(group_name.clone(), |el| el.opacity(1.0))
+                                    .hover(|el| el.bg(theme.glass_hover()))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_new_session_in_space(space_id.clone(), cx);
+                                    }))
+                                    .child(
+                                        icon(icons::PLUS)
+                                            .size(px(12.0))
+                                            .text_color(theme.text_muted),
+                                    ),
+                            )
+                        });
+                    let element = if is_empty {
                         div()
-                            .flex_none()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(12.0))
-                            .text_color(theme.text_faint.opacity(0.7))
-                            .child(device_label),
-                    )
-                })
-                .child(chevron)
-                .child(div().flex_1())
-                .when_some(target_space, |el, space_id| {
-                    let button_id = format!("sidebar-group-new-session-{space_id}");
-                    el.child(
-                        div()
-                            .id(SharedString::from(button_id))
-                            .size(px(20.0))
-                            .flex_none()
+                            .w_full()
                             .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(5.0))
-                            .cursor_pointer()
-                            .role(gpui::Role::Button)
-                            .aria_label("New session in project")
-                            .opacity(0.0)
-                            .group_hover(group_name.clone(), |el| el.opacity(1.0))
-                            .hover(|el| el.bg(theme.glass_hover()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.open_new_session_in_space(space_id.clone(), cx);
-                            }))
-                            .child(icon(icons::PLUS).size(px(12.0)).text_color(theme.text_muted)),
-                    )
-                });
-            let body = self.render_sidebar_disclosure_body(
-                &motion_key,
-                !collapsed,
-                body_height,
-                body.into_any_element(),
-            );
-            let height =
-                SIDEBAR_DISCLOSURE_SECTION_HEIGHT + if collapsed { 0.0 } else { body_height };
-            let element = div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .pt(px(SIDEBAR_SECTION_GAP))
-                .child(header)
-                .child(body)
-                .into_any_element();
-            rendered.push((format!("g:{collapse_key}"), height, element));
+                            .flex_col()
+                            .pt(px(SIDEBAR_SECTION_GAP))
+                            .child(header)
+                            .into_any_element()
+                    } else {
+                        let body = div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
+                            .gap(px(SIDEBAR_LIST_GAP))
+                            .children(rendered_rows.into_iter().map(|(_, _, row)| row));
+                        let body = self.render_sidebar_disclosure_body(
+                            &motion_key,
+                            !collapsed,
+                            body_height,
+                            body.into_any_element(),
+                        );
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .pt(px(SIDEBAR_SECTION_GAP))
+                            .child(header)
+                            .child(body)
+                            .into_any_element()
+                    };
+                    let height = SIDEBAR_DISCLOSURE_SECTION_HEIGHT
+                        + if is_empty || collapsed {
+                            0.0
+                        } else {
+                            body_height
+                        };
+                    rendered.push((format!("g:{collapse_key}"), height, element));
+                }
+            }
         }
         rendered
     }
@@ -3331,8 +3392,12 @@ impl Shell {
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
-    use super::{compare_sidebar_chats, promote_local_device_group};
-    use crate::settings::SidebarSort;
+    use super::{
+        ActiveChatRow, SidebarEntry, SidebarSection, compare_sidebar_chats, project_sidebar,
+        promote_local_device_group,
+    };
+    use crate::settings::{SidebarOrganization, SidebarSort};
+    use zeron_proto::ChatIndicator;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
         (Some((device.into(), device.into())), vec![value])
@@ -3393,6 +3458,63 @@ mod tests {
         promote_local_device_group(&mut groups, Some("not-present"));
 
         assert_eq!(groups, before);
+    }
+
+    fn active_row(id: &str, device: &str, space: &str, section: SidebarSection) -> ActiveChatRow {
+        ActiveChatRow {
+            status: ChatIndicator::Working,
+            chat: zeron_proto::Chat {
+                id: id.into(),
+                device_id: device.into(),
+                space_id: Some(space.into()),
+                ..chat(id)
+            },
+            project: space.into(),
+            branch: None,
+            remote_device: None,
+            change_request: None,
+            group: Some((device.into(), space.into())),
+            section,
+        }
+    }
+
+    #[test]
+    fn active_only_project_keeps_its_device_group_header() {
+        // A project whose sessions all sit in "Running" loses its rows to the
+        // state section, but its ByDevice header must stay so the scoped "New
+        // session" action survives.
+        let projection = project_sidebar(
+            vec![
+                active_row("a", "device", "alpha", SidebarSection::Running),
+                active_row("b", "device", "beta", SidebarSection::Rest),
+            ],
+            SidebarOrganization::ByDevice,
+            Some("device"),
+        );
+
+        assert!(matches!(
+            &projection.entries[0],
+            SidebarEntry::Heading(SidebarSection::Running)
+        ));
+        assert!(matches!(
+            &projection.entries[1],
+            SidebarEntry::Row(row) if row.chat.id == "a"
+        ));
+        let lifted = match &projection.entries[2] {
+            SidebarEntry::Group { space_id, rows, .. } => (space_id.as_str(), rows.len()),
+            _ => panic!("the lifted project must keep its group header"),
+        };
+        assert_eq!(lifted, ("alpha", 0));
+        let settled = match &projection.entries[3] {
+            SidebarEntry::Group { space_id, rows, .. } => (space_id.as_str(), rows.len()),
+            _ => panic!("the settled project must keep its group"),
+        };
+        assert_eq!(settled, ("beta", 1));
+        // One projection: the flattened keyboard order is the drawn order.
+        assert_eq!(
+            projection.visible_chat_ids(),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
     }
 }
 
