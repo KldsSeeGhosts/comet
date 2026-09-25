@@ -18,7 +18,7 @@ mod browser_agent;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable as _,
     IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
@@ -1798,7 +1798,8 @@ pub struct Shell {
     /// Clears the jump hints when the window deactivates: a Cmd+Tab away
     /// swallows the key-up, so without this the chips stay on screen for good.
     activation_sub: Option<Subscription>,
-    /// 1s heartbeat re-rendering the working indicator (elapsed + flavour word).
+    /// Deadline-driven chrome heartbeat re-rendering time-derived values
+    /// (elapsed clocks, relative times, pending-send grace, presence).
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
@@ -1877,37 +1878,37 @@ impl Shell {
         let composer_events = Self::dock_composer_events(&composer, transcript.clone(), cx);
         // Spawn chips open their subagent's transcript as a right-pane tab.
         let transcript_events = cx.subscribe(&transcript, Self::on_transcript_event);
-        // Working-indicator heartbeat: notify once a second while a session is
-        // live so elapsed time and the flavour word stay fresh.
+        // Time-derived chrome heartbeat: sleep toward the next visible value
+        // change (`AppState::next_display_refresh`) and redraw then, instead
+        // of re-rendering every second or waiting for the next wall minute.
+        // The sleep never exceeds a second, so a state change that starts a
+        // new clock or pending send folds into the next deadline promptly.
         let ticker = cx.spawn(async move |this, cx| {
-            let mut displayed_minute = Utc::now().timestamp().div_euclid(60);
+            // Never tighter than a quarter second (a deadline can land
+            // arbitrarily close to a wake), never looser than a second.
+            const MIN_SLEEP_MS: i64 = 250;
+            const MAX_SLEEP_MS: i64 = 1_000;
+            // `None` until the first wake arms it: the shell entity cannot be
+            // read before `new` has returned.
+            let mut deadline: Option<DateTime<Utc>> = None;
             loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                let minute = Utc::now().timestamp().div_euclid(60);
-                let minute_changed = minute != displayed_minute;
-                displayed_minute = minute;
-                let alive = this.update(cx, |shell: &mut Shell, cx| {
-                    let live = {
-                        let s = shell.state.read(cx);
-                        s.selected_chat
-                            .as_deref()
-                            .is_some_and(|id| s.indicator_for(id, Utc::now()) != Indicator::None)
-                            // The connection pill's retry countdown needs the
-                            // same per-second refresh while degraded.
-                            || matches!(
-                                s.connectivity.state,
-                                zeron_proto::ConnectivityState::Offline
-                                    | zeron_proto::ConnectivityState::Reconnecting
-                            )
-                    };
-                    // Relative sidebar times still advance when unchanged
-                    // presence heartbeats no longer invalidate the whole UI.
-                    if live || minute_changed {
+                let wait_ms = deadline
+                    .map(|deadline| (deadline - Utc::now()).num_milliseconds())
+                    .unwrap_or(MAX_SLEEP_MS)
+                    .clamp(MIN_SLEEP_MS, MAX_SLEEP_MS);
+                cx.background_executor()
+                    .timer(Duration::from_millis(wait_ms as u64))
+                    .await;
+                let due = deadline.is_some_and(|deadline| Utc::now() >= deadline);
+                let updated = this.update(cx, |shell: &mut Shell, cx| {
+                    if due {
                         cx.notify();
                     }
+                    shell.state.read(cx).next_display_refresh(Utc::now())
                 });
-                if alive.is_err() {
-                    break;
+                match updated {
+                    Ok(next) => deadline = Some(next),
+                    Err(_) => break,
                 }
             }
         });

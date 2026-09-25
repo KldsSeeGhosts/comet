@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
@@ -857,6 +857,29 @@ impl gpui::EventEmitter<TranscriptTextChanged> for AppState {}
 fn is_text_append(frame: &TranscriptFrame) -> bool {
     matches!(frame, TranscriptFrame::Delta { upsert, append, remove, .. }
         if upsert.is_empty() && remove.is_empty() && !append.is_empty())
+}
+
+/// The next wall-clock minute boundary: the coarse tick relative timestamps
+/// ([`format_time_ago`]) and anything not enumerated in
+/// [`AppState::next_display_refresh`] ride on. Pure.
+fn next_minute_boundary(now: DateTime<Utc>) -> DateTime<Utc> {
+    let second = now.timestamp().rem_euclid(60);
+    now + TimeDelta::seconds(60 - second)
+}
+
+/// The instant the Working elapsed label for a turn started at `started` next
+/// changes: every second under a minute, then every whole minute
+/// (`crate::shell::format_working_elapsed`'s granularity - keep in step).
+/// Always strictly after `now`, because the label at `now` derives from whole
+/// elapsed seconds. Pure.
+fn next_elapsed_label_change(started: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    let elapsed = now.signed_duration_since(started).num_seconds().max(0);
+    let next = if elapsed < 60 {
+        elapsed + 1
+    } else {
+        (elapsed / 60 + 1) * 60
+    };
+    started + TimeDelta::seconds(next)
 }
 
 impl Default for AppState {
@@ -1876,6 +1899,93 @@ impl AppState {
             return Indicator::Working;
         }
         effective_indicator(self.session_for(chat_id), now)
+    }
+
+    /// The next instant at which a time-derived display value changes, so the
+    /// shell's chrome heartbeat can redraw exactly when something on screen
+    /// moves instead of every second. The soonest of:
+    ///
+    /// - the next wall-clock minute boundary: the coarse refresh relative
+    ///   timestamps ride on, and the backstop for the surfaces this list does
+    ///   not enumerate (settings' last-seen, the palette);
+    /// - each live session's staleness deadline ([`SESSION_STALE_MS`]), when
+    ///   Working/AwaitingInput retires to its settled state;
+    /// - each pending send's grace deadline ([`UNDELIVERED_GRACE_MS`]), when
+    ///   it flips to the explicit failed state;
+    /// - each device's presence deadline, when it drops offline (the Queued
+    ///   send badge and the space tag's disconnected glyph read it);
+    /// - each row that resolves to Working: its elapsed label's next change;
+    /// - `now + 1s` while the selected chat has a live indicator or the
+    ///   connection is degraded (the transcript trailer's timer and flavour
+    ///   word, the connection pill's retry countdown).
+    ///
+    /// Always strictly after `now`: callers keep the instant they last slept
+    /// toward and notify once it has passed, so a deadline that lapsed while
+    /// the heartbeat was asleep still redraws exactly once.
+    pub fn next_display_refresh(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        use zeron_proto::ConnectivityState as S;
+        let mut next = next_minute_boundary(now);
+        // A deadline already past is a change the caller owes a redraw for,
+        // not an instant to re-arm on.
+        let mut arm = |deadline: DateTime<Utc>| {
+            if deadline > now {
+                next = next.min(deadline);
+            }
+        };
+        for session in &self.sessions {
+            // Only a live session has a deadline left; a stale one already
+            // reads as settled.
+            if effective_indicator(Some(session), now) != Indicator::None {
+                arm(session.updated_at + TimeDelta::milliseconds(SESSION_STALE_MS + 1));
+            }
+        }
+        for pending in self.pending_sends.values() {
+            arm(pending.started + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1));
+        }
+        for device in &self.devices {
+            if let Some(last_seen) = device.last_seen_at {
+                // Presence counts whole seconds, so the dot expires on the
+                // second after the window.
+                arm(last_seen
+                    + TimeDelta::seconds(crate::settings::devices::DEVICE_ONLINE_WINDOW_SECS + 1));
+            }
+        }
+        for chat in self
+            .visible_chats()
+            .filter(|c| match c.space_id.as_deref() {
+                // The row set the sidebar draws: project-less chats always, plus
+                // chats whose space still exists.
+                None => true,
+                Some(id) => self.space_row(id).is_some(),
+            })
+        {
+            // The elapsed clock rides the row's resolved state, where send
+            // truth beats the engine's indicator (`render_chat_row`).
+            if self.send_queued(&chat.id, now) || self.send_undelivered(&chat.id, now) {
+                continue;
+            }
+            if self.display_status_for(chat, now) != ChatIndicator::Working {
+                continue;
+            }
+            let started = self
+                .session_for(&chat.id)
+                .and_then(|row| row.started_at)
+                .into_iter()
+                .chain(self.pending_send_started(&chat.id, now))
+                .max();
+            if let Some(started) = started {
+                arm(next_elapsed_label_change(started, now));
+            }
+        }
+        let live_selected = self
+            .selected_chat
+            .as_deref()
+            .is_some_and(|id| self.indicator_for(id, now) != Indicator::None);
+        let degraded = matches!(self.connectivity.state, S::Offline | S::Reconnecting);
+        if live_selected || degraded {
+            next = next.min(now + TimeDelta::seconds(1));
+        }
+        next
     }
 
     pub fn selected_chat_row(&self) -> Option<&Chat> {
@@ -4214,6 +4324,70 @@ mod tests {
         );
         assert_eq!(s.indicator_for("c", later), Indicator::None);
         assert!(s.send_undelivered("c", later));
+    }
+
+    #[test]
+    fn elapsed_label_deadline_lands_on_the_next_visible_tick() {
+        let now = Utc::now();
+        for elapsed in [
+            0_i64, 1, 30, 58, 59, 60, 61, 119, 3_599, 3_600, 3_661, 90_000,
+        ] {
+            let started = now - TimeDelta::seconds(elapsed);
+            let deadline = next_elapsed_label_change(started, now);
+            assert!(deadline > now, "elapsed {elapsed} must arm a future wake");
+            // The label really does change at the deadline and not a second
+            // before it - the heartbeat's whole contract.
+            let at = (deadline - started).num_seconds();
+            assert_ne!(
+                crate::shell::format_working_elapsed(at - 1),
+                crate::shell::format_working_elapsed(at),
+                "elapsed {elapsed} must change at {at}s"
+            );
+        }
+    }
+
+    #[test]
+    fn display_refresh_arms_the_soonest_visible_deadline() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.chats = vec![chat("c", 0, None)];
+        state.begin_pending_send("c", "m1", now);
+        // A fresh send reads as Working: its clock ticks every second.
+        assert_eq!(state.next_display_refresh(now), now + TimeDelta::seconds(1));
+        // Off the sidebar (no chat row) the grace deadline is the next
+        // change: the explicit failed flip one millisecond past the window.
+        // Probe on a wall-minute boundary so the next minute is a known 60s
+        // away and the grace is unambiguously sooner.
+        let probe = next_minute_boundary(now);
+        let mut off_screen = AppState::new();
+        off_screen.begin_pending_send("c", "m1", probe - TimeDelta::seconds(119));
+        assert_eq!(
+            off_screen.next_display_refresh(probe),
+            probe + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1 - 119_000)
+        );
+        // Past the grace the send is failed, not working: nothing arms but
+        // the minute boundary relative timestamps advance on.
+        let failed_at = probe + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 2 - 119_000);
+        assert!(off_screen.send_undelivered("c", failed_at));
+        assert_eq!(
+            off_screen.next_display_refresh(failed_at),
+            next_minute_boundary(failed_at)
+        );
+        // A live session retires to its settled state when the host stops
+        // heartbeating (`SESSION_STALE_MS`), not on the next minute.
+        state.chats.clear();
+        state.sessions = vec![Session {
+            last_completed_turn: None,
+            chat_id: "c".into(),
+            device_id: "host".into(),
+            status: SessionStatus::Working,
+            started_at: Some(probe - TimeDelta::seconds(30)),
+            updated_at: probe - TimeDelta::seconds(30),
+        }];
+        assert_eq!(
+            state.next_display_refresh(probe),
+            probe + TimeDelta::milliseconds(SESSION_STALE_MS + 1 - 30_000)
+        );
     }
 
     #[test]
