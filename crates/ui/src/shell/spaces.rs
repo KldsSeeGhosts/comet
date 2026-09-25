@@ -227,19 +227,31 @@ fn project_sidebar(
     let mut needs: Vec<ActiveChatRow> = Vec::new();
     let mut running: Vec<ActiveChatRow> = Vec::new();
     let mut rest: Vec<ActiveChatRow> = Vec::new();
-    // Group order follows the first row of each (device, project) in draw
-    // order, so a project whose rows were all lifted still keeps its header in
-    // the slot its top session occupied.
-    let mut group_keys: Vec<(String, String)> = Vec::new();
+    // Rank each (device, project) by its first settled row in the user's sort -
+    // the order before the section partition - so a session lifted into a
+    // state section never re-ranks the projects below it. A group whose rows
+    // all floated up has no settled row to rank by and falls back to its first
+    // row overall, keeping its header (and its scoped "New session" action)
+    // near where its sessions draw.
+    let mut first_row: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    let mut first_settled: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        let Some(key) = &row.group else { continue };
+        first_row.entry(key.clone()).or_insert(index);
+        if row.section == SidebarSection::Rest {
+            first_settled.entry(key.clone()).or_insert(index);
+        }
+    }
+    let mut group_keys: Vec<(String, String)> = first_row.keys().cloned().collect();
+    group_keys.sort_by_key(|key| first_settled.get(key).copied().unwrap_or(first_row[key]));
     let mut group_index: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
+    for (index, key) in group_keys.iter().enumerate() {
+        group_index.insert(key.clone(), index);
+    }
     for row in order_sidebar_sections(rows, |row| row.section) {
-        if let Some(key) = &row.group
-            && !group_index.contains_key(key)
-        {
-            group_index.insert(key.clone(), group_keys.len());
-            group_keys.push(key.clone());
-        }
         match row.section {
             SidebarSection::NeedsYou => needs.push(row),
             SidebarSection::Running => running.push(row),
@@ -3474,7 +3486,7 @@ mod tests {
                 space_id: Some(space.into()),
                 ..chat(id)
             },
-            badge: super::ProjectIconRequest::monogram_only(id, space),
+            badge: super::ProjectIconRequest::monogram_fallback(id, space),
             project: space.into(),
             branch: None,
             remote_device: None,
@@ -3521,6 +3533,62 @@ mod tests {
             projection.visible_chat_ids(),
             vec!["a".to_owned(), "b".to_owned()]
         );
+    }
+
+    #[test]
+    fn device_group_order_follows_settled_recency_not_section_order() {
+        // The user's sort, before section partitioning: A's newest session is
+        // working, so A's first settled row (a2) is older than B's (b1). The
+        // Running lift must not re-rank the groups - B still draws above A.
+        let projection = project_sidebar(
+            vec![
+                active_row("a1", "device", "alpha", SidebarSection::Running),
+                active_row("b1", "device", "beta", SidebarSection::Rest),
+                active_row("a2", "device", "alpha", SidebarSection::Rest),
+            ],
+            SidebarOrganization::ByDevice,
+            Some("device"),
+        );
+
+        assert!(matches!(
+            &projection.entries[0],
+            SidebarEntry::Heading(SidebarSection::Running)
+        ));
+        assert!(matches!(
+            &projection.entries[1],
+            SidebarEntry::Row(row) if row.chat.id == "a1"
+        ));
+        let beta = match &projection.entries[2] {
+            SidebarEntry::Group { space_id, rows, .. } => (space_id.as_str(), rows.len()),
+            _ => panic!("the older settled project draws first"),
+        };
+        assert_eq!(beta, ("beta", 1));
+        let alpha = match &projection.entries[3] {
+            SidebarEntry::Group { space_id, rows, .. } => (space_id.as_str(), rows.len()),
+            _ => panic!("alpha follows its first settled row, not a1"),
+        };
+        assert_eq!(alpha, ("alpha", 1));
+
+        // A project with no settled rows ranks by its first row overall, so a
+        // header whose sessions all floated up keeps its recency slot.
+        let projection = project_sidebar(
+            vec![
+                active_row("c1", "device", "gamma", SidebarSection::Running),
+                active_row("b1", "device", "beta", SidebarSection::Rest),
+            ],
+            SidebarOrganization::ByDevice,
+            Some("device"),
+        );
+        let header_only = match &projection.entries[2] {
+            SidebarEntry::Group { space_id, rows, .. } => (space_id.as_str(), rows.len()),
+            _ => panic!("an all-lifted project keeps its header"),
+        };
+        assert_eq!(header_only, ("gamma", 0));
+        let beta = match &projection.entries[3] {
+            SidebarEntry::Group { space_id, .. } => space_id.as_str(),
+            _ => panic!("beta is settled"),
+        };
+        assert_eq!(beta, "beta");
     }
 }
 

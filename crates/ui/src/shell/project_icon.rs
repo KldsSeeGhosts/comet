@@ -367,13 +367,15 @@ pub(super) struct ProjectIconRequest {
 }
 
 impl ProjectIconRequest {
-    /// A monogram-only request for tests that build sidebar rows by hand.
-    #[cfg(test)]
-    pub(super) fn monogram_only(chat_id: &str, name: &str) -> Self {
+    /// A monogram-only request for a session whose chat cannot be resolved
+    /// (a pane binding can briefly precede its chat) and for tests that build
+    /// sidebar rows by hand. The seed lowercases the name so the project-less
+    /// fallback tone matches the sidebar's `Home`.
+    pub(super) fn monogram_fallback(chat_id: &str, name: &str) -> Self {
         Self {
             chat_id: chat_id.into(),
             name: name.into(),
-            seed: name.into(),
+            seed: name.to_lowercase(),
             device: "Unknown device".into(),
             context: None,
             source: ProjectIconSource::WorkspaceRpc,
