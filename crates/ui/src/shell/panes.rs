@@ -179,8 +179,15 @@ impl Shell {
             .filter_map(|(pane, session)| {
                 let chat_id = session?;
                 let state = self.state.read(cx);
-                let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
-                let badge = ProjectIconRequest::resolve(state, chat, state.space_for_chat(chat));
+                let badge = match state.chats.iter().find(|chat| chat.id == chat_id) {
+                    Some(chat) => {
+                        ProjectIconRequest::resolve(state, chat, state.space_for_chat(chat))
+                    }
+                    // A pane can be bound before its chat lands (the prune
+                    // pass that clears dead sessions runs after); the monogram
+                    // keeps the header's badge slot from collapsing.
+                    None => ProjectIconRequest::monogram_fallback(&chat_id, "Home"),
+                };
                 Some((pane, self.render_project_icon(badge, 14.0, false, cx)))
             })
             .collect();
