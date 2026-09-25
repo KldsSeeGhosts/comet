@@ -22,7 +22,7 @@ use crate::pane::render::{
     OUTLET_PAD_PX, OUTLET_TOP_PAD_PX, PaneSnap, ViewSnap, WorkspaceSnap, workspace_outlet,
 };
 use crate::pane::{
-    DIVIDER_HIT_PX, DividerTarget, DragSplitState, EQUALIZE_RATIO, PaneChatSurface, ToolKind,
+    DIVIDER_SEAM_PX, DividerTarget, DragSplitState, EQUALIZE_RATIO, PaneChatSurface, ToolKind,
     ratio_from_pointer,
 };
 use crate::state::ChatTarget;
@@ -133,7 +133,7 @@ impl Shell {
     }
 
     /// The workspace tree as the chat outlet. Every Chat-mode pane in the
-    /// layout owns a live transcript+composer pair bound to its session - 
+    /// layout owns a live transcript+composer pair bound to its session -
     /// created lazily here (render pass, like the lazy terminal panel) for
     /// panes across ALL tabs/views, not only visible or focused ones - then
     /// the tree is snapshotted and handed to [`crate::pane::render`]. The
@@ -141,9 +141,13 @@ impl Shell {
     pub(super) fn render_workspace_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         self.ensure_pane_chat_surfaces(cx);
-        let available = self.workspace.focused_pane_bounds()
+        let available = self
+            .workspace
+            .focused_pane_bounds()
             .map(|bounds| (f32::from(bounds.size.width) - 100.0).max(0.0))
-            .unwrap_or_else(|| (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0));
+            .unwrap_or_else(|| {
+                (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0)
+            });
         let action_control =
             self.render_project_actions_control(available, px(self.viewport_height), cx);
         let project_badges = self.render_pane_project_badges(cx);
@@ -233,12 +237,18 @@ impl Shell {
     pub(super) fn ensure_pane_chat_surfaces(&mut self, cx: &mut Context<Self>) {
         self.workspace.prune_caches();
         for (pane, _) in self.workspace.chat_pane_sessions() {
-            if let Some(composer) = self.workspace.chat_surfaces.get(&pane)
+            if let Some(composer) = self
+                .workspace
+                .chat_surfaces
+                .get(&pane)
                 .map(|surface| surface.composer.clone())
             {
                 self.sync_pane_composer_target(pane, &composer, cx);
             }
-            let session = self.workspace.layout.pane(pane)
+            let session = self
+                .workspace
+                .layout
+                .pane(pane)
                 .and_then(|state| state.session_id.clone());
             if !self.workspace.chat_surfaces.contains_key(&pane) {
                 let surface = self.create_pane_chat_surface(pane, session, cx);
@@ -276,13 +286,19 @@ impl Shell {
         composer: &Entity<Composer>,
         cx: &mut Context<Self>,
     ) {
-        let ChatTarget::Fixed(target) = &composer.read(cx).target else { return; };
+        let ChatTarget::Fixed(target) = &composer.read(cx).target else {
+            return;
+        };
         let target = target.clone();
-        let Some(surface) = self.workspace.chat_surfaces.get(&pane) else { return; };
+        let Some(surface) = self.workspace.chat_surfaces.get(&pane) else {
+            return;
+        };
         if surface.composer.entity_id() != composer.entity_id() || surface.chat_id == target {
             return;
         }
-        let Some(binding) = self.workspace.layout.pane(pane) else { return; };
+        let Some(binding) = self.workspace.layout.pane(pane) else {
+            return;
+        };
         if binding.mode != PaneMode::Chat
             || (binding.session_id != surface.chat_id && binding.session_id != target)
         {
@@ -366,7 +382,10 @@ impl Shell {
             shell.sync_pane_composer_target(pane, &composer, cx);
         });
         let composer_events = cx.subscribe(&composer, move |shell, composer, event, cx| {
-            if shell.workspace.chat_surfaces.get(&pane)
+            if shell
+                .workspace
+                .chat_surfaces
+                .get(&pane)
                 .is_some_and(|surface| surface.composer.entity_id() == composer.entity_id())
             {
                 shell.sync_pane_composer_target(pane, &composer, cx);
@@ -393,7 +412,8 @@ impl Shell {
         for pane in panes {
             let composer = self.workspace.chat_surfaces[&pane].composer.clone();
             let snapshot = composer.read(cx).snapshot_draft_state(cx);
-            self.parked_pane_drafts.insert((space.clone(), pane), snapshot);
+            self.parked_pane_drafts
+                .insert((space.clone(), pane), snapshot);
         }
     }
 
@@ -426,9 +446,15 @@ impl Shell {
         if let ComposerEvent::Sent { chat_id, .. } | ComposerEvent::Queued { chat_id, .. } = event {
             // A queue acknowledgement can arrive after this same composer
             // navigated elsewhere. Do not rebind the pane to the old send.
-            let bound = self.workspace.layout.pane(pane)
+            let bound = self
+                .workspace
+                .layout
+                .pane(pane)
                 .is_some_and(|state| state.session_id.as_deref() == Some(chat_id.as_str()));
-            let current = self.workspace.chat_surfaces.get(&pane)
+            let current = self
+                .workspace
+                .chat_surfaces
+                .get(&pane)
                 .is_some_and(|surface| surface.chat_id.as_deref() == Some(chat_id.as_str()));
             if !bound || !current {
                 return;
@@ -676,7 +702,9 @@ impl Shell {
         }
         // A pointer action wins over an earlier, not-yet-painted focus request.
         for surface in self.workspace.chat_surfaces.values() {
-            surface.composer.update(cx, |composer, _| composer.focus_pending = false);
+            surface
+                .composer
+                .update(cx, |composer, _| composer.focus_pending = false);
         }
         cx.notify();
     }
@@ -804,7 +832,7 @@ impl Shell {
                 f32::from(event.event.position.y),
             )
         };
-        let Some(ratio) = ratio_from_pointer(pointer, origin, length, DIVIDER_HIT_PX) else {
+        let Some(ratio) = ratio_from_pointer(pointer, origin, length, DIVIDER_SEAM_PX) else {
             return;
         };
         self.apply_divider_ratio(&target, ratio, cx);
@@ -936,11 +964,7 @@ impl Shell {
     ) {
         let (source, session_id, pointer) = {
             let drag = event.drag(cx);
-            (
-                drag.source,
-                drag.session_id.clone(),
-                event.event.position,
-            )
+            (drag.source, drag.session_id.clone(), event.event.position)
         };
         let anchor = self.split_drag.as_ref().and_then(|s| s.resolution.anchor);
         let geom = self.workspace_geometry(event.bounds);
@@ -979,14 +1003,15 @@ impl Shell {
             return None;
         }
         let pane = self.find_pane_with_session(session_id?)?;
-        let preview = geometry
-            .panes
-            .iter()
-            .find(|p| p.pane == pane)
-            .map(|p| hit_test::DropPreview {
-                rect: p.rect,
-                kind: hit_test::PreviewKind::FullTarget,
-            });
+        let preview =
+            geometry
+                .panes
+                .iter()
+                .find(|p| p.pane == pane)
+                .map(|p| hit_test::DropPreview {
+                    rect: p.rect,
+                    kind: hit_test::PreviewKind::FullTarget,
+                });
         Some(hit_test::DropResolution {
             plan: DropPlan::FocusPane { pane },
             preview,
@@ -1012,11 +1037,7 @@ impl Shell {
     ) {
         let (source, session_id, pointer) = {
             let drag = event.drag(cx);
-            (
-                drag.source,
-                drag.session_id.clone(),
-                event.event.position,
-            )
+            (drag.source, drag.session_id.clone(), event.event.position)
         };
         if self.workspace_mode() || source != DragSource::SidebarSession {
             return;
@@ -1182,7 +1203,7 @@ impl Shell {
     }
 
     /// Sidebar-session commit on a tab strip (or a pane center): mint a tab
-    /// in `view` - at `tab_before` when the strip drop resolved a position - 
+    /// in `view` - at `tab_before` when the strip drop resolved a position -
     /// bind the session to its pane, and focus it.
     fn add_sidebar_session_tab(
         &mut self,
@@ -1308,7 +1329,7 @@ impl Shell {
 
     /// ⌘D / ⇧⌘D and the context-menu split rows: split the focused pane and
     /// commit a NEW CHAT pane immediately. (§2's open-the-picker-first
-    /// contract is superseded by product decision: every split grows a chat - 
+    /// contract is superseded by product decision: every split grows a chat -
     /// terminals have no surface yet anyway - so a popup that could only ever
     /// mint the same pane is friction. The picker lives on solely as the
     /// tab-strip "+" launcher.)
@@ -1656,10 +1677,9 @@ impl Shell {
             let key = ChatTarget::Selected.key(composer.state.read(cx));
             if composer.current_key == key {
                 composer.target = ChatTarget::Selected;
-                composer
-                    .pickers()
-                    .clone()
-                    .update(cx, |pickers, cx| pickers.set_target(ChatTarget::Selected, cx));
+                composer.pickers().clone().update(cx, |pickers, cx| {
+                    pickers.set_target(ChatTarget::Selected, cx)
+                });
                 cx.notify();
                 return;
             }
@@ -1709,8 +1729,9 @@ impl Shell {
             // its space: the layout stays owned by the space it was opened
             // from, so focusing a pane bound to another space's session must
             // not trigger a layout restore that swaps the tree out.
-            self.state
-                .update(cx, |state, cx| state.select_workspace_pane_chat(session, cx));
+            self.state.update(cx, |state, cx| {
+                state.select_workspace_pane_chat(session, cx)
+            });
         }
     }
 
@@ -1836,7 +1857,9 @@ impl Shell {
         // target. Seed its default pane before retargeting; a real saved
         // layout still owns its remembered focus, including an empty canvas.
         let initial_session = if saved_layout.is_none() {
-            self.state.read(cx).selected_chat_row()
+            self.state
+                .read(cx)
+                .selected_chat_row()
                 .filter(|chat| chat.space_id.as_deref() == space.as_deref())
                 .map(|chat| chat.id.clone())
         } else {
@@ -1859,7 +1882,7 @@ impl Shell {
     }
 
     /// Once chats are synced, clear pane bindings whose session no longer
-    /// exists (a chat deleted here or on another device). The pane STAYS - 
+    /// exists (a chat deleted here or on another device). The pane STAYS -
     /// it degrades to the new-thread body until focused, and its session_id
     /// is simply gone (Super's stale-session handling; a terminal pane keeps
     /// its placeholder, no PTY to lose). Frequent no-op: cheap per frame.
@@ -1911,10 +1934,7 @@ fn preview_bounds(
     let origin = state.root_bounds.origin;
     Some((
         gpui::Bounds {
-            origin: gpui::point(
-                gpui::px(rect.x) - origin.x,
-                gpui::px(rect.y) - origin.y,
-            ),
+            origin: gpui::point(gpui::px(rect.x) - origin.x, gpui::px(rect.y) - origin.y),
             size: gpui::size(gpui::px(rect.w), gpui::px(rect.h)),
         },
         preview.kind,
@@ -1959,10 +1979,7 @@ mod preview_tests {
         };
         let (bounds, kind) = preview_bounds(&state).unwrap();
         assert_eq!(bounds.origin, gpui::point(gpui::px(180.0), gpui::px(130.0)));
-        assert_eq!(
-            bounds.size,
-            gpui::size(gpui::px(250.0), gpui::px(192.5))
-        );
+        assert_eq!(bounds.size, gpui::size(gpui::px(250.0), gpui::px(192.5)));
         assert_eq!(kind, hit_test::PreviewKind::PaneHalf);
     }
 

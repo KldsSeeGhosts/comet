@@ -139,10 +139,10 @@ impl Rect {
             && self.h > 0.0
     }
 
-    /// The incoming split's footprint, excluding the shared resize gutter.
+    /// The incoming split's footprint, excluding the 1px split seam.
     pub(crate) fn half_adjacent(&self, dir: Direction) -> Rect {
-        let width = ((self.w - super::DIVIDER_HIT_PX) / 2.0).max(0.0);
-        let height = ((self.h - super::DIVIDER_HIT_PX) / 2.0).max(0.0);
+        let width = ((self.w - super::DIVIDER_SEAM_PX) / 2.0).max(0.0);
+        let height = ((self.h - super::DIVIDER_SEAM_PX) / 2.0).max(0.0);
         match dir {
             Direction::Left => Rect::new(self.x, self.y, width, self.h),
             Direction::Right => Rect::new(self.right() - width, self.y, width, self.h),
@@ -316,7 +316,10 @@ pub(crate) enum DropPlan {
     },
     /// Interior-edge drop: split at `pane` toward `direction`; the dragged
     /// content becomes the new half adjacent to the hovered edge.
-    SplitPane { pane: PaneId, direction: Direction },
+    SplitPane {
+        pane: PaneId,
+        direction: Direction,
+    },
     /// Workspace-outer-edge drop on a boundary pane: split the workspace at
     /// `view` (the adjacent top-level region) toward `direction`.
     ///
@@ -324,7 +327,10 @@ pub(crate) enum DropPlan {
     /// op (`tab_to_view`/`pane_to_view`) needs the TARGET view - with ≥3
     /// views, direction alone is ambiguous - and the preview rect is that
     /// view's region, so the id rides along.
-    SplitView { view: ViewId, direction: Direction },
+    SplitView {
+        view: ViewId,
+        direction: Direction,
+    },
     /// Same-strip drop of a tab chip: reorder within the strip (`before`).
     ReorderStrip {
         view: ViewId,
@@ -333,7 +339,9 @@ pub(crate) enum DropPlan {
     /// A sidebar session already bound somewhere in the layout: the drop
     /// focuses its existing pane instead of minting a second binding.
     /// Synthesized by the shell (the pure resolver never produces it).
-    FocusPane { pane: PaneId },
+    FocusPane {
+        pane: PaneId,
+    },
 }
 
 /// How a resolved preview paints - the plan's own visual contract, carried
@@ -388,8 +396,7 @@ pub(crate) fn resolve_drop(
     source: DragSource,
     anchor: Option<PaneId>,
 ) -> DropResolution {
-    if !x.is_finite() || !y.is_finite() || !geom.content.valid() || !geom.content.contains(x, y)
-    {
+    if !x.is_finite() || !y.is_finite() || !geom.content.valid() || !geom.content.contains(x, y) {
         return DropResolution::none();
     }
 
@@ -404,12 +411,10 @@ pub(crate) fn resolve_drop(
         }
         let before = strip_insert_before(chips, x);
         let plan = match source {
-            DragSource::TabChip(_tab, src_view) if src_view == *view => {
-                DropPlan::ReorderStrip {
-                    view: *view,
-                    before,
-                }
-            }
+            DragSource::TabChip(_tab, src_view) if src_view == *view => DropPlan::ReorderStrip {
+                view: *view,
+                before,
+            },
             // Another view's chip, or a pane header: join this strip.
             DragSource::TabChip(..) | DragSource::PaneHeader(..) | DragSource::SidebarSession => {
                 DropPlan::MoveIntoPane {
@@ -451,10 +456,14 @@ pub(crate) fn resolve_drop(
             if self_hit(source, hit) {
                 return DropResolution::none();
             }
-            if extraction_doomed(geom, source, &DropPlan::SplitPane {
-                pane: hit.pane,
-                direction,
-            }) {
+            if extraction_doomed(
+                geom,
+                source,
+                &DropPlan::SplitPane {
+                    pane: hit.pane,
+                    direction,
+                },
+            ) {
                 return DropResolution::none();
             }
             if view_level_drop(geom, hit, x, y, direction) {
@@ -597,9 +606,7 @@ fn hit_pane<'a>(
     }
     geom.panes
         .iter()
-        .filter(|p| {
-            p.rect.valid() && p.rect.expanded(HIT_SLOP_PX).contains(x, y)
-        })
+        .filter(|p| p.rect.valid() && p.rect.expanded(HIT_SLOP_PX).contains(x, y))
         .min_by(|a, b| {
             let dist = |p: &&PaneRect| {
                 let (cx, cy) = p.rect.center();
@@ -719,7 +726,10 @@ mod tests {
             views: vec![view(V1, rect(0.0, 0.0, 1000.0, 800.0), 3)],
             strips: vec![(
                 V1,
-                vec![chip(T1, rect(8.0, 4.0, 120.0, 22.0)), chip(T2, rect(132.0, 4.0, 120.0, 22.0))],
+                vec![
+                    chip(T1, rect(8.0, 4.0, 120.0, 22.0)),
+                    chip(T2, rect(132.0, 4.0, 120.0, 22.0)),
+                ],
             )],
         }
     }
@@ -804,7 +814,7 @@ mod tests {
         );
         assert_eq!(
             r.preview,
-            preview(rect(254.0, 30.0, 246.0, 385.0), PreviewKind::PaneHalf)
+            preview(rect(250.5, 30.0, 249.5, 385.0), PreviewKind::PaneHalf)
         );
         // Down edge of p1 (bottom at 415) - interior too.
         let r = resolve_drop(&geom, 250.0, 412.0, DragSource::TabChip(T2, V1), None);
@@ -817,7 +827,7 @@ mod tests {
         );
         assert_eq!(
             r.preview,
-            preview(rect(0.0, 226.5, 500.0, 188.5), PreviewKind::PaneHalf)
+            preview(rect(0.0, 223.0, 500.0, 192.0), PreviewKind::PaneHalf)
         );
     }
 
@@ -858,20 +868,32 @@ mod tests {
             // stays local: it splits THAT pane, not the view containing all
             // four panes.
             let local = resolve_drop(&geom, 250.0, 770.0, source, None);
-            assert_eq!(local.plan, DropPlan::SplitPane {
-                pane: PaneId(3), direction: Direction::Down,
-            });
-            assert_eq!(local.preview,
-                preview(rect(0.0, 611.5, 500.0, 188.5), PreviewKind::PaneHalf));
+            assert_eq!(
+                local.plan,
+                DropPlan::SplitPane {
+                    pane: PaneId(3),
+                    direction: Direction::Down,
+                }
+            );
+            assert_eq!(
+                local.preview,
+                preview(rect(0.0, 608.0, 500.0, 192.0), PreviewKind::PaneHalf)
+            );
             // Inside the ring the flush layout has no gutter left, so the
             // boundary pane's edge band targets the whole view. Its preview
             // must show the lower destination, never a full ring.
             let outer = resolve_drop(&geom, 250.0, 799.0, source, local.anchor);
-            assert_eq!(outer.plan, DropPlan::SplitView {
-                view: V1, direction: Direction::Down,
-            });
-            assert_eq!(outer.preview,
-                preview(rect(0.0, 404.0, 1000.0, 396.0), PreviewKind::ViewHalf));
+            assert_eq!(
+                outer.plan,
+                DropPlan::SplitView {
+                    view: V1,
+                    direction: Direction::Down,
+                }
+            );
+            assert_eq!(
+                outer.preview,
+                preview(rect(0.0, 400.5, 1000.0, 399.5), PreviewKind::ViewHalf)
+            );
         }
     }
 
@@ -889,7 +911,7 @@ mod tests {
         );
         assert_eq!(
             r.preview,
-            preview(rect(854.0, 0.0, 146.0, 800.0), PreviewKind::ViewHalf)
+            preview(rect(850.5, 0.0, 149.5, 800.0), PreviewKind::ViewHalf)
         );
         // V1's left edge is the workspace left boundary.
         let r = resolve_drop(&geom, 0.0, 400.0, DragSource::TabChip(T2, V2), None);
@@ -902,7 +924,7 @@ mod tests {
         );
         assert_eq!(
             r.preview,
-            preview(rect(0.0, 0.0, 146.0, 800.0), PreviewKind::ViewHalf)
+            preview(rect(0.0, 0.0, 149.5, 800.0), PreviewKind::ViewHalf)
         );
     }
 
@@ -919,7 +941,10 @@ mod tests {
             views: vec![view(V1, rect(0.0, 0.0, 800.0, 600.0), 2)],
             strips: vec![(
                 V1,
-                vec![chip(T1, rect(8.0, 4.0, 120.0, 22.0)), chip(T2, rect(132.0, 4.0, 120.0, 22.0))],
+                vec![
+                    chip(T1, rect(8.0, 4.0, 120.0, 22.0)),
+                    chip(T2, rect(132.0, 4.0, 120.0, 22.0)),
+                ],
             )],
         };
         let r = resolve_drop(&geom, 800.0, 300.0, DragSource::TabChip(T1, V1), None);
@@ -940,7 +965,13 @@ mod tests {
         // only exist on ≥2-pane tabs, so the hovered pane differs from the
         // source): the pane re-docks as a new top-level region.
         let geom = three_views();
-        let r = resolve_drop(&geom, 1000.0, 400.0, DragSource::PaneHeader(PaneId(1)), None);
+        let r = resolve_drop(
+            &geom,
+            1000.0,
+            400.0,
+            DragSource::PaneHeader(PaneId(1)),
+            None,
+        );
         assert_eq!(
             r.plan,
             DropPlan::SplitView {
@@ -1094,7 +1125,13 @@ mod tests {
         // The same chip over ANOTHER TAB's pane is fine (merge lands there).
         let geom = three_views();
         let r = resolve_drop(&geom, 303.0, 400.0, DragSource::TabChip(T1, V1), None);
-        assert!(matches!(r.plan, DropPlan::SplitPane { pane: PaneId(2), .. }));
+        assert!(matches!(
+            r.plan,
+            DropPlan::SplitPane {
+                pane: PaneId(2),
+                ..
+            }
+        ));
     }
 
     // ---- degenerate / outside ----
@@ -1113,7 +1150,14 @@ mod tests {
             DropPlan::None
         );
         assert_eq!(
-            resolve_drop(&geom, 250.0, f32::INFINITY, DragSource::TabChip(T1, V1), None).plan,
+            resolve_drop(
+                &geom,
+                250.0,
+                f32::INFINITY,
+                DragSource::TabChip(T1, V1),
+                None
+            )
+            .plan,
             DropPlan::None
         );
         // Zero-size content.
@@ -1140,22 +1184,40 @@ mod tests {
 
     #[test]
     fn divider_gap_falls_to_the_nearest_pane() {
-        // Panes separated by an 8px divider: the gap resolves (nearest
-        // center), so the preview never blanks while crossing.
+        // Panes separated by the 1px hairline seam: the seam resolves
+        // (nearest center / anchor hysteresis) so the preview never blanks
+        // while crossing.
         let geom = WorkspaceGeometry {
-            content: rect(0.0, 0.0, 1008.0, 600.0),
+            content: rect(0.0, 0.0, 1001.0, 600.0),
             panes: vec![
                 pane(1, V1, T1, rect(0.0, 30.0, 500.0, 570.0)),
-                pane(2, V1, T1, rect(508.0, 30.0, 500.0, 570.0)),
+                pane(2, V1, T1, rect(501.0, 30.0, 500.0, 570.0)),
             ],
-            views: vec![view(V1, rect(0.0, 0.0, 1008.0, 600.0), 2)],
+            views: vec![view(V1, rect(0.0, 0.0, 1001.0, 600.0), 2)],
             strips: vec![],
         };
-        // Mid-gap: nearest center wins (p1's center is closer from the left).
-        let r = resolve_drop(&geom, 504.0, 300.0, DragSource::TabChip(T2, V1), None);
-        assert!(matches!(r.plan, DropPlan::SplitPane { pane: PaneId(1), .. }));
-        let r = resolve_drop(&geom, 504.0, 300.0, DragSource::TabChip(T2, V1), Some(PaneId(2)));
-        assert!(matches!(r.plan, DropPlan::SplitPane { pane: PaneId(2), .. }));
+        let r = resolve_drop(&geom, 500.5, 300.0, DragSource::TabChip(T2, V1), None);
+        assert!(matches!(
+            r.plan,
+            DropPlan::SplitPane {
+                pane: PaneId(1),
+                ..
+            }
+        ));
+        let r = resolve_drop(
+            &geom,
+            500.5,
+            300.0,
+            DragSource::TabChip(T2, V1),
+            Some(PaneId(2)),
+        );
+        assert!(matches!(
+            r.plan,
+            DropPlan::SplitPane {
+                pane: PaneId(2),
+                ..
+            }
+        ));
     }
 
     // ---- outlet content region (the drag geometry's coordinate anchor) ----
@@ -1204,7 +1266,12 @@ mod tests {
         // covers a few pixels of sub-pixel snap / slop.
         let content = rect(0.0, 0.0, 1000.0, 800.0);
         let flush = rect(0.0, 0.0, 1000.0, 800.0);
-        for dir in [Direction::Left, Direction::Right, Direction::Up, Direction::Down] {
+        for dir in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
             assert!(
                 touches_boundary(&flush, &content, dir),
                 "flush {dir:?} edge must read as the workspace boundary"
@@ -1217,7 +1284,12 @@ mod tests {
             1000.0 - 2.0 * BOUNDARY_EPSILON_PX,
             800.0 - 2.0 * BOUNDARY_EPSILON_PX,
         );
-        for dir in [Direction::Left, Direction::Right, Direction::Up, Direction::Down] {
+        for dir in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
             assert!(touches_boundary(&within, &content, dir), "{dir:?}");
         }
         let interior = rect(
@@ -1248,7 +1320,10 @@ mod tests {
         // edge and a sample inside the ring resolve the same plan.
         let outlet = rect(0.0, 0.0, 800.0, 600.0);
         let (content, pane_rect) = single_pane_rects(outlet);
-        assert_eq!(pane_rect, content, "the lone pane is flush with the content");
+        assert_eq!(
+            pane_rect, content,
+            "the lone pane is flush with the content"
+        );
         let cases = [
             (0.0, 300.0, Direction::Left),
             (5.0, 300.0, Direction::Left),
@@ -1350,7 +1425,15 @@ mod tests {
         );
         // Degenerate content never resolves.
         assert_eq!(
-            resolve_single_pane_drop(&rect(0.0, 0.0, 0.0, 600.0), PaneId(1), V1, T1, 0.0, 0.0, None),
+            resolve_single_pane_drop(
+                &rect(0.0, 0.0, 0.0, 600.0),
+                PaneId(1),
+                V1,
+                T1,
+                0.0,
+                0.0,
+                None
+            ),
             DropResolution::none()
         );
         assert_eq!(
@@ -1364,7 +1447,7 @@ mod tests {
     #[test]
     fn outside_content_is_none_even_within_hit_slop_of_a_pane() {
         // A pane flush against the content edge: the slop band reaches past
-        // the boundary, but a pointer outside `content` resolves to none - 
+        // the boundary, but a pointer outside `content` resolves to none -
         // it belongs to the sidebar, never to a drop plan.
         let geom = WorkspaceGeometry {
             content: rect(0.0, 0.0, 1000.0, 800.0),
@@ -1372,7 +1455,11 @@ mod tests {
             views: vec![view(V1, rect(0.0, 0.0, 1000.0, 800.0), 1)],
             strips: vec![],
         };
-        for (x, y) in [(-HIT_SLOP_PX / 2.0, 400.0), (1000.0 + 5.0, 400.0), (400.0, -2.0)] {
+        for (x, y) in [
+            (-HIT_SLOP_PX / 2.0, 400.0),
+            (1000.0 + 5.0, 400.0),
+            (400.0, -2.0),
+        ] {
             assert_eq!(
                 resolve_drop(&geom, x, y, DragSource::SidebarSession, None).plan,
                 DropPlan::None,
