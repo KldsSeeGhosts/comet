@@ -40,6 +40,7 @@ use zeron_workspace::{PaneId, PaneMode, TabId, ViewId};
 use crate::icons::{self, icon};
 use crate::motion;
 use crate::shell::Shell;
+use crate::status_palette::SessionState;
 use crate::theme::Theme;
 
 use super::hit_test::DragSource;
@@ -64,12 +65,79 @@ impl gpui::Render for ChromeTooltip {
     }
 }
 
-/// The pane's session avatar status: buddy icon, indicator state, and badge color.
+/// The pane header's session metadata: the mono context line and the bound
+/// session's display state. Replaces the old buddy avatar (rule 5: no
+/// mascots in chrome); an unbound pane (the new-chat canvas, a terminal
+/// pane) carries no context and reads idle.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct PaneBuddy {
-    pub session_key: SharedString,
-    pub status: zeron_proto::ChatIndicator,
-    pub status_color: Hsla,
+pub(crate) struct PaneMeta {
+    /// Mono 11px `text_faint`: `{project}:{branch}` or `{project}`, plus
+    /// ` · {device}` when the session runs on a remote device. `None` when
+    /// the pane has no session.
+    pub context: Option<SharedString>,
+    /// The bound session's display state (send truth included); `Idle` for
+    /// an unbound or settled pane - the status label only renders for
+    /// non-idle states.
+    pub state: SessionState,
+}
+
+impl PaneMeta {
+    /// A pane with no bound session carries no metadata.
+    pub(crate) fn empty() -> Self {
+        Self {
+            context: None,
+            state: SessionState::Idle,
+        }
+    }
+}
+
+/// The pane header's status cell for a live session: the state glyph plus
+/// its label, both in the state color (rule 1; Queued stays neutral).
+/// `None` for idle/settled sessions, so their headers stay quiet.
+fn status_label(state: SessionState, theme: &Theme) -> Option<AnyElement> {
+    let label = state.label()?;
+    let tone = state.color(theme).unwrap_or(theme.text_muted);
+    let glyph: AnyElement = match state {
+        // The sidebar's equalizer needs an entity context this renderer does
+        // not own; the 6px dot keeps Working chromatic without it.
+        SessionState::Working => div()
+            .size(px(6.0))
+            .flex_none()
+            .rounded_full()
+            .bg(tone)
+            .into_any_element(),
+        SessionState::AwaitingInput => icon(icons::CHAT_ROUND_LINE)
+            .size(px(12.0))
+            .text_color(tone)
+            .into_any_element(),
+        SessionState::Failed => icon(icons::DANGER_TRIANGLE)
+            .size(px(12.0))
+            .text_color(tone)
+            .into_any_element(),
+        SessionState::Completed => icon(icons::CHECK)
+            .size(px(12.0))
+            .text_color(tone)
+            .into_any_element(),
+        SessionState::Queued => icon(icons::CLOCK_CIRCLE)
+            .size(px(12.0))
+            .text_color(tone)
+            .into_any_element(),
+        SessionState::Idle => return None,
+    };
+    Some(
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .text_size(crate::typography::ui_rems(11.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(tone)
+            .child(glyph)
+            .child(SharedString::from(label))
+            .into_any_element(),
+    )
 }
 
 /// A tab chip's provider mark: the harness brand icon + optional tint
@@ -135,14 +203,19 @@ pub(crate) struct TabChip {
 /// legacy single-pane route and the transcript's top fade inset.
 pub(crate) const PANE_HEADER_HEIGHT: f32 = 36.0;
 
-/// The pane header: truncated title left, labelled controls right.
-/// Right-click opens the split/close menu. Draggable headers can be re-docked.
+/// The pane header: leading harness mark, truncated title, project badge,
+/// mono context, status label, then the labelled controls right.
+/// Right-click opens the split/close menu. Draggable headers can be
+/// re-docked.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pane_header(
     pane: PaneId,
     title: SharedString,
     mark: TabMark,
-    buddy: Option<&PaneBuddy>,
+    meta: &PaneMeta,
+    badge: Option<AnyElement>,
     closable: bool,
+    focused: bool,
     show_changes: bool,
     action_control: Option<AnyElement>,
     draggable: bool,
@@ -208,51 +281,63 @@ pub(crate) fn pane_header(
                 },
             )
         })
-        .when_some(buddy, |el, buddy| {
-            let (image, blink_image) = crate::sidebar_buddy::avatar_for_session(&buddy.session_key);
-            el.child(
-                div()
-                    .size(px(24.0))
-                    .flex_none()
-                    .child(
-                        crate::sidebar_buddy::buddy(
-                            format!("pane-buddy-{}", pane.0),
-                            image,
-                            blink_image,
-                            buddy.status,
-                            false,
-                            buddy.status_color,
-                            theme.bg,
-                        )
-                        .size(24.0),
-                    ),
-            )
-        })
-        .when(buddy.is_none(), |el| {
-            el.child(
-                div()
-                    .size(px(24.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        icon(mark.icon)
-                            .size(px(18.0))
-                            .text_color(mark.tint.unwrap_or(theme.text_muted)),
-                    ),
-            )
-        })
+        // Leading 16px harness column: the brand mark identifies the agent at
+        // 14px in its brand tint (rule 1: Claude orange, the rest monochrome
+        // by design); `text_muted` is the fallback for untinted marks. The
+        // column keeps its width with no mark so text aligns.
         .child(
             div()
-                .flex_1()
+                .w(px(16.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    icon(mark.icon)
+                        .size(px(14.0))
+                        .text_color(mark.tint.unwrap_or(theme.text_muted)),
+                ),
+        )
+        // Title: UI face, 12.5px MEDIUM (rule 4: MEDIUM is the pane title's
+        // weight). It truncates and may shrink; the context below gives up
+        // space first.
+        .child(
+            div()
+                .flex_initial()
                 .min_w_0()
                 .truncate()
                 .text_size(crate::typography::ui_rems(12.5))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.text)
+                // Focus cue (rule 3): the focused title is full-strength text;
+                // unfocused panes rest muted. No border, no size change.
+                .text_color(if focused { theme.text } else { theme.text_muted })
                 .child(title),
         )
+        // Project identity (rule 1): the bound chat's 14px badge, right after
+        // the title. Unbound panes carry none.
+        .when_some(badge, |el, badge| el.child(badge))
+        // Context: mono 11px text_faint, `{project}:{branch}` (plus the remote
+        // device); it owns the remaining row and truncates first. With no
+        // session the spacer keeps the controls right-aligned.
+        .when_some(meta.context.clone(), |el, context| {
+            el.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_faint)
+                    .child(context),
+            )
+        })
+        .when(meta.context.is_none(), |el| {
+            el.child(div().flex_1().min_w_0())
+        })
+        // Status label (rule 1): the sidebar slot's vocabulary at the pane
+        // header's scale - icon plus label in the state color, hidden when
+        // idle so settled panes keep the context line as their last word.
+        .when_some(status_label(meta.state, theme), |el, label| el.child(label))
         .when_some(action_control, |el, action| el.child(action))
         // The right-pane toggle lives on the pane header — the window-wide
         // chat header that used to carry it is gone. Shown only on the

@@ -286,14 +286,15 @@ impl Shell {
                 let state = self.state.read(cx);
                 let chat = state.chats.iter().find(|chat| &chat.id == id)?;
                 let project = match (state.space_for_chat(chat), chat.space_id.as_deref()) {
-                    (Some(space), _) => space.display_name(),
-                    (None, None) => "~",
-                    _ => "?",
+                    (Some(space), _) => space.display_name().to_string(),
+                    (None, None) => "~".to_string(),
+                    _ => "?".to_string(),
                 };
-                let folder = match state.device_name(&chat.device_id) {
-                    Some(device) => format!("{project} @ {device}"),
-                    None => project.to_string(),
-                };
+                let remote_device = (state.local_device_id.as_deref()
+                    != Some(chat.device_id.as_str()))
+                .then(|| state.device_name(&chat.device_id))
+                .flatten()
+                .map(SharedString::from);
                 let branch = self
                     .settings
                     .sidebar_show_branch
@@ -317,8 +318,9 @@ impl Shell {
                     transcript::single_line(chat.title.as_deref().unwrap_or("New session")).into(),
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), Utc::now())
                         .into(),
-                    folder.into(),
+                    project.into(),
                     branch,
+                    remote_device,
                     pr,
                     harness,
                     state.display_status_for(chat, Utc::now()),

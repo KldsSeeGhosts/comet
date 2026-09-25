@@ -1026,6 +1026,17 @@ impl Pickers {
         }
     }
 
+    /// Human display name of the resolved harness from the loaded catalog
+    /// ("Claude Code", "Codex", "Pi", …) - the name the picker tabs carry.
+    /// `None` until the catalog names the harness.
+    pub fn effective_harness_name(&self, cx: &App) -> Option<SharedString> {
+        let harness = self.effective_harness(cx)?;
+        self.harnesses
+            .ready()
+            .and_then(|list| list.iter().find(|d| d.id == harness))
+            .map(|d| SharedString::from(d.name.clone()))
+    }
+
     // ---- open/close ----
 
     /// The picker that's open AND interactive — `None` while one animates out.
@@ -2478,7 +2489,6 @@ impl Pickers {
         &self,
         kind: PickerKind,
         label: SharedString,
-        set: bool,
         chip_icon: Option<(&'static str, Option<gpui::Hsla>)>,
         // The chip never collapses while identity resolves (user report):
         // `icon_loading` swaps the brand slot for the pixel-glyph loader
@@ -2486,7 +2496,7 @@ impl Pickers {
         // (model unknown).
         icon_loading: bool,
         label_loading: bool,
-        suffix: Option<(SharedString, Option<gpui::Hsla>)>,
+        suffix: Option<SharedString>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -2499,8 +2509,11 @@ impl Pickers {
         };
         let open = self.open_kind() == Some(kind);
         // Ghost pill (zeron composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
-        // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
-        // hover/open wash — no border, no caret; the actions row stays quiet.
+        // gap-1.5 text-[12px]`, icons size-4, hover/open wash - no border, no
+        // caret; the actions row stays quiet. Design rules 1/4
+        // (docs/design/control-plane.md): NORMAL weight, neutral text (only
+        // the harness mark keeps its brand tint); the hover wash alone marks
+        // the pointer.
         div()
             .id(id)
             .h(px(32.0))
@@ -2515,18 +2528,8 @@ impl Pickers {
             .px(px(10.0))
             .rounded(px(8.0))
             .text_size(crate::typography::ui_rems(12.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            // zeron composer/styles.tsx `pill`: `transition-colors` — the wash
-            // and text brighten fade over 150ms.
-            .text_color(motion::hover_blend(
-                id,
-                if set {
-                    theme.text.opacity(0.9)
-                } else {
-                    theme.text_muted
-                },
-                theme.text,
-            ))
+            .font_weight(gpui::FontWeight::NORMAL)
+            .text_color(theme.text_muted)
             .bg(if open {
                 theme.element_hover
             } else {
@@ -2566,18 +2569,17 @@ impl Pickers {
             .when(!label_loading, |el| {
                 el.child(div().min_w_0().truncate().child(label))
             })
-            // The effort half of the combined model+effort chip (and the space
-            // chip's "@ device" tag): muted, no icon — one button, two tones.
-            // `tint` overrides the muted tone (the offline warning). Under row
+            // The effort half of the combined model+effort chip: fainter than
+            // the model name, no icon - one button, two tones. Under row
             // pressure the suffix yields FIRST (large shrink factor) so the
             // model name — the run's identity — truncates last.
-            .when_some(suffix, |el, (suffix, tint)| {
+            .when_some(suffix, |el, suffix| {
                 el.child(
                     div()
                         .flex_shrink(1000.0)
                         .min_w_0()
                         .truncate()
-                        .text_color(tint.unwrap_or(theme.text_muted.opacity(0.7)))
+                        .text_color(theme.text_faint)
                         .child(suffix),
                 )
             })
@@ -4512,6 +4514,13 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
         .collect()
 }
 
+/// The chip's model name: a `provider/` prefix (the part before the last
+/// slash) is display noise there, while pickers, menus and tooltips keep the
+/// full id.
+pub(crate) fn chip_model_label(label: &str) -> &str {
+    label.rsplit_once('/').map_or(label, |(_, name)| name)
+}
+
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
     match harness {
         HarnessId::ClaudeCode | HarnessId::Mock => (
@@ -4733,7 +4742,9 @@ impl Render for Pickers {
                     None => remembered.map(|m| m.label.clone()),
                 }
             });
-            label.map(SharedString::from).unwrap_or_default()
+            label
+                .map(|label| SharedString::from(chip_model_label(&label)))
+                .unwrap_or_default()
         };
         let catalog_loading = matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
         let models_loading = self.effective_harness(cx).is_some_and(|harness| {
@@ -4750,24 +4761,18 @@ impl Render for Pickers {
         // remembered pick): a ghost label instead of a bare icon.
         let chip_label_loading =
             !no_agents && model_label.is_empty() && (catalog_loading || models_loading);
+        // Rule 1 (docs/design/control-plane.md): identity keeps its brand
+        // tint - the chip's harness mark is Claude orange (or another
+        // harness's mark) while the model and reasoning text stay neutral.
         let harness_icon: (&'static str, Option<gpui::Hsla>) = match self.effective_harness(cx) {
             Some(harness) => harness_brand_icon(harness),
-            None if no_agents => (crate::icons::TERMINAL, Some(theme.text_muted)),
-            None => (
-                crate::icons::CLAUDE_MARK,
-                Some(crate::icons::claude_brand()),
-            ),
+            None if no_agents => (crate::icons::TERMINAL, None),
+            None => harness_brand_icon(HarnessId::ClaudeCode),
         };
         let explicit_options = self.explicit_options(cx);
         let traits_set = traits_summary(
             self.selected_model(cx),
             self.effective_reasoning(cx),
-            &explicit_options,
-        );
-        let traits_active = traits_customized(
-            self.selected_model(cx),
-            self.effective_reasoning(cx),
-            &self.trait_ladder(cx),
             &explicit_options,
         );
         // Render the open popover's body first (mutable borrow), then the
@@ -4793,22 +4798,15 @@ impl Render for Pickers {
         };
 
         // The composer places this model chip beside the attachment button.
-        // ONE chip for the whole run identity (user request): brand icon +
-        // model name, then the joined traits summary ("Medium", "High · 1M ·
-        // Fast", "Agent · Balance") as the chip's muted second tone — the
-        // run's configuration reads without opening anything, and the suffix
-        // brightens only when something departs from its default. No suffix
-        // when the model has neither a ladder nor options (e.g. Hermes).
-        let chip_suffix = traits_set.map(|summary| {
-            (
-                SharedString::from(summary),
-                traits_active.then(|| theme.text.opacity(0.85)),
-            )
-        });
+        // ONE chip for the whole run identity (user request): monochrome mark
+        // + model name, then the joined traits summary ("Medium", "High · 1M
+        // · Fast", "Agent · Balance") as the chip's fainter second tone - the
+        // run's configuration reads without opening anything. No suffix when
+        // the model has neither a ladder nor options (e.g. Hermes).
+        let chip_suffix = traits_set.map(SharedString::from);
         let model_chip = self.trigger_chip(
             PickerKind::HarnessModel,
             model_label,
-            true,
             Some(harness_icon),
             chip_icon_loading,
             chip_label_loading,
@@ -5882,6 +5880,15 @@ mod tests {
         // Idempotent over a clean list.
         let clean = vec![bare_model("titan-5", "Titan 5")];
         assert_eq!(normalize_model_rows(HarnessId::Codex, clean.clone()), clean);
+    }
+
+    #[test]
+    fn chip_model_label_strips_provider_prefix() {
+        // Only the last segment survives: one- and multi-slash provider ids
+        // both lose their prefix, and a prefix-free label is untouched.
+        assert_eq!(chip_model_label("openai-codex/GPT-6 Luna"), "GPT-6 Luna");
+        assert_eq!(chip_model_label("anthropic/claude/opus-4"), "opus-4");
+        assert_eq!(chip_model_label("gpt-5"), "gpt-5");
     }
 
     #[test]

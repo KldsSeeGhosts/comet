@@ -60,6 +60,7 @@ use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
     format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
+use crate::status_palette::SessionState;
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript, TranscriptEvent};
@@ -68,6 +69,7 @@ use crate::workspace_links::resolve_workspace_file_link;
 mod actions_ui;
 mod command_palette;
 mod panes;
+mod project_icon;
 mod spaces;
 mod tabs;
 mod voice;
@@ -765,62 +767,31 @@ fn sidebar_key_order_changed(old: &[(String, f32)], new: &[(String, f32)]) -> bo
             .any(|((old_key, _), (new_key, _))| old_key != new_key)
 }
 
-/// Exact active-session row height. Open Design's 36px buddy row sits above a
-/// full-width metadata footer with the same stable geometry in every state.
-pub(super) fn chat_row_height(shows_branch: bool, shows_pull_request: bool) -> f32 {
-    if shows_branch || shows_pull_request {
-        CHAT_ROW_HEIGHT_TWO_LINE
-    } else {
-        CHAT_ROW_HEIGHT
-    }
+/// Exact active-session card height. Every row is one fixed three-line card
+/// (project/status, title, mono metadata), so the FLIP estimates and the
+/// drawn row agree in every state (control-plane.md, "Card (three lines,
+/// 72px)").
+pub(super) fn chat_row_height() -> f32 {
+    CHAT_ROW_HEIGHT
 }
-/// A Codex-style sidebar nav row: 20px icon column aligned with the session
-/// avatars, a 13px label, and the shortcut hint pinned right.
-fn sidebar_nav_row(
-    id: &'static str,
-    glyph: &'static str,
-    label: &'static str,
-    shortcut: String,
-    theme: &Theme,
-) -> gpui::Stateful<gpui::Div> {
-    let motion_key = format!("{id}-motion");
-    div()
-        .id(id)
-        .role(gpui::Role::Button)
-        .aria_label(label)
-        .h(px(30.0))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(SIDEBAR_ROW_ICON_GAP))
-        .px(px(Theme::SPACE_SM))
-        .rounded(px(8.0))
-        .cursor_pointer()
-        .text_size(crate::typography::ui_rems(13.0))
-        .text_color(motion::hover_blend(&motion_key, theme.text.opacity(0.8), theme.text))
-        .bg(motion::hover_blend(
-            &motion_key,
-            crate::theme::wash(0.0),
-            theme.glass_hover(),
-        ))
-        .on_hover(motion::hover_listener(motion_key.clone()))
-        .child(
-            div()
-                .size(px(SIDEBAR_BUDDY_SIZE))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon(glyph).size(px(16.0)).text_color(theme.text_muted)),
-        )
-        .child(div().flex_1().min_w_0().truncate().child(SharedString::from(label)))
-        .child(
-            div()
-                .flex_none()
-                .text_size(crate::typography::ui_rems(11.5))
-                .text_color(theme.text_faint.opacity(0.7))
-                .child(SharedString::from(shortcut)),
-        )
+
+/// Compact elapsed run time for the Working status slot: `45s`, `2m`,
+/// `1h 4m`, `3h`. Rounds down to whole units; negative input reads `0s`.
+pub(super) fn format_working_elapsed(total_seconds: i64) -> String {
+    let seconds = total_seconds.max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        }
+    }
 }
 
 /// Square icon button for the sidebar footer strip.
@@ -878,21 +849,30 @@ impl Render for SidebarTooltip {
     }
 }
 
-/// One-line session row: avatar + title + status/time.
-const CHAT_ROW_HEIGHT: f32 = 32.0;
-/// Session row with a branch / pull-request line under the title.
-const CHAT_ROW_HEIGHT_TWO_LINE: f32 = 48.0;
-/// Session avatar edge; also the leading icon column of the nav rows.
+/// One three-line session card, T3 Code's thread card: the project badge and
+/// state slot, the title, then the mono metadata line. Constant height.
+const CHAT_ROW_HEIGHT: f32 = 72.0;
+/// The card's line heights, top to bottom: 18 + 18 + 16, centered in 72.
+const SIDEBAR_CARD_LINE1_HEIGHT: f32 = 18.0;
+const SIDEBAR_CARD_LINE2_HEIGHT: f32 = 18.0;
+const SIDEBAR_CARD_LINE3_HEIGHT: f32 = 16.0;
+/// Project badge edge on line 1 (`Shell::render_project_icon`).
+const SIDEBAR_PROJECT_BADGE_SIZE: f32 = 16.0;
+/// Session avatar edge; also the leading column of the footer and filter
+/// rows.
 const SIDEBAR_BUDDY_SIZE: f32 = 20.0;
 /// Gap between a row's leading icon column and its label.
 const SIDEBAR_ROW_ICON_GAP: f32 = 8.0;
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
-/// Harness marks live in the active row footer and the archived shelf.
+/// The harness mark at the end of the card's metadata line.
 const SIDEBAR_ACTIVE_HARNESS_ICON_SIZE: f32 = 13.0;
 const SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE: f32 = 14.0;
 const SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP: f32 = 10.0;
-
+/// Needs-you accent bar in the row's left gutter: 2 x 20, rounded 1, 1px off
+/// the row's left edge and vertically centered.
+const SIDEBAR_NEEDS_BAR_WIDTH: f32 = 2.0;
+const SIDEBAR_NEEDS_BAR_HEIGHT: f32 = 20.0;
 
 /// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
@@ -1585,6 +1565,10 @@ pub struct Shell {
     right_plus: popover::Popup<()>,
     /// Host-owned project Actions cached per (device, space).
     project_actions: crate::project_actions::ProjectActionsController,
+    /// Repository favicons/app icons by (profile, device, checkout, space),
+    /// refreshed after 5 minutes (`shell::project_icon`).
+    project_icons:
+        std::cell::RefCell<std::collections::HashMap<String, Entity<project_icon::ProjectIcon>>>,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
     diffs: std::collections::HashMap<u64, Entity<Changes>>,
@@ -2037,6 +2021,7 @@ impl Shell {
             right_terminal: None,
             right_plus: popover::Popup::default(),
             project_actions: crate::project_actions::ProjectActionsController::default(),
+            project_icons: Default::default(),
             diffs: std::collections::HashMap::new(),
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
@@ -5913,16 +5898,18 @@ impl Shell {
             .into_any_element()
     }
 
-    /// One session row: a stable avatar, title/status line, and a compact
-    /// worktree/harness footer. Click selects; right-click opens its menu.
+    /// One session card, T3 Code's thread card: the project badge and name
+    /// with the state slot, the title, then a mono metadata line (branch, PR,
+    /// remote device, harness mark). Click selects; right-click opens its menu.
     #[allow(clippy::too_many_arguments)]
     fn render_chat_row(
         &self,
         id: String,
         title: SharedString,
         time_ago: SharedString,
-        space_name: SharedString,
+        project: SharedString,
         branch: Option<SharedString>,
+        remote_device: Option<SharedString>,
         change_request: Option<zeron_proto::ChangeRequestSummary>,
         harness: Option<zeron_proto::HarnessId>,
         status: zeron_proto::ChatIndicator,
@@ -5937,11 +5924,10 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Activity, not position: live rows use the Open Design equalizer/dot
-        // language in the top-right corner; settled rows show relative time.
-        // Hovering the ROW swaps the corner for the
-        // ARCHIVE button (UNARCHIVE on rows in the sidebar's archived
-        // accordion), t3code's settle-on-hover.
+        // Activity, not position: live rows put the state icon and label in
+        // the top-right slot; settled rows show relative time. Hovering the
+        // ROW swaps the slot for the ARCHIVE button (UNARCHIVE on rows in the
+        // sidebar's archived accordion), t3code's settle-on-hover.
         // A chat can appear on both surfaces at once. Namespace every hover
         // key and child id so the palette never animates the sidebar copy.
         let row_id = if search_query.is_some() {
@@ -5950,43 +5936,38 @@ impl Shell {
             format!("chat-{id}")
         };
         let corner_hovered = self.chat_status_hover.as_deref() == Some(row_id.as_str());
-        // Send-truth overrides: a send unadopted past the grace window is
-        // FAILED (explicit, with the transcript's retry affordance); a send
-        // whose delivery path is degraded is QUEUED, not Working — the
-        // pending pill tells the truth instead of faking a spinner.
-        let (queued, undelivered) = {
-            let now = Utc::now();
+        // One source of truth for state (status_palette.rs): send truth
+        // overrides the engine's indicator, and the title weight, gutter bar,
+        // icon, label and elapsed clock all read the same resolved state.
+        let now = Utc::now();
+        let (session, elapsed) = {
             let state = self.state.read(cx);
-            (
-                state.send_queued(&id, now),
-                state.send_undelivered(&id, now),
-            )
+            let queued = state.send_queued(&id, now);
+            let undelivered = state.send_undelivered(&id, now);
+            let session = SessionState::resolve(status, queued, undelivered);
+            // The elapsed base is the freshest of the live turn's start and
+            // the in-flight send - the same clock the status strip uses.
+            let elapsed = (session == SessionState::Working)
+                .then(|| {
+                    state
+                        .session_for(&id)
+                        .and_then(|row| row.started_at)
+                        .into_iter()
+                        .chain(state.pending_send_started(&id, now))
+                        .max()
+                })
+                .flatten()
+                .map(|started| {
+                    SharedString::from(format_working_elapsed(
+                        now.signed_duration_since(started).num_seconds(),
+                    ))
+                });
+            (session, elapsed)
         };
-        let status_color = if undelivered {
-            theme.danger
-        } else if queued {
-            theme.warning
-        } else if status == zeron_proto::ChatIndicator::AwaitingInput {
-            theme.warning
-        } else {
-            spaces::status_dot_color(status, theme)
-        };
-        let avatar_status_color = crate::sidebar_buddy::status_color(status, queued, undelivered, theme);
-        let status_label: Option<&'static str> = if undelivered {
-            Some("Failed")
-        } else if queued {
-            Some("Queued")
-        } else {
-            match status {
-                zeron_proto::ChatIndicator::Working => Some("Working"),
-                zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
-                zeron_proto::ChatIndicator::Errored => Some("Failed"),
-                zeron_proto::ChatIndicator::Completed => None,
-                zeron_proto::ChatIndicator::Idle => None,
-            }
-        };
-        let queued = queued && !undelivered;
-        let working = status == zeron_proto::ChatIndicator::Working && !queued && !undelivered;
+        let needs_you = session.needs_you();
+        // The gutter bar speaks the state hue: indigo under an awaiting
+        // session, danger under a failed one.
+        let needs_you_color = session.color(theme).unwrap_or(theme.danger);
         let corner_body: AnyElement = if let Some(label) = jump_label {
             // The jump hint replaces the status/time corner while the modifier
             // is held, cut to the sidebar PR badge's exact cloth
@@ -6006,6 +5987,7 @@ impl Shell {
                     .rounded(px(4.0))
                     .bg(tone.opacity(0.08))
                     .text_size(crate::typography::ui_rems(10.0))
+                    .line_height(px(16.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(tone.opacity(0.85))
                     .font_family(theme.font_mono.clone())
@@ -6022,9 +6004,7 @@ impl Shell {
                 // The pill's padding bleeds right into the row's padding so
                 // its TEXT right-aligns exactly where the status word/time
                 // sits — the swap moves pixels around the label, not it.
-                // 4px: what's left of the row's 8px padding then equals the
-                // 4px of air above the pill (18px tall on the 14px line,
-                // 6px row padding minus the 2px overflow).
+                // 4px: what's left of the row's 8px padding.
                 .px(px(4.0))
                 .mr(px(-4.0))
                 .rounded(px(5.0))
@@ -6051,49 +6031,76 @@ impl Shell {
                         })),
                 )
                 .into_any_element()
-        } else {
-            match status_label {
-                Some(_) if working => loaders::mini_equalizer(
+        } else if let Some(label) = session.label() {
+            // Rule 1: every live state is its 12px icon plus label in the
+            // state hue (Queued stays neutral). Working earns the clock.
+            let color = session.color(theme).unwrap_or(theme.text_muted);
+            let glyph: AnyElement = match session {
+                SessionState::Working => loaders::mini_equalizer(
                     format!("{row_id}-working"),
-                    status_color,
+                    color,
                     self.sidebar_pane.entity_id(),
                     cx,
                 )
                 .into_any_element(),
-                Some(_) if status == zeron_proto::ChatIndicator::AwaitingInput => {
-                    loaders::mini_waiting_ping(format!("{row_id}-waiting"), status_color)
-                        .into_any_element()
-                }
-                Some(label) => {
-                    let glyph: AnyElement = div()
-                        .size(px(6.0))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(status_color)
-                        .into_any_element();
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(4.0))
-                        .child(glyph)
-                        .child(
-                            div()
-                                .text_size(crate::typography::ui_rems(10.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(status_color)
-                                .child(SharedString::from(label)),
-                        )
-                        .into_any_element()
-                }
-                // Settled rows: the time is tertiary information — faint,
-                // regular weight, never competing with the title.
-                None => div()
-                    .text_size(crate::typography::ui_rems(11.5))
-                    .text_color(theme.text_faint.opacity(0.8))
-                    .child(time_ago.clone())
+                SessionState::AwaitingInput => icon(icons::CHAT_ROUND_LINE)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(color)
                     .into_any_element(),
+                SessionState::Failed => icon(icons::DANGER_TRIANGLE)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(color)
+                    .into_any_element(),
+                SessionState::Completed => icon(icons::CHECK)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(color)
+                    .into_any_element(),
+                SessionState::Queued => icon(icons::CLOCK_CIRCLE)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(color)
+                    .into_any_element(),
+                SessionState::Idle => unreachable!("label() is None for idle"),
+            };
+            let mut slot = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .h(px(16.0))
+                .child(glyph)
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .line_height(px(16.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(color)
+                        .child(SharedString::from(label)),
+                );
+            if let Some(elapsed) = elapsed {
+                slot = slot.child(
+                    div()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .line_height(px(16.0))
+                        .text_color(color)
+                        .child(elapsed),
+                );
             }
+            slot.into_any_element()
+        } else {
+            // Settled rows: the time is tertiary information - faint,
+            // regular weight, mono (rule 3), never competing with the title.
+            div()
+                .text_size(crate::typography::ui_rems(11.5))
+                .line_height(px(SIDEBAR_CARD_LINE1_HEIGHT))
+                .font_family(theme.font_mono.clone())
+                .text_color(theme.text_faint)
+                .child(time_ago.clone())
+                .into_any_element()
         };
         // One stable wrapper across both states (identity keeps the hover
         // from flickering as the content swaps); the swap is driven by the
@@ -6105,15 +6112,15 @@ impl Shell {
             div()
                 .id(SharedString::from(format!("{row_id}-corner")))
                 .flex_none()
-                // Pin the corner to line 1's text height so the archive pill
+                // Pin the slot to line 1's height so the archive pill
                 // (taller, padded) overflows vertically instead of growing the
-                // row — the swap must not shift the card's content.
+                // card - the swap must not shift the card's content.
                 // NO occlude: the ROW's hover drives the swap, and an
                 // occluding corner un-hovered the row underneath it —
                 // pill mounts, steals the pointer, row un-hovers, pill
                 // unmounts, repeat (user-reported flicker). The pill's
                 // stop_propagation click is separation enough.
-                .h(px(14.0))
+                .h(px(SIDEBAR_CARD_LINE1_HEIGHT))
                 .flex()
                 .items_center()
                 .cursor_pointer()
@@ -6128,11 +6135,6 @@ impl Shell {
         };
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
-        let subline = if search_query.is_some() {
-            theme.text_muted
-        } else {
-            theme.text_muted.opacity(0.5)
-        };
         let select_id = id.clone();
         let menu_id = id.clone();
         // Hover fades over transition-colors (zeron session-row.tsx) — both
@@ -6148,30 +6150,23 @@ impl Shell {
         // below its near-opaque selected fill, and blending toward it visibly
         // dimmed the active row under the pointer (user report).
         let hover_bg = if selected { selected_wash } else { hover };
-        let rest_text = if selected || search_query.is_some() {
+        // Rule 4: titles are NORMAL weight; a card that needs you lifts to
+        // MEDIUM and full-strength text. Everything else rests at 0.9.
+        let rest_text = if selected || needs_you || search_query.is_some() {
             text
         } else {
-            text.opacity(0.8)
+            text.opacity(0.9)
         };
-        // Codex/Cursor density: one 32px line by default. A second, muted
-        // line only exists when it carries information the title can't —
-        // the branch or PR (and the folder context in palette results).
-        let meta_text = if search_query.is_some() {
-            Some(branch.clone().unwrap_or_else(|| space_name.clone()))
-        } else {
-            branch.clone()
-        };
-        let two_line = meta_text.is_some() || change_request.is_some();
-        let row_height = chat_row_height(meta_text.is_some(), change_request.is_some());
-        let (avatar_icon, avatar_blink_icon) = crate::sidebar_buddy::avatar_for_session(&id);
         let harness_mark = harness.map(crate::pickers::harness_brand_icon);
         div()
             .id(SharedString::from(row_id.clone()))
-            .h(px(row_height))
+            // Fixed three-line card: the height never varies with content,
+            // so the list's FLIP estimates and the drawn row always agree.
+            .relative()
+            .h(px(chat_row_height()))
             .flex()
             .flex_col()
             .justify_center()
-            .gap(px(2.0))
             .rounded(px(if search_query.is_some() {
                 popover::PALETTE_ITEM_RADIUS
             } else {
@@ -6242,26 +6237,47 @@ impl Shell {
                     cx.notify();
                 }),
             )
+            // Line 1 - identity and state: the project badge and name, then
+            // the status slot (or its hover/jump replacement).
             .child(
                 div()
-                    .h(px(SIDEBAR_BUDDY_SIZE))
                     .w_full()
+                    .h(px(SIDEBAR_CARD_LINE1_HEIGHT))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(SIDEBAR_ROW_ICON_GAP))
+                    .gap(px(6.0))
+                    .child(self.render_project_icon(
+                        &id,
+                        SIDEBAR_PROJECT_BADGE_SIZE,
+                        selected,
+                        cx,
+                    ))
                     .child(
-                        crate::sidebar_buddy::buddy(
-                            format!("{row_id}-buddy"),
-                            avatar_icon,
-                            avatar_blink_icon,
-                            status,
-                            corner_hovered,
-                            avatar_status_color,
-                            theme.surface,
-                        )
-                        .size(SIDEBAR_BUDDY_SIZE),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .line_height(px(SIDEBAR_CARD_LINE1_HEIGHT))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted)
+                            .child(popover::search_highlight(
+                                project.clone(),
+                                search_query,
+                                theme,
+                            )),
                     )
+                    .child(corner),
+            )
+            // Line 2 - the title. Rule 4: NORMAL weight, MEDIUM and full
+            // strength when the session needs you.
+            .child(
+                div()
+                    .w_full()
+                    .h(px(SIDEBAR_CARD_LINE2_HEIGHT))
+                    .flex()
+                    .items_center()
                     .child(
                         div()
                             .flex_1()
@@ -6269,59 +6285,103 @@ impl Shell {
                             .truncate()
                             .text_size(crate::typography::ui_rems(13.0))
                             .line_height(px(18.0))
-                            .child(popover::search_highlight(title.clone(), search_query, theme)),
-                    )
-                    .child(corner),
+                            .when(needs_you, |el| el.font_weight(gpui::FontWeight::MEDIUM))
+                            .child(popover::search_highlight(
+                                title.clone(),
+                                search_query,
+                                theme,
+                            )),
+                    ),
             )
-            .when(two_line, |row| {
-                row.child(
-                    div()
-                        .w_full()
-                        .h(px(14.0))
-                        // Hang the metadata under the title, not the avatar.
-                        .pl(px(SIDEBAR_BUDDY_SIZE + SIDEBAR_ROW_ICON_GAP))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .text_color(subline)
-                        .when_some(meta_text, |el, meta| {
-                            el.when(branch.is_some(), |el| {
+            // Line 3 - mono metadata, all 11px: the branch on the left; PR
+            // badge, remote device and the harness mark on the right, in that
+            // order. Text starts at the badge's left edge (no leading column
+            // on the lines below line 1).
+            .child(
+                div()
+                    .w_full()
+                    .h(px(SIDEBAR_CARD_LINE3_HEIGHT))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .when_some(branch, |el, branch| {
                                 el.child(
                                     icon(icons::GIT_BRANCH)
                                         .size(px(11.0))
                                         .flex_none()
-                                        .text_color(subline),
+                                        .text_color(theme.text_faint),
                                 )
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(crate::typography::ui_rems(11.5))
-                                    .line_height(px(14.0))
-                                    .child(popover::search_highlight(meta, search_query, theme)),
-                            )
-                        })
-                        .child(div().flex_1().min_w_0())
-                        .when_some(change_request, |el, summary| {
-                            el.child(crate::change_requests::pull_request_badge_with_query(
-                                format!("{row_id}-pr").into(),
-                                summary,
-                                crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
-                                search_query,
-                                theme,
-                            ))
-                        })
-                        .when_some(harness_mark, |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.7)),
-                            )
-                        }),
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_family(theme.font_mono.clone())
+                                        .text_size(crate::typography::ui_rems(11.0))
+                                        .line_height(px(SIDEBAR_CARD_LINE3_HEIGHT))
+                                        .text_color(theme.text_faint)
+                                        .child(popover::search_highlight(
+                                            branch,
+                                            search_query,
+                                            theme,
+                                        )),
+                                )
+                            }),
+                    )
+                    .when_some(change_request, |el, summary| {
+                        el.child(crate::change_requests::pull_request_badge_with_query(
+                            format!("{row_id}-pr").into(),
+                            summary,
+                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                            search_query,
+                            theme,
+                        ))
+                    })
+                    .when_some(remote_device, |el, device| {
+                        el.child(
+                            div()
+                                .max_w(px(96.0))
+                                .min_w_0()
+                                .truncate()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .line_height(px(SIDEBAR_CARD_LINE3_HEIGHT))
+                                .text_color(theme.text_faint)
+                                .child(device),
+                        )
+                    })
+                    .when_some(harness_mark, |el, (path, tint)| {
+                        el.child(
+                            icon(path)
+                                .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                .flex_none()
+                                // Rule 1: identity keeps its brand tint; the
+                                // monochrome marks stay muted.
+                                .text_color(tint.unwrap_or(theme.text_muted)),
+                        )
+                    }),
+            )
+            .when(needs_you, |row| {
+                row.child(
+                    div()
+                        .absolute()
+                        // Sidebar: hang the bar in the list's side padding,
+                        // outside the row's hover/selected wash. Palette
+                        // rows have no such margin, so keep it inside.
+                        .left(px(if search_query.is_some() { 1.0 } else { -5.0 }))
+                        .top(px((CHAT_ROW_HEIGHT - SIDEBAR_NEEDS_BAR_HEIGHT) / 2.0))
+                        .w(px(SIDEBAR_NEEDS_BAR_WIDTH))
+                        .h(px(SIDEBAR_NEEDS_BAR_HEIGHT))
+                        .rounded(px(1.0))
+                        .bg(needs_you_color),
                 )
             })
             .into_any_element()
@@ -6510,40 +6570,10 @@ impl Shell {
             cx,
         );
 
-        // Top of the column: primary verbs as plain nav rows (Codex/Cursor),
-        // not a brand card — the window already says which app this is.
-        let keymap = self.settings.keymap.clone();
-        let side_nav = div()
-            .id("sidebar-nav")
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap(px(1.0))
-            .px(px(Theme::SPACE_SM))
-            .pt(px(6.0))
-            .pb(px(Theme::SPACE_SM))
-            .child(
-                sidebar_nav_row(
-                    "sidebar-new-session",
-                    icons::PEN_NEW_SQUARE,
-                    "New session",
-                    badge_combo(keymap.get(ShortcutId::NewSession)),
-                    theme,
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.open_new_session(cx))),
-            )
-            .child(
-                sidebar_nav_row(
-                    "sidebar-search",
-                    icons::MAGNIFER,
-                    "Search",
-                    badge_combo("mod-k"),
-                    theme,
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.toggle_command_palette(window, cx)
-                })),
-            );
+        // Top of the column: the space filter. "New session" and "Search"
+        // nav rows are gone (control-plane.md, "Removed"): the titlebar `+`
+        // and Cmd+N cover new sessions, and search moved into the filter row
+        // as an icon button.
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -6602,7 +6632,6 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
-            .child(side_nav)
             .child(filter_row)
             .child(sidebar_lists)
             .when_some(self.render_voice_bar(theme, cx), |el, bar| el.child(bar))
@@ -6736,8 +6765,9 @@ impl Shell {
                             .truncate()
                             .text_size(crate::typography::ui_rems(12.0))
                             .line_height(px(16.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
+                            // Rule 4: the footer is a caption, not a heading -
+                            // device names read NORMAL weight in text_muted.
+                            .text_color(theme.text_muted)
                             .child(user_line.clone()),
                     )
                     .when_some(trigger_subline, |identity, subline| {
@@ -8070,10 +8100,14 @@ impl Shell {
                         // route only (see that method for why the workspace
                         // route must never take it). The inset/band_top stay
                         // inert while the top edge is off.
+                        // Workspace panes own their composers as flex
+                        // footers, so nothing slides under a bottom band
+                        // there - and with flush panes the band would fade
+                        // the bottom pane's footer labels to nothing.
                         let fade = crate::edge_fade::edge_faded(
                             Theme::TRANSCRIPT_FADE_BAND,
                             self.transcript_underlay_fades_top(),
-                            true,
+                            self.transcript_underlay_fades_top(),
                             div().size_full().child(outlet),
                         );
                         if self.transcript_underlay_fades_top() {
@@ -11555,16 +11589,89 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_chat_row_grows_only_for_metadata() {
-        assert_eq!(chat_row_height(false, false), 32.0);
-        assert_eq!(chat_row_height(true, false), 48.0);
-        assert_eq!(chat_row_height(false, true), 48.0);
-        assert_eq!(chat_row_height(true, true), 48.0);
+    fn sidebar_chat_rows_keep_one_constant_height() {
+        // "Card (three lines, 72px)": the badge line, the title, and the
+        // metadata line are always drawn, so the FLIP estimates and the
+        // drawn card agree in every state. The needs-you bar is centered in
+        // that block.
+        assert_eq!(chat_row_height(), CHAT_ROW_HEIGHT);
+        assert_eq!(CHAT_ROW_HEIGHT, 72.0);
+        assert_eq!(
+            SIDEBAR_CARD_LINE1_HEIGHT + SIDEBAR_CARD_LINE2_HEIGHT + SIDEBAR_CARD_LINE3_HEIGHT,
+            52.0
+        );
+        assert_eq!((CHAT_ROW_HEIGHT - SIDEBAR_NEEDS_BAR_HEIGHT) / 2.0, 26.0);
     }
 
     #[test]
-    fn sidebar_harness_geometry_reflects_row_hierarchy() {
-        assert!(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE < SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE);
+    fn sidebar_card_geometry_matches_the_spec() {
+        // control-plane.md: line 1 is 18px with the 16px project badge, the
+        // title line 18px, the metadata line 16px, and the harness mark 13px.
+        assert_eq!(SIDEBAR_CARD_LINE1_HEIGHT, 18.0);
+        assert_eq!(SIDEBAR_CARD_LINE2_HEIGHT, 18.0);
+        assert_eq!(SIDEBAR_CARD_LINE3_HEIGHT, 16.0);
+        assert_eq!(SIDEBAR_PROJECT_BADGE_SIZE, 16.0);
+        assert_eq!(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, 13.0);
+    }
+
+    #[test]
+    fn working_elapsed_formats_seconds_minutes_and_hours() {
+        assert_eq!(format_working_elapsed(-3), "0s");
+        assert_eq!(format_working_elapsed(45), "45s");
+        assert_eq!(format_working_elapsed(119), "1m");
+        assert_eq!(format_working_elapsed(120), "2m");
+        assert_eq!(format_working_elapsed(3600), "1h");
+        assert_eq!(format_working_elapsed(3840), "1h 4m");
+        assert_eq!(format_working_elapsed(90_000), "25h");
+    }
+
+    #[test]
+    fn sidebar_state_sections_rank_needs_over_running() {
+        use zeron_proto::ChatIndicator::{AwaitingInput, Completed, Errored, Working};
+        let section = spaces::sidebar_section;
+        // Needs you: awaiting input, failed, and undelivered sends.
+        assert_eq!(
+            section(AwaitingInput, false, false),
+            spaces::SidebarSection::NeedsYou
+        );
+        assert_eq!(
+            section(Errored, false, false),
+            spaces::SidebarSection::NeedsYou
+        );
+        assert_eq!(
+            section(Working, false, true),
+            spaces::SidebarSection::NeedsYou
+        );
+        // Running: working, and queued sends.
+        assert_eq!(
+            section(Working, false, false),
+            spaces::SidebarSection::Running
+        );
+        assert_eq!(
+            section(Completed, true, false),
+            spaces::SidebarSection::Running
+        );
+        assert_eq!(
+            section(Completed, false, false),
+            spaces::SidebarSection::Rest
+        );
+    }
+
+    #[test]
+    fn sidebar_state_sections_keep_the_input_order_inside_a_section() {
+        use spaces::SidebarSection::{NeedsYou, Rest, Running};
+        let rows = vec![
+            (Rest, "a"),
+            (NeedsYou, "b"),
+            (Rest, "c"),
+            (Running, "d"),
+            (NeedsYou, "e"),
+        ];
+        let ordered = spaces::order_sidebar_sections(rows, |row| row.0);
+        assert_eq!(
+            ordered.into_iter().map(|row| row.1).collect::<Vec<_>>(),
+            vec!["b", "e", "d", "a", "c"]
+        );
     }
 
     #[test]

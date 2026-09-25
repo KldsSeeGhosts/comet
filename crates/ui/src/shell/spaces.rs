@@ -10,16 +10,69 @@
 
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
+use crate::status_palette::SessionState;
 use gpui::{FocusHandle, Window};
 use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
 
 struct ActiveChatRow {
     status: ChatIndicator,
     chat: zeron_proto::Chat,
-    folder: String,
+    project: String,
     branch: Option<String>,
+    /// The session's host device name, only when it is NOT this machine.
+    remote_device: Option<String>,
     change_request: Option<zeron_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
+    section: SidebarSection,
+}
+
+/// The non-collapsible state sections that float above the user's chosen
+/// organization (control-plane.md, "State sections").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SidebarSection {
+    NeedsYou,
+    Running,
+    Rest,
+}
+
+impl SidebarSection {
+    fn rank(self) -> u8 {
+        match self {
+            Self::NeedsYou => 0,
+            Self::Running => 1,
+            Self::Rest => 2,
+        }
+    }
+}
+
+/// Which section a row is drawn under. Delegates to the shared state
+/// language (`status_palette::SessionState`) so the sidebar, the pane
+/// headers and the palette cannot drift: needs-you wins over running, and an
+/// undelivered send is a failure to report even when the chat is mid-turn.
+pub(super) fn sidebar_section(
+    status: ChatIndicator,
+    queued: bool,
+    undelivered: bool,
+) -> SidebarSection {
+    let state = SessionState::resolve(status, queued, undelivered);
+    if state.needs_you() {
+        SidebarSection::NeedsYou
+    } else if state.running() {
+        SidebarSection::Running
+    } else {
+        SidebarSection::Rest
+    }
+}
+
+/// Stable partition into the state sections - the input order (the user's
+/// sort) is preserved inside each section.
+pub(super) fn order_sidebar_sections<T>(
+    rows: Vec<T>,
+    section: impl Fn(&T) -> SidebarSection,
+) -> Vec<T> {
+    let mut rows = rows;
+    rows.sort_by_key(|row| section(row).rank());
+    rows
 }
 
 pub(super) fn compare_sidebar_chats(
@@ -118,6 +171,10 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 7] = [
 const SIDEBAR_SECTION_GAP: f32 = 12.0;
 /// Height of the project filter row and its view-options button.
 const SIDEBAR_FILTER_HEIGHT: f32 = 26.0;
+/// State-section headings (needs you / running / recent).
+const SIDEBAR_SECTION_HEADER_HEIGHT: f32 = 30.0;
+/// The heading label's own line box; the 6px state dot centers on it.
+const SIDEBAR_SECTION_HEADER_LINE: f32 = 18.0;
 const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
@@ -158,6 +215,44 @@ fn promote_local_device_group<T>(
 /// Shared quiet rule for sidebar groups and palette sections.
 pub(super) fn sidebar_separator(theme: &Theme) -> gpui::Div {
     div().h(px(1.0)).bg(theme.border.opacity(0.6))
+}
+
+/// A non-collapsible state heading ("Needs you", "Running", "Recent"):
+/// 30px tall, 11.5px MEDIUM `text_faint`, sentence case, no count. State
+/// headings carry their state's 6px dot before the label (indigo for needs
+/// you, sky for running); Recent has none.
+fn sidebar_section_header(
+    label: &'static str,
+    dot: Option<gpui::Hsla>,
+    theme: &Theme,
+) -> AnyElement {
+    div()
+        .h(px(SIDEBAR_SECTION_HEADER_HEIGHT))
+        .flex_none()
+        .flex()
+        // Bottom-aligned: the extra air sits above the label, separating
+        // the section from the rows before it.
+        .items_end()
+        .pb(px(6.0))
+        .px(px(Theme::SPACE_SM))
+        .child(
+            div()
+                // The label's line box: the dot centers on the text, not on
+                // its descent.
+                .h(px(SIDEBAR_SECTION_HEADER_LINE))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(crate::typography::ui_rems(11.5))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_faint)
+                .when_some(dot, |el, dot| {
+                    el.child(div().size(px(6.0)).flex_none().rounded_full().bg(dot))
+                })
+                .child(SharedString::from(label)),
+        )
+        .into_any_element()
 }
 
 fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyElement) -> gpui::Div {
@@ -253,26 +348,6 @@ pub(super) struct RenameSpaceDialog {
     pub input: Entity<ComposerInput>,
     pub focus_pending: bool,
     pub _events: Subscription,
-}
-
-/// Dot color for a chat's display status (tab dots + Sessions rows).
-pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
-    match status {
-        // Preset activity tone, not warning amber: running is routine.
-        // Non-done statuses sit well below full
-        // strength: at full alpha the colored words shouted across the
-        // whole sidebar (user request) — only Done keeps its pop.
-        ChatIndicator::Working => theme.busy.opacity(0.55),
-        // Blue: "asking you a question" must read differently from "busy
-        // working" at a glance.
-        ChatIndicator::AwaitingInput => theme.accent.opacity(0.6),
-        ChatIndicator::Errored => theme.danger.opacity(0.65),
-        // Green: finished-but-unseen reads as "ready for you".
-        ChatIndicator::Completed => {
-            theme.success.opacity(0.9) // emerald-400
-        }
-        ChatIndicator::Idle => crate::theme::ink(0.14),
-    }
 }
 
 // Handle-based rail host for the spaces dropdown: its list is a plain
@@ -777,24 +852,19 @@ impl Shell {
     ) -> AnyElement {
         let filter = self.settings.space_filter.clone();
         // Name + the dropdown rows' "@ device" tag on the trigger itself, so
-        // the filtered space's host reads without opening the picker.
-        let (label, device_tag, session_count): (
-            SharedString,
-            Option<(SharedString, bool)>,
-            usize,
-        ) = {
+        // the filtered space's host reads without opening the picker. No
+        // session count: the list below IS the count.
+        let (label, device_tag): (SharedString, Option<(SharedString, bool)>) = {
             let state = self.state.read(cx);
-            let session_count = state.sidebar_chats(Utc::now(), filter.as_deref()).len();
             match filter.as_deref().and_then(|id| state.space_row(id)) {
                 Some(space) => {
                     let (tag, offline) = state.space_device_tag(space, Utc::now());
                     (
                         space.display_name().to_string().into(),
                         Some((tag.into(), offline)),
-                        session_count,
                     )
                 }
-                None => (SharedString::from("All projects"), None, session_count),
+                None => (SharedString::from("All projects"), None),
             }
         };
         let open = self.spaces_menu.is_open();
@@ -811,7 +881,7 @@ impl Shell {
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
             .text_size(crate::typography::ui_rems(12.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
+            // Rule 4: filters read NORMAL weight.
             .text_color(motion::hover_blend(
                 "spaces-filter",
                 theme.text_muted,
@@ -890,17 +960,7 @@ impl Shell {
                     .flex_none()
                     .text_color(theme.text_faint),
             )
-            .child(div().flex_1())
-            .when(session_count > 0, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .text_size(crate::typography::ui_rems(11.5))
-                        .font_weight(gpui::FontWeight::NORMAL)
-                        .text_color(theme.text_faint.opacity(0.7))
-                        .child(session_count.to_string()),
-                )
-            });
+            .child(div().flex_1());
         let trigger = if self.spaces_menu.get().is_some() {
             let closing = self.spaces_menu.closing_since();
             let menu = self.render_spaces_menu(theme, cx);
@@ -985,6 +1045,32 @@ impl Shell {
             view_trigger
         };
 
+        // Search moved out of the (removed) nav rows and into the filter
+        // row: same cloth as the view-options button beside it.
+        let search_trigger = div()
+            .id("sidebar-search")
+            .role(gpui::Role::Button)
+            .aria_label("Search")
+            .size(px(SIDEBAR_FILTER_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .text_color(theme.text_muted)
+            .bg(theme.glass_hover().opacity(0.0))
+            .hover(|el| el.bg(theme.glass_hover()))
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_command_palette(window, cx)))
+            .tooltip(|_, cx| cx.new(|_| super::SidebarTooltip("Search")).into())
+            .tooltip_show_delay(std::time::Duration::from_millis(350))
+            .child(
+                icon(icons::MAGNIFER)
+                    .size(px(14.0))
+                    .text_color(theme.text_faint),
+            );
+
         div()
             .flex_none()
             .flex()
@@ -992,9 +1078,10 @@ impl Shell {
             .items_center()
             .gap(px(2.0))
             .px(px(Theme::SPACE_SM))
-            .pt(px(4.0))
+            .pt(px(6.0))
             .pb(px(2.0))
             .child(trigger)
+            .child(search_trigger)
             .child(view_trigger)
             .into_any_element()
     }
@@ -1197,42 +1284,82 @@ impl Shell {
     }
 
     /// Flat top-to-bottom chat ids exactly as [`Self::render_active_rows`]
-    /// draws them - the user's sort, workspace/device grouping, and local-device
-    /// promotion applied. The jump shortcuts and session cycling read THIS
-    /// order (not the raw recency list) so keyboard order never drifts from
-    /// the screen.
+    /// draws them - the state sections (needs you, running) first, then the
+    /// user's sort, workspace/device grouping, and local-device promotion
+    /// applied. The jump shortcuts and session cycling read THIS order (not
+    /// the raw recency list) so keyboard order never drifts from the screen.
     pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
-        let filter = self.settings.space_filter.clone();
-        let state = self.state.read(cx);
-        let mut chats: Vec<zeron_proto::Chat> = state
-            .sidebar_chats(Utc::now(), filter.as_deref())
-            .into_iter()
-            .map(|(_, chat)| chat.clone())
-            .collect();
-        chats.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
-        if self.settings.sidebar_organization != SidebarOrganization::ByDevice {
-            return chats.into_iter().map(|chat| chat.id).collect();
+        /// One row's placement, computed exactly as the drawn list computes
+        /// it: its state section, and (for the rest) its device group.
+        struct VisibleChat {
+            section: SidebarSection,
+            group: Option<(String, String)>,
+            id: String,
         }
-        let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
-        for chat in chats {
-            let space_id = state
-                .space_for_chat(&chat)
-                .filter(|space| space.device_id == chat.device_id)
-                .map(|space| space.id.clone())
-                .unwrap_or_default();
-            let key = Some((chat.device_id.clone(), space_id));
-            if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
-                existing.push(chat);
+
+        let now = Utc::now();
+        let filter = self.settings.space_filter.clone();
+        let by_device = self.settings.sidebar_organization == SidebarOrganization::ByDevice;
+        let state = self.state.read(cx);
+        let mut chats: Vec<(ChatIndicator, zeron_proto::Chat)> = state
+            .sidebar_chats(now, filter.as_deref())
+            .into_iter()
+            .map(|(status, chat)| (status, chat.clone()))
+            .collect();
+        chats.sort_by(|left, right| {
+            compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
+        });
+        let rows: Vec<VisibleChat> = chats
+            .into_iter()
+            .map(|(status, chat)| {
+                let undelivered = state.send_undelivered(&chat.id, now);
+                let queued = state.send_queued(&chat.id, now);
+                VisibleChat {
+                    section: sidebar_section(status, queued, undelivered),
+                    group: by_device.then(|| {
+                        let space_id = state
+                            .space_for_chat(&chat)
+                            .filter(|space| space.device_id == chat.device_id)
+                            .map(|space| space.id.clone())
+                            .unwrap_or_default();
+                        (chat.device_id.clone(), space_id)
+                    }),
+                    id: chat.id,
+                }
+            })
+            .collect();
+        // State sections stay flat above the organization, so only the rest
+        // rows carry a device group.
+        let mut flat: Vec<String> = Vec::new();
+        let mut rest = Vec::new();
+        for row in order_sidebar_sections(rows, |row| row.section) {
+            if row.section == SidebarSection::Rest {
+                rest.push(row);
             } else {
-                groups.push((key, vec![chat]));
+                flat.push(row.id);
+            }
+        }
+        if !by_device {
+            flat.extend(rest.into_iter().map(|row| row.id));
+            return flat;
+        }
+        let mut groups: Vec<(Option<(String, String)>, Vec<VisibleChat>)> = Vec::new();
+        for row in rest {
+            let key = row.group.clone();
+            if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &key) {
+                existing.push(row);
+            } else {
+                groups.push((key, vec![row]));
             }
         }
         promote_local_device_group(&mut groups, state.local_device_id.as_deref());
-        groups
-            .into_iter()
-            .flat_map(|(_, rows)| rows)
-            .map(|chat| chat.id)
-            .collect()
+        flat.extend(
+            groups
+                .into_iter()
+                .flat_map(|(_, rows)| rows)
+                .map(|row| row.id),
+        );
+        flat
     }
 
     /// The sidebar's Sessions list: every session (idle included) of the
@@ -1258,23 +1385,20 @@ impl Shell {
             chats
                 .into_iter()
                 .map(|(status, chat)| {
-                    // Line 1 is "project @ device" (t3code's project row);
-                    // project-less sessions read as their home-dir cwd `~`.
+                    // Line 2 is "project:branch" + " · device" for a remote
+                    // session; project-less sessions read as their home-dir
+                    // cwd `~`.
                     let space = state.space_for_chat(&chat);
                     let project = match (space, chat.space_id.as_deref()) {
                         (Some(space), _) => space.display_name().to_string(),
                         (None, None) => "~".to_string(),
                         (None, Some(_)) => "?".to_string(),
                     };
-                    let device = state
-                        .device_name(&chat.device_id)
-                        .unwrap_or("Unknown device")
-                        .to_string();
-                    let mut folder = project.clone();
-                    // Unknown device → no fragment, same as the archived list.
-                    if state.device_name(&chat.device_id).is_some() {
-                        folder = format!("{folder} @ {device}");
-                    }
+                    let local_device_id = state.local_device_id.as_deref();
+                    let remote_device = (local_device_id != Some(chat.device_id.as_str()))
+                        .then(|| state.device_name(&chat.device_id))
+                        .flatten()
+                        .map(str::to_string);
                     // The branch shows whenever the engine has stamped one —
                     // main-checkout sessions included, not just worktrees.
                     let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
@@ -1292,13 +1416,19 @@ impl Shell {
                         )),
                         SidebarOrganization::ByProject | SidebarOrganization::InOneList => None,
                     };
+                    // Send truth decides the section: an undelivered send
+                    // needs you, a queued one is running.
+                    let undelivered = state.send_undelivered(&chat.id, now);
+                    let queued = state.send_queued(&chat.id, now);
                     ActiveChatRow {
                         status,
                         chat: chat.clone(),
-                        folder,
+                        project,
                         branch,
+                        remote_device,
                         change_request,
                         group,
+                        section: sidebar_section(status, queued, undelivered),
                     }
                 })
                 .collect()
@@ -1314,8 +1444,24 @@ impl Shell {
             }
         }
 
+        // State sections float above the chosen organization: needs-you and
+        // running always come first, flat and non-collapsible; everything
+        // else keeps the user's organization (and InOneList gains a "Recent"
+        // header only when a section above it is non-empty).
+        let mut needs: Vec<ActiveChatRow> = Vec::new();
+        let mut running: Vec<ActiveChatRow> = Vec::new();
+        let mut rest: Vec<ActiveChatRow> = Vec::new();
+        for row in order_sidebar_sections(rows, |row| row.section) {
+            match row.section {
+                SidebarSection::NeedsYou => needs.push(row),
+                SidebarSection::Running => running.push(row),
+                SidebarSection::Rest => rest.push(row),
+            }
+        }
+
         let mut groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = Vec::new();
-        for row in rows {
+        let has_rest = !rest.is_empty();
+        for row in rest {
             if let Some((_, existing)) = groups.iter_mut().find(|(group, _)| group == &row.group) {
                 existing.push(row);
             } else {
@@ -1332,60 +1478,74 @@ impl Shell {
         // not on the next modifier event — the jumps are suppressed under it.
         let jump_hints = self.jump_hints && !self.overlay_owns_keyboard(cx);
         let keymap = self.settings.keymap.clone();
-        // Flat top-to-bottom slot across groups: the same order
+        // Flat top-to-bottom slot across sections and groups: the same order
         // `sidebar_visible_order` hands the jump shortcuts and cycling, so a
         // chip always names the key that opens its row.
         let mut slot = 0usize;
         let mut rendered = Vec::new();
+        for (key, label, dot, rows) in [
+            (
+                "s:needs",
+                "Needs you",
+                SessionState::AwaitingInput.color(theme),
+                needs,
+            ),
+            (
+                "s:running",
+                "Running",
+                SessionState::Working.color(theme),
+                running,
+            ),
+        ] {
+            if rows.is_empty() {
+                continue;
+            }
+            rendered.push((
+                key.to_string(),
+                SIDEBAR_SECTION_HEADER_HEIGHT,
+                sidebar_section_header(label, dot, theme),
+            ));
+            for row in rows {
+                rendered.push(self.render_active_chat_row(
+                    row,
+                    now,
+                    slot,
+                    jump_hints,
+                    &keymap,
+                    selected.as_deref(),
+                    theme,
+                    cx,
+                ));
+                slot += 1;
+            }
+        }
+        // The rest keeps the chosen organization. Only InOneList needs a
+        // header to separate it from the sections above, and only when one of
+        // them is on screen AND there are rows to head.
+        if self.settings.sidebar_organization == SidebarOrganization::InOneList
+            && has_rest
+            && !rendered.is_empty()
+        {
+            rendered.push((
+                "s:recent".to_string(),
+                SIDEBAR_SECTION_HEADER_HEIGHT,
+                sidebar_section_header("Recent", None, theme),
+            ));
+        }
         for (group, rows) in groups {
             let mut rendered_rows = Vec::with_capacity(rows.len());
             for row in rows {
-                let ActiveChatRow {
-                    status,
-                    chat,
-                    folder,
-                    branch,
-                    change_request,
-                    group: _,
-                } = row;
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
-                let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let harness = self
-                    .settings
-                    .sidebar_show_harness
-                    .then(|| chat.config.as_ref().map(|c| c.harness))
-                    .flatten();
-                let height = super::chat_row_height(branch.is_some(), change_request.is_some());
-                // Only rows a jump slot can reach wear a chip; row 10 onward
-                // keeps its time-ago.
-                let jump_label: Option<SharedString> = if jump_hints {
-                    let combo = keymap.get(ShortcutId::JumpSession(slot));
-                    (slot < JUMP_SLOTS && !combo.is_empty()).then(|| badge_combo(combo).into())
-                } else {
-                    None
-                };
-                slot += 1;
-                let element = self.render_chat_row(
-                    chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )
-                    .into(),
-                    time_ago,
-                    folder.into(),
-                    branch.map(SharedString::from),
-                    change_request,
-                    harness,
-                    status,
-                    is_selected,
-                    false,
-                    jump_label,
-                    None,
+                rendered_rows.push(self.render_active_chat_row(
+                    row,
+                    now,
+                    slot,
+                    jump_hints,
+                    &keymap,
+                    selected.as_deref(),
                     theme,
                     cx,
-                );
-                rendered_rows.push((format!("c:{}", chat.id), height, element));
+                ));
+                slot += 1;
             }
 
             let Some((device_id, space_id)) = group else {
@@ -1533,6 +1693,67 @@ impl Shell {
             rendered.push((format!("g:{collapse_key}"), height, element));
         }
         rendered
+    }
+
+    /// Draw one active session row and its keyed height. Shared by the flat
+    /// state sections and the grouped organization below them.
+    #[allow(clippy::too_many_arguments)]
+    fn render_active_chat_row(
+        &mut self,
+        row: ActiveChatRow,
+        now: chrono::DateTime<Utc>,
+        slot: usize,
+        jump_hints: bool,
+        keymap: &KeymapConfig,
+        selected: Option<&str>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> (String, f32, AnyElement) {
+        let ActiveChatRow {
+            status,
+            chat,
+            project,
+            branch,
+            remote_device,
+            change_request,
+            group: _,
+            section: _,
+        } = row;
+        let time_ago: SharedString =
+            format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+        let is_selected = selected == Some(chat.id.as_str());
+        let harness = self
+            .settings
+            .sidebar_show_harness
+            .then(|| chat.config.as_ref().map(|c| c.harness))
+            .flatten();
+        // Only rows a jump slot can reach wear a chip; row 10 onward keeps
+        // its time-ago.
+        let jump_label: Option<SharedString> = if jump_hints {
+            let combo = keymap.get(ShortcutId::JumpSession(slot));
+            (slot < JUMP_SLOTS && !combo.is_empty()).then(|| badge_combo(combo).into())
+        } else {
+            None
+        };
+        let element = self.render_chat_row(
+            chat.id.clone(),
+            transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
+                .into(),
+            time_ago,
+            project.into(),
+            branch.map(SharedString::from),
+            remote_device.map(SharedString::from),
+            change_request,
+            harness,
+            status,
+            is_selected,
+            false,
+            jump_label,
+            None,
+            theme,
+            cx,
+        );
+        (format!("c:{}", chat.id), super::chat_row_height(), element)
     }
 
     /// The sidebar's archived shelf — a direct port of t3code's settled

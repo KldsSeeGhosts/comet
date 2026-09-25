@@ -12,6 +12,10 @@
 
 use super::*;
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
 use crate::pane::chrome::{self, TabChip, tab_mark};
 use crate::pane::hit_test::{self, DragSource, DropPlan};
 use crate::pane::render::{
@@ -22,24 +26,71 @@ use crate::pane::{
     ratio_from_pointer,
 };
 use crate::state::ChatTarget;
+use crate::status_palette::SessionState;
 use zeron_workspace::{Direction, PaneId, PaneMode, TabId, ViewId};
 
-fn pane_buddy(pane: PaneId, session: Option<&str>, state: &AppState, theme: &Theme) -> chrome::PaneBuddy {
+/// The pane header's metadata for a bound session: the mono
+/// `{project}:{branch}` (plus ` · {device}` for a remote device) context line
+/// and the session's display state. Computed here because it reads AppState;
+/// the shapes match the sidebar's line-2 derivation in `shell/spaces.rs`. An
+/// unbound pane (no session) carries no metadata.
+fn pane_meta(session: Option<&str>, state: &AppState) -> chrome::PaneMeta {
+    let Some(chat) = session.and_then(|id| state.chats.iter().find(|chat| chat.id == id)) else {
+        return chrome::PaneMeta::empty();
+    };
+    // Project: the owning space's display name; project-less sessions read as
+    // their home-dir cwd `~` (or `?` when the space is unknown).
+    let space = state.space_for_chat(chat);
+    let mut context = match (space, chat.space_id.as_deref()) {
+        (Some(space), _) => space.display_name().to_string(),
+        (None, None) => "~".to_string(),
+        (None, Some(_)) => "?".to_string(),
+    };
+    // The branch shows whenever the engine has stamped one - main-checkout
+    // sessions included, not just worktrees.
+    if let Some(branch) = crate::change_requests::conversation_branch(chat, &state.spaces)
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+    {
+        context.push(':');
+        context.push_str(branch);
+    }
+    // Device only for a session that is NOT on this machine.
+    let local_device_id = state.local_device_id.as_deref();
+    let remote_device = (local_device_id != Some(chat.device_id.as_str()))
+        .then(|| state.device_name(&chat.device_id))
+        .flatten();
+    if let Some(device) = remote_device {
+        context.push_str(" · ");
+        context.push_str(device);
+    }
     let now = Utc::now();
-    let status = session
-        .and_then(|id| state.chats.iter().find(|chat| chat.id == id))
-        .map(|chat| state.display_status_for(chat, now))
-        .unwrap_or(zeron_proto::ChatIndicator::Idle);
-    chrome::PaneBuddy {
-        session_key: session.map(SharedString::from)
-            .unwrap_or_else(|| format!("new-pane-{}", pane.0).into()),
-        status,
-        status_color: crate::sidebar_buddy::status_color(
-            status,
-            session.is_some_and(|id| state.send_queued(id, now)),
-            session.is_some_and(|id| state.send_undelivered(id, now)),
-            theme,
-        ),
+    let status = state.display_status_for(chat, now);
+    let undelivered = state.send_undelivered(&chat.id, now);
+    let queued = state.send_queued(&chat.id, now) && !undelivered;
+    chrome::PaneMeta {
+        context: Some(context.into()),
+        // Send truth decides the state (undelivered -> failed, degraded
+        // delivery -> queued), same as the sidebar's slot.
+        state: SessionState::resolve(status, queued, undelivered),
+    }
+}
+
+/// The pane header's identity mark: a bound chat's harness brand icon + tint
+/// when the chat names one (rule 1: Claude orange, the rest monochrome by
+/// design), else the provider/mode tab mark. Tab chips always keep
+/// [`tab_mark`].
+fn header_mark(
+    chat: Option<&zeron_proto::Chat>,
+    mode: PaneMode,
+    provider_key: Option<&str>,
+) -> chrome::TabMark {
+    match chat.and_then(|chat| chat.config.as_ref().map(|config| config.harness)) {
+        Some(harness) => {
+            let (icon, tint) = crate::pickers::harness_brand_icon(harness);
+            chrome::TabMark { icon, tint }
+        }
+        None => tab_mark(mode, provider_key),
     }
 }
 
@@ -62,7 +113,7 @@ impl Shell {
     /// Whether the shell's transcript-underlay fade may take a TOP ramp.
     /// Legacy single-pane route only: there the primary transcript slides
     /// under the mounted pane header, so content must be fully faded by the
-    /// header's bottom edge. The workspace route must NOT take it — its panes
+    /// header's bottom edge. The workspace route must NOT take it - its panes
     /// carry their own chrome (header row, tab strip) inside the outlet, and
     /// a zero band across the outlet's top erased those glyphs (the "faded
     /// top bar, no title" split-view bug) while every pane transcript is an
@@ -82,9 +133,9 @@ impl Shell {
     }
 
     /// The workspace tree as the chat outlet. Every Chat-mode pane in the
-    /// layout owns a live transcript+composer pair bound to its session —
+    /// layout owns a live transcript+composer pair bound to its session - 
     /// created lazily here (render pass, like the lazy terminal panel) for
-    /// panes across ALL tabs/views, not only visible or focused ones — then
+    /// panes across ALL tabs/views, not only visible or focused ones - then
     /// the tree is snapshotted and handed to [`crate::pane::render`]. The
     /// outer dock stays suppressed while `workspace_mode()` holds.
     pub(super) fn render_workspace_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -95,17 +146,42 @@ impl Shell {
             .unwrap_or_else(|| (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0));
         let action_control =
             self.render_project_actions_control(available, px(self.viewport_height), cx);
-        let snap =
-            Self::workspace_snapshot(&self.workspace, &self.state, action_control, cx);
+        let project_badges = self.render_pane_project_badges(cx);
+        let snap = Self::workspace_snapshot(
+            &self.workspace,
+            &self.state,
+            action_control,
+            project_badges,
+            cx,
+        );
         // WS4: the active drag's preview, converted to outlet-relative space.
         let drag_preview = self.split_drag_preview();
         workspace_outlet(cx, &theme, &snap, drag_preview)
     }
 
+    /// One 14px project badge per session-bound chat pane, keyed by pane.
+    /// `AnyElement` is not cloneable, so the snapshot hands them to the
+    /// renderer through a take-once registry (the same pattern as
+    /// `action_control`); each pane container removes its own entry.
+    fn render_pane_project_badges(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Rc<RefCell<BTreeMap<PaneId, AnyElement>>> {
+        let badges = self
+            .workspace
+            .chat_pane_sessions()
+            .into_iter()
+            .filter_map(|(pane, session)| {
+                session.map(|chat_id| (pane, self.render_project_icon(&chat_id, 14.0, false, cx)))
+            })
+            .collect();
+        Rc::new(RefCell::new(badges))
+    }
+
     /// The legacy single-pane route's chat identity row: the same pane
     /// header the workspace tree renders per pane, mounted above the
     /// transcript when `workspace_mode()` is off (the workspace outlet then
-    /// supplies its own headers). Not closable and not a drag source — the
+    /// supplies its own headers). Not closable and not a drag source - the
     /// trivial layout has no splits to re-dock.
     pub(super) fn render_primary_pane_header(
         &mut self,
@@ -115,14 +191,22 @@ impl Shell {
         let Some(pane) = self.workspace.focused_pane() else {
             return Empty.into_any_element();
         };
-        let (title, has_selection, buddy) = {
-            let row = self.state.read(cx).selected_chat_row();
+        let (title, chat_id, meta, mark) = {
+            let state = self.state.read(cx);
+            let row = state.selected_chat_row();
             let title = row
                 .and_then(|chat| chat.title.clone())
                 .map(|title| SharedString::from(transcript::single_line(&title)))
                 .unwrap_or_else(|| SharedString::from("New session"));
-            (title, row.is_some(), pane_buddy(pane, row.map(|chat| chat.id.as_str()), self.state.read(cx), theme))
+            let chat_id = row.map(|chat| chat.id.clone());
+            let meta = pane_meta(chat_id.as_deref(), state);
+            let mark = header_mark(row, PaneMode::Chat, None);
+            (title, chat_id, meta, mark)
         };
+        let has_selection = chat_id.is_some();
+        let badge = chat_id
+            .as_deref()
+            .map(|chat_id| self.render_project_icon(chat_id, 14.0, false, cx));
         let available =
             (self.viewport_width - self.sidebar_now() - self.right_now(cx) - 24.0).max(0.0);
         let action_control =
@@ -130,9 +214,12 @@ impl Shell {
         chrome::pane_header(
             pane,
             title,
-            tab_mark(PaneMode::Chat, None),
-            Some(&buddy),
+            mark,
+            &meta,
+            badge,
             false,
+            // The legacy route has one pane and it is always the active one.
+            true,
             has_selection,
             action_control,
             false,
@@ -270,7 +357,7 @@ impl Shell {
         let focused = self.workspace.focused_pane() == Some(pane);
         composer.update(cx, |composer, _| composer.focus_pending = focused);
         // Project-switch parking: rehydrate the draft state parked for this
-        // (space, pane). Adopted composers rehydrate too — `restore_draft_state`
+        // (space, pane). Adopted composers rehydrate too - `restore_draft_state`
         // only fills an EMPTY input, so the adopted dock composer keeps any
         // text it already carries for this key (never clobbered) while a
         // stranded park (the adopt fired after the park) still lands.
@@ -327,7 +414,7 @@ impl Shell {
     }
 
     /// A workspace pane's composer event stream. Unlike the shell composer,
-    /// pane composers never drive the global dock transition — `Sent` /
+    /// pane composers never drive the global dock transition - `Sent` /
     /// `Queued` bind the layout pane to the minted chat and hand the
     /// own-turn marker to THAT pane's transcript.
     pub(super) fn on_pane_composer_event(
@@ -354,7 +441,7 @@ impl Shell {
                 cx.notify();
             }
             ComposerEvent::Sent { chat_id, .. } | ComposerEvent::Queued { chat_id, .. } => {
-                // Bind the layout pane to the minted chat (idempotent — the
+                // Bind the layout pane to the minted chat (idempotent - the
                 // selection sync may already have landed it) and arm the
                 // workspace persistence write.
                 let bound = self
@@ -367,7 +454,7 @@ impl Shell {
                 }
                 self.workspace.mark_dirty();
                 self.note_workspace_mutation(cx);
-                // The composer already bound itself during the mint — keep
+                // The composer already bound itself during the mint - keep
                 // that entity, mirror the session, and ensure the pane's
                 // fixed transcript exists before the marker lands.
                 let needs_transcript = self
@@ -429,6 +516,7 @@ impl Shell {
         workspace: &crate::pane::PaneHost,
         state: &Entity<AppState>,
         action_control: Option<AnyElement>,
+        project_badges: Rc<RefCell<BTreeMap<PaneId, AnyElement>>>,
         cx: &App,
     ) -> WorkspaceSnap {
         let layout = &workspace.layout;
@@ -497,6 +585,9 @@ impl Shell {
                             .iter()
                             .map(|(pane_id, pane_state)| {
                                 let surface = workspace.chat_surfaces.get(pane_id);
+                                let chat = pane_state.session_id.as_deref().and_then(|id| {
+                                    state.read(cx).chats.iter().find(|chat| chat.id == id)
+                                });
                                 PaneSnap {
                                     pane: *pane_id,
                                     mode: pane_state.mode,
@@ -505,13 +596,15 @@ impl Shell {
                                         pane_state.mode,
                                         &pane_state.label,
                                     ),
-                                    mark: tab_mark(
+                                    mark: header_mark(
+                                        chat,
                                         pane_state.mode,
                                         pane_state.provider_key.as_deref(),
                                     ),
-                                    buddy: (pane_state.mode == PaneMode::Chat).then(|| pane_buddy(
-                                        *pane_id, pane_state.session_id.as_deref(), state.read(cx), Theme::of(cx),
-                                    )),
+                                    meta: pane_meta(
+                                        pane_state.session_id.as_deref(),
+                                        state.read(cx),
+                                    ),
                                     has_session: pane_state.session_id.is_some(),
                                     focused: global_focus == Some(*pane_id),
                                     transcript: surface
@@ -554,6 +647,7 @@ impl Shell {
             view_bounds: workspace.view_bounds_handle(),
             chip_bounds: workspace.chip_bounds_handle(),
             action_control: std::rc::Rc::new(std::cell::RefCell::new(action_control)),
+            project_badges,
         }
     }
 
@@ -639,7 +733,7 @@ impl Shell {
     }
 
     /// Tab chip ×: engine `close_tab`. Engine semantics (documented WS3
-    /// deviation — the empty-view launcher needs engine changes that are out
+    /// deviation - the empty-view launcher needs engine changes that are out
     /// of this workstream's scope): closing a view's LAST tab closes the
     /// VIEW, and closing the last remaining view's last tab ERRORS (no-op),
     /// so the app can never be left without a view.
@@ -676,7 +770,7 @@ impl Shell {
     /// Mouse-up (or out) releases the latch. No tween on release: the last
     /// dragged ratio IS the resting state (direct manipulation). WS5: the
     /// drag's per-sample ratio commits latched dirty but never armed a save
-    /// (mid-gesture flushes are forbidden) — arm it here, on the commit.
+    /// (mid-gesture flushes are forbidden) - arm it here, on the commit.
     pub(crate) fn end_divider_drag(&mut self, cx: &mut Context<Self>) {
         if !self.divider_dragging {
             return;
@@ -717,7 +811,7 @@ impl Shell {
     }
 
     /// Double-click on a divider: equalize that node to 0.5/0.5 (§1). Direct
-    /// snap — the manual-tween plumbing is keyed to the shell's width tweens;
+    /// snap - the manual-tween plumbing is keyed to the shell's width tweens;
     /// a ratio spring is deferred with the WS6 motion pass.
     pub(crate) fn equalize_divider(&mut self, target: &DividerTarget, cx: &mut Context<Self>) {
         self.apply_divider_ratio(target, EQUALIZE_RATIO, cx);
@@ -748,8 +842,8 @@ impl Shell {
     /// behind an engine change) filter out against the live layout, so a
     /// mid-drag mutation resolves against what is actually on screen. The
     /// outlet hitbox (re-read every sample, so a resize mid-drag cannot drag
-    /// stale edges along) shrinks by the outlet's own padding — the same
-    /// constants `pane::render` lays out with — into the content region the
+    /// stale edges along) shrinks by the outlet's own padding - the same
+    /// constants `pane::render` lays out with - into the content region the
     /// view regions paint into, which is the edge boundary detection compares
     /// against.
     fn workspace_geometry(
@@ -853,7 +947,7 @@ impl Shell {
         let x = f32::from(pointer.x);
         let y = f32::from(pointer.y);
         // A sidebar session already open anywhere in the layout always
-        // resolves to focusing its existing pane — never a duplicate.
+        // resolves to focusing its existing pane - never a duplicate.
         let resolution = self
             .existing_sidebar_session_resolution(session_id.as_deref(), &geom, x, y)
             .unwrap_or_else(|| hit_test::resolve_drop(&geom, x, y, source, anchor));
@@ -873,7 +967,7 @@ impl Shell {
     /// pane somewhere in the layout: focus that pane (`DropPlan::FocusPane`)
     /// rather than minting a second binding. Previews the pane's painted
     /// rect as a `FullTarget` wash when the geometry knows it (a pane in an
-    /// inactive tab has no painted rect — the commit activates it).
+    /// inactive tab has no painted rect - the commit activates it).
     pub(crate) fn existing_sidebar_session_resolution(
         &self,
         session_id: Option<&str>,
@@ -903,9 +997,9 @@ impl Shell {
     /// `on_drag_move` on the SINGLE-PANE content area (the workspace outlet
     /// is not rendered there, so the legacy container is the only drag
     /// surface): the whole area is the focused pane, so the sample resolves
-    /// through [`hit_test::resolve_single_pane_drop`] — the same outer-20%
+    /// through [`hit_test::resolve_single_pane_drop`] - the same outer-20%
     /// edge rule as the workspace matrix, with the center resolving to a
-    /// tab-joining `MoveIntoPane` — and stores the same [`DragSplitState`]
+    /// tab-joining `MoveIntoPane` - and stores the same [`DragSplitState`]
     /// the workspace path uses, so the preview overlay paints and
     /// [`Self::accept_sidebar_session_drop`] commits the resolved plan.
     /// Workspace mode must win when both surfaces are live (the outlet owns
@@ -961,7 +1055,7 @@ impl Shell {
     }
 
     /// The active drag's preview rect and kind in its paint surface's local
-    /// coordinates — the workspace outlet in workspace mode, the single-pane
+    /// coordinates - the workspace outlet in workspace mode, the single-pane
     /// content area otherwise. Both render the same accent overlay from this.
     pub(crate) fn split_drag_preview(
         &self,
@@ -981,7 +1075,7 @@ impl Shell {
         let Some(state) = self.split_drag.take() else {
             return;
         };
-        // The stored resolution belongs to the payload that produced it — a
+        // The stored resolution belongs to the payload that produced it - a
         // mismatched drop commits nothing.
         if !split_drag_matches_payload(&state, payload) {
             cx.notify();
@@ -1004,7 +1098,7 @@ impl Shell {
     /// Each plan variant targets the pane/view/tab the resolver identified,
     /// not the focused pane. A session already open in the tree focuses its
     /// pane instead of minting a second binding for the same chat; sessions
-    /// from ANY space dock here — the layout stays owned by the space it was
+    /// from ANY space dock here - the layout stays owned by the space it was
     /// opened from, and pane focus no longer mutates the selected space.
     fn commit_sidebar_split(
         &mut self,
@@ -1064,7 +1158,7 @@ impl Shell {
                     self.add_sidebar_session_tab(view, tab_before, session_id)
                 }
                 // A ReorderStrip plan from a sidebar source only reaches here
-                // defensively — append is the honest fallback.
+                // defensively - append is the honest fallback.
                 DropPlan::ReorderStrip { view, .. } => {
                     self.add_sidebar_session_tab(view, None, session_id)
                 }
@@ -1088,7 +1182,7 @@ impl Shell {
     }
 
     /// Sidebar-session commit on a tab strip (or a pane center): mint a tab
-    /// in `view` — at `tab_before` when the strip drop resolved a position —
+    /// in `view` - at `tab_before` when the strip drop resolved a position - 
     /// bind the session to its pane, and focus it.
     fn add_sidebar_session_tab(
         &mut self,
@@ -1121,8 +1215,8 @@ impl Shell {
         }
     }
 
-    /// Drag ended without a commit (mouse-up outside the outlet — the
-    /// sidebar, status bar — or a stray mouse-up after an in-place cancel):
+    /// Drag ended without a commit (mouse-up outside the outlet - the
+    /// sidebar, status bar - or a stray mouse-up after an in-place cancel):
     /// clear the state so no stale preview lingers. Idempotent.
     pub(crate) fn cancel_split_drag(&mut self, cx: &mut Context<Self>) {
         if self.split_drag.take().is_some() {
@@ -1133,7 +1227,7 @@ impl Shell {
     /// Accept a sidebar session drop on the single-pane content area (the
     /// workspace outlet is not rendered, so this is the entry point for
     /// drag-to-split from the default screen). Commits the plan the preview
-    /// tracked via `apply_single_pane_drag_move` — a view/pane split, a new
+    /// tracked via `apply_single_pane_drag_move` - a view/pane split, a new
     /// tab for a center drop, or a focus for an already-open session. A
     /// missing state, a mismatched payload, or `DropPlan::None` is an honest
     /// no-op.
@@ -1214,8 +1308,8 @@ impl Shell {
 
     /// ⌘D / ⇧⌘D and the context-menu split rows: split the focused pane and
     /// commit a NEW CHAT pane immediately. (§2's open-the-picker-first
-    /// contract is superseded by product decision: every split grows a chat —
-    /// terminals have no surface yet anyway — so a popup that could only ever
+    /// contract is superseded by product decision: every split grows a chat - 
+    /// terminals have no surface yet anyway - so a popup that could only ever
     /// mint the same pane is friction. The picker lives on solely as the
     /// tab-strip "+" launcher.)
     pub(crate) fn split_workspace_pane(&mut self, direction: Direction, cx: &mut Context<Self>) {
@@ -1457,14 +1551,14 @@ impl Shell {
 
     // ------------------------------------------------------------------
     // Actions (workspace::SplitViewRight / SplitViewDown /
-    // CloseSplitView — the picker-backed pane splits live above)
+    // CloseSplitView - the picker-backed pane splits live above)
     // ------------------------------------------------------------------
 
     /// ⌥⌘D / ⌥⌘⇧D: split the workspace at the focused view (a second
     /// top-level region with its own tab strip). The engine's `split_view`
     /// provisions the new view's single tab + pane and focuses it. Split
     /// views keep the immediate new-view behavior (Super's new view already
-    /// gets a default chat — verified §4), no picker.
+    /// gets a default chat - verified §4), no picker.
     pub(crate) fn split_workspace_view(&mut self, direction: Direction, cx: &mut Context<Self>) {
         if !matches!(self.route, Route::Chat) || self.overlay_owns_keyboard(cx) {
             return;
@@ -1492,7 +1586,7 @@ impl Shell {
 
     /// Sync global state to the focused pane: prune dead cache entries,
     /// select the pane's chat in AppState (the sidebar/global routing model
-    /// — pane surfaces are unaffected, each keeps its own transcript and
+    /// - pane surfaces are unaffected, each keeps its own transcript and
     /// composer), and route keyboard focus to that pane's composer. `None`
     /// sessions land on the new-thread canvas, whose mint-on-send binds the
     /// pane via [`Self::sync_workspace_selection`]. Every mutation path
@@ -1519,7 +1613,7 @@ impl Shell {
     /// composer (and unsent draft) alive while a split exists; once the
     /// layout is trivial again that entity is adopted as the shared dock
     /// composer so the glass single-session route keeps the same live state.
-    /// The cache is then dropped — it must never pin `workspace_mode`.
+    /// The cache is then dropped - it must never pin `workspace_mode`.
     ///
     /// Never rebuild from [`crate::composer::ComposerDraftState`]: that
     /// snapshot is intentionally lossy (no in-flight send/interrupt tasks,
@@ -1555,7 +1649,7 @@ impl Shell {
 
     /// Flip the adopted composer onto `ChatTarget::Selected` so the dock
     /// event stream and the next first-split adopt see a normal dock
-    /// composer — without dropping a still-valid queue-edit lease across the
+    /// composer - without dropping a still-valid queue-edit lease across the
     /// Fixed→Selected projection flip.
     fn reseat_composer_as_dock(&self, cx: &mut Context<Self>) {
         self.composer.update(cx, |composer, cx| {
@@ -1635,7 +1729,7 @@ impl Shell {
     // ------------------------------------------------------------------
 
     /// A workspace mutation latched dirty (structure, ratio, focus, tab, or
-    /// session binding — every [`PaneHost`] wrapper). Arm the debounced store
+    /// session binding - every [`PaneHost`] wrapper). Arm the debounced store
     /// write. Never mid-gesture: divider drags commit a ratio per pointer
     /// sample, so a live drag skips the arm and the gesture's END
     /// ([`Self::end_divider_drag`], [`Self::commit_split_drop`]) schedules
@@ -1670,7 +1764,7 @@ impl Shell {
 
     /// Consume the dirty latch into the store, prune deleted spaces' entries,
     /// and write the store file. Runs on the debounce timer, on every space
-    /// switch, and at app quit. I/O failures log only — a failed save must
+    /// switch, and at app quit. I/O failures log only - a failed save must
     /// never break the UI (the store keeps the data pending for the next
     /// flush).
     pub(crate) fn flush_workspace_layout(&mut self, cx: &mut App) {
@@ -1683,7 +1777,7 @@ impl Shell {
         }
         // A deleted space (here or on another device) drops its layout entry;
         // orphan keys would be harmless but pointless to keep. Gated on the
-        // synced frame — the empty pre-sync list must not wipe the saved set.
+        // synced frame - the empty pre-sync list must not wipe the saved set.
         if self.state.read(cx).spaces_synced {
             let live: std::collections::BTreeSet<String> = self
                 .state
@@ -1765,7 +1859,7 @@ impl Shell {
     }
 
     /// Once chats are synced, clear pane bindings whose session no longer
-    /// exists (a chat deleted here or on another device). The pane STAYS —
+    /// exists (a chat deleted here or on another device). The pane STAYS - 
     /// it degrades to the new-thread body until focused, and its session_id
     /// is simply gone (Super's stale-session handling; a terminal pane keeps
     /// its placeholder, no PTY to lose). Frequent no-op: cheap per frame.
@@ -1791,7 +1885,7 @@ impl Shell {
 }
 
 /// Whether the stored drag state still belongs to the payload being
-/// committed — the source plus the session identity the resolver stored. A
+/// committed - the source plus the session identity the resolver stored. A
 /// mismatch means the state predates this drop: clear and no-op rather than
 /// committing a plan resolved against a different session.
 fn split_drag_matches_payload(state: &DragSplitState, payload: &crate::pane::TabSplitDrag) -> bool {
@@ -1803,7 +1897,7 @@ fn split_drag_matches_payload(state: &DragSplitState, payload: &crate::pane::Tab
 /// paints it (the workspace outlet, or the single-pane content area), where
 /// the overlay div is absolutely positioned. GPUI/Taffy measure an
 /// `.absolute()` child's `.left()/.top()` insets from the containing block's
-/// PADDING box — its border-box origin plus its border — and both surfaces
+/// PADDING box - its border-box origin plus its border - and both surfaces
 /// are borderless, so subtracting `root_bounds.origin` (the surface's
 /// paint-time hitbox origin, `DragMoveEvent::bounds`) is exact; the
 /// container's padding is deliberately NOT subtracted (it does not shift
@@ -1843,7 +1937,7 @@ mod preview_tests {
     #[test]
     fn preview_bounds_converts_window_space_to_the_overlay_surface() {
         // A SplitPane resolution's window-space half-pane converts by
-        // origin subtraction only — the overlay's `.absolute()` insets are
+        // origin subtraction only - the overlay's `.absolute()` insets are
         // measured from the surface's border-box origin (its padding does
         // not shift absolute children), so subtracting padding here would
         // double-count it.
@@ -1874,7 +1968,7 @@ mod preview_tests {
 
     #[test]
     fn preview_bounds_is_none_without_a_preview() {
-        // Invalid drops and self-hits carry no preview — nothing to convert.
+        // Invalid drops and self-hits carry no preview - nothing to convert.
         let state = DragSplitState {
             source: DragSource::PaneHeader(PaneId(1)),
             session_id: None,
@@ -1893,97 +1987,181 @@ mod preview_tests {
 }
 
 #[cfg(test)]
-mod buddy_tests {
+mod pane_meta_tests {
     use super::*;
+    use zeron_proto::{Chat, Session, SessionStatus};
 
-    #[test]
-    fn moving_sessions_keeps_their_avatar_identity() {
-        let state = AppState::new();
-        let theme = Theme::default();
-        let first = pane_buddy(PaneId(1), Some("chat-a"), &state, &theme);
-        let moved = pane_buddy(PaneId(2), Some("chat-a"), &state, &theme);
-        assert_eq!(first.session_key, moved.session_key);
-        assert_eq!(first.session_key.as_ref(), "chat-a");
-        assert_ne!(
-            pane_buddy(PaneId(1), None, &state, &theme).session_key,
-            pane_buddy(PaneId(2), None, &state, &theme).session_key,
-        );
+    const PROJECT: &str = "project";
+
+    fn chat(id: &str, device: &str, branch: Option<&str>) -> Chat {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "deviceId": device,
+            "spaceId": PROJECT,
+            "title": "Build the Fieldnotes workspace",
+            "archived": false,
+            "createdAt": "2026-09-08T00:00:00Z",
+            // Unseen (no lastSeenAt): Errored sessions must surface instead
+            // of decaying to Completed/Idle.
+            "lastMessageAt": "2026-09-08T00:00:00Z",
+            "sourceContext": branch.map(|branch| serde_json::json!({
+                "checkoutId": "checkout",
+                "repoRoot": "/tmp",
+                "cwd": "/tmp",
+                "branch": branch,
+                "observedAt": "2026-09-08T00:00:00Z",
+            })),
+        }))
+        .unwrap()
+    }
+
+    fn seeded_state() -> AppState {
+        let mut state = AppState::new();
+        state.spaces = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": PROJECT,
+                "deviceId": "local",
+                "path": "/tmp/project",
+                "gitDetected": true,
+                "createdAt": "2026-09-08T00:00:00Z",
+            }))
+            .unwrap(),
+        ];
+        state.local_device_id = Some("local".into());
+        state
     }
 
     #[test]
-    fn pane_buddy_uses_bound_chat_live_status_independent_of_selection() {
-        use zeron_proto::{Chat, ChatIndicator, Session, SessionStatus};
+    fn unbound_panes_carry_no_header_metadata() {
+        let meta = pane_meta(None, &seeded_state());
+        assert_eq!(meta, chrome::PaneMeta::empty());
+        // A session id with no matching chat is the same empty state (a
+        // just-minted canvas send).
+        let meta = pane_meta(Some("missing-chat"), &seeded_state());
+        assert_eq!(meta, chrome::PaneMeta::empty());
+    }
 
-        let mut state = AppState::new();
-        let theme = Theme::default();
+    #[test]
+    fn context_is_project_colon_branch_plus_a_remote_device_only() {
+        let mut state = seeded_state();
+        state.chats = vec![
+            chat("local-chat", "local", Some("feat/auth")),
+            chat("remote-chat", "studio", Some("main")),
+            chat("branchless", "local", None),
+        ];
+        state.devices = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "studio",
+                "name": "Mac Studio",
+                "platform": "macos",
+                "createdAt": "2026-09-08T00:00:00Z",
+            }))
+            .unwrap(),
+        ];
 
-        let bound_chat: Chat = serde_json::from_value(serde_json::json!({
-            "id": "bound-chat",
-            "deviceId": "local",
-            "spaceId": "project",
-            "title": "Build the Fieldnotes workspace",
-            "archived": false,
-            "createdAt": "2026-09-08T00:00:00Z",
-            "config": {
-                "harness": "claude-code",
-                "model": "claude-sonnet-4-6",
-                "reasoning": null,
-                "sandbox": "workspace-write"
-            }
-        }))
-        .unwrap();
+        // Local session: project:branch, no device fragment.
+        let local = pane_meta(Some("local-chat"), &state);
+        assert_eq!(local.context.as_deref(), Some("project:feat/auth"));
+        // Remote session: the device is appended after a middot.
+        let remote = pane_meta(Some("remote-chat"), &state);
+        assert_eq!(remote.context.as_deref(), Some("project:main · Mac Studio"));
+        // No branch stamped: project alone.
+        let branchless = pane_meta(Some("branchless"), &state);
+        assert_eq!(branchless.context.as_deref(), Some("project"));
+    }
 
-        let selected_chat: Chat = serde_json::from_value(serde_json::json!({
-            "id": "selected-chat",
-            "deviceId": "local",
-            "spaceId": "project",
-            "title": "Build the Fieldnotes workspace",
-            "archived": false,
-            "createdAt": "2026-09-08T00:00:00Z",
-            "config": {
-                "harness": "claude-code",
-                "model": "claude-sonnet-4-6",
-                "reasoning": null,
-                "sandbox": "workspace-write"
-            }
-        }))
-        .unwrap();
+    #[test]
+    fn state_resolves_from_the_session_and_send_truth() {
+        let mut state = seeded_state();
+        state.chats = vec![
+            chat("working", "local", None),
+            chat("awaiting", "local", None),
+            chat("errored", "local", None),
+        ];
+        state.sessions = vec![
+            Session {
+                last_completed_turn: None,
+                chat_id: "working".into(),
+                device_id: "local".into(),
+                status: SessionStatus::Working,
+                started_at: None,
+                updated_at: Utc::now(),
+            },
+            Session {
+                last_completed_turn: None,
+                chat_id: "awaiting".into(),
+                device_id: "local".into(),
+                status: SessionStatus::AwaitingInput,
+                started_at: None,
+                updated_at: Utc::now(),
+            },
+            Session {
+                last_completed_turn: None,
+                chat_id: "errored".into(),
+                device_id: "local".into(),
+                status: SessionStatus::Errored,
+                started_at: None,
+                updated_at: Utc::now(),
+            },
+        ];
 
-        state.chats = vec![bound_chat, selected_chat];
-        state.selected_chat = Some("selected-chat".into());
-
-        // Bound chat has live Working status via Session.
-        state.sessions = vec![Session {
-            last_completed_turn: None,
-            chat_id: "bound-chat".into(),
-            device_id: "local".into(),
-            status: SessionStatus::Working,
-            started_at: None,
-            updated_at: Utc::now(),
-        }];
-
-        let bound_buddy = pane_buddy(PaneId(1), Some("bound-chat"), &state, &theme);
-        assert_eq!(bound_buddy.session_key.as_ref(), "bound-chat");
-        assert_eq!(bound_buddy.status, ChatIndicator::Working);
-        assert_eq!(bound_buddy.status_color, theme.busy);
-
-        let selected_buddy = pane_buddy(PaneId(2), Some("selected-chat"), &state, &theme);
-        assert_eq!(selected_buddy.session_key.as_ref(), "selected-chat");
-        assert_eq!(selected_buddy.status, ChatIndicator::Idle);
-
-        // Missing session yields Idle status:
-        let missing_buddy = pane_buddy(PaneId(3), Some("missing-chat"), &state, &theme);
-        assert_eq!(missing_buddy.status, ChatIndicator::Idle);
-
-        let unassigned_buddy = pane_buddy(PaneId(4), None, &state, &theme);
-        assert_eq!(unassigned_buddy.status, ChatIndicator::Idle);
-
-        // Pending send also reflects live working status on the bound chat:
+        // The engine's indicator reaches the header verbatim; working is a
+        // live (chromatic) state, idle stays quiet.
+        assert_eq!(
+            pane_meta(Some("working"), &state).state,
+            SessionState::Working
+        );
+        assert_eq!(
+            pane_meta(Some("awaiting"), &state).state,
+            SessionState::AwaitingInput
+        );
+        assert_eq!(
+            pane_meta(Some("errored"), &state).state,
+            SessionState::Failed
+        );
+        // No session row: the unseen chat settles to Completed, which still
+        // carries a label (idle is the only label-less state).
         state.sessions.clear();
-        state.begin_pending_send("bound-chat", "msg-1", Utc::now());
+        let settled = pane_meta(Some("working"), &state);
+        assert_eq!(settled.state, SessionState::Completed);
+        assert_eq!(settled.state.label(), Some("Completed"));
+        // A send stuck past the delivery grace overrides the display status
+        // and reads as failed (danger), same as the sidebar slot.
+        state.begin_pending_send(
+            "working",
+            "msg-1",
+            Utc::now() - chrono::Duration::seconds(300),
+        );
+        let undelivered = pane_meta(Some("working"), &state);
+        assert_eq!(undelivered.state, SessionState::Failed);
+        assert_eq!(undelivered.context.as_deref(), Some("project"));
+    }
 
-        let pending_buddy = pane_buddy(PaneId(1), Some("bound-chat"), &state, &theme);
-        assert_eq!(pending_buddy.status, ChatIndicator::Working);
-        assert_eq!(pending_buddy.status_color, theme.busy);
+    #[test]
+    fn header_mark_prefers_the_bound_harness_brand() {
+        let mut state = seeded_state();
+        let mut claude = chat("claude-chat", "local", None);
+        claude.config = Some(zeron_proto::ChatConfig {
+            harness: zeron_proto::HarnessId::ClaudeCode,
+            model: None,
+            reasoning: None,
+            model_options: Default::default(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        });
+        state.chats = vec![claude];
+
+        // A bound chat's known harness wins over the provider/mode mark.
+        let mark = header_mark(state.chats.first(), PaneMode::Chat, None);
+        assert_eq!(mark.icon, icons::CLAUDE_MARK);
+        assert_eq!(mark.tint, Some(icons::claude_brand()));
+        // Unbound panes (and chats without config) keep the tab mark.
+        assert_eq!(
+            header_mark(None, PaneMode::Chat, Some("opencode")),
+            tab_mark(PaneMode::Chat, Some("opencode"))
+        );
+        assert_eq!(
+            header_mark(None, PaneMode::Terminal, None),
+            tab_mark(PaneMode::Terminal, None)
+        );
     }
 }

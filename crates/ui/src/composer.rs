@@ -3007,8 +3007,8 @@ impl ComposerInput {
         }
         // Rebuild this even for an empty draft. Otherwise deleting the final
         // mention can leave its previous paint geometry alive while the
-        // placeholder is already being shaped, tinting "Do anything" for a
-        // frame (or longer when no subsequent layout is requested).
+        // placeholder is already being shaped, tinting it for a frame (or
+        // longer when no subsequent layout is requested).
         self.refresh_projection();
         let (display, is_placeholder) = if self.content.is_empty() {
             (self.placeholder.clone(), true)
@@ -4233,6 +4233,31 @@ impl Composer {
         self.pickers.read(cx).resolved(cx).chat_config()
     }
 
+    /// The free-text placeholder: names the agent currently at the composer's
+    /// side once the catalog resolves it, else the generic invitation.
+    fn composer_placeholder(&self, cx: &App) -> SharedString {
+        self.pickers
+            .read(cx)
+            .effective_harness_name(cx)
+            .map(|name| SharedString::from(format!("Message {name}…")))
+            .unwrap_or_else(|| SharedString::from("Message the agent…"))
+    }
+
+    /// Keep the input's placeholder in step with the resolved harness (the
+    /// pickers notify this composer on a harness switch). Wizard pages borrow
+    /// the input for their own copy and are skipped until their reset sites
+    /// re-enter here.
+    fn sync_placeholder(&mut self, cx: &mut Context<Self>) {
+        if self.wizard.is_some() {
+            return;
+        }
+        let placeholder = self.composer_placeholder(cx);
+        if self.input.read(cx).placeholder != placeholder {
+            self.input
+                .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+        }
+    }
+
     /// Feed the stable conversation-column width into responsive composer
     /// controls.
     pub fn set_available_width(&mut self, width: f32, cx: &mut Context<Self>) {
@@ -4271,7 +4296,7 @@ impl Composer {
             .detach();
         let input = cx.new(|cx| {
             let mut input =
-                ComposerInput::with_context("Do anything…", MESSAGE_COMPOSER_CONTEXT, cx);
+                ComposerInput::with_context("Message the agent…", MESSAGE_COMPOSER_CONTEXT, cx);
             input.enable_mentions();
             input
         });
@@ -4448,6 +4473,7 @@ impl Composer {
                     .extend(staged);
             }
         }
+        composer.sync_placeholder(cx);
         composer
     }
 
@@ -6079,8 +6105,7 @@ impl Composer {
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
-                        self.input
-                            .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+                        self.sync_placeholder(cx);
                     }
                 }
             }
@@ -6972,10 +6997,10 @@ impl Composer {
         self.answered_requests.insert(wizard.request_id.clone());
         self.input.update(cx, |input, cx| {
             input.set_text("", cx);
-            // The panel borrowed the composer input; hand back its identity.
-            input.set_placeholder("Do anything…", cx);
             input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
         });
+        // The panel borrowed the composer input; hand back its identity.
+        self.sync_placeholder(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -7350,6 +7375,9 @@ impl Render for Composer {
             let focus = self.input.focus_handle(cx);
             window.focus(&focus, cx);
         }
+        // A picker-side harness switch notifies this composer; the placeholder
+        // follows the resolved harness on every repaint.
+        self.sync_placeholder(cx);
         let theme = Theme::of(cx).clone();
         let wizard_active = self.wizard.is_some();
         if self.mention.token.is_some()
