@@ -5892,7 +5892,7 @@ impl Transcript {
                 // waiting on connectivity — say so instead of faking
                 // progress. (The overlay holds while degraded, so this line
                 // owns the surface until the ack or the failed state.)
-                let queued = sending && state.chat_delivery_degraded(&chat_id);
+                let queued = sending && state.chat_delivery_degraded(&chat_id, now);
                 let elapsed = turn_started
                     .map(|t| now.signed_duration_since(t).num_seconds().max(0))
                     .unwrap_or(0);
@@ -11125,14 +11125,16 @@ mod tests {
                     feed(this, vec![prompt("prompt")], cx);
                     this.rail_enabled = false;
                     this.state.update(cx, |state, _| {
-                        state.sessions.push(zeron_proto::Session {
+                        let mut sessions = state.sessions().to_vec();
+                        sessions.push(zeron_proto::Session {
                             last_completed_turn: None,
                             chat_id: "chat".into(),
                             device_id: "test".into(),
                             status: zeron_proto::SessionStatus::Working,
                             started_at: Some(chrono::Utc::now()),
                             updated_at: chrono::Utc::now(),
-                        })
+                        });
+                        state.set_sessions(sessions);
                     });
                     this.on_own_send("chat".into(), "prompt".into(), cx);
                 });
