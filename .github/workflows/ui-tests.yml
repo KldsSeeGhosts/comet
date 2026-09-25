@@ -58,6 +58,8 @@ jobs:
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: OpenCode protocol and permission regressions
         run: |
           cargo test --locked -p zeron-harness --lib opencode::
@@ -85,6 +87,8 @@ jobs:
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: UI and headless layout regressions
         run: cargo test --release --locked -p zeron-ui --lib
 
@@ -109,6 +113,7 @@ jobs:
           git -C frame-source-tests checkout --detach FETCH_HEAD
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           cache-on-failure: true
           workspaces: |
             .
@@ -212,6 +217,8 @@ jobs:
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Build browser fixture
         run: cargo build --release --locked -p zeron-ui --example browser-fixture --features browser-fixture,webkit-browser
       - name: X11 and Wayland browser regressions
@@ -249,6 +256,8 @@ jobs:
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Build Chromium and shared-page fixture
         run: |
           scripts/build-chromium.sh "$RUNNER_TEMP/chromium" debug

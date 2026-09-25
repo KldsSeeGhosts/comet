@@ -66,6 +66,8 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Application and updater tests
         run: cargo test --locked -p zeron-update -p zeron
       - name: Linux input-seat tests
@@ -99,6 +101,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       - name: Application and updater tests
         run: cargo test --locked -p zeron-update -p zeron
       - name: Chromium build dependencies
