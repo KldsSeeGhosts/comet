@@ -16,13 +16,14 @@ color is plentiful but always *means* something.
    - Identity: harness marks keep their brand tint (Claude orange; the other
      marks are monochrome by design). Projects show their repository favicon
      or a colored monogram (`Shell::render_project_icon`).
-   - Change: diff counts use `status_palette::diff_colors` (green `+N`, red
-     `-N`). PR badges keep their state colors.
+   - Change: PR badges keep their state colors. Diff stats in the Changes pane
+     use `theme.diff_add` and `theme.diff_del`; per-card diff counts in the
+     sidebar are deferred to a later phase (see Card line 3).
    - Surfaces, text, and hairlines stay neutral theme tokens.
 2. **One surface, hairline splits.** Panes are flush and opaque (`theme.bg`)
    and are separated by 1px `theme.border` hairlines.
-3. **Metadata is monospace.** Branch, diff counts, device, elapsed time, and
-   the model use `theme.font_mono` at 11px. Titles use the UI face.
+3. **Metadata is monospace.** Branch, device, elapsed time, and the model use
+   `theme.font_mono` at 11px. Titles use the UI face.
 4. **Weight is hierarchy.** Titles use NORMAL weight, or MEDIUM when the
    session needs you. Project names and status labels use MEDIUM at 11.5 to
    12px.
@@ -41,15 +42,15 @@ any other hex values in UI code.
  Needs you
 ▌[N] noches              ◌ Awaiting input     line 1: project + status
     Fix auth token refresh                    line 2: title
-    ⑂ feat/auth-refresh     #42 +18 -3  ✳     line 3: branch, PR, diff, harness
+    ⑂ feat/auth-refresh            #42  ✳     line 3: branch, PR, device, harness
  Running
  [N] noches                 ◌ Working 2m
     Port sidebar sections
-    ⑂ design/control-plane        +210 -96  ✳
+    ⑂ design/control-plane              ✳
  Recent
  [W] website                          3h
     Pricing page copy pass
-    ⑂ main                                  ◎
+    ⑂ main                              ◎
 ```
 
 ### Card (three lines, 72px)
@@ -68,10 +69,18 @@ any other hex values in UI code.
   full `text` plus MEDIUM when the session needs you.
 - Line 3 (16px), all mono 11px:
   - Left: a git-branch glyph and the branch in `text_faint`, truncating.
-  - Right, in order: the PR badge, diff counts `+a -d` in diff colors (only
-    when known and nonzero), the remote device name in `text_faint` (only
-    when it is not the local device), and the harness mark at 13px in its
-    brand tint.
+  - Right, in order: the PR badge, the remote device name in `text_faint`
+    (only when it is not the local device), and the harness mark at 13px in
+    its brand tint.
+  - Deferred (later phase): per-card `+a -d` diff counts between the PR badge
+    and the remote device name. Today `WatchCheckoutDiffs` is opened lazily by
+    the Changes pane for a single target device and streams full `CheckoutDiff`
+    frames carrying up to 3 MiB of unified patch (`MAX_PATCH_BYTES`). Showing
+    counts on sidebar cards needs a bounded summary-only engine stream
+    (`{checkout_id, device_id, cwd, additions, deletions, updated_at}` without
+    the patch), subscribed once per engine connection in `AppState` and keyed
+    to cards via `changes::resolve_diff`-style checkout identity
+    (`checkout_id` first, then `device_id + cwd`, then `cwd`).
 - Text starts at the badge's left edge; there is no leading column on lines
   2 and 3. That is how T3 aligns the card.
 - Needs-you rows keep the 2px bar in the list's side padding, colored by
