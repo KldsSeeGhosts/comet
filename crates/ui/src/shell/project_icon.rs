@@ -49,10 +49,10 @@ fn load_local_icon(root: &std::path::Path) -> Option<MediaImage> {
                 .ok()?;
             Some(bytes)
         })?;
-        let mime = if path.extension().is_some_and(|e| e == "svg") {
-            "image/svg+xml"
-        } else {
-            "image/png"
+        let mime = match path.extension().and_then(|e| e.to_str()) {
+            Some("svg") => "image/svg+xml",
+            Some("ico") => "image/x-icon",
+            _ => "image/png",
         };
         return decode_project_icon(mime, bytes).ok();
     }
@@ -194,10 +194,15 @@ impl ProjectIcon {
                         Err(error) if error.retryable() => return None,
                         Err(_) => continue,
                     };
-                    let (mime, bytes) = client
-                        .read_image((*path).into(), file.checkout_id)
-                        .await
-                        .ok()?;
+                    // Skip candidates the remote engine cannot serve (such as an older
+                    // host rejecting .ico or an oversized file), while a fetched but
+                    // corrupt first match stays terminal and falls back to the monogram.
+                    let (mime, bytes) =
+                        match client.read_image((*path).into(), file.checkout_id).await {
+                            Ok(image) => image,
+                            Err(error) if error.retryable() => return None,
+                            Err(_) => continue,
+                        };
                     return executor
                         .spawn(async move { decode_project_icon(&mime, bytes).ok() })
                         .await;
