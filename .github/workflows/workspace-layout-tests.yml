@@ -12,7 +12,7 @@ on:
       - 'crates/ui/src/shell/**'
       - '.github/workflows/workspace-layout-tests.yml'
   push:
-    branches: [main]
+    branches: [main, dev]
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -20,6 +20,10 @@ on:
       - 'crates/workspace/**'
       - '.github/workflows/workspace-layout-tests.yml'
   workflow_dispatch:
+
+env:
+  # Test-only release build: skip the workspace's thin-LTO link time.
+  CARGO_PROFILE_RELEASE_LTO: 'off'
 
 permissions:
   contents: read
@@ -39,5 +43,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - name: Workspace layout engine regressions
         run: cargo test --release --locked -p zeron-workspace

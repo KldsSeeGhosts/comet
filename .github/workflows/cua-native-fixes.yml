@@ -92,7 +92,9 @@ jobs:
           path: native-test-results
           retention-days: 7
       - uses: actions/cache/save@v4
-        if: always() && !cancelled()
+        # Only dev push runs save; PRs restore via restore-keys instead of
+        # evicting the shared cache with a sha-keyed entry on every run.
+        if: always() && !cancelled() && github.ref == 'refs/heads/dev'
         with:
           path: |
             ~/.cargo/registry
