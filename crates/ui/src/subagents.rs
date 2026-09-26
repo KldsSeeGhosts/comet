@@ -708,10 +708,8 @@ pub fn agents_panel_body(
             .child("No agents yet")
             .into_any_element();
     }
-    let active: Vec<&SubagentSummary> =
-        summaries.iter().filter(|s| s.status.active()).collect();
-    let done: Vec<&SubagentSummary> =
-        summaries.iter().filter(|s| !s.status.active()).collect();
+    let active: Vec<&SubagentSummary> = summaries.iter().filter(|s| s.status.active()).collect();
+    let done: Vec<&SubagentSummary> = summaries.iter().filter(|s| !s.status.active()).collect();
     let row = |s: &SubagentSummary| -> AnyElement {
         let summary = s.clone();
         let chat = chat_id.to_string();
@@ -796,7 +794,10 @@ pub fn agents_panel_body(
         children.extend(active.iter().map(|s| row(s)));
     }
     if !done.is_empty() {
-        children.push(agents_section(format!("Done \u{00b7} {}", done.len()), theme));
+        children.push(agents_section(
+            format!("Done \u{00b7} {}", done.len()),
+            theme,
+        ));
         children.extend(done.iter().map(|s| row(s)));
     }
     div()

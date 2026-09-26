@@ -8892,10 +8892,7 @@ impl Shell {
                 RightSurface::Agents => {
                     let theme = Theme::of(cx).clone();
                     let chat_id = self.panel_key(cx);
-                    let summaries = crate::subagents::subagents_for(
-                        self.state.read(cx),
-                        &chat_id,
-                    );
+                    let summaries = crate::subagents::subagents_for(self.state.read(cx), &chat_id);
                     let open: crate::subagents::OpenAgent =
                         std::rc::Rc::new(|this, chat, summary, cx| {
                             this.open_subagent_summary(chat, summary, cx)
