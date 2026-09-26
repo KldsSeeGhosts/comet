@@ -1826,7 +1826,7 @@ impl Shell {
             let summaries = crate::subagents::subagents_for(self.state.read(cx), &chat.id);
             summaries
                 .iter()
-                .filter(|s| s.status.active())
+                .filter(|s| s.status == crate::subagents::SubagentPhase::Running)
                 .cloned()
                 .collect::<Vec<_>>()
         } else {

@@ -88,6 +88,16 @@ fn input_str<'a>(input: Option<&'a serde_json::Value>, key: &str) -> Option<&'a 
         .filter(|s| !s.is_empty())
 }
 
+/// A spawn that returns immediately and keeps running detached. Harnesses
+/// send the flag as a JSON bool; tolerate a stringly `"true"` too.
+fn is_background_spawn(input: Option<&serde_json::Value>) -> bool {
+    match input.and_then(|i| i.get("run_in_background")) {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::String(flag)) => flag.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
 /// Strip a leading `Agent:`/`Task:` genus from a spawn's name, then take the
 /// first non-empty line. Mirrors the spawn chip's title rules.
 fn spawn_title(call: &ToolCall) -> SharedString {
@@ -186,8 +196,7 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
             if !call.is_subagent_spawn() {
                 continue;
             }
-            let background = input_str(spawn_input(call), "run_in_background")
-                .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            let background = is_background_spawn(spawn_input(call));
             let status = if *is_error {
                 SubagentPhase::Failed
             } else {
@@ -291,7 +300,9 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
 pub fn strip_visible(summaries: &[SubagentSummary]) -> Vec<SubagentSummary> {
     summaries
         .iter()
-        .filter(|s| s.latest_turn || s.status.active())
+        // Earlier turns only carry agents we KNOW are live: a detached
+        // `Started` spawn never reports back, so it must not pin the strip.
+        .filter(|s| s.latest_turn || s.status == SubagentPhase::Running)
         .cloned()
         .collect()
 }
@@ -558,7 +569,10 @@ pub fn sidebar_children(
     open_panel: OpenPanel,
     cx: &Context<Shell>,
 ) -> AnyElement {
-    let running: Vec<&SubagentSummary> = summaries.iter().filter(|s| s.status.active()).collect();
+    let running: Vec<&SubagentSummary> = summaries
+        .iter()
+        .filter(|s| s.status == SubagentPhase::Running)
+        .collect();
     let more = running.len().saturating_sub(SIDEBAR_CHILD_MAX);
     let mut col = div().w_full().flex().flex_col();
     for s in running.iter().take(SIDEBAR_CHILD_MAX) {
@@ -855,7 +869,7 @@ mod tests {
         if let MessagePart::Tool { call, .. } = &mut started {
             *call = ToolCall::Unknown {
                 name: "Agent: bg".into(),
-                input: Some(serde_json::json!({"run_in_background": "true"})),
+                input: Some(serde_json::json!({"run_in_background": true})),
             };
         }
         state.transcript = vec![
