@@ -527,6 +527,7 @@ pub fn agents_tray_row(
     row.child(
         div()
             .id("agents-panel-toggle")
+            .debug_selector(|| "agents-panel-toggle".into())
             .size(px(24.0))
             .flex_none()
             .flex()

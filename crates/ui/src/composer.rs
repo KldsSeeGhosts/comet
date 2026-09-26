@@ -8342,6 +8342,139 @@ mod tests {
         (dir, window)
     }
 
+    /// A spawn part in the selected chat's transcript makes the composer
+    /// render its agents tray; clicking the tray chevron must emit
+    /// `ComposerEvent::ToggleAgentsPanel`.
+    #[gpui::test]
+    fn agents_tray_chevron_click_emits_toggle(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            struct Host {
+                composer: gpui::Entity<Composer>,
+            }
+            impl Render for Host {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    div()
+                        .size_full()
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .id("underlay")
+                                .on_click(|_, _, _| {})
+                                .child("transcript underlay"),
+                        )
+                        .child(div().flex_1().min_h_0())
+                        .child(self.composer.clone())
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .opacity(0.0)
+                                .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.opacity(1.0)),
+                        )
+                }
+            }
+            let state = cx.new(|_| AppState::new());
+            state.update(cx, |state, cx| {
+                state.apply_chats(vec![zeron_proto::Chat {
+                    id: "parent".into(),
+                    device_id: "dev".into(),
+                    title: Some("parent".into()),
+                    archived: false,
+                    cwd: None,
+                    branch: None,
+                    checkout_id: None,
+                    source_context: None,
+                    config: None,
+                    last_message_preview: None,
+                    last_message_at: None,
+                    created_at: chrono::Utc::now(),
+                    harness_session_id: None,
+                    harness_session_cwd: None,
+                    space_id: None,
+                    last_seen_at: None,
+                    room_gen: None,
+                }]);
+                state.selected_chat = Some("parent".into());
+                state.transcript = vec![SessionMessageEntry {
+                    id: "m1".into(),
+                    role: MessageRole::Assistant,
+                    parts: vec![MessagePart::Tool {
+                        id: "spawn-1".into(),
+                        call: zeron_proto::ToolCall::Unknown {
+                            name: "Agent: scout".into(),
+                            input: Some(serde_json::json!({"description": "scout"})),
+                        },
+                        is_error: false,
+                        resolved: false,
+                        output: None,
+                        diff: None,
+                        output_ref: None,
+                        output_bytes: None,
+                        diff_ref: None,
+                        diff_stats: None,
+                        subagent_ref: Some("doc-1".into()),
+                        subagent_status: Some(zeron_doc::SubagentStatus::Running),
+                        subagent_tail: None,
+                    }],
+                    created_at: 1_700_000_000_000,
+                    device_id: "dev".into(),
+                    status: Some(zeron_doc::MessageStatus::Streaming),
+                    continuation_of: None,
+                }];
+                cx.notify();
+            });
+            Host {
+                composer: cx.new(|cx| Composer::new(state, cx)),
+            }
+        });
+        let composer = host.read_with(cx, |host, _| host.composer.clone());
+        let mut events = cx.events(&composer);
+        cx.update(|window, cx| window.draw(cx).clear());
+        if cx.debug_bounds("agents-panel-toggle").is_none() {
+            let diag = composer.update(cx, |composer, cx| {
+                let state = composer.state.read(cx);
+                let chat_id = composer.target.chat_id(state).map(str::to_owned);
+                let all = chat_id
+                    .as_deref()
+                    .map(|id| crate::subagents::subagents_for(state, id))
+                    .unwrap_or_default();
+                let vis = crate::subagents::strip_visible(&all);
+                (
+                    chat_id,
+                    state.transcript.len(),
+                    all.len(),
+                    vis.len(),
+                    composer.last_available_width(),
+                )
+            });
+            panic!("agents tray chevron not painted: {diag:?}");
+        }
+        let chevron = cx.debug_bounds("agents-panel-toggle").unwrap();
+        cx.simulate_click(chevron.center(), gpui::Modifiers::default());
+        let mut toggled = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, ComposerEvent::ToggleAgentsPanel) {
+                toggled += 1;
+            }
+        }
+        assert!(toggled > 0, "chevron click emitted no ToggleAgentsPanel");
+    }
+
     #[gpui::test]
     fn adopting_a_composer_into_a_split_releases_shared_dock_geometry(
         cx: &mut gpui::TestAppContext,
