@@ -7488,7 +7488,7 @@ fn chip_header_row(
     cx: &mut gpui::App,
 ) -> gpui::Div {
     let (label, detail) = if tool.is_thought {
-        ("Thought process", String::new())
+        ("Thought process".into(), String::new())
     } else {
         tool_chip_content(&tool.call)
     };
@@ -7505,14 +7505,19 @@ fn chip_header_row(
     let failed = tool.is_error
         || (tool.subagent_ref.is_some()
             && matches!(tool.subagent_status, Some(SubagentStatus::Failed)));
+    // Failure is reserved to the icon and a trailing "failed" tag; the verb
+    // and detail keep their usual colors so a failed probe doesn't paint
+    // the whole row red.
+    let icon_tint = if failed {
+        theme.danger
+    } else {
+        crate::tool_palette::ToolFamily::of(&tool.call, tool.is_thought)
+            .color(theme)
+            .unwrap_or(theme.text_muted)
+    };
     // Text resolves its color during layout, so group-hover text needs stable
     // child IDs under the keyed, expandable header to retain hover state.
     let hover_text = activity && trail.is_some() && !failed;
-    let tint = if failed {
-        theme.danger
-    } else {
-        theme.text_muted
-    };
     div()
         .group("tool-header")
         .h(px(if activity {
@@ -7548,7 +7553,7 @@ fn chip_header_row(
                             tool_icon_path(&tool.call)
                         })
                         .size(px(12.0))
-                        .text_color(theme.text_muted),
+                        .text_color(icon_tint),
                     ),
             )
         })
@@ -7561,7 +7566,7 @@ fn chip_header_row(
                 .when(!activity, |label| {
                     label.font_weight(gpui::FontWeight::MEDIUM)
                 })
-                .text_color(tint)
+                .text_color(theme.text_muted)
                 .child(SharedString::from(label))
                 .map(|label| {
                     if hover_text {
@@ -7587,9 +7592,7 @@ fn chip_header_row(
                 .when(activity && detail.is_empty(), |detail| detail.hidden())
                 .items_center()
                 .truncate()
-                .text_color(if failed {
-                    theme.danger
-                } else if activity {
+                .text_color(if activity {
                     theme.text_muted
                 } else {
                     theme.text.opacity(0.85)
@@ -7606,11 +7609,7 @@ fn chip_header_row(
                         .bg(theme.ink(0.06))
                         .pl(px(1.0))
                         .pr(px(6.0))
-                        .text_color(if failed {
-                            theme.danger
-                        } else {
-                            theme.text.opacity(0.85)
-                        })
+                        .text_color(theme.text.opacity(0.85))
                         .child(
                             div()
                                 .size(px(20.0))
@@ -7665,6 +7664,21 @@ fn chip_header_row(
                     }
                 }),
         )
+        .when(failed, |row| {
+            // Reserved failure tag: a quiet mono marker in danger at 0.9
+            // opacity — the only red besides the icon.
+            row.child(
+                div()
+                    .flex_none()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(theme.danger.opacity(0.9))
+                    .child("failed"),
+            )
+        })
         .when_some(tool.call.subagent_model(), |row, model| {
             // Which model the child runs on, when the spawn named one.
             //
@@ -7846,10 +7860,15 @@ fn activity_rail(
     theme: &Theme,
 ) -> gpui::Div {
     let color = theme.hairline(0.12);
+    // Failure turns the icon danger; otherwise the icon carries the tool
+    // family's muted hue (Neutral falls back to text_muted). The connector
+    // ribbon stays neutral either way.
     let tint = if tool.is_error {
         theme.danger
     } else {
-        theme.text_muted
+        crate::tool_palette::ToolFamily::of(&tool.call, tool.is_thought)
+            .color(theme)
+            .unwrap_or(theme.text_muted)
     };
     let (incoming_reveal, branch_reveal) = tool_connector_parts(reveal, has_predecessor);
     div()
@@ -12589,30 +12608,34 @@ mod tests {
 
     #[test]
     fn tool_chip_labels_per_kind() {
+        let chip = |call: &ToolCall| {
+            let (l, d) = tool_chip_content(call);
+            (l.to_string(), d)
+        };
         assert_eq!(
-            tool_chip_content(&ToolCall::Exec {
+            chip(&ToolCall::Exec {
                 command: "cargo test".into()
             }),
-            ("Run", "cargo test".to_string())
+            ("Run".to_string(), "cargo test".to_string())
         );
         assert_eq!(
-            tool_chip_content(&ToolCall::Search {
+            chip(&ToolCall::Search {
                 pattern: "foo".into(),
                 path: Some("src".into())
             }),
-            ("Search", "foo in src".to_string())
+            ("Search".to_string(), "foo in src".to_string())
         );
         assert_eq!(
-            tool_chip_content(&ToolCall::ApplyPatch { path: None }),
-            ("Patch", "workspace".to_string())
+            chip(&ToolCall::ApplyPatch { path: None }),
+            ("Patch".to_string(), "workspace".to_string())
         );
         assert_eq!(
-            tool_chip_content(&ToolCall::Mcp {
+            chip(&ToolCall::Mcp {
                 server: "gh".into(),
                 tool: "issues".into(),
                 input: None
             }),
-            ("MCP", "gh · issues".to_string())
+            ("MCP".to_string(), "gh · issues".to_string())
         );
         let todo = ToolCall::Todo {
             items: vec![
@@ -12626,7 +12649,8 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(tool_chip_content(&todo), ("Todo", "1/2 done".to_string()));
+        let (l, d) = tool_chip_content(&todo);
+        assert_eq!((l.as_ref(), d.as_str()), ("Todo", "1/2 done"));
     }
 
     #[test]
@@ -13132,8 +13156,9 @@ mod tests {
 
             // First real overflow: the render-armed frame callback rebuilds
             // the ListState with Bottom and re-pins to the end.
-            transcript
-                .update(&mut visual.cx, |this, cx| feed(this, overflowing_entries(), cx));
+            transcript.update(&mut visual.cx, |this, cx| {
+                feed(this, overflowing_entries(), cx)
+            });
             draw(&transcript, &mut visual);
             transcript.update(&mut visual.cx, |this, _| {
                 assert!(
@@ -13219,9 +13244,7 @@ mod tests {
         }
 
         #[gpui::test]
-        fn dock_transcript_stays_bottom_and_read_only_docs_stay_top(
-            cx: &mut gpui::TestAppContext,
-        ) {
+        fn dock_transcript_stays_bottom_and_read_only_docs_stay_top(cx: &mut gpui::TestAppContext) {
             let dir = tempfile::tempdir().unwrap();
             cx.update(|cx| {
                 let state = init(cx, dir.path());
@@ -13240,8 +13263,7 @@ mod tests {
                 // pane sessions START top-anchored (until first overflow).
                 let doc = cx.new(|cx| Transcript::for_doc(state.clone(), "sub".into(), true, cx));
                 assert!(doc.read(cx).is_top_anchored());
-                let pane =
-                    cx.new(|cx| Transcript::for_session(state, "pane-chat".into(), cx));
+                let pane = cx.new(|cx| Transcript::for_session(state, "pane-chat".into(), cx));
                 assert!(pane.read(cx).is_top_anchored());
             });
         }

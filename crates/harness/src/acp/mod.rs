@@ -2378,6 +2378,7 @@ fn session_update_events(
     params: &Value,
     session_id: &str,
     subagents: &mut SubagentObserver,
+    shapes: &mut normalize::ToolShapes,
 ) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
@@ -2388,7 +2389,7 @@ fn session_update_events(
             SubagentObserver::Devin(tracker) => tracker.map(update),
             _ => {
                 subagents.observe(update);
-                map_update(update)
+                map_update(update, shapes)
             }
         },
         "_x.ai/session_notification" => {
@@ -3190,6 +3191,10 @@ async fn run_session(session: Session) {
         ))
     };
 
+    // Per-call kind/title memory across partial tool_call_updates (pi sends
+    // the identity only on the opening frame).
+    let mut tool_shapes = normalize::ToolShapes::default();
+
     // ---- main loop --------------------------------------------------------
     // Prompt-completion settlement state (the prompt-complete extension):
     // one prompt is outstanding at a time, identified by `current_prompt_id`;
@@ -3334,8 +3339,13 @@ async fn run_session(session: Session) {
                 while let Ok(inc) = incoming.try_recv() {
                     match inc {
                         Incoming::Notification { method, params } => {
-                            let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
+                            let events = session_update_events(
+                                &method,
+                                &params,
+                                &session_id,
+                                &mut subagents,
+                                &mut tool_shapes,
+                            );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -3513,8 +3523,13 @@ async fn run_session(session: Session) {
                     }
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
-                    let events =
-                        session_update_events(&method, &params, &session_id, &mut subagents);
+                    let events = session_update_events(
+                        &method,
+                        &params,
+                        &session_id,
+                        &mut subagents,
+                        &mut tool_shapes,
+                    );
                     for ev in events {
                         track_open_tools(&ev, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -3624,8 +3639,13 @@ async fn run_session(session: Session) {
                         while let Ok(inc) = incoming.try_recv() {
                             match inc {
                                 Incoming::Notification { method, params } => {
-                                    let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents);
+                                    let events = session_update_events(
+                                        &method,
+                                        &params,
+                                        &session_id,
+                                        &mut subagents,
+                                        &mut tool_shapes,
+                                    );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;

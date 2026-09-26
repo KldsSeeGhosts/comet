@@ -501,6 +501,126 @@ impl Harness for MockHarness {
             })
             .into_iter()
             .flatten();
+        // Dev/testing knob: `ZERON_MOCK_TOOLS=1` appends a representative
+        // tool-family mix for palette/typing QA: explore (read/search/glob),
+        // change (edit), neutral (exec/todo/unknown), a delegate spawn, and
+        // one FAILED exec (icon + trailing tag in danger, row stays muted).
+        let mock_tools = std::env::var("ZERON_MOCK_TOOLS")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let tool_mix_events = mock_tools
+            .then(|| {
+                use zeron_proto::ToolCall;
+                let call = |id: &str, call: ToolCall| AgentEvent::ToolCall {
+                    id: id.into(),
+                    call,
+                };
+                let ok = |id: &str| AgentEvent::ToolResult {
+                    id: id.into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                };
+                vec![
+                    AgentEvent::TextDelta {
+                        text: "\n### Tool pass\n\nSweeping the workspace, then patching and probing.\n\n".into(),
+                    },
+                    call(
+                        "mix-read",
+                        ToolCall::ReadFile {
+                            path: "crates/ui/src/transcript.rs".into(),
+                        },
+                    ),
+                    call(
+                        "mix-grep",
+                        ToolCall::Search {
+                            pattern: "tool_icon_path".into(),
+                            path: Some("crates/ui".into()),
+                        },
+                    ),
+                    call(
+                        "mix-glob",
+                        ToolCall::Glob {
+                            pattern: "crates/ui/src/**/*.rs".into(),
+                        },
+                    ),
+                    call(
+                        "mix-web",
+                        ToolCall::WebSearch {
+                            query: "gpui text_color hsla".into(),
+                        },
+                    ),
+                    call(
+                        "mix-exec",
+                        ToolCall::Exec {
+                            command: "cargo test -p zeron-ui --lib".into(),
+                        },
+                    ),
+                    call(
+                        "mix-edit",
+                        ToolCall::EditFile {
+                            path: "crates/ui/src/transcript.rs".into(),
+                            old_string: None,
+                            new_string: None,
+                        },
+                    ),
+                    call(
+                        "mix-todo",
+                        ToolCall::Todo {
+                            items: vec![
+                                zeron_proto::TodoItem {
+                                    text: "type kind-other tools by title".into(),
+                                    done: true,
+                                },
+                                zeron_proto::TodoItem {
+                                    text: "tint icons by tool family".into(),
+                                    done: false,
+                                },
+                            ],
+                        },
+                    ),
+                    call(
+                        "mix-unknown",
+                        ToolCall::Unknown {
+                            name: "codex-research".into(),
+                            input: Some(serde_json::json!({"query": "tool palette"})),
+                        },
+                    ),
+                    call(
+                        "mix-spawn",
+                        ToolCall::Unknown {
+                            name: "Agent: Sweep the sidebar states".into(),
+                            input: Some(serde_json::json!({
+                                "description": "Sweep the sidebar states",
+                                "prompt": "Check every session-state hue against the palette",
+                            })),
+                        },
+                    ),
+                    call(
+                        "mix-fail",
+                        ToolCall::Exec {
+                            command: "cargo test -p zeron-ui tool_rows".into(),
+                        },
+                    ),
+                    ok("mix-read"),
+                    ok("mix-grep"),
+                    ok("mix-glob"),
+                    ok("mix-web"),
+                    ok("mix-exec"),
+                    ok("mix-edit"),
+                    ok("mix-todo"),
+                    ok("mix-unknown"),
+                    ok("mix-spawn"),
+                    AgentEvent::ToolResult {
+                        id: "mix-fail".into(),
+                        is_error: true,
+                        output: Some("error[E0308]: mismatched types".into()),
+                        diff: None,
+                    },
+                ]
+            })
+            .into_iter()
+            .flatten();
         let events: Vec<Result<AgentEvent, HarnessError>> = body
             .iter()
             .cycle()
@@ -509,6 +629,7 @@ impl Harness for MockHarness {
             .chain(thinking_events)
             .chain(code_tool_events)
             .chain(subagent_events)
+            .chain(tool_mix_events)
             .chain(code_event)
             .chain(table_event)
             .chain(mend_event)

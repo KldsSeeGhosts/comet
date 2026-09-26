@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde_json::Value;
 use zeron_proto::{AgentEvent, DoneStatus};
 
-use super::normalize::map_update;
+use super::normalize::{ToolShapes, map_update};
 
 #[derive(Debug)]
 struct PendingSpawn {
@@ -32,6 +32,9 @@ pub(crate) struct DevinTracker {
     /// Completion can race the final child frames; never reopen a settled
     /// transcript under the child id after its parent binding is gone.
     settled: HashSet<String>,
+    /// Kind/title memory for the parent's own tool calls (the tracker's
+    /// `map_update` calls share the session stream's partial updates).
+    shapes: ToolShapes,
 }
 
 impl DevinTracker {
@@ -105,7 +108,7 @@ impl DevinTracker {
         let child_id = meta(update, "cognition.ai/subagent_context")
             .and_then(|ctx| nonempty(ctx, "parentAgentId"));
         let Some(child_id) = child_id else {
-            return map_update(update);
+            return map_update(update, &mut self.shapes);
         };
         if self.settled.contains(child_id) {
             return Vec::new();
@@ -115,7 +118,7 @@ impl DevinTracker {
             .get(child_id)
             .cloned()
             .unwrap_or_else(|| child_id.to_owned());
-        let events = map_update(update);
+        let events = map_update(update, &mut self.shapes);
         if events
             .iter()
             .any(|event| matches!(event, AgentEvent::TextDelta { .. }))
