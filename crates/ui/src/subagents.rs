@@ -1,6 +1,6 @@
 //! Codex-style subagent inventory: a pure selector over a chat's transcript
-//! (spawn tool parts) plus the surfaces that render it — the composer dock
-//! strip, the right-pane Agents panel, and the sidebar's nested child rows.
+//! (spawn tool parts) plus the surfaces that render it — the composer agents
+//! tray, the right-pane Agents panel, and the sidebar's nested child rows.
 //! Status hues come only from [`SessionState`]; everything else stays on
 //! neutral theme tokens.
 
@@ -39,7 +39,7 @@ impl SubagentPhase {
     }
 }
 
-/// One spawned subagent, reduced to what the strip/panel/sidebar draw.
+/// One spawned subagent, reduced to what the tray/panel/sidebar draw.
 #[derive(Debug, Clone)]
 pub struct SubagentSummary {
     /// The spawn tool part id (`parent_tool_use_id` for tagged traffic).
@@ -60,12 +60,14 @@ pub struct SubagentSummary {
 
 impl SubagentSummary {
     /// `45s` / `2m` / `1h 4m` — live for active phases, frozen at finish.
+    /// Settled agents with no observed finish time show nothing rather
+    /// than a guessed duration.
     pub fn elapsed(&self, now: DateTime<Utc>) -> Option<String> {
         let started = self.started?;
         let end = if self.status.active() {
             now
         } else {
-            self.finished.unwrap_or(started)
+            self.finished?
         };
         Some(crate::shell::format_working_elapsed(
             end.signed_duration_since(started).num_seconds(),
@@ -284,18 +286,24 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
         })
     });
     // Record first-observation finish times so terminal agents without a
-    // loaded doc still stop their elapsed clock somewhere stable.
+    // loaded doc still stop their elapsed clock somewhere stable. Only keys
+    // this session has seen ACTIVE qualify — after a restart a terminal
+    // agent's real finish time is gone, and stamping "now" would render a
+    // bogus multi-minute elapsed for a seconds-long agent.
+    let mut active = state.subagent_active_obs.borrow_mut();
     let mut obs = state.subagent_finished_obs.borrow_mut();
     for s in &out {
-        if !s.status.active() && s.finished.is_none() {
-            obs.entry(part_key(chat_id, &s.id))
-                .or_insert_with(|| Utc::now().timestamp_millis());
+        let key = part_key(chat_id, &s.id);
+        if s.status.active() {
+            active.insert(key);
+        } else if s.finished.is_none() && active.contains(&key) {
+            obs.entry(key).or_insert_with(|| Utc::now().timestamp_millis());
         }
     }
     out
 }
 
-/// The strip's visible subset: the latest turn's subagents, plus anything
+/// The tray's visible subset: the latest turn's subagents, plus anything
 /// still live from earlier turns.
 pub fn strip_visible(summaries: &[SubagentSummary]) -> Vec<SubagentSummary> {
     summaries
@@ -350,20 +358,18 @@ pub fn status_glyph(
 }
 
 // ---------------------------------------------------------------------------
-// Composer dock strip
+// Composer agents tray
 // ---------------------------------------------------------------------------
 
-/// The strip's footprint above the composer pill (28px row + 6px gap).
-pub const STRIP_HEIGHT: f32 = 28.0;
-pub const STRIP_BOTTOM_GAP: f32 = 6.0;
+/// The tray content row: `Agents` label, pills, `+N`, chevron (the surface's
+/// own top radius and bottom tuck come from the queue-tray metrics).
+pub const TRAY_ROW_HEIGHT: f32 = 32.0;
 const PILL_GAP: f32 = 6.0;
 
 /// Estimated pill width (12px glyph + ≤22ch title + mono elapsed + pads) —
-/// the strip packs greedily off this estimate; `+N` covers the rest.
-/// `open(chat_id, summary)` — pill/sidebar click → select chat + open thread.
+/// the tray packs greedily off this estimate; `+N` covers the rest.
+/// `open(chat_id, summary)` — sidebar click → select chat + open thread.
 pub type OpenAgent = Rc<dyn Fn(&mut Shell, String, SubagentSummary, &mut Context<Shell>)>;
-/// Right-pane Agents tab toggle (the strip's trailing chevron).
-pub type TogglePanel = Rc<dyn Fn(&mut Shell, &mut Context<Shell>)>;
 /// `open_panel(chat_id)` — sidebar `+N more` → select chat + Agents tab.
 pub type OpenPanel = Rc<dyn Fn(&mut Shell, String, &mut Context<Shell>)>;
 
@@ -371,9 +377,9 @@ fn pill_width(title_chars: usize) -> f32 {
     8.0 * 2.0 + 12.0 + 6.0 + title_chars.min(22) as f32 * 6.6 + 6.0 + 34.0
 }
 
-/// How many leading pills fit `width` (the composer column's content width),
-/// keeping room for the leading label, the `+N` overflow pill and the
-/// trailing chevron.
+/// How many leading pills fit `width` (the tray's inner width), keeping
+/// room for the leading label, the `+N` overflow pill and the trailing
+/// chevron.
 fn fitting(summaries: &[SubagentSummary], width: f32) -> usize {
     let mut used = 74.0 + 28.0 + PILL_GAP;
     let mut shown = 0usize;
@@ -389,35 +395,41 @@ fn fitting(summaries: &[SubagentSummary], width: f32) -> usize {
     shown.min(summaries.len())
 }
 
-/// The strip's pills that fit `width`; `+N` covers the remainder.
-pub fn strip_layout(summaries: &[SubagentSummary], width: f32) -> (Vec<SubagentSummary>, usize) {
+/// The tray's pills that fit `width`; `+N` covers the remainder.
+pub fn tray_layout(summaries: &[SubagentSummary], width: f32) -> (Vec<SubagentSummary>, usize) {
     let shown = fitting(summaries, width);
     (summaries[..shown].to_vec(), summaries.len() - shown)
 }
 
-/// The dock strip: `Agents {done}/{total}` label, fitted pills, `+N`
-/// overflow, and the trailing chevron that toggles the Agents panel.
-/// `seen` = subagent keys whose thread the user already opened.
-#[allow(clippy::too_many_arguments)] // render fn; params are the strip's props
-pub fn dock_strip(
+/// The agents tray content row: `Agents {done}/{total}` label, fitted
+/// pills, `+N` overflow, and the trailing chevron that toggles the Agents
+/// panel. Rendered INSIDE the queue-tray surface by the composer itself
+/// (its stack order is the composer's), so it is one continuous surface
+/// with the queue tray and the pill on every route.
+///
+/// Pills lose their own borders inside the tray (the tray frames them);
+/// fills stay on `wash`. `seen` = subagent keys whose thread the user
+/// already opened. Fitting uses the tray's inner width.
+#[allow(clippy::too_many_arguments)] // render fn; params are the tray's props
+pub fn agents_tray_row(
     chat_id: &str,
     summaries: &[SubagentSummary],
-    width: f32,
+    inner_width: f32,
     panel_open: bool,
     seen: &HashSet<String>,
-    open: OpenAgent,
-    toggle_panel: TogglePanel,
     now: DateTime<Utc>,
     theme: &Theme,
     view: gpui::EntityId,
-    cx: &Context<Shell>,
+    cx: &mut Context<crate::composer::Composer>,
 ) -> AnyElement {
     let done = summaries.iter().filter(|s| !s.status.active()).count();
-    let (shown, more) = strip_layout(summaries, width);
+    let (shown, more) = tray_layout(summaries, inner_width);
     let mut row = div()
-        .id("subagent-dock-strip")
-        .h(px(STRIP_HEIGHT))
+        .id("subagent-agents-tray")
+        .h(px(TRAY_ROW_HEIGHT))
         .w_full()
+        .pl(px(12.0))
+        .pr(px(6.0))
         .flex()
         .flex_row()
         .items_center()
@@ -445,7 +457,6 @@ pub fn dock_strip(
     for s in shown {
         let summary = s.clone();
         let chat = chat_id.to_string();
-        let open = open.clone();
         let elapsed = s.elapsed(now);
         let phase = s.status;
         row = row.child(
@@ -458,12 +469,14 @@ pub fn dock_strip(
                 .gap(px(6.0))
                 .px(px(8.0))
                 .rounded(px(12.0))
-                .border_1()
-                .border_color(theme.border)
+                .bg(crate::theme::wash(0.06))
                 .cursor_pointer()
-                .hover(|s| s.bg(crate::theme::wash(0.06)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    open(this, chat.clone(), summary.clone(), cx);
+                .hover(|s| s.bg(crate::theme::wash(0.10)))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(crate::composer::ComposerEvent::OpenSubagentSummary {
+                        chat_id: chat.clone(),
+                        summary: summary.clone(),
+                    });
                 }))
                 .child(status_glyph(
                     SharedString::from(format!("agent-pill-glyph-{}", s.id)),
@@ -494,7 +507,6 @@ pub fn dock_strip(
         );
     }
     if more > 0 {
-        let toggle = toggle_panel.clone();
         row = row.child(
             div()
                 .id("agent-pill-more")
@@ -504,12 +516,11 @@ pub fn dock_strip(
                 .items_center()
                 .px(px(8.0))
                 .rounded(px(12.0))
-                .border_1()
-                .border_color(theme.border)
+                .bg(crate::theme::wash(0.06))
                 .cursor_pointer()
-                .hover(|s| s.bg(crate::theme::wash(0.06)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    toggle(this, cx);
+                .hover(|s| s.bg(crate::theme::wash(0.10)))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(crate::composer::ComposerEvent::ToggleAgentsPanel);
                 }))
                 .child(
                     div()
@@ -520,10 +531,11 @@ pub fn dock_strip(
                 ),
         );
     }
-    row = row.child(div().flex_1().min_w_0()).child({
-        let toggle = toggle_panel.clone();
+    row = row.child(div().flex_1().min_w_0());
+    row.child(
         div()
             .id("agents-panel-toggle")
+            .debug_selector(|| "agents-panel-toggle".into())
             .size(px(24.0))
             .flex_none()
             .flex()
@@ -532,8 +544,8 @@ pub fn dock_strip(
             .rounded(px(6.0))
             .cursor_pointer()
             .hover(|s| s.bg(crate::theme::wash(0.08)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                toggle(this, cx);
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(crate::composer::ComposerEvent::ToggleAgentsPanel);
             }))
             .child(
                 icons::icon(if panel_open {
@@ -543,9 +555,9 @@ pub fn dock_strip(
                 })
                 .size(px(12.0))
                 .text_color(theme.text_muted),
-            )
-    });
-    row.into_any_element()
+            ),
+    )
+    .into_any_element()
 }
 
 // ---------------------------------------------------------------------------
@@ -554,10 +566,19 @@ pub fn dock_strip(
 
 pub const SIDEBAR_CHILD_HEIGHT: f32 = 22.0;
 pub const SIDEBAR_CHILD_MAX: usize = 3;
+/// Breathing room between a card's line 3 and its first child row.
+pub const SIDEBAR_CHILD_GAP: f32 = 2.0;
+/// Bottom inset when the card carries children (the same 10px a bare card
+/// gets from `justify_center`; line 3's own row keeps its height).
+pub const SIDEBAR_CHILD_PAD_BOTTOM: f32 = 4.0;
 
-/// Up to `SIDEBAR_CHILD_MAX` running subagents below a chat card, aligned to
-/// the card's text start with a 1px hairline tree stub; `+N more` opens the
-/// Agents panel.
+/// Up to `SIDEBAR_CHILD_MAX` running subagents as EXTRA LINES inside the
+/// chat card (after line 3), sharing its wash and radius. Each row: 12px
+/// status glyph at the card's text-start x, 6px gap, 12px `text_muted`
+/// title truncating, mono 11px `text_faint` elapsed flush to the card's
+/// right edge. No tree stubs, no hairlines. `+N more` opens the Agents
+/// panel. Children stop click propagation (they open the thread, not the
+/// card's plain select).
 #[allow(clippy::too_many_arguments)]
 pub fn sidebar_children(
     chat_id: &str,
@@ -574,7 +595,12 @@ pub fn sidebar_children(
         .filter(|s| s.status == SubagentPhase::Running)
         .collect();
     let more = running.len().saturating_sub(SIDEBAR_CHILD_MAX);
-    let mut col = div().w_full().flex().flex_col();
+    let mut col = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .pt(px(SIDEBAR_CHILD_GAP))
+        .pb(px(SIDEBAR_CHILD_PAD_BOTTOM));
     for s in running.iter().take(SIDEBAR_CHILD_MAX) {
         let summary = (*s).clone();
         let chat = chat_id.to_string();
@@ -588,7 +614,6 @@ pub fn sidebar_children(
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
-                .pl(px(10.0))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
@@ -596,19 +621,20 @@ pub fn sidebar_children(
                 }))
                 .child(
                     div()
-                        .w(px(1.0))
-                        .h(px(10.0))
+                        .size(px(12.0))
                         .flex_none()
-                        .bg(theme.hairline(0.10)),
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(status_glyph(
+                            SharedString::from(format!("sub-glyph-{}", s.id)),
+                            s.status,
+                            true,
+                            theme,
+                            view,
+                            cx,
+                        )),
                 )
-                .child(status_glyph(
-                    SharedString::from(format!("sub-glyph-{}", s.id)),
-                    s.status,
-                    true,
-                    theme,
-                    view,
-                    cx,
-                ))
                 .child(
                     div()
                         .flex_1()
@@ -640,9 +666,9 @@ pub fn sidebar_children(
                 .w_full()
                 .flex()
                 .items_center()
-                .pl(px(10.0 + 7.0 + 12.0))
-                .font_family(theme.font_mono.clone())
-                .text_size(crate::typography::ui_rems(11.0))
+                // No glyph: indent to the child rows' title start.
+                .pl(px(12.0 + 6.0))
+                .text_size(crate::typography::ui_rems(12.0))
                 .text_color(theme.text_faint)
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -652,21 +678,7 @@ pub fn sidebar_children(
                 .child(SharedString::from(format!("+{more} more"))),
         );
     }
-    // The tree stub hangs off the card's text-start edge.
-    div()
-        .relative()
-        .w_full()
-        .child(
-            div()
-                .absolute()
-                .left(px(1.0))
-                .top(px(4.0))
-                .bottom(px(4.0))
-                .w(px(1.0))
-                .bg(theme.hairline(0.10)),
-        )
-        .child(col)
-        .into_any_element()
+    col.into_any_element()
 }
 
 // ---------------------------------------------------------------------------
@@ -674,20 +686,24 @@ pub fn sidebar_children(
 // ---------------------------------------------------------------------------
 
 const AGENTS_ROW_HEIGHT: f32 = 44.0;
+const AGENTS_ROW_HEIGHT_BARE: f32 = 32.0;
 const AGENTS_SECTION_HEIGHT: f32 = 30.0;
 
 /// One 30px "Active" / "Done · N" header, 11.5px text_faint like the
-/// sidebar's own section labels.
-fn agents_section(label: String, theme: &Theme) -> AnyElement {
+/// sidebar's own section labels. `dot` is the section's state hue (the
+/// sidebar's 6px section dot); settled sections carry none.
+fn agents_section(label: String, dot: Option<gpui::Hsla>, theme: &Theme) -> AnyElement {
     div()
         .h(px(AGENTS_SECTION_HEIGHT))
         .w_full()
         .flex()
         .items_center()
+        .gap(px(6.0))
         .px(px(Theme::SPACE_SM))
         .font_weight(FontWeight::MEDIUM)
         .text_size(crate::typography::ui_rems(11.5))
         .text_color(theme.text_faint)
+        .children(dot.map(|hue| div().size(px(6.0)).flex_none().rounded_full().bg(hue)))
         .child(SharedString::from(label))
         .into_any_element()
 }
@@ -727,84 +743,131 @@ pub fn agents_panel_body(
             || s.doc_ref
                 .as_ref()
                 .is_some_and(|d| seen.contains(d.as_str()));
-        let mut meta = String::new();
-        if let Some(t) = &s.agent_type {
-            meta.push_str(t);
-        }
-        if let Some(m) = &s.model {
-            if !meta.is_empty() {
-                meta.push_str(" \u{00b7} ");
-            }
-            meta.push_str(m);
-        }
+        // Right meta: `agent_type · model` (mono 11px) - either part may
+        // be absent, and the dot is omitted when only one exists.
+        let meta = [s.agent_type.as_deref(), s.model.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" \u{00b7} ");
+        let summary_line = s.summary.clone();
+        // No summary and no meta: the row collapses to the title-only
+        // 32px (a line-2 slot with nothing on either side).
+        let bare = summary_line.is_none() && meta.is_empty();
+        let elapsed = s.elapsed(now);
         div()
             .id(SharedString::from(format!("agents-row-{}", s.id)))
-            .h(px(AGENTS_ROW_HEIGHT))
+            .h(px(if bare {
+                AGENTS_ROW_HEIGHT_BARE
+            } else {
+                AGENTS_ROW_HEIGHT
+            }))
             .w_full()
             .flex()
-            .items_center()
-            .gap(px(8.0))
+            .flex_col()
+            .justify_center()
             .px(px(Theme::SPACE_SM))
             .cursor_pointer()
             .hover(|el| el.bg(crate::theme::wash(0.06)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 open(this, chat.clone(), summary.clone(), cx);
             }))
-            .child(status_glyph(
-                SharedString::from(format!("agents-glyph-{}", s.id)),
-                s.status,
-                is_seen,
-                theme,
-                view,
-                cx,
-            ))
+            // Line 1 (18px): 12px glyph + 8px + 13px title truncating,
+            // then the mono elapsed right-aligned on the title's baseline.
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .w_full()
+                    .h(px(18.0))
                     .flex()
-                    .flex_col()
-                    .justify_center()
+                    .flex_row()
+                    // Centered, not baseline: the glyph box has no text
+                    // baseline, so baseline alignment dropped it below the
+                    // title.
+                    .items_center()
+                    .gap(px(8.0))
                     .child(
                         div()
-                            .w_full()
+                            .size(px(12.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(status_glyph(
+                                SharedString::from(format!("agents-glyph-{}", s.id)),
+                                s.status,
+                                is_seen,
+                                theme,
+                                view,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
                             .truncate()
-                            .text_size(crate::typography::ui_rems(12.5))
+                            .text_size(crate::typography::ui_rems(13.0))
                             .text_color(theme.text)
                             .child(s.title.clone()),
                     )
-                    .children(s.summary.clone().map(|sum| {
+                    .children(elapsed.map(|e| {
                         div()
-                            .w_full()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(11.5))
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(crate::typography::ui_rems(11.0))
                             .text_color(theme.text_faint)
-                            .child(sum)
+                            .child(e)
                             .into_any_element()
                     })),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(crate::typography::ui_rems(11.0))
-                    .text_color(theme.text_faint)
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .child(s.elapsed(now).unwrap_or_default())
-                    .child(SharedString::from(meta)),
-            )
+            // Line 2 (16px) starts at the title's x: one-line summary
+            // truncating, `agent_type · model` right-aligned. Either side
+            // may be absent (empty rows collapse above).
+            .when(!bare, |row| {
+                row.child(
+                    div()
+                        .w_full()
+                        .h(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .pl(px(12.0 + 8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.text_muted)
+                                .child(summary_line.unwrap_or_default()),
+                        )
+                        .when(!meta.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .font_family(theme.font_mono.clone())
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(meta)),
+                            )
+                        }),
+                )
+            })
             .into_any_element()
     };
     let mut children: Vec<AnyElement> = Vec::new();
     if !active.is_empty() {
-        children.push(agents_section("Active".into(), theme));
+        children.push(agents_section(
+            "Active".into(),
+            SessionState::Working.color(theme),
+            theme,
+        ));
         children.extend(active.iter().map(|s| row(s)));
     }
     if !done.is_empty() {
         children.push(agents_section(
             format!("Done \u{00b7} {}", done.len()),
+            None,
             theme,
         ));
         children.extend(done.iter().map(|s| row(s)));
@@ -818,6 +881,57 @@ pub fn agents_panel_body(
         .pb(px(Theme::SPACE_SM))
         .children(children)
         .into_any_element()
+}
+
+impl crate::composer::Composer {
+    /// The agents tray: a queue-tray surface over this composer's chat, or
+    /// `None` when nothing qualifies (no chat, or no visible subagents).
+    /// `tucked` (queue tray rendered below) drops the tray's own radius:
+    /// the queue tray's top edge becomes the shared seam.
+    pub(crate) fn render_agents_tray(
+        &mut self,
+        tucked: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let chat_id = self
+            .target
+            .chat_id(self.state.read(cx))
+            .map(str::to_owned)?;
+        let summaries = strip_visible(&subagents_for(self.state.read(cx), &chat_id));
+        if summaries.is_empty() {
+            return None;
+        }
+        let theme = Theme::of(cx).clone();
+        // Fitting budget: the tray's inner width = the measured composer
+        // column minus the tray inset on both sides minus the row pads.
+        let inner_width = self
+            .last_available_width()
+            .unwrap_or(crate::composer::COMPOSER_MAX_WIDTH)
+            - 2.0 * crate::composer::QUEUE_SIDE_INSET
+            - 12.0
+            - 6.0;
+        let panel_open = self.agents_panel_open;
+        let seen = std::mem::take(&mut self.subagent_seen);
+        let row = agents_tray_row(
+            &chat_id,
+            &summaries,
+            inner_width,
+            panel_open,
+            &seen,
+            Utc::now(),
+            &theme,
+            cx.entity_id(),
+            cx,
+        );
+        self.subagent_seen = seen;
+        let surface = crate::queue::queue_panel_surface(&theme)
+            .when(tucked, |el| el.rounded_bl(px(0.0)).rounded_br(px(0.0)))
+            .child(row);
+        Some(
+            crate::frost::frosted(crate::queue::PANEL_RADIUS, crate::frost::MENU_BLUR, surface)
+                .into_any_element(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -925,5 +1039,55 @@ mod tests {
         state.transcript = vec![entry("u", MessageRole::User, vec![]), live];
         let out = subagents_for(&state, "c");
         assert_eq!(out[0].status, SubagentPhase::Started);
+    }
+
+    #[test]
+    fn finished_observation_requires_an_active_observation_this_session() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        // A settled agent first observed after an app restart (no doc, no
+        // output): never stamp a finish time and never show a guessed
+        // elapsed.
+        state.transcript = vec![
+            entry("u", MessageRole::User, vec![]),
+            entry(
+                "m",
+                MessageRole::Assistant,
+                vec![spawn("a", true, Some(SubagentStatus::Done))],
+            ),
+        ];
+        let out = subagents_for(&state, "c");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, SubagentPhase::Done);
+        assert!(out[0].finished.is_none());
+        assert!(out[0].elapsed(Utc::now()).is_none());
+        assert!(state.subagent_finished_obs.borrow().is_empty());
+
+        // The same agent seen Running first, then Done: the transition
+        // stamps a finish observation and elapsed freezes.
+        let mut live = entry(
+            "m",
+            MessageRole::Assistant,
+            vec![spawn("a", false, Some(SubagentStatus::Running))],
+        );
+        live.status = Some(MessageStatus::Streaming);
+        state.transcript = vec![entry("u", MessageRole::User, vec![]), live];
+        let out = subagents_for(&state, "c");
+        assert_eq!(out[0].status, SubagentPhase::Running);
+
+        state.transcript = vec![
+            entry("u", MessageRole::User, vec![]),
+            entry(
+                "m",
+                MessageRole::Assistant,
+                vec![spawn("a", true, Some(SubagentStatus::Done))],
+            ),
+        ];
+        // The terminal frame stamps the observation; the next read returns it.
+        subagents_for(&state, "c");
+        let out = subagents_for(&state, "c");
+        assert_eq!(out[0].status, SubagentPhase::Done);
+        assert!(out[0].finished.is_some());
+        assert!(out[0].elapsed(Utc::now()).is_some());
     }
 }

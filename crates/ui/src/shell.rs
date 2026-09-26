@@ -1936,6 +1936,10 @@ impl Shell {
                         target_device_id.clone(),
                         cx,
                     ),
+                    ComposerEvent::OpenSubagentSummary { chat_id, summary } => {
+                        this.open_subagent_summary(chat_id.clone(), summary.clone(), cx)
+                    }
+                    ComposerEvent::ToggleAgentsPanel => this.toggle_agents_panel(cx),
                 }
             }
         })
@@ -3575,59 +3579,6 @@ impl Shell {
         self.set_right_active(RightSurface::Subagent(id), cx);
     }
 
-    /// The subagent dock strip above this chat's composer (Codex parity):
-    /// visible while the latest turn has >=1 spawn or any spawn is still
-    /// live. Returns `None` when the chat has no loaded transcript or
-    /// nothing qualifies.
-    fn subagent_strip(
-        &self,
-        chat_id: &str,
-        width: f32,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if chat_id.is_empty() {
-            return None;
-        }
-        let summaries = {
-            let state = self.state.read(cx);
-            crate::subagents::strip_visible(&crate::subagents::subagents_for(state, chat_id))
-        };
-        if summaries.is_empty() {
-            return None;
-        }
-        let theme = Theme::of(cx).clone();
-        let panel_open = self.agents_panel_open(cx);
-        let open: crate::subagents::OpenAgent =
-            std::rc::Rc::new(|this, chat, summary, cx| {
-                this.open_subagent_summary(chat, summary, cx)
-            });
-        let toggle: crate::subagents::TogglePanel =
-            std::rc::Rc::new(|this, cx| this.toggle_agents_panel(cx));
-        Some(
-            motion::fade_quick(
-                "subagent-dock-in",
-                div()
-                    .h(px(
-                        crate::subagents::STRIP_HEIGHT + crate::subagents::STRIP_BOTTOM_GAP
-                    ))
-                    .child(crate::subagents::dock_strip(
-                        chat_id,
-                        &summaries,
-                        width,
-                        panel_open,
-                        &self.subagent_seen.borrow(),
-                        open,
-                        toggle,
-                        Utc::now(),
-                        &theme,
-                        cx.entity_id(),
-                        cx,
-                    )),
-            )
-            .into_any_element(),
-        )
-    }
-
     /// A pill/sidebar-child click: select the parent chat and open the
     /// subagent thread in the right pane. Doc-less harnesses (Pi) get a
     /// synthetic frozen snapshot of the spawn call's result instead of an
@@ -3684,10 +3635,27 @@ impl Shell {
         self.add_subagent_surface(chat_id, doc_id, summary.title.to_string(), frozen, cx);
     }
 
-    /// Whether the Agents surface is the visible right-pane tab (the dock
-    /// strip chevron's open state).
+    /// Whether the Agents surface is the visible right-pane tab (the agents
+    /// tray chevron's open state).
     pub(crate) fn agents_panel_open(&self, cx: &App) -> bool {
         self.right_pane_open(cx) && self.resolved_right_active(cx) == RightSurface::Agents
+    }
+
+    /// Mirror the Agents-tab open flag + the opened-thread `seen` set into
+    /// every composer that can render the tray (the shared dock composer and
+    /// each workspace pane composer). Called once per render; the composers
+    /// self-notify only on change.
+    fn sync_composer_agents_state(&mut self, cx: &mut Context<Self>) {
+        let open = self.agents_panel_open(cx);
+        let seen = self.subagent_seen.borrow().clone();
+        self.composer.update(cx, |composer, cx| {
+            composer.set_agents_panel_state(open, seen.clone(), cx)
+        });
+        for surface in self.workspace.chat_surfaces.values() {
+            surface.composer.update(cx, |composer, cx| {
+                composer.set_agents_panel_state(open, seen.clone(), cx)
+            });
+        }
     }
 
     /// The strip chevron / sidebar `+N more`: the right pane's Agents tab.
@@ -6424,15 +6392,21 @@ impl Shell {
             text.opacity(0.9)
         };
         let harness_mark = harness.map(crate::pickers::harness_brand_icon);
-        let card = div()
+        div()
             .id(SharedString::from(row_id.clone()))
-            // Fixed three-line card: the height never varies with content,
-            // so the list's FLIP estimates and the drawn row always agree.
+            // Fixed three-line card: 9px top/bottom padding centers the
+            // 54px of lines (the old fixed-height + justify_center drew
+            // the same 72px box), and nested child rows below line 3 grow
+            // the card from there - the caller adds their height to the
+            // keyed row so the list's FLIP estimates and the drawn row
+            // always agree.
             .relative()
-            .h(px(chat_row_height()))
             .flex()
             .flex_col()
-            .justify_center()
+            .pt(px(9.0))
+            // A bare card keeps the original 72px (justify_center's 9px
+            // bottom); with children the block carries its own pb(4px).
+            .pb(px(if sub_children.is_some() { 0.0 } else { 9.0 }))
             .rounded(px(if search_query.is_some() {
                 popover::PALETTE_ITEM_RADIUS
             } else {
@@ -6630,6 +6604,10 @@ impl Shell {
                         )
                     }),
             )
+            // Running subagent lines live INSIDE the card's wash/radius,
+            // after line 3 (subagents.rs sidebar_children owns the rows;
+            // the caller wraps them in the `sub:{chat}` disclosure tween).
+            .children(sub_children)
             .when(needs_you, |row| {
                 row.child(
                     div()
@@ -6645,17 +6623,7 @@ impl Shell {
                         .bg(needs_you_color),
                 )
             })
-            .into_any_element();
-        match sub_children {
-            Some(children) => div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .child(card)
-                .child(children)
-                .into_any_element(),
-            None => card,
-        }
+            .into_any_element()
     }
 
     /// The global connection line. `None` while healthy (`Connected`) or on
@@ -8428,16 +8396,19 @@ impl Shell {
                     .flex_col()
                     .child(
                         gpui::canvas(
-                            move |bounds, window, cx| {
-                                // Reserve the destination footprint, never the animated height.
-                                let next_height = f32::from(bounds.size.height)
-                                    + composer.read(cx).dock_clearance_correction();
-                                let changed = (measured.get() - next_height).abs() > 0.5
-                                    || measured_has_composer.get() != contains_composer;
-                                measured.set(next_height);
-                                measured_has_composer.set(contains_composer);
-                                if changed {
-                                    window.request_animation_frame();
+                            {
+                                let composer = composer.clone();
+                                move |bounds, window, cx| {
+                                    // Reserve the destination footprint, never the animated height.
+                                    let next_height = f32::from(bounds.size.height)
+                                        + composer.read(cx).dock_clearance_correction();
+                                    let changed = (measured.get() - next_height).abs() > 0.5
+                                        || measured_has_composer.get() != contains_composer;
+                                    measured.set(next_height);
+                                    measured_has_composer.set(contains_composer);
+                                    if changed {
+                                        window.request_animation_frame();
+                                    }
                                 }
                             },
                             |_, _, _, _| {},
@@ -8466,11 +8437,11 @@ impl Shell {
                                     .mx_auto()
                                     .flex()
                                     .flex_col()
-                                    .children(self.subagent_strip(
-                                        &self.active_chat.clone(),
-                                        composer_width - 2.0 * Theme::SPACE_LG,
-                                        cx,
-                                    ))
+                                    // The strip shares the composer
+                                    // container's px(SPACE_LG) inset, so
+                                    // its edges ARE the pill's outer edges
+                                    // at every width (the outer column is
+                                    // already clamped to COMPOSER_MAX_WIDTH).
                                     .child(self.composer.clone())
                                     .children(if has_selection {
                                         self.render_jump_to_bottom(cx)
@@ -10835,6 +10806,7 @@ impl Render for Shell {
                         t.set_bottom_clearance(stack_h, cx);
                     }
                 });
+                self.sync_composer_agents_state(cx);
 
                 let sidebar = self.render_sidebar(cx);
                 let sidebar_handle = self.resize_handle(

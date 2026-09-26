@@ -185,24 +185,41 @@ Status hues come from `SessionState` only: sky equalizer Running,
 emerald check Done (neutral once the thread has been opened), danger
 triangle Failed, neutral dot Started.
 
-- **Dock strip**: a single 28px row above the composer, same column
-  width, 6px above the pill. Leading `Agents` label (11.5px MEDIUM,
-  `text_faint`) with a mono `{done}/{total}` count, then 24px pills
-  (border only, `wash(0.06)` hover): 12px status glyph, truncated title
-  at 12px `text_muted`, mono 11px elapsed. A trailing chevron toggles
-  the Agents tab, and a `+N` pill opens it when pills overflow. The
-  strip shows the latest turn's agents plus anything still running, and
-  animates its height in.
+- **Agents tray**: a queue-tray surface stacked above the composer pill
+  (same `QUEUE_SIDE_INSET`, rounded top `PANEL_RADIUS`, tucked
+  `QUEUE_COMPOSER_OVERLAP` behind the pill, `popover::surface_bg` +
+  `theme.border`, frost-aware shadow). Rendered by the composer itself
+  on every route, so the transcript's measured bottom clearance already
+  covers it - no floating row. When the queue tray is also up, the
+  agents tray sits on top of it and tucks behind the queue tray's top
+  edge (one continuous stack: agents, queue, pill). The content row is
+  32px: 12px left pad, `Agents` 11.5px MEDIUM `text_faint` + mono
+  `{done}/{total}`, then 24px pills (no border inside the tray -
+  `wash(0.06)` fill, `wash(0.10)` hover): 12px status glyph, truncated
+  title at 12px `text_muted`, mono 11px elapsed. A `+N` pill and the
+  trailing 24px chevron toggle the Agents tab; 6px right pad. The tray
+  shows the latest turn's agents plus anything still running, and
+  appears/disappears with `motion::fade_quick`.
 - **Agents panel**: `RightSurface::Agents`, one "Agents" tab with the
   `BOT` icon. `Active` and `Done · N` sections (30px headers like the
-  sidebar's), 44px rows: glyph, title + one-line tail, mono elapsed and
-  `agent_type · model` right-aligned. Rows open the child thread. There
-  is no bulk stop - the engine exposes no subagent-interrupt call.
+  sidebar's), 44px rows: line 1 is the 12px status glyph, 8px, 13px
+  `text` title truncating, and the mono 11px elapsed right-aligned on
+  the title's baseline; line 2 (16px, starting at the title's x) holds
+  the one-line result in 12px `text_muted` truncating with `agent_type
+  · model` in mono 11px `text_faint` right-aligned (either part may be
+  absent; no summary and no meta collapses the row to 32px). Rows open
+  the child thread. There is no bulk stop - the engine exposes no
+  subagent-interrupt call.
 - **Sidebar children**: under selected or pane-open cards with running
-  agents only, up to three 22px rows below line 3 (hairline tree stub,
-  glyph, title, elapsed) plus a `+N more` row that selects the chat and
-  opens the Agents tab. Child clicks open the agent thread. Finished
-  agents never nest; card height animates via the disclosure tween.
+  agents only, up to three 22px rows rendered as extra lines INSIDE the
+  card after line 3 (sharing the card's wash and radius; no tree stubs,
+  no hairlines). Each row: 12px status glyph at the card's text-start x,
+  6px gap, 12px `text_muted` title truncating, mono 11px `text_faint`
+  elapsed flush to the card's right edge. A `+N more` row (no glyph,
+  indented to the title start) selects the chat and opens the Agents tab.
+  2px between line 3 and the first child, 4px bottom pad. Child clicks
+  stop propagation and open the agent thread. Finished agents never
+  nest; card height animates via the disclosure tween.
 
 Opening an agent opens its thread, not a dead end: real sub docs go
 through `add_subagent_surface`; doc-less results (Pi) render a frozen
