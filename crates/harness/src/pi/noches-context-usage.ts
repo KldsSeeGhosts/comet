@@ -14,8 +14,8 @@ interface UsageSnapshot {
   contextWindow: number;
   percent: number | null;
   model?: string;
-  /** Auto-compaction threshold percent (contextWindow - reserveTokens). */
-  compactionPercent?: number;
+  /** Token count where auto-compaction triggers (contextWindow - reserveTokens). */
+  compactAt?: number;
   sessionTokens?: { input: number; output: number; cacheRead: number };
   ts: number;
 }
@@ -57,13 +57,13 @@ function configuredReserveTokens(cwd: string): number | undefined {
 // contextWindow - reserveTokens. Model-specific overrides resolve through
 // pi's settings manager, which extensions cannot reach; with the ordinary
 // reserve this is exact, otherwise the field stays absent rather than lying.
-function compactionPercent(
+function compactAt(
   contextWindow: number,
   reserveTokens: number | undefined,
 ): number | undefined {
   if (contextWindow <= 0 || reserveTokens === undefined) return undefined;
-  const percent = ((contextWindow - reserveTokens) / contextWindow) * 100;
-  return percent > 0 && percent < 100 ? percent : undefined;
+  const threshold = Math.floor(contextWindow - reserveTokens);
+  return threshold > 0 && threshold < contextWindow ? threshold : undefined;
 }
 
 // Mirrors AgentSession.getSessionStats(): dedicated usage entries plus the
@@ -114,7 +114,7 @@ function snapshot(ctx: ExtensionContext): UsageSnapshot | undefined {
     contextWindow: usage.contextWindow,
     percent,
     model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
-    compactionPercent: compactionPercent(usage.contextWindow, reserve),
+    compactAt: compactAt(usage.contextWindow, reserve),
     sessionTokens: sessionTokenTotals(ctx),
     ts: Date.now(),
   };

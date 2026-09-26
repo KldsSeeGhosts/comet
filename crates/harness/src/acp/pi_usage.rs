@@ -33,7 +33,7 @@ struct Snapshot {
     /// `null` right after compaction until the next assistant response.
     tokens: Option<u64>,
     context_window: Option<u64>,
-    compaction_percent: Option<f64>,
+    compact_at: Option<u64>,
     session_tokens: Option<SessionTotals>,
 }
 
@@ -59,7 +59,7 @@ impl Snapshot {
             usage: ContextUsage {
                 tokens: self.tokens,
                 window: Some(window),
-                compaction_percent: self.compaction_percent.filter(|p| *p > 0.0),
+                compact_at: self.compact_at.filter(|t| *t > 0 && *t < window),
                 session: self.session_tokens.map(|s| SessionTokenTotals {
                     input: s.input,
                     output: s.output,
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn snapshot_carries_compaction_and_session_totals() {
         let ev = parse_snapshot(
-            r#"{"tokens":84213,"contextWindow":200000,"compactionPercent":91.8,"sessionTokens":{"input":50000,"output":10000,"cacheRead":40000}}"#,
+            r#"{"tokens":84213,"contextWindow":200000,"compactAt":183616,"sessionTokens":{"input":50000,"output":10000,"cacheRead":40000}}"#,
         )
         .unwrap()
         .event()
@@ -150,7 +150,7 @@ mod tests {
         assert!(matches!(
             ev,
             AgentEvent::ContextUsageSnapshot { usage }
-                if usage.compaction_percent == Some(91.8)
+                if usage.compact_at == Some(183_616)
                     && usage.session
                         == Some(SessionTokenTotals {
                             input: 50000,

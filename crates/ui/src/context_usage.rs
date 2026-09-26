@@ -217,7 +217,11 @@ impl Render for UsageCard {
                     .text_color(theme.text_muted)
                     .child(SharedString::from(line))
             }));
-        if let Some(compaction) = usage.and_then(|u| u.compaction_percent) {
+        let compact_percent = usage.and_then(|u| {
+            let window = u.window.filter(|w| *w > 0)?;
+            Some(u.compact_at? as f64 / window as f64 * 100.0)
+        });
+        if let Some(compaction) = compact_percent {
             card = card.child(
                 div()
                     .font_family(theme.font_mono.clone())

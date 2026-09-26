@@ -586,16 +586,16 @@ mod tests {
 }
 
 /// Host-owned context snapshot, replicated with the chat document.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub window: Option<u64>,
-    /// Auto-compaction threshold as a percent of the window, when the
-    /// harness reports it truthfully (Pi: contextWindow - reserveTokens).
-    /// Never guessed - absent when unknown.
+    /// Token count at which the harness auto-compacts, when it reports it
+    /// truthfully (Pi: contextWindow - reserveTokens). Never guessed -
+    /// absent when unknown. An integer keeps the replicated struct `Eq`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compaction_percent: Option<f64>,
+    pub compact_at: Option<u64>,
     /// Session-wide token totals (input/output/cache-read), when cheaply
     /// available. Display-only; never feeds the ring's fraction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -603,7 +603,7 @@ pub struct ContextUsage {
 }
 
 /// Cumulative billed tokens for the whole session (not the window estimate).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTokenTotals {
     pub input: u64,
