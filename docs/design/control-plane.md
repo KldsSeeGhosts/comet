@@ -135,6 +135,17 @@ The placeholder is "Message {Harness}…". The model chip keeps the harness
 mark's brand tint, shows the model name without the `provider/` prefix at
 NORMAL weight in `text_muted`, and shows reasoning in `text_faint`.
 
+The context ring (16px, 1.8px stroke) sits left of the send button
+whenever the harness reports a window. Its fill is `text_muted`, turning
+`warning` at 75% and `danger` at 90%. Hovering opens the context card:
+"Context window" with the percent in mono, a 4px usage bar, then mono
+11px lines - `used / window tokens`, `left`, `Auto-compacts at ~N%`
+(only when the harness reports the threshold), and session totals
+(`in · out · cache`) when available. Pi reports through the Noches Pi
+extension (`crates/harness/src/pi/noches-context-usage.ts`), which writes
+snapshots the harness polls; `tokens: null` after compaction reads as
+"Waiting for context usage", never 0%.
+
 ## Tool rows
 
 Transcript tool rows tint the 14px icon by the identity of the action -
