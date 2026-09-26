@@ -690,17 +690,20 @@ const AGENTS_ROW_HEIGHT_BARE: f32 = 32.0;
 const AGENTS_SECTION_HEIGHT: f32 = 30.0;
 
 /// One 30px "Active" / "Done · N" header, 11.5px text_faint like the
-/// sidebar's own section labels.
-fn agents_section(label: String, theme: &Theme) -> AnyElement {
+/// sidebar's own section labels. `dot` is the section's state hue (the
+/// sidebar's 6px section dot); settled sections carry none.
+fn agents_section(label: String, dot: Option<gpui::Hsla>, theme: &Theme) -> AnyElement {
     div()
         .h(px(AGENTS_SECTION_HEIGHT))
         .w_full()
         .flex()
         .items_center()
+        .gap(px(6.0))
         .px(px(Theme::SPACE_SM))
         .font_weight(FontWeight::MEDIUM)
         .text_size(crate::typography::ui_rems(11.5))
         .text_color(theme.text_faint)
+        .children(dot.map(|hue| div().size(px(6.0)).flex_none().rounded_full().bg(hue)))
         .child(SharedString::from(label))
         .into_any_element()
 }
@@ -777,7 +780,10 @@ pub fn agents_panel_body(
                     .h(px(18.0))
                     .flex()
                     .flex_row()
-                    .items_baseline()
+                    // Centered, not baseline: the glyph box has no text
+                    // baseline, so baseline alignment dropped it below the
+                    // title.
+                    .items_center()
                     .gap(px(8.0))
                     .child(
                         div()
@@ -851,12 +857,17 @@ pub fn agents_panel_body(
     };
     let mut children: Vec<AnyElement> = Vec::new();
     if !active.is_empty() {
-        children.push(agents_section("Active".into(), theme));
+        children.push(agents_section(
+            "Active".into(),
+            SessionState::Working.color(theme),
+            theme,
+        ));
         children.extend(active.iter().map(|s| row(s)));
     }
     if !done.is_empty() {
         children.push(agents_section(
             format!("Done \u{00b7} {}", done.len()),
+            None,
             theme,
         ));
         children.extend(done.iter().map(|s| row(s)));
