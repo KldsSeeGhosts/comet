@@ -115,3 +115,28 @@ pane header, left to right:
 The placeholder is "Message {Harness}…". The model chip keeps the harness
 mark's brand tint, shows the model name without the `provider/` prefix at
 NORMAL weight in `text_muted`, and shows reasoning in `text_faint`.
+
+## Tool rows
+
+Transcript tool rows tint the 14px icon by the identity of the action -
+`crate::tool_palette::ToolFamily`, the same (dark, light) hue-pair pattern
+as `status_palette`. Verbs stay `text_muted` (MEDIUM on card chips),
+details stay `text_faint`, and connectors/badges stay neutral.
+
+- Explore (read, search, glob/list, fetch, web search): muted teal
+  `0x7cc4bd` dark / `0x2f7f78` light.
+- Change (edit, write, patch): muted amber `0xd9b26f` / `0x946514`.
+- Delegate (subagent spawn, "Wait for agents"): muted orchid
+  `0xc9a0dc` / `0x8a4a9e`.
+- Run, Plan/Todo, MCP/Unknown, Thinking: neutral `text_muted` - commands
+  are the bulk of the column and keeping them quiet is what makes the
+  tinted families legible.
+
+These hues are deliberately desaturated and in different sectors than the
+session status hues (sky/indigo/emerald); a tinted tool icon must never be
+readable as session state.
+
+Failure is reserved: a failed row keeps its verb/detail colors, the icon
+turns `theme.danger`, and a trailing mono 11px `failed` tag in danger at
+0.9 opacity follows the detail. The tree connector stays neutral. Running
+rows keep the existing live treatment, neutral.

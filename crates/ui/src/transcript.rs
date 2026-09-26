@@ -7505,14 +7505,19 @@ fn chip_header_row(
     let failed = tool.is_error
         || (tool.subagent_ref.is_some()
             && matches!(tool.subagent_status, Some(SubagentStatus::Failed)));
+    // Failure is reserved to the icon and a trailing "failed" tag; the verb
+    // and detail keep their usual colors so a failed probe doesn't paint
+    // the whole row red.
+    let icon_tint = if failed {
+        theme.danger
+    } else {
+        crate::tool_palette::ToolFamily::of(&tool.call, tool.is_thought)
+            .color(theme)
+            .unwrap_or(theme.text_muted)
+    };
     // Text resolves its color during layout, so group-hover text needs stable
     // child IDs under the keyed, expandable header to retain hover state.
     let hover_text = activity && trail.is_some() && !failed;
-    let tint = if failed {
-        theme.danger
-    } else {
-        theme.text_muted
-    };
     div()
         .group("tool-header")
         .h(px(if activity {
@@ -7548,7 +7553,7 @@ fn chip_header_row(
                             tool_icon_path(&tool.call)
                         })
                         .size(px(12.0))
-                        .text_color(theme.text_muted),
+                        .text_color(icon_tint),
                     ),
             )
         })
@@ -7561,7 +7566,7 @@ fn chip_header_row(
                 .when(!activity, |label| {
                     label.font_weight(gpui::FontWeight::MEDIUM)
                 })
-                .text_color(tint)
+                .text_color(theme.text_muted)
                 .child(SharedString::from(label))
                 .map(|label| {
                     if hover_text {
@@ -7587,9 +7592,7 @@ fn chip_header_row(
                 .when(activity && detail.is_empty(), |detail| detail.hidden())
                 .items_center()
                 .truncate()
-                .text_color(if failed {
-                    theme.danger
-                } else if activity {
+                .text_color(if activity {
                     theme.text_muted
                 } else {
                     theme.text.opacity(0.85)
@@ -7606,11 +7609,7 @@ fn chip_header_row(
                         .bg(theme.ink(0.06))
                         .pl(px(1.0))
                         .pr(px(6.0))
-                        .text_color(if failed {
-                            theme.danger
-                        } else {
-                            theme.text.opacity(0.85)
-                        })
+                        .text_color(theme.text.opacity(0.85))
                         .child(
                             div()
                                 .size(px(20.0))
@@ -7665,6 +7664,21 @@ fn chip_header_row(
                     }
                 }),
         )
+        .when(failed, |row| {
+            // Reserved failure tag: a quiet mono marker in danger at 0.9
+            // opacity — the only red besides the icon.
+            row.child(
+                div()
+                    .flex_none()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(theme.danger.opacity(0.9))
+                    .child("failed"),
+            )
+        })
         .when_some(tool.call.subagent_model(), |row, model| {
             // Which model the child runs on, when the spawn named one.
             //
@@ -7846,10 +7860,15 @@ fn activity_rail(
     theme: &Theme,
 ) -> gpui::Div {
     let color = theme.hairline(0.12);
+    // Failure turns the icon danger; otherwise the icon carries the tool
+    // family's muted hue (Neutral falls back to text_muted). The connector
+    // ribbon stays neutral either way.
     let tint = if tool.is_error {
         theme.danger
     } else {
-        theme.text_muted
+        crate::tool_palette::ToolFamily::of(&tool.call, tool.is_thought)
+            .color(theme)
+            .unwrap_or(theme.text_muted)
     };
     let (incoming_reveal, branch_reveal) = tool_connector_parts(reveal, has_predecessor);
     div()
