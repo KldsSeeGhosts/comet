@@ -159,3 +159,41 @@ Failure is reserved: a failed row keeps its verb/detail colors, the icon
 turns `theme.danger`, and a trailing mono 11px `failed` tag in danger at
 0.9 opacity follows the detail. The tree connector stays neutral. Running
 rows keep the existing live treatment, neutral.
+
+## Subagents
+
+Three surfaces read one selector, `subagents_for(state, chat)`, which
+distills a chat's spawn tool parts into `SubagentSummary` rows: id, title
+(from the spawn's `description`, else "Agent"), agent type, model, a
+four-phase status (Running / Started / Done / Failed), start and finish
+instants, and a one-line result tail. `Started` is the honest state for
+background spawns - a bare tool result never means Done there - and for
+doc-less harnesses like Pi where the call's lifecycle is all we have.
+Ordering: running first (oldest first), then finished (newest first).
+Status hues come from `SessionState` only: sky equalizer Running,
+emerald check Done (neutral once the thread has been opened), danger
+triangle Failed, neutral dot Started.
+
+- **Dock strip**: a single 28px row above the composer, same column
+  width, 6px above the pill. Leading `Agents` label (11.5px MEDIUM,
+  `text_faint`) with a mono `{done}/{total}` count, then 24px pills
+  (border only, `wash(0.06)` hover): 12px status glyph, truncated title
+  at 12px `text_muted`, mono 11px elapsed. A trailing chevron toggles
+  the Agents tab, and a `+N` pill opens it when pills overflow. The
+  strip shows the latest turn's agents plus anything still running, and
+  animates its height in.
+- **Agents panel**: `RightSurface::Agents`, one "Agents" tab with the
+  `BOT` icon. `Active` and `Done · N` sections (30px headers like the
+  sidebar's), 44px rows: glyph, title + one-line tail, mono elapsed and
+  `agent_type · model` right-aligned. Rows open the child thread. There
+  is no bulk stop - the engine exposes no subagent-interrupt call.
+- **Sidebar children**: under selected or pane-open cards with running
+  agents only, up to three 22px rows below line 3 (hairline tree stub,
+  glyph, title, elapsed) plus a `+N more` row that selects the chat and
+  opens the Agents tab. Child clicks open the agent thread. Finished
+  agents never nest; card height animates via the disclosure tween.
+
+Opening an agent opens its thread, not a dead end: real sub docs go
+through `add_subagent_surface`; doc-less results (Pi) render a frozen
+single-entry snapshot titled from the spawn, so the row never opens an
+empty transcript.

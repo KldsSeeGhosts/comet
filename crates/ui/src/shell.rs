@@ -593,6 +593,9 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
+    /// The chat's subagent inventory (Codex-style Agents panel) — one per
+    /// panel key; lists Active and Done rows that open Subagent tabs.
+    Agents,
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -1663,6 +1666,12 @@ pub struct Shell {
     /// [`Transcript`] pinned to its subagent doc.
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
     subagent_seq: u64,
+    /// Subagent keys (`{chat_id}/{part_id}` or doc id) whose thread the user
+    /// already opened — the Done glyph goes neutral once seen.
+    pub(crate) subagent_seen: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    /// Per-chat sidebar child-row count last rendered — diffs kick the
+    /// `sub:{chat}` disclosure tween that animates the card's growth.
+    sidebar_sub_rows: std::collections::HashMap<String, usize>,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
@@ -2131,6 +2140,10 @@ impl Shell {
             diff_seq: 0,
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
+            subagent_seen: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashSet::new(),
+            )),
+            sidebar_sub_rows: std::collections::HashMap::new(),
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
@@ -2858,6 +2871,7 @@ impl Shell {
                         browser.page.url.clone().map(Into::into),
                     )
                 }),
+                RightSurface::Agents => Some((*surface, "Agents".into(), false, None)),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -2878,6 +2892,7 @@ impl Shell {
             | RightSurface::Diff(_)
             | RightSurface::Terminal(_)
             | RightSurface::Subagent(_)
+            | RightSurface::Agents
             | RightSurface::Browser(_) => {
                 return None;
             }
@@ -2980,7 +2995,7 @@ impl Shell {
             }
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
-            RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
+            RightSurface::Subagent(_) | RightSurface::Browser(_) | RightSurface::Agents => {}
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -3529,11 +3544,17 @@ impl Shell {
             transcript.set_workspace_link_handler(links)
         });
         let events = cx.subscribe(&transcript, Self::on_transcript_event);
-        let fetch = if frozen {
+        // A snapshot already in place wins (frozen blob from an earlier
+        // open, or a doc-less result snapshot) — the blob fetch and the live
+        // watch would race it with a possibly-purged doc.
+        let content_ready = !self.state.read(cx).sub_transcript(&doc_id).is_empty();
+        let fetch = if frozen && !content_ready {
             self.spawn_subagent_snapshot_fetch(&chat_id, &doc_id, cx)
-        } else {
+        } else if !frozen {
             self.state
                 .update(cx, |s, cx| s.watch_subagent_doc(doc_id.clone(), cx));
+            None
+        } else {
             None
         };
         self.subagent_tabs.insert(
@@ -3552,6 +3573,134 @@ impl Shell {
             .or_default()
             .push(RightSurface::Subagent(id));
         self.set_right_active(RightSurface::Subagent(id), cx);
+    }
+
+    /// The subagent dock strip above this chat's composer (Codex parity):
+    /// visible while the latest turn has >=1 spawn or any spawn is still
+    /// live. Returns `None` when the chat has no loaded transcript or
+    /// nothing qualifies.
+    fn subagent_strip(
+        &self,
+        chat_id: &str,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if chat_id.is_empty() {
+            return None;
+        }
+        let summaries = {
+            let state = self.state.read(cx);
+            crate::subagents::strip_visible(&crate::subagents::subagents_for(state, chat_id))
+        };
+        if summaries.is_empty() {
+            return None;
+        }
+        let theme = Theme::of(cx).clone();
+        let panel_open = self.agents_panel_open(cx);
+        let open: crate::subagents::OpenAgent =
+            std::rc::Rc::new(|this, chat, summary, cx| {
+                this.open_subagent_summary(chat, summary, cx)
+            });
+        let toggle: crate::subagents::TogglePanel =
+            std::rc::Rc::new(|this, cx| this.toggle_agents_panel(cx));
+        Some(
+            motion::fade_quick(
+                "subagent-dock-in",
+                div()
+                    .h(px(
+                        crate::subagents::STRIP_HEIGHT + crate::subagents::STRIP_BOTTOM_GAP
+                    ))
+                    .child(crate::subagents::dock_strip(
+                        chat_id,
+                        &summaries,
+                        width,
+                        panel_open,
+                        &self.subagent_seen.borrow(),
+                        open,
+                        toggle,
+                        Utc::now(),
+                        &theme,
+                        cx.entity_id(),
+                        cx,
+                    )),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// A pill/sidebar-child click: select the parent chat and open the
+    /// subagent thread in the right pane. Doc-less harnesses (Pi) get a
+    /// synthetic frozen snapshot of the spawn call's result instead of an
+    /// empty transcript.
+    pub(crate) fn open_subagent_summary(
+        &mut self,
+        chat_id: String,
+        summary: crate::subagents::SubagentSummary,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
+            self.open_chat(chat_id.clone(), cx);
+        }
+        let doc_id = summary
+            .doc_ref
+            .clone()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| {
+                let doc_id = crate::subagents::result_doc_id(&chat_id, &summary.id);
+                let text = summary
+                    .summary
+                    .clone()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "No output.".to_string());
+                self.state.update(cx, |state, _| {
+                    if state.sub_transcript(&doc_id).is_empty() {
+                        state.set_subagent_snapshot(
+                            doc_id.clone(),
+                            vec![zeron_doc::SessionMessageEntry {
+                                id: "result".into(),
+                                role: zeron_doc::MessageRole::Assistant,
+                                parts: vec![zeron_doc::MessagePart::Text {
+                                    id: "t0".into(),
+                                    text,
+                                }],
+                                created_at: summary
+                                    .started
+                                    .map(|t| t.timestamp_millis())
+                                    .unwrap_or_default(),
+                                device_id: String::new(),
+                                status: Some(zeron_doc::MessageStatus::Complete),
+                                continuation_of: None,
+                            }],
+                        );
+                    }
+                });
+                doc_id
+            });
+        self.subagent_seen.borrow_mut().insert(doc_id.clone());
+        self.subagent_seen
+            .borrow_mut()
+            .insert(format!("{chat_id}/{}", summary.id));
+        let frozen = !summary.status.active();
+        self.add_subagent_surface(chat_id, doc_id, summary.title.to_string(), frozen, cx);
+    }
+
+    /// Whether the Agents surface is the visible right-pane tab (the dock
+    /// strip chevron's open state).
+    pub(crate) fn agents_panel_open(&self, cx: &App) -> bool {
+        self.right_pane_open(cx) && self.resolved_right_active(cx) == RightSurface::Agents
+    }
+
+    /// The strip chevron / sidebar `+N more`: the right pane's Agents tab.
+    pub(crate) fn toggle_agents_panel(&mut self, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        let tabs = self.right_tabs.entry(key).or_default();
+        if !tabs.contains(&RightSurface::Agents) {
+            tabs.push(RightSurface::Agents);
+        }
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        self.set_right_active(RightSurface::Agents, cx);
     }
 
     /// Fetch a finished subagent's frozen transcript blob
@@ -3671,7 +3820,7 @@ impl Shell {
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
             }
-            RightSurface::Picker => {}
+            RightSurface::Agents | RightSurface::Picker => {}
         }
         self.panels.update(&key, |p| {
             if p.right_active == surface {
@@ -6033,6 +6182,10 @@ impl Shell {
         // row is busy or under the pointer.
         jump_label: Option<SharedString>,
         search_query: Option<&str>,
+        // Running-subagent rows appended under the card (Codex-style nested
+        // threads). The caller adds their height to the keyed row so the
+        // FLIP estimate and the drawn card agree.
+        sub_children: Option<AnyElement>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -6271,7 +6424,7 @@ impl Shell {
             text.opacity(0.9)
         };
         let harness_mark = harness.map(crate::pickers::harness_brand_icon);
-        div()
+        let card = div()
             .id(SharedString::from(row_id.clone()))
             // Fixed three-line card: the height never varies with content,
             // so the list's FLIP estimates and the drawn row always agree.
@@ -6492,7 +6645,17 @@ impl Shell {
                         .bg(needs_you_color),
                 )
             })
-            .into_any_element()
+            .into_any_element();
+        match sub_children {
+            Some(children) => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(card)
+                .child(children)
+                .into_any_element(),
+            None => card,
+        }
     }
 
     /// The global connection line. `None` while healthy (`Connected`) or on
@@ -6798,7 +6961,11 @@ impl Shell {
     ) -> AnyElement {
         let theme = &theme.for_popup();
         let open = self.user_menu.is_open();
-        let action = if self.boot.remote.is_some() { None } else { account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow) };
+        let action = if self.boot.remote.is_some() {
+            None
+        } else {
+            account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow)
+        };
         // Bottom-of-sidebar device strip. The left side remains the account
         // menu trigger, while the two compact actions expose device control
         // and Settings without making the profile menu the whole footer.
@@ -8297,6 +8464,13 @@ impl Shell {
                                     .w(px(composer_width))
                                     .opacity(composer_opacity)
                                     .mx_auto()
+                                    .flex()
+                                    .flex_col()
+                                    .children(self.subagent_strip(
+                                        &self.active_chat.clone(),
+                                        composer_width - 2.0 * Theme::SPACE_LG,
+                                        cx,
+                                    ))
                                     .child(self.composer.clone())
                                     .children(if has_selection {
                                         self.render_jump_to_bottom(cx)
@@ -8753,6 +8927,25 @@ impl Shell {
                         .children(pill)
                         .into_any_element()
                 }
+                RightSurface::Agents => {
+                    let theme = Theme::of(cx).clone();
+                    let chat_id = self.panel_key(cx);
+                    let summaries = crate::subagents::subagents_for(self.state.read(cx), &chat_id);
+                    let open: crate::subagents::OpenAgent =
+                        std::rc::Rc::new(|this, chat, summary, cx| {
+                            this.open_subagent_summary(chat, summary, cx)
+                        });
+                    crate::subagents::agents_panel_body(
+                        &chat_id,
+                        &summaries,
+                        &self.subagent_seen.borrow(),
+                        Utc::now(),
+                        &theme,
+                        cx.entity_id(),
+                        open,
+                        cx,
+                    )
+                }
                 _ => self.render_surface_picker(cx),
             }
         } else {
@@ -9103,7 +9296,7 @@ impl Shell {
                         }
                     })
                     .unwrap_or(icons::LIST),
-                RightSurface::Subagent(_) => icons::BOT,
+                RightSurface::Subagent(_) | RightSurface::Agents => icons::BOT,
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
                 RightSurface::Picker => icons::PLUS,

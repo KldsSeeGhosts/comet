@@ -742,6 +742,19 @@ impl Shell {
                                     transcript: surface
                                         .and_then(|surface| surface.transcript.clone()),
                                     composer: surface.map(|surface| surface.composer.clone()),
+                                    agent_strip: pane_state
+                                        .session_id
+                                        .as_deref()
+                                        .and_then(|chat_id| {
+                                            let visible = crate::subagents::strip_visible(
+                                                &crate::subagents::subagents_for(
+                                                    state.read(cx),
+                                                    chat_id,
+                                                ),
+                                            );
+                                            (!visible.is_empty())
+                                                .then(|| (chat_id.to_string(), visible))
+                                        }),
                                 }
                             })
                             .collect()

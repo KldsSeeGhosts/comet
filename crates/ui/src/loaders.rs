@@ -179,7 +179,7 @@ pub fn mini_equalizer(
     key: impl Into<SharedString>,
     tint: gpui::Hsla,
     _view: EntityId,
-    _cx: &mut App,
+    _cx: &App,
 ) -> impl IntoElement {
     MiniEqualizer {
         key: key.into(),
