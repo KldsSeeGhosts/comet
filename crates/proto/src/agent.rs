@@ -265,12 +265,16 @@ impl ToolCall {
 pub const SUBAGENT_MODEL_KEYS: [&str; 4] = ["model", "modelId", "model_id", "subagent_model"];
 
 /// The spawn-input keys [`sanitize_tool_call`](crate::) must preserve so the
-/// chip can name the child's model. Deliberately tiny: everything else on a
-/// spawn's input (the whole prompt, most of all) stays host-local.
-pub const SUBAGENT_INPUT_KEEP: [&str; 5] = [
+/// chip can name the child's model and the agents UI can title the pill and
+/// tell a background spawn apart (its bare result never means Done).
+/// Deliberately tiny: everything else on a spawn's input (the whole prompt,
+/// most of all) stays host-local.
+pub const SUBAGENT_INPUT_KEEP: [&str; 7] = [
+    "description",
     "model",
     "modelId",
     "model_id",
+    "run_in_background",
     "subagent_model",
     "subagent_type",
 ];

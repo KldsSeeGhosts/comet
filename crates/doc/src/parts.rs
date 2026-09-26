@@ -896,6 +896,7 @@ mod tests {
             ToolCall::Unknown {
                 name: "Agent: Explore theme system".into(),
                 input: Some(serde_json::json!({
+                    "description": "Explore theme system",
                     "model": "haiku",
                     "subagent_type": "Explore",
                 })),

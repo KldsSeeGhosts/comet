@@ -131,6 +131,9 @@ pub(crate) struct PaneSnap {
     pub transcript: Option<Entity<Transcript>>,
     /// The pane's own composer.
     pub composer: Option<Entity<Composer>>,
+    /// The pane chat's subagent dock-strip data (chat id + the strip's
+    /// visible summaries); `None` when the strip has nothing to show.
+    pub agent_strip: Option<(String, Vec<crate::subagents::SubagentSummary>)>,
 }
 
 /// The content-area outlet for workspace mode: the whole view tree. Every
@@ -631,11 +634,16 @@ fn pane_container(
             theme,
             cx,
         ))
-        .child(pane_body(theme, pane))
+        .child(pane_body(cx, theme, pane, snap))
         .into_any_element()
 }
 
-fn pane_body(theme: &Theme, pane: &PaneSnap) -> AnyElement {
+fn pane_body(
+    cx: &Context<'_, Shell>,
+    theme: &Theme,
+    pane: &PaneSnap,
+    snap: &WorkspaceSnap,
+) -> AnyElement {
     match pane.mode {
         PaneMode::Terminal => div()
             .flex_1()
@@ -674,6 +682,34 @@ fn pane_body(theme: &Theme, pane: &PaneSnap) -> AnyElement {
             // pane's actual width into the composer's responsive mode (each
             // composer measures against its own pane, not the dock column).
             let composer = pane.composer.clone().map(|composer| {
+                // The subagent dock strip rides the same column width; its
+                // pills/chat id arrive precomputed in the snapshot.
+                let strip = pane.agent_strip.as_ref().map(|(chat_id, summaries)| {
+                    let open: crate::subagents::OpenAgent = Rc::new(|this, chat, summary, cx| {
+                        this.open_subagent_summary(chat, summary, cx)
+                    });
+                    let toggle: crate::subagents::TogglePanel =
+                        Rc::new(|this, cx| this.toggle_agents_panel(cx));
+                    let width = snap
+                        .pane_bounds
+                        .borrow()
+                        .get(&pane.pane)
+                        .map(|b| f32::from(b.size.width) - 20.0)
+                        .unwrap_or(480.0);
+                    crate::subagents::dock_strip(
+                        chat_id,
+                        summaries,
+                        width,
+                        cx.entity().read(cx).agents_panel_open(cx),
+                        &cx.entity().read(cx).subagent_seen.borrow(),
+                        open,
+                        toggle,
+                        chrono::Utc::now(),
+                        theme,
+                        cx.entity_id(),
+                        cx,
+                    )
+                });
                 div().relative().w_full().px(px(10.0)).pb(px(10.0)).child(
                     div()
                         .relative()
@@ -698,6 +734,7 @@ fn pane_body(theme: &Theme, pane: &PaneSnap) -> AnyElement {
                             .absolute()
                             .inset_0(),
                         )
+                        .children(strip)
                         .child(composer.clone()),
                 )
             });
