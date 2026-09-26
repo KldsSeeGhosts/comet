@@ -347,7 +347,7 @@ pub(crate) fn pane_header(
                 .flex_row()
                 .items_center()
                 .gap(px(2.0))
-                // The right-pane toggle lives on the pane header — the
+                // The right-pane toggle lives on the pane header - the
                 // window-wide chat header that used to carry it is gone.
                 // Shown only on the focused session-bound pane so idle
                 // panes stay quiet.

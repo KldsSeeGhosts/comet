@@ -7666,7 +7666,7 @@ fn chip_header_row(
         )
         .when(failed, |row| {
             // Reserved failure tag: a quiet mono marker in danger at 0.9
-            // opacity — the only red besides the icon.
+            // opacity - the only red besides the icon.
             row.child(
                 div()
                     .flex_none()

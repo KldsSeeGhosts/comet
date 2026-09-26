@@ -841,13 +841,13 @@ pub struct AppState {
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
     /// First-observation finish times for terminal subagents whose doc is
-    /// not loaded — `{chat_id}/{part_id}` -> epoch millis. The selector
+    /// not loaded - `{chat_id}/{part_id}` -> epoch millis. The selector
     /// (`crate::subagents`) stamps it the frame a terminal status lands, but
-    /// only for keys this session earlier observed ACTIVE — after a restart
+    /// only for keys this session earlier observed ACTIVE - after a restart
     /// the real finish time is lost and no duration should be guessed.
     pub(crate) subagent_finished_obs: std::cell::RefCell<HashMap<String, i64>>,
     /// Subagent keys (`{chat_id}/{part_id}`) this app session has observed
-    /// in an active phase. Memory-only — cleared on restart, which is what
+    /// in an active phase. Memory-only - cleared on restart, which is what
     /// keeps `subagent_finished_obs` from stamping bogus post-restart
     /// finish times.
     pub(crate) subagent_active_obs: std::cell::RefCell<std::collections::HashSet<String>>,

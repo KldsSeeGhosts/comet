@@ -480,12 +480,12 @@ impl Harness for MockHarness {
             .into_iter()
             .flatten();
         // Dev/testing knob: `ZERON_MOCK_AGENTS=1` appends three spawn chips
-        // — one whose tagged subagent traffic settles fast (done), one that
+        // - one whose tagged subagent traffic settles fast (done), one that
         // errors (failed), and one whose nested traffic is paced by
         // `ZERON_MOCK_SUBAGENT_DELAY_MS` so it stays RUNNING through the
         // demo (set that knob to e.g. 2000 to hold it). Unlike
         // `ZERON_MOCK_SUBAGENT` (which ends all of its subagents before the
-        // run's Done), this fixture leaves one live at run end — the shape
+        // run's Done), this fixture leaves one live at run end - the shape
         // the dock strip / Agents panel / sidebar children are built for.
         let mock_agents = std::env::var("ZERON_MOCK_AGENTS")
             .ok()
@@ -568,7 +568,7 @@ impl Harness for MockHarness {
                     tag(
                         "mock-agt-done",
                         AgentEvent::TextDelta {
-                            text: "Padding holds at every measured width — 4px rhythm intact.".into(),
+                            text: "Padding holds at every measured width - 4px rhythm intact.".into(),
                         },
                     ),
                     tag("mock-agt-done", done(DoneStatus::Completed)),
@@ -580,7 +580,7 @@ impl Harness for MockHarness {
                         },
                     ),
                     tag("mock-agt-fail", done(DoneStatus::Errored)),
-                    // The runner streams slowly — every tagged beat keeps
+                    // The runner streams slowly - every tagged beat keeps
                     // its chip Running while the parent turn has settled.
                     tag(
                         "mock-agt-run",

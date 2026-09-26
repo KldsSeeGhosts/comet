@@ -424,7 +424,7 @@ impl Protocol {
     /// builds, e.g. 2.0.18, where it 404s) while 1.x answers
     /// `GET /global/health` with `{healthy, version}`. The version field
     /// discriminates when present; 2.x builds that dropped it are caught by
-    /// any other `/api/*` route answering JSON — 1.x serves its web UI
+    /// any other `/api/*` route answering JSON - 1.x serves its web UI
     /// (HTML) under those paths instead. `None` = still booting.
     async fn detect(server: &Server) -> Option<Self> {
         for (path, protocol) in [

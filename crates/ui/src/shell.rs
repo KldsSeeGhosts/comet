@@ -593,7 +593,7 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
-    /// The chat's subagent inventory (Codex-style Agents panel) — one per
+    /// The chat's subagent inventory (Codex-style Agents panel) - one per
     /// panel key; lists Active and Done rows that open Subagent tabs.
     Agents,
 }
@@ -1667,9 +1667,9 @@ pub struct Shell {
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
     subagent_seq: u64,
     /// Subagent keys (`{chat_id}/{part_id}` or doc id) whose thread the user
-    /// already opened — the Done glyph goes neutral once seen.
+    /// already opened - the Done glyph goes neutral once seen.
     pub(crate) subagent_seen: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
-    /// Per-chat sidebar child-row count last rendered — diffs kick the
+    /// Per-chat sidebar child-row count last rendered - diffs kick the
     /// `sub:{chat}` disclosure tween that animates the card's growth.
     sidebar_sub_rows: std::collections::HashMap<String, usize>,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
@@ -3549,7 +3549,7 @@ impl Shell {
         });
         let events = cx.subscribe(&transcript, Self::on_transcript_event);
         // A snapshot already in place wins (frozen blob from an earlier
-        // open, or a doc-less result snapshot) — the blob fetch and the live
+        // open, or a doc-less result snapshot) - the blob fetch and the live
         // watch would race it with a possibly-purged doc.
         let content_ready = !self.state.read(cx).sub_transcript(&doc_id).is_empty();
         let fetch = if frozen && !content_ready {

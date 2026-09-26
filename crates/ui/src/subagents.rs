@@ -1,5 +1,5 @@
 //! Codex-style subagent inventory: a pure selector over a chat's transcript
-//! (spawn tool parts) plus the surfaces that render it — the composer agents
+//! (spawn tool parts) plus the surfaces that render it - the composer agents
 //! tray, the right-pane Agents panel, and the sidebar's nested child rows.
 //! Status hues come only from [`SessionState`]; everything else stays on
 //! neutral theme tokens.
@@ -22,7 +22,7 @@ use crate::theme::Theme;
 use crate::{icons, loaders, transcript};
 
 /// Display lifecycle of one spawned subagent. `Started` is the honest
-/// neutral state for a spawn that returned without lifecycle proof — the
+/// neutral state for a spawn that returned without lifecycle proof - the
 /// "eager-done" window and `run_in_background` spawns live here (never
 /// "Done" just because the spawn call resolved).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +59,7 @@ pub struct SubagentSummary {
 }
 
 impl SubagentSummary {
-    /// `45s` / `2m` / `1h 4m` — live for active phases, frozen at finish.
+    /// `45s` / `2m` / `1h 4m` - live for active phases, frozen at finish.
     /// Settled agents with no observed finish time show nothing rather
     /// than a guessed duration.
     pub fn elapsed(&self, now: DateTime<Utc>) -> Option<String> {
@@ -158,7 +158,7 @@ pub fn result_doc_id(chat_id: &str, part_id: &str) -> String {
 /// The chat's spawn calls as display summaries. `chat_id` resolves its
 /// transcript: the selected chat's joined transcript, or a pane-opened
 /// chat's doc watch (`sub_transcripts`). A chat with no loaded transcript
-/// selects nothing — that is the "transcript loaded" gate the sidebar uses.
+/// selects nothing - that is the "transcript loaded" gate the sidebar uses.
 ///
 /// Order: running first (oldest first), then finished (newest first).
 pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
@@ -211,7 +211,7 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
                             SubagentPhase::Started
                         } else if !resolved {
                             // A turn that ended without the spawn resolving
-                            // can never report again — it died with the run.
+                            // can never report again - it died with the run.
                             if streaming {
                                 SubagentPhase::Running
                             } else {
@@ -219,7 +219,7 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
                             }
                         } else if output.is_some() {
                             // The call's own result IS the subagent's final
-                            // report (ACP harnesses, e.g. Pi — no nested doc).
+                            // report (ACP harnesses, e.g. Pi - no nested doc).
                             SubagentPhase::Done
                         } else if streaming {
                             // Eager-done window: the call returned while the
@@ -287,7 +287,7 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
     });
     // Record first-observation finish times so terminal agents without a
     // loaded doc still stop their elapsed clock somewhere stable. Only keys
-    // this session has seen ACTIVE qualify — after a restart a terminal
+    // this session has seen ACTIVE qualify - after a restart a terminal
     // agent's real finish time is gone, and stamping "now" would render a
     // bogus multi-minute elapsed for a seconds-long agent.
     let mut active = state.subagent_active_obs.borrow_mut();
@@ -366,11 +366,11 @@ pub fn status_glyph(
 pub const TRAY_ROW_HEIGHT: f32 = 32.0;
 const PILL_GAP: f32 = 6.0;
 
-/// Estimated pill width (12px glyph + ≤22ch title + mono elapsed + pads) —
+/// Estimated pill width (12px glyph + ≤22ch title + mono elapsed + pads) -
 /// the tray packs greedily off this estimate; `+N` covers the rest.
-/// `open(chat_id, summary)` — sidebar click → select chat + open thread.
+/// `open(chat_id, summary)` - sidebar click → select chat + open thread.
 pub type OpenAgent = Rc<dyn Fn(&mut Shell, String, SubagentSummary, &mut Context<Shell>)>;
-/// `open_panel(chat_id)` — sidebar `+N more` → select chat + Agents tab.
+/// `open_panel(chat_id)` - sidebar `+N more` → select chat + Agents tab.
 pub type OpenPanel = Rc<dyn Fn(&mut Shell, String, &mut Context<Shell>)>;
 
 fn pill_width(title_chars: usize) -> f32 {

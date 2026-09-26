@@ -482,7 +482,7 @@ async fn cancelled_catalog_decode_releases_a_stalled_http_body() {
 }
 
 /// 2.0.18 dropped the version-bearing `/api/health` (404) and serves the
-/// SPA's HTML under `/global/health` — `Protocol::detect` must still resolve
+/// SPA's HTML under `/global/health` - `Protocol::detect` must still resolve
 /// V2 off any answering `/api/*` JSON route, or readiness never converges
 /// and spawn burns the whole startup budget (the "Loading models…" hang).
 #[tokio::test]

@@ -1815,7 +1815,7 @@ impl Shell {
             None
         };
         // Nested child rows: running subagents only, and only under cards
-        // whose transcript is actually open (selected or pinned to a pane) —
+        // whose transcript is actually open (selected or pinned to a pane) -
         // the selector can only read loaded transcripts anyway.
         let pane_open = self
             .workspace
