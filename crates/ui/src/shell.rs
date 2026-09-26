@@ -1599,10 +1599,13 @@ pub struct Shell {
     /// Shared route clock and measured prepaint geometry for the persistent composer.
     composer_dock: crate::composer_dock::SharedDock,
     new_thread_artwork_ready: crate::new_thread_background_effects::Readiness,
-    /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
-    /// (user request), session-transient. `archived_shown` pages the
-    /// expanded list ("Show more" reveals another page).
-    pub(super) archived_open: bool,
+    /// The sidebar's archived accordion (t3code Sidebar): session-transient.
+    /// `None` is "no user choice this session" and resolves per content:
+    /// OPEN when the active list has live rows, COLLAPSED when every session
+    /// is archived - the empty state stays quiet rather than leading with a
+    /// shelf of stale rows. `archived_shown` pages the expanded list
+    /// ("Show more" reveals another page).
+    pub(super) archived_open: Option<bool>,
     pub(super) archived_shown: usize,
     /// Archived slim row under the pointer — swaps its time label for the
     /// Unarchive affordance and restores the dimmed harness mark (t3code's
@@ -2102,7 +2105,7 @@ impl Shell {
             bottom_stack_has_composer: std::rc::Rc::new(std::cell::Cell::new(false)),
             composer_dock: Default::default(),
             new_thread_artwork_ready: Default::default(),
-            archived_open: true,
+            archived_open: None,
             archived_shown: 0,
             archived_hover: None,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
@@ -6722,7 +6725,7 @@ impl Shell {
                             .pb(px(Theme::SPACE_SM))
                             .text_size(crate::typography::ui_rems(12.0))
                             .text_color(theme.text_faint)
-                            .child(SharedString::from("No sessions yet"))
+                            .child(SharedString::from("No active sessions"))
                             .into_any_element()
                     })
                     .children(archived_section),
