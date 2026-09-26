@@ -100,15 +100,34 @@ label. `sidebar_visible_order` must match the rendered order.
 ## Panes
 
 Shared shell surface, hairline dividers, and focus cues are unchanged from v1. The
-pane header, left to right:
+pane header is a 36px row, `pl` 10px / `pr` 6px (the trailing inset pairs
+with the titlebar's `TITLEBAR_ACTION_EDGE_INSET`), content left to right:
 
-- The harness mark at 14px in its brand tint.
-- The title at 12.5px MEDIUM (`text` when focused, `text_muted` when not).
+- The harness mark at 14px in its brand tint inside a fixed 16px column.
+  A bound chat shows its configured harness; an unbound new-session pane
+  shows the harness picked in its composer. When no harness resolves the
+  column stays empty - never a placeholder glyph.
+- The title at 13px MEDIUM (`text` when focused, `text_muted` when not).
 - A 14px project badge, then the context in mono 11px `text_faint`:
   `{project}:{branch}`, plus ` · {device}` for a remote device.
-- A status label when not idle: icon and label in the state color at 11.5px
-  MEDIUM, the same as the sidebar slot.
-- The action control, the changes toggle, and close.
+- A status label only when it adds information the transcript does not
+  already show: icon and label in the state color at 11.5px MEDIUM. Awaiting
+  input and Failed show on every pane; unfocused panes in a split show all
+  states; Working hides on the focused pane because the transcript's live
+  activity line already carries it.
+- The project action control: a quiet 24px ghost segment. With no action
+  configured it is a play glyph at 14px with an "Add action" tooltip; with
+  one configured it is `[icon] {name}` at 12px `text_muted`. Hover is the
+  single `wash(0.11)` blend - no pills, no plus signs.
+- Changes toggle and close as 24px icon buttons on a 2px in-group rhythm
+  (14px glyphs, `text_muted`, tooltips + aria labels).
+
+While the sidebar is collapsed (or mid-collapse) the pane at the window's
+top-left adds `pane_header_leading_inset` of left padding so its mark and
+title start `TITLEBAR_IDENTITY_GAP` past the titlebar cluster (traffic
+lights, sidebar toggle, nav, and the "+" slot). Only that one pane (or
+top-left tab strip) insets; the value rides the sidebar and titlebar
+tweens, so it animates rather than jumping.
 
 ## Composer
 

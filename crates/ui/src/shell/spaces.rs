@@ -1869,7 +1869,21 @@ impl Shell {
             return None;
         }
         let total = rows.len();
-        let open = self.archived_open;
+        // No live sessions left: default the shelf collapsed so the empty
+        // state stays quiet ("No active sessions" alone); an explicit toggle
+        // still wins. Live rows present -> default OPEN as before.
+        let has_live = {
+            let state = self.state.read(cx);
+            state
+                .chats
+                .iter()
+                .filter(|c| !c.archived)
+                .any(|chat| match &filter {
+                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
+                    None => true,
+                })
+        };
+        let open = self.archived_open.unwrap_or(has_live);
         let shown = self.archived_shown.max(INITIAL);
         let visible_count = total.min(shown);
         let has_more = total > shown;
@@ -1893,13 +1907,13 @@ impl Shell {
         let header = sidebar_disclosure_header(theme, label, chevron)
             .id("archived-toggle")
             .on_click(cx.listener(move |this, _, _, cx| {
-                let was_open = this.archived_open;
+                let was_open = this.archived_open.unwrap_or(has_live);
                 this.begin_sidebar_disclosure_motion(
                     "archived",
                     if was_open { body_height } else { 0.0 },
                     if was_open { 0.0 } else { body_height },
                 );
-                this.archived_open = !was_open;
+                this.archived_open = Some(!was_open);
                 this.archived_shown = INITIAL;
                 cx.notify();
             }));

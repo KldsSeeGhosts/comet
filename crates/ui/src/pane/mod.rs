@@ -168,12 +168,13 @@ impl gpui::Render for SplitDragGhost {
             .text_size(crate::typography::ui_rems(11.0))
             .text_color(theme.text)
             .opacity(0.9)
-            .child(
-                icon(self.mark.icon)
+            .children(self.mark.icon.map(|path| {
+                icon(path)
                     .size(px(11.0))
                     .flex_none()
-                    .text_color(tint),
-            )
+                    .text_color(tint)
+                    .into_any_element()
+            }))
             .child(div().min_w_0().truncate().child(self.title.clone()))
     }
 }
@@ -244,7 +245,7 @@ pub(crate) const TOOL_PICKER_ROWS: &[ToolPickerRow] = &[
     ToolPickerRow {
         kind: ToolKind::Chat,
         label: "New chat",
-        icon: icons::ZERON_LOGO,
+        icon: icons::CHAT_ROUND_LINE,
         badge: None,
     },
     ToolPickerRow {

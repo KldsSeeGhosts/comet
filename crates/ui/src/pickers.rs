@@ -889,7 +889,9 @@ impl Pickers {
     }
 
     /// Effective harness: picked, or the chat's config, or the first listed.
-    fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+    /// `pub(crate)` so pane headers can borrow the composer's pick for the
+    /// identity mark of an unbound new-session pane.
+    pub(crate) fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }
@@ -4521,6 +4523,28 @@ pub(crate) fn chip_model_label(label: &str) -> &str {
     label.rsplit_once('/').map_or(label, |(_, name)| name)
 }
 
+/// The model chip's terminal label when nothing named a model: a real label
+/// always wins, then the no-agents verdict, then the discovery-failed hint,
+/// then "Default model" once the catalog resolved but named nothing. An
+/// unresolved load (still loading) yields the empty string the caller pairs
+/// with the ghost "Loading models…" - never an eternally blank chip.
+pub(crate) fn chip_terminal_label(
+    label: SharedString,
+    no_agents: bool,
+    discovery_failed: bool,
+    resolved_without_model: bool,
+) -> SharedString {
+    if !label.is_empty() || no_agents {
+        label
+    } else if discovery_failed {
+        SharedString::from("Models unavailable")
+    } else if resolved_without_model {
+        SharedString::from("Default model")
+    } else {
+        label
+    }
+}
+
 pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
     match harness {
         HarnessId::ClaudeCode | HarnessId::Mock => (
@@ -4746,17 +4770,34 @@ impl Render for Pickers {
                 .map(|label| SharedString::from(chip_model_label(&label)))
                 .unwrap_or_default()
         };
-        let catalog_loading = matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
+        // A load only counts as in-flight while an engine exists to answer
+        // it; with no engine the Idle/Loading slots can never resolve, which
+        // was the "Loading models…"-forever chip (user report).
+        let engine_missing = self.engine(cx).is_none();
+        let catalog_loading =
+            matches!(self.harnesses, Loadable::Idle | Loadable::Loading) && !engine_missing;
+        let models_errored = self.effective_harness(cx).is_some_and(|harness| {
+            matches!(self.models.get(&harness), Some(Loadable::Error(_)))
+        });
         let models_loading = self.effective_harness(cx).is_some_and(|harness| {
             !matches!(
                 self.models.get(&harness),
                 Some(Loadable::Ready(_)) | Some(Loadable::Error(_))
             )
-        });
+        }) && !engine_missing;
         // Harness unknown while the catalog resolves: the pixel-glyph loader
         // instead of guessing a brand mark.
         let chip_icon_loading =
             self.effective_harness(cx).is_none() && !no_agents && catalog_loading;
+        // Terminal fallbacks keep the chip legible when discovery is done
+        // (or cannot run): models errored -> "Models unavailable"; catalog
+        // done, nothing remembered -> "Default model".
+        let model_label: SharedString = chip_terminal_label(
+            model_label,
+            no_agents,
+            engine_missing || models_errored,
+            !catalog_loading && !models_loading && self.effective_harness(cx).is_some(),
+        );
         // Harness known but nothing names the model yet (fresh install, no
         // remembered pick): a ghost label instead of a bare icon.
         let chip_label_loading =
@@ -4766,7 +4807,7 @@ impl Render for Pickers {
         // harness's mark) while the model and reasoning text stay neutral.
         let harness_icon: (&'static str, Option<gpui::Hsla>) = match self.effective_harness(cx) {
             Some(harness) => harness_brand_icon(harness),
-            None if no_agents => (crate::icons::TERMINAL, None),
+            None if no_agents || engine_missing => (crate::icons::TERMINAL, None),
             None => harness_brand_icon(HarnessId::ClaudeCode),
         };
         let explicit_options = self.explicit_options(cx);
@@ -5889,6 +5930,33 @@ mod tests {
         assert_eq!(chip_model_label("openai-codex/GPT-6 Luna"), "GPT-6 Luna");
         assert_eq!(chip_model_label("anthropic/claude/opus-4"), "opus-4");
         assert_eq!(chip_model_label("gpt-5"), "gpt-5");
+    }
+
+    #[test]
+    fn chip_terminal_label_never_leaves_a_blank_chip() {
+        // A named model always wins.
+        assert_eq!(
+            chip_terminal_label("Fable 5".into(), false, true, true),
+            "Fable 5"
+        );
+        // Discovery done (or impossible) with no model name: honest hints,
+        // never the eternal loader.
+        assert_eq!(
+            chip_terminal_label("".into(), false, true, false),
+            "Models unavailable"
+        );
+        assert_eq!(
+            chip_terminal_label("".into(), false, false, true),
+            "Default model"
+        );
+        // Still loading stays empty - the caller pairs it with the ghost
+        // "Loading models…" label, which only paints while a load can run.
+        assert_eq!(chip_terminal_label("".into(), false, false, false), "");
+        // The no-agents verdict is already in the label; pass through.
+        assert_eq!(
+            chip_terminal_label("No agents available".into(), true, false, true),
+            "No agents available"
+        );
     }
 
     #[test]
