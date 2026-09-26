@@ -4258,6 +4258,12 @@ impl Composer {
         }
     }
 
+    /// The last width `set_available_width` committed (the composer
+    /// column's measured width, clamped to `COMPOSER_MAX_WIDTH`).
+    pub fn last_available_width(&self) -> Option<f32> {
+        self.last_available_width
+    }
+
     /// Feed the stable conversation-column width into responsive composer
     /// controls.
     pub fn set_available_width(&mut self, width: f32, cx: &mut Context<Self>) {

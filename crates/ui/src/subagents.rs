@@ -398,11 +398,16 @@ pub fn strip_layout(summaries: &[SubagentSummary], width: f32) -> (Vec<SubagentS
 /// The dock strip: `Agents {done}/{total}` label, fitted pills, `+N`
 /// overflow, and the trailing chevron that toggles the Agents panel.
 /// `seen` = subagent keys whose thread the user already opened.
+///
+/// The row renders as the composer container's OWN column child (the
+/// caller nests it), so it inherits the same outer padding and centers on
+/// the same `max_w(768px)` axis as the pill - its edges track the pill's
+/// outer edges at every width with no measured offsets.
 #[allow(clippy::too_many_arguments)] // render fn; params are the strip's props
 pub fn dock_strip(
     chat_id: &str,
     summaries: &[SubagentSummary],
-    width: f32,
+    composer: &gpui::Entity<crate::composer::Composer>,
     panel_open: bool,
     seen: &HashSet<String>,
     open: OpenAgent,
@@ -413,11 +418,20 @@ pub fn dock_strip(
     cx: &Context<Shell>,
 ) -> AnyElement {
     let done = summaries.iter().filter(|s| !s.status.active()).count();
+    // Fitting budget: the pill column's content width, read off the same
+    // measurement the composer uses for its responsive mode (its own
+    // canvas feeds `set_available_width`) - never a stale layout cell.
+    let width = composer
+        .read(cx)
+        .last_available_width()
+        .unwrap_or(crate::composer::COMPOSER_MAX_WIDTH)
+        - 2.0 * Theme::SPACE_LG;
     let (shown, more) = strip_layout(summaries, width);
     let mut row = div()
         .id("subagent-dock-strip")
         .h(px(STRIP_HEIGHT))
         .w_full()
+        .mb(px(STRIP_BOTTOM_GAP))
         .flex()
         .flex_row()
         .items_center()

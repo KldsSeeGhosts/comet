@@ -691,24 +691,20 @@ fn pane_body(
             // pane's actual width into the composer's responsive mode (each
             // composer measures against its own pane, not the dock column).
             let composer = pane.composer.clone().map(|composer| {
-                // The subagent dock strip rides the same column width; its
-                // pills/chat id arrive precomputed in the snapshot.
+                // The subagent dock strip rides the composer's own column:
+                // same padding, same 768px centered axis, so its edges track
+                // the pill's outer edges at every pane width. Its pills/chat
+                // id arrive precomputed in the snapshot.
                 let strip = pane.agent_strip.as_ref().map(|(chat_id, summaries)| {
                     let open: crate::subagents::OpenAgent = Rc::new(|this, chat, summary, cx| {
                         this.open_subagent_summary(chat, summary, cx)
                     });
                     let toggle: crate::subagents::TogglePanel =
                         Rc::new(|this, cx| this.toggle_agents_panel(cx));
-                    let width = snap
-                        .pane_bounds
-                        .borrow()
-                        .get(&pane.pane)
-                        .map(|b| f32::from(b.size.width) - 20.0)
-                        .unwrap_or(480.0);
                     crate::subagents::dock_strip(
                         chat_id,
                         summaries,
-                        width,
+                        &composer,
                         cx.entity().read(cx).agents_panel_open(cx),
                         &cx.entity().read(cx).subagent_seen.borrow(),
                         open,
@@ -743,7 +739,11 @@ fn pane_body(
                             .absolute()
                             .inset_0(),
                         )
-                        .children(strip)
+                        // The strip shares the composer container's
+                        // px(SPACE_LG) inset, so its edges ARE the pill's
+                        // outer edges (the column is already clamped to
+                        // COMPOSER_MAX_WIDTH and centered).
+                        .child(div().w_full().px(px(Theme::SPACE_LG)).children(strip))
                         .child(composer.clone()),
                 )
             });

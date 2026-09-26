@@ -3578,11 +3578,12 @@ impl Shell {
     /// The subagent dock strip above this chat's composer (Codex parity):
     /// visible while the latest turn has >=1 spawn or any spawn is still
     /// live. Returns `None` when the chat has no loaded transcript or
-    /// nothing qualifies.
+    /// nothing qualifies. Renders inside the composer container's own
+    /// padded column, so its edges track the pill's outer edges.
     fn subagent_strip(
         &self,
         chat_id: &str,
-        width: f32,
+        composer: &Entity<Composer>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if chat_id.is_empty() {
@@ -3597,32 +3598,27 @@ impl Shell {
         }
         let theme = Theme::of(cx).clone();
         let panel_open = self.agents_panel_open(cx);
-        let open: crate::subagents::OpenAgent =
-            std::rc::Rc::new(|this, chat, summary, cx| {
-                this.open_subagent_summary(chat, summary, cx)
-            });
+        let open: crate::subagents::OpenAgent = std::rc::Rc::new(|this, chat, summary, cx| {
+            this.open_subagent_summary(chat, summary, cx)
+        });
         let toggle: crate::subagents::TogglePanel =
             std::rc::Rc::new(|this, cx| this.toggle_agents_panel(cx));
         Some(
             motion::fade_quick(
                 "subagent-dock-in",
-                div()
-                    .h(px(
-                        crate::subagents::STRIP_HEIGHT + crate::subagents::STRIP_BOTTOM_GAP
-                    ))
-                    .child(crate::subagents::dock_strip(
-                        chat_id,
-                        &summaries,
-                        width,
-                        panel_open,
-                        &self.subagent_seen.borrow(),
-                        open,
-                        toggle,
-                        Utc::now(),
-                        &theme,
-                        cx.entity_id(),
-                        cx,
-                    )),
+                div().child(crate::subagents::dock_strip(
+                    chat_id,
+                    &summaries,
+                    composer,
+                    panel_open,
+                    &self.subagent_seen.borrow(),
+                    open,
+                    toggle,
+                    Utc::now(),
+                    &theme,
+                    cx.entity_id(),
+                    cx,
+                )),
             )
             .into_any_element(),
         )
@@ -8428,16 +8424,19 @@ impl Shell {
                     .flex_col()
                     .child(
                         gpui::canvas(
-                            move |bounds, window, cx| {
-                                // Reserve the destination footprint, never the animated height.
-                                let next_height = f32::from(bounds.size.height)
-                                    + composer.read(cx).dock_clearance_correction();
-                                let changed = (measured.get() - next_height).abs() > 0.5
-                                    || measured_has_composer.get() != contains_composer;
-                                measured.set(next_height);
-                                measured_has_composer.set(contains_composer);
-                                if changed {
-                                    window.request_animation_frame();
+                            {
+                                let composer = composer.clone();
+                                move |bounds, window, cx| {
+                                    // Reserve the destination footprint, never the animated height.
+                                    let next_height = f32::from(bounds.size.height)
+                                        + composer.read(cx).dock_clearance_correction();
+                                    let changed = (measured.get() - next_height).abs() > 0.5
+                                        || measured_has_composer.get() != contains_composer;
+                                    measured.set(next_height);
+                                    measured_has_composer.set(contains_composer);
+                                    if changed {
+                                        window.request_animation_frame();
+                                    }
                                 }
                             },
                             |_, _, _, _| {},
@@ -8466,10 +8465,17 @@ impl Shell {
                                     .mx_auto()
                                     .flex()
                                     .flex_col()
-                                    .children(self.subagent_strip(
-                                        &self.active_chat.clone(),
-                                        composer_width - 2.0 * Theme::SPACE_LG,
-                                        cx,
+                                    // The strip shares the composer
+                                    // container's px(SPACE_LG) inset, so
+                                    // its edges ARE the pill's outer edges
+                                    // at every width (the outer column is
+                                    // already clamped to COMPOSER_MAX_WIDTH).
+                                    .child(div().w_full().px(px(Theme::SPACE_LG)).children(
+                                        self.subagent_strip(
+                                            &self.active_chat.clone(),
+                                            &composer,
+                                            cx,
+                                        ),
                                     ))
                                     .child(self.composer.clone())
                                     .children(if has_selection {
