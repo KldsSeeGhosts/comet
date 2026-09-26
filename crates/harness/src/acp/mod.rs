@@ -1325,11 +1325,7 @@ impl AcpHarness {
     }
 
     #[cfg(windows)]
-    fn pi_cua_wrapper(
-        dir: &Path,
-        _real: &Path,
-        _extension: &Path,
-    ) -> (PathBuf, String, bool) {
+    fn pi_cua_wrapper(dir: &Path, _real: &Path, _extension: &Path) -> (PathBuf, String, bool) {
         (
             dir.join("pi-with-noches-cua.cmd"),
             concat!(
@@ -2347,6 +2343,7 @@ fn session_update_events(
     params: &Value,
     session_id: &str,
     subagents: &mut SubagentObserver,
+    shapes: &mut normalize::ToolShapes,
 ) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
@@ -2357,7 +2354,7 @@ fn session_update_events(
             SubagentObserver::Devin(tracker) => tracker.map(update),
             _ => {
                 subagents.observe(update);
-                map_update(update)
+                map_update(update, shapes)
             }
         },
         "_x.ai/session_notification" => {
@@ -3152,6 +3149,10 @@ async fn run_session(session: Session) {
         ))
     };
 
+    // Per-call kind/title memory across partial tool_call_updates (pi sends
+    // the identity only on the opening frame).
+    let mut tool_shapes = normalize::ToolShapes::default();
+
     // ---- main loop --------------------------------------------------------
     // Prompt-completion settlement state (the prompt-complete extension):
     // one prompt is outstanding at a time, identified by `current_prompt_id`;
@@ -3296,8 +3297,13 @@ async fn run_session(session: Session) {
                 while let Ok(inc) = incoming.try_recv() {
                     match inc {
                         Incoming::Notification { method, params } => {
-                            let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
+                            let events = session_update_events(
+                                &method,
+                                &params,
+                                &session_id,
+                                &mut subagents,
+                                &mut tool_shapes,
+                            );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -3475,8 +3481,13 @@ async fn run_session(session: Session) {
                     }
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
-                    let events =
-                        session_update_events(&method, &params, &session_id, &mut subagents);
+                    let events = session_update_events(
+                        &method,
+                        &params,
+                        &session_id,
+                        &mut subagents,
+                        &mut tool_shapes,
+                    );
                     for ev in events {
                         track_open_tools(&ev, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -3586,8 +3597,13 @@ async fn run_session(session: Session) {
                         while let Ok(inc) = incoming.try_recv() {
                             match inc {
                                 Incoming::Notification { method, params } => {
-                                    let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents);
+                                    let events = session_update_events(
+                                        &method,
+                                        &params,
+                                        &session_id,
+                                        &mut subagents,
+                                        &mut tool_shapes,
+                                    );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -4074,8 +4090,7 @@ mod tests {
         let dir = PathBuf::from(r"C:\Temp\Noches");
         let real = PathBuf::from(r"C:\Users\100%!\AppData\Roaming\npm\pi.cmd");
         let extension = dir.join("日本語 100%!-noches-cua.ts");
-        let (wrapper, script, executable) =
-            AcpHarness::pi_cua_wrapper(&dir, &real, &extension);
+        let (wrapper, script, executable) = AcpHarness::pi_cua_wrapper(&dir, &real, &extension);
 
         assert_eq!(wrapper, dir.join("pi-with-noches-cua.cmd"));
         assert!(!executable);
@@ -4097,8 +4112,7 @@ mod tests {
         let dir = PathBuf::from("/tmp/noches-private");
         let real = PathBuf::from("/opt/pi agent/bin/pi");
         let extension = dir.join("noches-cua.ts");
-        let (wrapper, script, executable) =
-            AcpHarness::pi_cua_wrapper(&dir, &real, &extension);
+        let (wrapper, script, executable) = AcpHarness::pi_cua_wrapper(&dir, &real, &extension);
 
         assert_eq!(wrapper, dir.join("pi-with-noches-cua"));
         assert!(executable);
