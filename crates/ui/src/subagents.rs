@@ -688,6 +688,7 @@ pub fn sidebar_children(
 // ---------------------------------------------------------------------------
 
 const AGENTS_ROW_HEIGHT: f32 = 44.0;
+const AGENTS_ROW_HEIGHT_BARE: f32 = 32.0;
 const AGENTS_SECTION_HEIGHT: f32 = 30.0;
 
 /// One 30px "Active" / "Done · N" header, 11.5px text_faint like the
@@ -741,74 +742,113 @@ pub fn agents_panel_body(
             || s.doc_ref
                 .as_ref()
                 .is_some_and(|d| seen.contains(d.as_str()));
-        let mut meta = String::new();
-        if let Some(t) = &s.agent_type {
-            meta.push_str(t);
-        }
-        if let Some(m) = &s.model {
-            if !meta.is_empty() {
-                meta.push_str(" \u{00b7} ");
-            }
-            meta.push_str(m);
-        }
+        // Right meta: `agent_type · model` (mono 11px) - either part may
+        // be absent, and the dot is omitted when only one exists.
+        let meta = [s.agent_type.as_deref(), s.model.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" \u{00b7} ");
+        let summary_line = s.summary.clone();
+        // No summary and no meta: the row collapses to the title-only
+        // 32px (a line-2 slot with nothing on either side).
+        let bare = summary_line.is_none() && meta.is_empty();
+        let elapsed = s.elapsed(now);
         div()
             .id(SharedString::from(format!("agents-row-{}", s.id)))
-            .h(px(AGENTS_ROW_HEIGHT))
+            .h(px(if bare {
+                AGENTS_ROW_HEIGHT_BARE
+            } else {
+                AGENTS_ROW_HEIGHT
+            }))
             .w_full()
             .flex()
-            .items_center()
-            .gap(px(8.0))
+            .flex_col()
+            .justify_center()
             .px(px(Theme::SPACE_SM))
             .cursor_pointer()
             .hover(|el| el.bg(crate::theme::wash(0.06)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 open(this, chat.clone(), summary.clone(), cx);
             }))
-            .child(status_glyph(
-                SharedString::from(format!("agents-glyph-{}", s.id)),
-                s.status,
-                is_seen,
-                theme,
-                view,
-                cx,
-            ))
+            // Line 1 (18px): 12px glyph + 8px + 13px title truncating,
+            // then the mono elapsed right-aligned on the title's baseline.
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .w_full()
+                    .h(px(18.0))
                     .flex()
-                    .flex_col()
-                    .justify_center()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(px(8.0))
                     .child(
                         div()
-                            .w_full()
+                            .size(px(12.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(status_glyph(
+                                SharedString::from(format!("agents-glyph-{}", s.id)),
+                                s.status,
+                                is_seen,
+                                theme,
+                                view,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
                             .truncate()
-                            .text_size(crate::typography::ui_rems(12.5))
+                            .text_size(crate::typography::ui_rems(13.0))
                             .text_color(theme.text)
                             .child(s.title.clone()),
                     )
-                    .children(s.summary.clone().map(|sum| {
+                    .children(elapsed.map(|e| {
                         div()
-                            .w_full()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(11.5))
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(crate::typography::ui_rems(11.0))
                             .text_color(theme.text_faint)
-                            .child(sum)
+                            .child(e)
                             .into_any_element()
                     })),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(crate::typography::ui_rems(11.0))
-                    .text_color(theme.text_faint)
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .child(s.elapsed(now).unwrap_or_default())
-                    .child(SharedString::from(meta)),
-            )
+            // Line 2 (16px) starts at the title's x: one-line summary
+            // truncating, `agent_type · model` right-aligned. Either side
+            // may be absent (empty rows collapse above).
+            .when(!bare, |row| {
+                row.child(
+                    div()
+                        .w_full()
+                        .h(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .pl(px(12.0 + 8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.text_muted)
+                                .child(summary_line.unwrap_or_default()),
+                        )
+                        .when(!meta.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .font_family(theme.font_mono.clone())
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(meta)),
+                            )
+                        }),
+                )
+            })
             .into_any_element()
     };
     let mut children: Vec<AnyElement> = Vec::new();

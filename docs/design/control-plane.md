@@ -196,9 +196,14 @@ triangle Failed, neutral dot Started.
   animates its height in.
 - **Agents panel**: `RightSurface::Agents`, one "Agents" tab with the
   `BOT` icon. `Active` and `Done · N` sections (30px headers like the
-  sidebar's), 44px rows: glyph, title + one-line tail, mono elapsed and
-  `agent_type · model` right-aligned. Rows open the child thread. There
-  is no bulk stop - the engine exposes no subagent-interrupt call.
+  sidebar's), 44px rows: line 1 is the 12px status glyph, 8px, 13px
+  `text` title truncating, and the mono 11px elapsed right-aligned on
+  the title's baseline; line 2 (16px, starting at the title's x) holds
+  the one-line result in 12px `text_muted` truncating with `agent_type
+  · model` in mono 11px `text_faint` right-aligned (either part may be
+  absent; no summary and no meta collapses the row to 32px). Rows open
+  the child thread. There is no bulk stop - the engine exposes no
+  subagent-interrupt call.
 - **Sidebar children**: under selected or pane-open cards with running
   agents only, up to three 22px rows rendered as extra lines INSIDE the
   card after line 3 (sharing the card's wash and radius; no tree stubs,
