@@ -7488,7 +7488,7 @@ fn chip_header_row(
     cx: &mut gpui::App,
 ) -> gpui::Div {
     let (label, detail) = if tool.is_thought {
-        ("Thought process", String::new())
+        ("Thought process".into(), String::new())
     } else {
         tool_chip_content(&tool.call)
     };
@@ -12589,30 +12589,34 @@ mod tests {
 
     #[test]
     fn tool_chip_labels_per_kind() {
+        let chip = |call: &ToolCall| {
+            let (l, d) = tool_chip_content(call);
+            (l.to_string(), d)
+        };
         assert_eq!(
-            tool_chip_content(&ToolCall::Exec {
+            chip(&ToolCall::Exec {
                 command: "cargo test".into()
             }),
-            ("Run", "cargo test".to_string())
+            ("Run".to_string(), "cargo test".to_string())
         );
         assert_eq!(
-            tool_chip_content(&ToolCall::Search {
+            chip(&ToolCall::Search {
                 pattern: "foo".into(),
                 path: Some("src".into())
             }),
-            ("Search", "foo in src".to_string())
+            ("Search".to_string(), "foo in src".to_string())
         );
         assert_eq!(
-            tool_chip_content(&ToolCall::ApplyPatch { path: None }),
-            ("Patch", "workspace".to_string())
+            chip(&ToolCall::ApplyPatch { path: None }),
+            ("Patch".to_string(), "workspace".to_string())
         );
         assert_eq!(
-            tool_chip_content(&ToolCall::Mcp {
+            chip(&ToolCall::Mcp {
                 server: "gh".into(),
                 tool: "issues".into(),
                 input: None
             }),
-            ("MCP", "gh · issues".to_string())
+            ("MCP".to_string(), "gh · issues".to_string())
         );
         let todo = ToolCall::Todo {
             items: vec![
@@ -12626,7 +12630,8 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(tool_chip_content(&todo), ("Todo", "1/2 done".to_string()));
+        let (l, d) = tool_chip_content(&todo);
+        assert_eq!((l.as_ref(), d.as_str()), ("Todo", "1/2 done"));
     }
 
     #[test]
@@ -13132,8 +13137,9 @@ mod tests {
 
             // First real overflow: the render-armed frame callback rebuilds
             // the ListState with Bottom and re-pins to the end.
-            transcript
-                .update(&mut visual.cx, |this, cx| feed(this, overflowing_entries(), cx));
+            transcript.update(&mut visual.cx, |this, cx| {
+                feed(this, overflowing_entries(), cx)
+            });
             draw(&transcript, &mut visual);
             transcript.update(&mut visual.cx, |this, _| {
                 assert!(
@@ -13219,9 +13225,7 @@ mod tests {
         }
 
         #[gpui::test]
-        fn dock_transcript_stays_bottom_and_read_only_docs_stay_top(
-            cx: &mut gpui::TestAppContext,
-        ) {
+        fn dock_transcript_stays_bottom_and_read_only_docs_stay_top(cx: &mut gpui::TestAppContext) {
             let dir = tempfile::tempdir().unwrap();
             cx.update(|cx| {
                 let state = init(cx, dir.path());
@@ -13240,8 +13244,7 @@ mod tests {
                 // pane sessions START top-anchored (until first overflow).
                 let doc = cx.new(|cx| Transcript::for_doc(state.clone(), "sub".into(), true, cx));
                 assert!(doc.read(cx).is_top_anchored());
-                let pane =
-                    cx.new(|cx| Transcript::for_session(state, "pane-chat".into(), cx));
+                let pane = cx.new(|cx| Transcript::for_session(state, "pane-chat".into(), cx));
                 assert!(pane.read(cx).is_top_anchored());
             });
         }

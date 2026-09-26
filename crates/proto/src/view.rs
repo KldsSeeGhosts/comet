@@ -397,46 +397,119 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 
 /// Per-kind chip label + one-line detail. Labels match zeron's `describeTool`
 /// (tool-chip.tsx) exactly, so the two viewports name a tool identically.
-pub fn tool_chip_content(call: &crate::ToolCall) -> (&'static str, String) {
+pub fn tool_chip_content(call: &crate::ToolCall) -> (std::borrow::Cow<'static, str>, String) {
     let (label, detail) = tool_chip_content_raw(call);
     (label, single_line(&detail))
 }
 
-fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
+fn tool_chip_content_raw(call: &crate::ToolCall) -> (std::borrow::Cow<'static, str>, String) {
     use crate::ToolCall;
     match call {
-        ToolCall::Exec { command } => ("Run", command.clone()),
-        ToolCall::ReadFile { path } => ("Read", path.clone()),
-        ToolCall::WriteFile { path, .. } => ("Write", path.clone()),
-        ToolCall::EditFile { path, .. } => ("Edit", path.clone()),
-        ToolCall::ApplyPatch { path } => {
-            ("Patch", path.clone().unwrap_or_else(|| "workspace".into()))
-        }
+        ToolCall::Exec { command } => ("Run".into(), command.clone()),
+        ToolCall::ReadFile { path } => ("Read".into(), path.clone()),
+        ToolCall::WriteFile { path, .. } => ("Write".into(), path.clone()),
+        ToolCall::EditFile { path, .. } => ("Edit".into(), path.clone()),
+        ToolCall::ApplyPatch { path } => (
+            "Patch".into(),
+            path.clone().unwrap_or_else(|| "workspace".into()),
+        ),
         ToolCall::Search { pattern, path } => (
-            "Search",
+            "Search".into(),
             match path {
                 Some(path) => format!("{pattern} in {path}"),
                 None => pattern.clone(),
             },
         ),
-        ToolCall::Glob { pattern } => ("Glob", pattern.clone()),
-        ToolCall::WebFetch { url, .. } => ("Fetch", url.clone()),
-        ToolCall::WebSearch { query } => ("Web", query.clone()),
+        ToolCall::Glob { pattern } => ("Glob".into(), pattern.clone()),
+        ToolCall::WebFetch { url, .. } => ("Fetch".into(), url.clone()),
+        ToolCall::WebSearch { query } => ("Web".into(), query.clone()),
         ToolCall::Todo { items } => {
             let done = items.iter().filter(|i| i.done).count();
-            ("Todo", format!("{done}/{} done", items.len()))
+            ("Todo".into(), format!("{done}/{} done", items.len()))
         }
-        ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
+        ToolCall::Mcp { server, tool, .. } => ("MCP".into(), format!("{server} · {tool}")),
         // Subagent spawns decode as Unknown named "Agent[: <description>]"
         // (every native driver's convention): label them "Agent" with the
         // description as the detail — "Tool · Agent: scan repo" read as two
         // labels fighting.
         ToolCall::Unknown { name, .. } => match name.strip_prefix("Agent: ") {
-            Some(description) => ("Agent", description.to_owned()),
-            None if name == "Agent" => ("Agent", String::new()),
-            None => ("Tool", name.clone()),
+            Some(description) => ("Agent".into(), description.to_owned()),
+            None if name == "Agent" => ("Agent".into(), String::new()),
+            None => (humanize_tool_name(name).into(), unknown_detail(call)),
         },
     }
+}
+
+/// A human-readable verb for an Unknown tool's wire name: snake/kebab and
+/// `server__tool` MCP-ish names become Title Case words ("codex-research" ->
+/// "Codex research", "mcp__server__tool" -> "server · tool").
+fn humanize_tool_name(name: &str) -> String {
+    // The raw kind word is not a name ("other" was the clobbering bug's
+    // signature) - the row falls back to the generic verb.
+    if name.trim().eq_ignore_ascii_case("other") {
+        return "Tool".to_owned();
+    }
+    let mut parts: Vec<String> = name
+        .split("__")
+        .map(|part| {
+            part.split(['_', '-'])
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
+    // An MCP-style "mcp__server__tool" reads as "server · tool" (drop the
+    // mcp prefix marker itself).
+    if parts.first().map(String::as_str) == Some("mcp") {
+        parts.remove(0);
+    }
+    if parts.is_empty() {
+        return "Tool".to_owned();
+    }
+    let mut label = parts.join(" · ");
+    if let Some(first) = label.get(0..1) {
+        label.replace_range(0..1, &first.to_uppercase());
+    }
+    label
+}
+
+/// The most informative scalar arg of an Unknown call, for its chip detail.
+fn unknown_detail(call: &crate::ToolCall) -> String {
+    let crate::ToolCall::Unknown {
+        input: Some(input), ..
+    } = call
+    else {
+        return String::new();
+    };
+    for key in [
+        "description",
+        "query",
+        "q",
+        "pattern",
+        "path",
+        "url",
+        "command",
+        "subject",
+        "action",
+        "title",
+    ] {
+        if let Some(s) = input.get(key).and_then(serde_json::Value::as_str)
+            && !s.is_empty()
+        {
+            return truncate_chars(s, 80);
+        }
+    }
+    String::new()
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
@@ -593,6 +666,44 @@ pub fn checkout_label(kind: CheckoutKind, picked: Option<&crate::RepoRef>) -> &'
                 "Current checkout"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_label_tests {
+    use super::tool_chip_content;
+    use crate::ToolCall;
+
+    #[test]
+    fn unknown_tools_render_humanized_verbs_and_arg_details() {
+        let (label, detail) = tool_chip_content(&ToolCall::Unknown {
+            name: "codex-research".into(),
+            input: Some(serde_json::json!({"query": "pi acp tool kinds"})),
+        });
+        assert_eq!(label.as_ref(), "Codex research");
+        assert_eq!(detail, "pi acp tool kinds");
+
+        let (label, _) = tool_chip_content(&ToolCall::Unknown {
+            name: "ask_user_question".into(),
+            input: None,
+        });
+        assert_eq!(label.as_ref(), "Ask user question");
+
+        // MCP-ish double-underscore names read as "server · tool".
+        let (label, detail) = tool_chip_content(&ToolCall::Unknown {
+            name: "mcp__github__create_issue".into(),
+            input: Some(serde_json::json!({"title": "Bug"})),
+        });
+        assert_eq!(label.as_ref(), "Github · create issue");
+        assert_eq!(detail, "Bug");
+
+        // A bare "other" (the pi fallback before the fix) never shows the
+        // literal kind word.
+        let (label, _) = tool_chip_content(&ToolCall::Unknown {
+            name: "other".into(),
+            input: None,
+        });
+        assert_eq!(label.as_ref(), "Tool");
     }
 }
 
