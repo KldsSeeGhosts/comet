@@ -4412,7 +4412,11 @@ mod tests {
 
     #[test]
     fn display_refresh_arms_the_soonest_visible_deadline() {
-        let now = Utc::now();
+        // Keep the wall-minute backstop farther away than the working clock's
+        // next tick, regardless of when this test happens to run in CI.
+        let now = DateTime::<Utc>::UNIX_EPOCH
+            + TimeDelta::seconds(1_700_000_000)
+            + TimeDelta::milliseconds(500);
         let mut state = AppState::new();
         state.chats = vec![chat("c", 0, None)];
         state.begin_pending_send("c", "m1", now);

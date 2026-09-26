@@ -65,6 +65,22 @@ fn port() -> u16 {
         .unwrap()
         .port()
 }
+// An ephemeral port is available only at the instant we probe it. Wait for
+// each child to bind before choosing the next one, or the OS can hand out the
+// same port twice while Vite/Node are still starting.
+fn wait_for_server(child: &mut Child, port: u16) -> anyhow::Result<()> {
+    let address = (std::net::Ipv4Addr::LOCALHOST, port);
+    for _ in 0..200 {
+        if std::net::TcpStream::connect(address).is_ok() {
+            return Ok(());
+        }
+        if let Some(status) = child.0.try_wait()? {
+            anyhow::bail!("fixture server on port {port} exited before listening: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    anyhow::bail!("fixture server on port {port} did not start within 10 seconds")
+}
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();
     let output = PathBuf::from(std::env::args().nth(1).expect("capture directory"));
@@ -97,14 +113,17 @@ fn main() -> anyhow::Result<()> {
         ))
     };
     let first_port = port();
-    let vite_child = start(first_port)?;
-    let api = Child(
+    let mut vite_child = start(first_port)?;
+    wait_for_server(&mut vite_child, first_port)?;
+    let api_port = port();
+    let mut api = Child(
         std::process::Command::new("node")
             .arg("api.js")
-            .arg(port().to_string())
+            .arg(api_port.to_string())
             .current_dir(&project)
             .spawn()?,
     );
+    wait_for_server(&mut api, api_port)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let core = runtime.block_on(async {
         zeron_engine::EngineCore::assemble(
