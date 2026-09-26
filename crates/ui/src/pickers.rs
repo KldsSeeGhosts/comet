@@ -30,6 +30,11 @@ use zeron_rpc::methods;
 /// footer; a flat cap + "Showing X of Y refs" reads the same without
 /// pagination plumbing).
 const MAX_REF_ROWS: usize = 300;
+/// Catalog calls resolve to Ready or Error, never an eternal Loading: past
+/// these bounds the chip shows "Models unavailable" and the picker's Retry.
+/// Models get longer because a plugin-heavy OpenCode cold start is slow.
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
+const MODELS_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A triangle from the last point in the active trigger to the near edge
 /// of its submenu. Mirroring the edge handles menus placed on either side.
@@ -1264,10 +1269,16 @@ impl Pickers {
                     serde_json::Value::String(target.clone()),
                 );
             }
-            let result = engine
-                .client()
-                .call(methods::LIST_HARNESSES, serde_json::Value::Object(params))
-                .await;
+            // Bounded: an unanswered catalog call (a wedged peer route or a
+            // hung harness probe) otherwise pins "Loading models..." forever.
+            let result = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                methods::LIST_HARNESSES,
+                serde_json::Value::Object(params),
+                CATALOG_TIMEOUT,
+            )
+            .await;
             if let Some(delay) = slow_catalog_delay() {
                 cx.background_executor().timer(delay).await;
             }
@@ -1347,10 +1358,14 @@ impl Pickers {
             // no picker close/reopen and cannot launch duplicate probes.
             let mut attempt = 1_u64;
             let result = loop {
-                let result = engine
-                    .client()
-                    .call(methods::LIST_MODELS, params.clone())
-                    .await;
+                let result = crate::attachments::call_with_timeout(
+                    &engine,
+                    cx.background_executor(),
+                    methods::LIST_MODELS,
+                    params.clone(),
+                    MODELS_TIMEOUT,
+                )
+                .await;
                 if result.is_ok() || harness != HarnessId::Opencode || attempt >= 3 {
                     break result;
                 }
@@ -4795,7 +4810,7 @@ impl Render for Pickers {
         let model_label: SharedString = chip_terminal_label(
             model_label,
             no_agents,
-            engine_missing || models_errored,
+            engine_missing || models_errored || matches!(self.harnesses, Loadable::Error(_)),
             !catalog_loading && !models_loading && self.effective_harness(cx).is_some(),
         );
         // Harness known but nothing names the model yet (fresh install, no
@@ -4807,7 +4822,9 @@ impl Render for Pickers {
         // harness's mark) while the model and reasoning text stay neutral.
         let harness_icon: (&'static str, Option<gpui::Hsla>) = match self.effective_harness(cx) {
             Some(harness) => harness_brand_icon(harness),
-            None if no_agents || engine_missing => (crate::icons::TERMINAL, None),
+            None if no_agents || engine_missing || matches!(self.harnesses, Loadable::Error(_)) => {
+                (crate::icons::TERMINAL, None)
+            }
             None => harness_brand_icon(HarnessId::ClaudeCode),
         };
         let explicit_options = self.explicit_options(cx);
