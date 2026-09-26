@@ -7,8 +7,8 @@
 //! Hosting rules:
 //! - every Chat-mode pane renders its OWN transcript (or an empty canvas
 //!   area for an unbound pane) over its OWN composer footer - focus changes
-//!   nothing in the element tree; each pane is a flush, opaque `theme.bg`
-//!   surface separated from its siblings only by the divider hairlines;
+//!   nothing in the element tree; each pane is flush on the same shell glass
+//!   as the single-chat route, separated only by divider hairlines;
 //! - click-to-focus controls keyboard/selection routing and brightens the
 //!   header title without changing any size or dimming other panes;
 //! - every pane renders its header - the pane's chat identity row;
@@ -154,6 +154,7 @@ pub(crate) fn workspace_outlet(
     theme: &Theme,
     snap: &WorkspaceSnap,
     drag_preview: Option<(Bounds<Pixels>, PreviewKind)>,
+    sidebar_drop_outlet: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
 ) -> AnyElement {
     div()
         .relative()
@@ -162,11 +163,18 @@ pub(crate) fn workspace_outlet(
         .flex_col()
         .overflow_hidden()
         .p(px(OUTLET_PAD_PX))
+        .child(
+            canvas(
+                move |bounds, _, _| sidebar_drop_outlet.set(Some(bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
         .child(view_node(cx, theme, &snap.root, &[], snap))
-        // The workspace reads as ONE opaque surface: the outlet carries the
-        // pane background so the tab-strip band and the divider strips never
-        // reveal the shell backdrop between panes.
-        .bg(theme.bg)
+        // Share the shell's backdrop with the single-chat route. Painting
+        // theme.bg here made every split workspace substantially darker than
+        // the same chat opened alone, especially on frosted macOS windows.
         // The live drop preview (§3): every resolved plan paints one, above
         // everything it covers.
         .children(drag_preview.map(|(b, kind)| split_drop_preview(b, kind, theme)))
@@ -557,9 +565,9 @@ fn split_child(weight: f32, child: AnyElement) -> AnyElement {
 
 /// One pane: click-to-focus container, its header (the chat identity row -
 /// `closable` only gates the ×), and the pane's own transcript + composer
-/// body. Each leaf is a flush, opaque `theme.bg` surface (no radius, no
-/// island border): panes tile the content region and the dividers carry the
-/// only hairlines. Theme tokens preserve light, dark, and custom palettes.
+/// body. Each leaf is flush on the same shell backdrop as a lone chat (no
+/// radius or island border); the dividers carry the only hairlines. Avoid a
+/// pane-local opaque fill that changes the appearance when a chat is split.
 /// Focus brightens the header title only, so switching panes never shifts
 /// their contents. A paint-time canvas records the pane's bounds for the
 /// tool-picker anchor.
@@ -580,7 +588,6 @@ fn pane_container(
         .relative()
         .flex()
         .flex_col()
-        .bg(theme.bg)
         .overflow_hidden()
         // Click anywhere in the pane focuses it (§7); the listener no-ops
         // when the pane is already focused, so scrolling a transcript never

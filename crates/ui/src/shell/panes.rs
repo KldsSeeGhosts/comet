@@ -108,7 +108,47 @@ impl Shell {
     /// moves that draft into the shared dock and clears the cache so a
     /// single session always takes the glass path.
     pub(super) fn workspace_mode(&self) -> bool {
-        !self.workspace.is_trivial()
+        !self.solo_session && !self.workspace.is_trivial()
+    }
+
+    /// Show the normal full-width dock without changing the workspace tree.
+    /// The first split may have adopted the dock's composer as a pane's live
+    /// composer. Detach it before selecting None so that pane keeps its draft,
+    /// attachments, and in-flight send intact.
+    pub(super) fn reveal_workspace_session(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
+        let owner = if self.find_pane_with_session(chat_id).is_some() {
+            Some(self.active_workspace_space.clone())
+        } else {
+            let native_space = self.state.read(cx).chats.iter()
+                .find(|chat| chat.id == chat_id)
+                .and_then(|chat| chat.space_id.as_deref());
+            self.workspace_layouts.space_for_session(chat_id, native_space)
+        };
+        let Some(owner) = owner else { return false; };
+        self.solo_chat_ids.remove(chat_id);
+        self.solo_session = false;
+        if self.state.read(cx).selected_space != owner {
+            self.state.update(cx, |state, cx| state.select_space(owner, cx));
+        }
+        true
+    }
+
+    pub(super) fn enter_solo_session(&mut self, cx: &mut Context<Self>) {
+        if self.solo_session {
+            return;
+        }
+        if !self.workspace.is_trivial() {
+            self.ensure_pane_chat_surfaces(cx);
+        }
+        if self.workspace.chat_surfaces.values().any(|surface| {
+            surface.composer.entity_id() == self.composer.entity_id()
+        }) {
+            self.composer = cx.new(|cx| Composer::new(self.state.clone(), cx));
+            self._composer_events =
+                Self::dock_composer_events(&self.composer, self.transcript.clone(), cx);
+        }
+        self.solo_session = true;
+        cx.notify();
     }
 
     /// Whether the shell's transcript-underlay fade may take a TOP ramp.
@@ -161,7 +201,13 @@ impl Shell {
         );
         // WS4: the active drag's preview, converted to outlet-relative space.
         let drag_preview = self.split_drag_preview();
-        workspace_outlet(cx, &theme, &snap, drag_preview)
+        workspace_outlet(
+            cx,
+            &theme,
+            &snap,
+            drag_preview,
+            self.sidebar_drop_outlet.clone(),
+        )
     }
 
     /// One 14px project badge per session-bound chat pane, keyed by pane.
@@ -370,7 +416,7 @@ impl Shell {
         // matching pane. The shared event listener ignores fixed targets.
         let adopt_shared = {
             let composer = self.composer.read(cx);
-            matches!(composer.target, ChatTarget::Selected)
+            !self.solo_session && matches!(composer.target, ChatTarget::Selected)
                 && composer.current_key == session.as_deref().unwrap_or_default()
         };
         let composer = if adopt_shared {
@@ -1087,6 +1133,135 @@ impl Shell {
         }
     }
 
+    /// Resolve a sidebar pointer against the same geometry and plans used by
+    /// GPUI tab/header drags. The outlet's canvas records its actual bounds at
+    /// paint time, so scrolling/resizing during a drag never uses an estimated
+    /// coordinate. Only a changed resolution schedules a frame.
+    fn resolve_sidebar_pointer(
+        &mut self,
+        session_id: &str,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.sidebar_drop_outlet.get() else {
+            self.cancel_split_drag(cx);
+            return;
+        };
+        let source = DragSource::SidebarSession;
+        let x = f32::from(position.x);
+        let y = f32::from(position.y);
+        let anchor = self.split_drag.as_ref().and_then(|s| s.resolution.anchor);
+        let resolution = if self.workspace_mode() {
+            let geom = self.workspace_geometry(bounds);
+            self.existing_sidebar_session_resolution(Some(session_id), &geom, x, y)
+                .unwrap_or_else(|| hit_test::resolve_drop(&geom, x, y, source, anchor))
+        } else {
+            let outlet = hit_test::Rect::from_bounds(bounds);
+            self.workspace
+                .focused_pane()
+                .and_then(|pane| {
+                    self.workspace
+                        .layout
+                        .pane_location(pane)
+                        .map(|(view, tab)| (pane, view, tab))
+                })
+                .map(|(pane, view, tab)| {
+                    self.existing_sidebar_session_resolution(
+                        Some(session_id),
+                        &hit_test::single_pane_geometry(&outlet, pane, view, tab),
+                        x,
+                        y,
+                    )
+                    .unwrap_or_else(|| {
+                        hit_test::resolve_single_pane_drop(&outlet, pane, view, tab, x, y, anchor)
+                    })
+                })
+                .unwrap_or_else(hit_test::DropResolution::none)
+        };
+        let next = DragSplitState {
+            source,
+            session_id: Some(session_id.to_owned()),
+            root_bounds: bounds,
+            resolution,
+        };
+        if self.split_drag.as_ref() != Some(&next) {
+            self.split_drag = Some(next);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn move_sidebar_session_pointer(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        // A release outside the window may not deliver MouseUp here. Heal on
+        // the first subsequent move without the left button, and never keep a
+        // stuck drag cursor or stale preview on re-entry.
+        if event.pressed_button != Some(gpui::MouseButton::Left) || cx.has_active_drag() {
+            if self.sidebar_session_pointer.take().is_some() {
+                self.cancel_split_drag(cx);
+                cx.notify();
+            }
+            return;
+        }
+        let Some(pointer) = self.sidebar_session_pointer.as_mut() else {
+            return;
+        };
+        let was_dragging = pointer.dragging;
+        if pointer.advance(event.position) {
+            let session_id = pointer.session_id.clone();
+            if !was_dragging {
+                // Switch to the native closed-hand cursor once, not on every
+                // pointer sample. The target highlight keeps its own equality
+                // guard in resolve_sidebar_pointer.
+                cx.notify();
+            }
+            self.resolve_sidebar_pointer(&session_id, event.position, cx);
+        }
+    }
+
+    /// Re-resolve on mouse-up: the last move can precede a resize, an outlet
+    /// transition or a jump across zones. A release outside produces None and
+    /// must never focus an already-open session.
+    pub(super) fn release_sidebar_session_pointer(
+        &mut self,
+        event: &gpui::MouseUpEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pointer) = self.sidebar_session_pointer.take() else {
+            return false;
+        };
+        if !pointer.dragging {
+            return false;
+        }
+        self.sidebar_drag_suppressed_click = true;
+        self.resolve_sidebar_pointer(&pointer.session_id, event.position, cx);
+        let has_valid_target = self
+            .split_drag
+            .as_ref()
+            .and_then(|state| sidebar_commit_plan(state, &pointer.session_id))
+            .is_some();
+        if has_valid_target {
+            let payload = crate::pane::TabSplitDrag {
+                source: DragSource::SidebarSession,
+                session_id: Some(pointer.session_id),
+                mark: crate::pane::chrome::TabMark {
+                    icon: crate::icons::ZERON_LOGO,
+                    tint: None,
+                },
+                title: "".into(),
+            };
+            self.accept_sidebar_session_drop(&payload, cx);
+        } else {
+            self.cancel_split_drag(cx);
+        }
+        // Clear the preview and the window-wide cursor even for an invalid
+        // target or an outlet that unmounted during the gesture.
+        cx.notify();
+        true
+    }
+
     /// The active drag's preview rect and kind in its paint surface's local
     /// coordinates - the workspace outlet in workspace mode, the single-pane
     /// content area otherwise. Both render the same accent overlay from this.
@@ -1139,6 +1314,16 @@ impl Shell {
         payload: &crate::pane::TabSplitDrag,
         cx: &mut Context<Self>,
     ) {
+        // The duplicate-session focus guard only applies to a VALID target.
+        // Without it, an outside/sidebar release focuses an existing session.
+        if plan == DropPlan::None {
+            cx.notify();
+            return;
+        }
+        // A drop onto the full-width solo surface explicitly returns to the
+        // workspace before applying its plan. It must never modify a hidden
+        // tree while leaving the destination invisible.
+        self.solo_session = false;
         if let Some(session_id) = payload.session_id.as_deref()
             && let Some(pane) = self.find_pane_with_session(session_id)
         {
@@ -1199,6 +1384,9 @@ impl Shell {
             }
         })();
         if succeeded {
+            if let Some(id) = payload.session_id.as_deref() {
+                self.solo_chat_ids.remove(id);
+            }
             self.retarget_to_focused_pane(cx);
         } else {
             cx.notify();
@@ -1349,6 +1537,7 @@ impl Shell {
         if !matches!(self.route, Route::Chat) || self.overlay_owns_keyboard(cx) {
             return;
         }
+        self.solo_session = false;
         if self
             .workspace
             .split_focused_pane_with(direction, crate::pane::tool_pane_state(ToolKind::Chat))
@@ -1596,6 +1785,7 @@ impl Shell {
         if !matches!(self.route, Route::Chat) || self.overlay_owns_keyboard(cx) {
             return;
         }
+        self.solo_session = false;
         if self.workspace.split_focused_view(direction).is_err() {
             return;
         }
@@ -1752,6 +1942,9 @@ impl Shell {
     /// sidebar click, jump shortcut, banner, canvas mint-on-send (the
     /// composer selects the new chat id, this binds it to the focused pane).
     pub(crate) fn sync_workspace_selection(&mut self, cx: &mut Context<Self>) {
+        if self.solo_session {
+            return;
+        }
         let selected = self.state.read(cx).selected_chat.clone();
         self.workspace.sync_focused_session(selected.as_deref());
         self.note_workspace_mutation(cx);
@@ -1913,10 +2106,21 @@ impl Shell {
         }
         // If the focused pane's session was among the dead, the selection
         // follows it off the stale chat (no composer focus steal).
-        self.sync_selection_to_focused_pane(cx);
+        if !self.solo_session {
+            self.sync_selection_to_focused_pane(cx);
+        }
         cx.notify();
         self.note_workspace_mutation(cx);
     }
+}
+
+/// Fail closed on stale samples and outside drops, including an already-open
+/// session whose FocusPane preview was last painted inside the outlet.
+fn sidebar_commit_plan(state: &DragSplitState, session_id: &str) -> Option<DropPlan> {
+    (state.source == DragSource::SidebarSession
+        && state.session_id.as_deref() == Some(session_id)
+        && state.resolution.plan != DropPlan::None)
+        .then_some(state.resolution.plan)
 }
 
 /// Whether the stored drag state still belongs to the payload being
@@ -1956,6 +2160,29 @@ fn preview_bounds(
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+
+    #[test]
+    fn sidebar_release_rejects_outside_and_stale_drag_even_for_existing_session() {
+        let mut state = DragSplitState {
+            source: DragSource::SidebarSession,
+            session_id: Some("chat-a".into()),
+            root_bounds: root_bounds(),
+            resolution: hit_test::DropResolution {
+                plan: DropPlan::FocusPane { pane: PaneId(3) },
+                preview: None,
+                anchor: Some(PaneId(3)),
+            },
+        };
+        assert_eq!(
+            sidebar_commit_plan(&state, "chat-a"),
+            Some(DropPlan::FocusPane { pane: PaneId(3) })
+        );
+        assert_eq!(sidebar_commit_plan(&state, "chat-b"), None);
+        state.resolution = hit_test::DropResolution::none();
+        assert_eq!(sidebar_commit_plan(&state, "chat-a"), None);
+        state.source = DragSource::PaneHeader(PaneId(3));
+        assert_eq!(sidebar_commit_plan(&state, "chat-a"), None);
+    }
 
     /// The outlet hitbox (sidebar + titlebar in front of it) the previews in
     /// these tests convert from.

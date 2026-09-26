@@ -20,8 +20,9 @@ color is plentiful but always *means* something.
      use `theme.diff_add` and `theme.diff_del`; per-card diff counts in the
      sidebar are deferred to a later phase (see Card line 3).
    - Surfaces, text, and hairlines stay neutral theme tokens.
-2. **One surface, hairline splits.** Panes are flush and opaque (`theme.bg`)
-   and are separated by 1px `theme.border` hairlines.
+2. **One surface, hairline splits.** Panes are flush on the same shell
+   backdrop as a lone session and are separated by 1px `theme.border`
+   hairlines. Do not add opaque pane fills that darken split sessions.
 3. **Metadata is monospace.** Branch, device, elapsed time, and the model use
    `theme.font_mono` at 11px. Titles use the UI face.
 4. **Weight is hierarchy.** Titles use NORMAL weight, or MEDIUM when the
@@ -98,7 +99,7 @@ label. `sidebar_visible_order` must match the rendered order.
 
 ## Panes
 
-Flush surface, hairline dividers, and focus cues are unchanged from v1. The
+Shared shell surface, hairline dividers, and focus cues are unchanged from v1. The
 pane header, left to right:
 
 - The harness mark at 14px in its brand tint.

@@ -2,8 +2,9 @@
 # One-command demo: boots a seeded engine daemon + the headed app, offline.
 # Made for judging look & feel with real input — no edge, no auth needed.
 #
-#   scripts/dev-demo.sh            # build, seed demo data, open the app
+#   scripts/dev-demo.sh            # optimized build, seed demo data, open the app
 #   scripts/dev-demo.sh --slow     # pace mock streams (~10s) to watch streaming
+#   scripts/dev-demo.sh --debug    # faster unoptimized build for debugging
 #
 # Everything lives under /tmp/zeron-demo-*; re-runs reuse it. Ctrl-C cleans up.
 set -euo pipefail
@@ -13,15 +14,26 @@ DAEMON_DIR=/tmp/zeron-demo-daemon
 UI_DIR=/tmp/zeron-demo-ui
 IPC=27921
 DELAY=""
-[[ "${1:-}" == "--slow" ]] && DELAY=350
+PROFILE=release
+for arg in "$@"; do
+  case "$arg" in
+    --slow) DELAY=350 ;;
+    --debug) PROFILE=debug ;;
+    *) echo "usage: $0 [--slow] [--debug]" >&2; exit 2 ;;
+  esac
+done
 
-echo "▸ building (first run takes a few minutes)…"
-cargo build -p zeron -q
+# Use the distributable build by default when judging interaction smoothness.
+BUILD_FLAGS=()
+if [[ "$PROFILE" == release ]]; then BUILD_FLAGS=(--release); fi
+BIN="./target/$PROFILE/zeron"
+echo "▸ building $PROFILE demo (first run takes a few minutes)…"
+cargo build -p zeron "${BUILD_FLAGS[@]}" -q
 
 echo "▸ starting engine daemon on :$IPC"
 env ZERON_DATA_DIR="$DAEMON_DIR" ZERON_IPC_PORT=$IPC ZERON_HARNESS=mock \
   ${DELAY:+ZERON_MOCK_DELAY_MS=$DELAY} RUST_LOG=warn \
-  ./target/debug/zeron headless &
+  "$BIN" headless &
 DAEMON_PID=$!
 trap 'kill $DAEMON_PID 2>/dev/null || true' EXIT
 for _ in $(seq 1 40); do
@@ -62,4 +74,4 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
 fi
 
 echo "▸ opening zeron (composer is live — type into it; --slow shows streaming)"
-ZERON_DATA_DIR="$UI_DIR" ZERON_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/zeron
+ZERON_DATA_DIR="$UI_DIR" ZERON_IPC_PORT=$IPC RUST_LOG=warn "$BIN"

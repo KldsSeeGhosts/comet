@@ -7,7 +7,7 @@ The desktop UI follows **docs/design/control-plane.md**: a control plane for cod
 - Color encodes state or identity, never decoration.
 - Status hues come only from `crate::status_palette::SessionState` (sky working, indigo awaiting input, emerald completed-unseen, danger failed).
 - Projects show a repo favicon or a colored monogram (`Shell::render_project_icon`). Harness marks keep their brand tint.
-- Panes are flush and opaque with 1px hairline dividers, not rounded islands.
+- Panes are flush on the same shell backdrop as a lone session, with 1px hairline dividers, not rounded islands or darker opaque fills.
 - Metadata (branch, device, elapsed time, model) is monospace 11px.
 
 ## Where things live

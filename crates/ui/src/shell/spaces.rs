@@ -580,7 +580,7 @@ impl popover::ScrollRailHost for Shell {
 }
 
 impl Shell {
-    fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+    pub(super) fn open_new_session_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         if self.state.read(cx).space_row(&space_id).is_none() {
             return;
         }

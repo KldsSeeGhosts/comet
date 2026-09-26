@@ -281,10 +281,12 @@ fn pane_navigation_restores_drafts_without_replacing_the_composer(cx: &mut TestA
             draft(&composer, "existing session draft", cx);
             shell.open_new_session(cx);
             shell.on_state_changed(&shell.state.clone(), cx);
-            assert_eq!(shell.active_composer().entity_id(), composer.entity_id());
-            assert_eq!(draft_text(&composer, cx), "new session draft");
+            assert_ne!(shell.active_composer().entity_id(), composer.entity_id());
+            assert_eq!(draft_text(&shell.active_composer(), cx), "");
+            assert_eq!(draft_text(&composer, cx), "existing session draft");
             shell.open_chat("chat-b".into(), cx);
             shell.on_state_changed(&shell.state.clone(), cx);
+            assert_eq!(shell.active_composer().entity_id(), composer.entity_id());
             assert_eq!(draft_text(&composer, cx), "existing session draft");
         })
         .unwrap();
@@ -523,7 +525,10 @@ fn a_late_first_send_failure_preserves_the_new_session_and_draft(cx: &mut TestAp
             assert_eq!(draft_text(&composer, cx), "newer session draft");
             shell.open_new_session(cx);
             shell.on_state_changed(&shell.state.clone(), cx);
-            assert_eq!(draft_text(&composer, cx), "recover first prompt");
+            assert!(shell.solo_session);
+            assert_eq!(draft_text(&composer, cx), "newer session draft");
+            assert_eq!(draft_text(&shell.active_composer(), cx), "");
+            assert_eq!(shell.workspace.layout.pane(pane).unwrap().session_id.as_deref(), Some("chat-b"));
         })
         .unwrap();
 }
@@ -542,7 +547,8 @@ fn a_late_existing_send_failure_restores_only_its_own_draft(cx: &mut TestAppCont
             shell.on_state_changed(&shell.state.clone(), cx);
             shell.open_new_session(cx);
             shell.on_state_changed(&shell.state.clone(), cx);
-            draft(&composer, "newer canvas draft", cx);
+            let solo_composer = shell.active_composer();
+            draft(&solo_composer, "newer canvas draft", cx);
             composer.update(cx, |composer, cx| {
                 composer.restore_failed_send_input(
                     "chat-b",
@@ -552,10 +558,11 @@ fn a_late_existing_send_failure_restores_only_its_own_draft(cx: &mut TestAppCont
                 );
             });
             shell.ensure_pane_chat_surfaces(cx);
-            assert_eq!(composer.read(cx).current_key, "");
-            assert_eq!(draft_text(&composer, cx), "newer canvas draft");
+            assert_eq!(composer.read(cx).current_key, "chat-b");
+            assert_eq!(draft_text(&solo_composer, cx), "newer canvas draft");
             shell.open_chat("chat-b".into(), cx);
             shell.on_state_changed(&shell.state.clone(), cx);
+            assert_eq!(shell.active_composer().entity_id(), composer.entity_id());
             assert_eq!(draft_text(&composer, cx), "recover existing prompt");
         })
         .unwrap();

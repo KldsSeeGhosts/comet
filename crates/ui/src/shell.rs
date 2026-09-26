@@ -885,6 +885,43 @@ const NEW_THREAD_BACKGROUND_FROSTED_OPACITY: f32 = 0.84;
 const NEW_THREAD_BACKGROUND_VIEWPORT_RATIO: f32 = 0.72;
 const NEW_THREAD_BACKGROUND_MAX_HEIGHT: f32 = 760.0;
 
+/// Sidebar rows use pointer tracking rather than GPUI's floating active_drag:
+/// the latter refreshes the entire window at every mouse sample just to move
+/// its ghost. Only a changed drop zone needs a shell redraw.
+const SIDEBAR_SESSION_DRAG_THRESHOLD: f64 = 4.0;
+
+struct SidebarSessionPointer {
+    session_id: String,
+    origin: Point<Pixels>,
+    dragging: bool,
+}
+
+impl SidebarSessionPointer {
+    fn advance(&mut self, position: Point<Pixels>) -> bool {
+        if !self.dragging && (position - self.origin).magnitude() > SIDEBAR_SESSION_DRAG_THRESHOLD {
+            self.dragging = true;
+        }
+        self.dragging
+    }
+}
+
+#[cfg(test)]
+mod sidebar_pointer_tests {
+    use super::*;
+
+    #[test]
+    fn click_stays_below_threshold_and_drag_latches_after_crossing() {
+        let mut pointer = SidebarSessionPointer {
+            session_id: "chat-a".into(),
+            origin: gpui::point(px(20.0), px(30.0)),
+            dragging: false,
+        };
+        assert!(!pointer.advance(gpui::point(px(22.0), px(32.0))));
+        assert!(pointer.advance(gpui::point(px(25.0), px(30.0))));
+        assert!(pointer.advance(pointer.origin));
+    }
+}
+
 /// Drag marker for the sidebar resize handle.
 struct SidebarResize;
 /// Drag marker for the right-pane resize handle.
@@ -1497,6 +1534,12 @@ pub struct Shell {
     /// resolution). The outlet's drop preview paints from it; per-sample
     /// resolution is `pane/hit_test.rs`, commit/cancel `shell/panes.rs`.
     split_drag: Option<crate::pane::DragSplitState>,
+    sidebar_session_pointer: Option<SidebarSessionPointer>,
+    /// Last mouse-up was a drag, so a row click delivered after it cannot
+    /// navigate. Reset on the next left mouse-down (keyboard clicks remain live).
+    sidebar_drag_suppressed_click: bool,
+    /// Paint-time bounds of the single-pane dropzone or workspace outlet.
+    sidebar_drop_outlet: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<Pixels>>>>,
     /// WS5: per-space layout persistence — `{data_dir}/workspace-layout.json`
     /// (`workspace_layout_store`), the debounced write task, and the space
     /// whose tree the host currently holds (`None` = the projectless canvas).
@@ -1504,6 +1547,12 @@ pub struct Shell {
     workspace_save_task: Option<Task<()>>,
     active_workspace_space: Option<String>,
     workspace_space_loaded: bool,
+    /// Full-width session presentation over a preserved workspace tree. A +
+    /// never clears a pane merely to show a new-session canvas.
+    solo_session: bool,
+    /// Chats minted from that canvas retain their standalone navigation while
+    /// the split tree remains intact (in-memory presentation state only).
+    solo_chat_ids: std::collections::HashSet<String>,
     /// Unsent pane composer content parked while a project switch tears the
     /// pane surfaces down (`restore_workspace_layout`), keyed
     /// `(space, pane)` — PaneId numerals are only unique WITHIN one space's
@@ -1517,12 +1566,10 @@ pub struct Shell {
     >,
     /// Explicit user navigation target that must survive a workspace layout
     /// restore. `Some(Some(chat_id))` = sidebar click / deep link;
-    /// `Some(None)` = new-session request. `None` = no pending navigation
-    /// (boot / passive restore). Consumed once by the restore path. Both
-    /// arming sites (`open_chat` / `open_new_session`) follow up with a
-    /// `select_chat`, which notifies even when the selection is unchanged —
-    /// so the intent is always consumed by the next observation, never left
-    /// armed for an unrelated future frame.
+    /// `None` = no pending navigation (boot / passive restore / solo canvas).
+    /// Consumed once by the restore path. `open_chat` follows up with a
+    /// notifying selection, even when unchanged, so an armed intent never
+    /// survives into an unrelated observation.
     pending_explicit_nav: Option<Option<String>>,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under. Paint-time
@@ -2021,10 +2068,15 @@ impl Shell {
             pane_menu: popover::Popup::default(),
             divider_dragging: false,
             split_drag: None,
+            sidebar_session_pointer: None,
+            sidebar_drag_suppressed_click: false,
+            sidebar_drop_outlet: Default::default(),
             workspace_layouts: crate::workspace_layout_store::WorkspaceLayoutStore::load(&layout_dir),
             workspace_save_task: None,
             active_workspace_space: None,
             workspace_space_loaded: false,
+            solo_session: false,
+            solo_chat_ids: std::collections::HashSet::new(),
             parked_pane_drafts: std::collections::HashMap::new(),
             pending_explicit_nav: None,
             // Seed with the compact composer stack's rough height so the
@@ -2489,6 +2541,15 @@ impl Shell {
         if state.read(cx).chats_synced {
             self.prune_dead_workspace_sessions(cx);
         }
+        // Deep links and engine-side selections bypass `open_chat`. If they
+        // target a pane in the preserved (or saved) tree, reveal it instead
+        // of silently treating that chat as another standalone session.
+        if self.solo_session
+            && let Some(chat_id) = state.read(cx).selected_chat.clone()
+            && self.reveal_workspace_session(&chat_id, cx)
+        {
+            self.pending_explicit_nav = Some(Some(chat_id));
+        }
         // Restore a project's layout before applying explicit navigation. The
         // intent must also be consumed within the same project: otherwise a
         // sidebar click can replace the focused pane instead of focusing the
@@ -2496,12 +2557,18 @@ impl Shell {
         let selected_space = state.read(cx).selected_space.clone();
         if state.read(cx).spaces_synced {
             let explicit_nav = self.pending_explicit_nav.take();
-            if !self.workspace_space_loaded || self.active_workspace_space != selected_space {
-                self.workspace_space_loaded = true;
-                self.restore_workspace_layout(selected_space, cx);
-            }
-            if let Some(nav_target) = explicit_nav {
-                self.apply_explicit_workspace_navigation(nav_target, cx);
+            // The solo canvas is an overlay, not a mutation of the saved
+            // workspace. Defer a cross-space restore until a workspace-bound
+            // session is opened; restoring now would select the old focused
+            // pane over the new canvas and destroy its routing.
+            if !self.solo_session {
+                if !self.workspace_space_loaded || self.active_workspace_space != selected_space {
+                    self.workspace_space_loaded = true;
+                    self.restore_workspace_layout(selected_space, cx);
+                }
+                if let Some(nav_target) = explicit_nav {
+                    self.apply_explicit_workspace_navigation(nav_target, cx);
+                }
             }
         }
         // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
@@ -2521,6 +2588,9 @@ impl Shell {
         }
         if selected != self.active_chat {
             self.suspend_file_images(cx);
+            if self.solo_session && !selected.is_empty() {
+                self.solo_chat_ids.insert(selected.clone());
+            }
             self.active_chat = selected;
             // Workspace panes: bind the FOCUSED pane's session to the newly
             // selected chat. Every selection path converges here (sidebar
@@ -4061,11 +4131,10 @@ impl Shell {
         self.suspend_file_images(cx);
         match entry {
             NavEntry::Chat(chat_id) => {
-                self.route = Route::Chat;
-                self.focus_composer(cx);
-                let target = (!chat_id.is_empty()).then_some(chat_id);
-                if self.state.read(cx).selected_chat != target {
-                    self.state.update(cx, |s, cx| s.select_chat(target, cx));
+                if chat_id.is_empty() {
+                    self.open_new_session(cx);
+                } else {
+                    self.open_chat(chat_id, cx);
                 }
             }
             NavEntry::Settings(section) => {
@@ -6221,34 +6290,29 @@ impl Shell {
                 })
             })
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_chat(select_id.clone(), cx);
-            }))
-            // WS4: sidebar session drag - dropping a chat row onto the
-            // content area creates a split pane bound to this session.
-            .on_drag(
+            .on_click(cx.listener(move |this, event, _, cx| {
+                if !matches!(event, gpui::ClickEvent::Mouse(_))
+                    || !this.sidebar_drag_suppressed_click
                 {
+                    this.open_chat(select_id.clone(), cx);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener({
                     let drag_id = id.clone();
-                    let (mark_icon, mark_tint) = harness
-                        .map(crate::pickers::harness_brand_icon)
-                        .unwrap_or((crate::icons::ZERON_LOGO, None));
-                    crate::pane::TabSplitDrag {
-                        source: crate::pane::hit_test::DragSource::SidebarSession,
-                        mark: crate::pane::chrome::TabMark {
-                            icon: mark_icon,
-                            tint: mark_tint,
-                        },
-                        title: title.clone(),
-                        session_id: Some(drag_id),
+                    move |this, event: &MouseDownEvent, _, cx| {
+                        if this.sidebar_session_pointer.take().is_some() {
+                            this.cancel_split_drag(cx);
+                        }
+                        this.sidebar_drag_suppressed_click = false;
+                        this.sidebar_session_pointer = Some(SidebarSessionPointer {
+                            session_id: drag_id.clone(),
+                            origin: event.position,
+                            dragging: false,
+                        });
                     }
-                },
-                |payload, point, _, cx| {
-                    cx.new(|_| crate::pane::SplitDragGhost {
-                        mark: payload.mark,
-                        title: payload.title.clone(),
-                        cursor_offset: point,
-                    })
-                },
+                }),
             )
             .on_mouse_down(
                 MouseButton::Right,
@@ -7388,6 +7452,12 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.keystroke.key == "escape" && self.sidebar_session_pointer.take().is_some() {
+            self.sidebar_drag_suppressed_click = true;
+            self.cancel_split_drag(cx);
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key == "escape" && self.command_palette.is_some() {
             self.close_command_palette(window, cx);
             cx.stop_propagation();
@@ -8059,17 +8129,6 @@ impl Shell {
                 }
                 cx.notify();
             }))
-            // Sidebar session drag-to-split: dropping a sidebar chat row onto
-            // the single-pane content area creates a split. When workspace
-            // mode is already active the workspace_outlet handles this; this
-            // receiver covers the default single-pane screen.
-            .on_drop::<crate::pane::TabSplitDrag>(cx.listener(
-                |this, payload: &crate::pane::TabSplitDrag, _, cx| {
-                    if payload.source == crate::pane::hit_test::DragSource::SidebarSession {
-                        this.accept_sidebar_session_drop(payload, cx);
-                    }
-                },
-            ))
             // WS4 single-pane drag surface: per-sample resolution feeds the
             // preview overlay below and the drop's split direction (the
             // workspace outlet owns the samples in workspace mode; the
@@ -8088,6 +8147,15 @@ impl Shell {
                 MouseButton::Left,
                 cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| this.cancel_split_drag(cx)),
             )
+            .child({
+                let outlet = self.sidebar_drop_outlet.clone();
+                gpui::canvas(
+                    move |bounds, _, _| outlet.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0()
+            })
             // The hero is deliberately outside the transcript EdgeFade below:
             // it must paint under the overlaid titlebar instead of becoming
             // fully transparent across the titlebar's inset band.
@@ -10251,6 +10319,8 @@ impl Render for Shell {
                 window,
                 |this: &mut Shell, window, cx| {
                     if !window.is_window_active() {
+                        this.sidebar_session_pointer = None;
+                        this.cancel_split_drag(cx);
                         this.reset_command_palette_key_state();
                         this.set_jump_hints(false, cx);
                         this.active_composer().update(cx, |composer, cx| {
@@ -10295,6 +10365,41 @@ impl Render for Shell {
             .id("shell-root")
             .track_focus(&self.shortcut_focus)
             .child(div().track_focus(&self.unfocused))
+            .child({
+                let shell = cx.entity().clone();
+                let dragging_sidebar_session = self
+                    .sidebar_session_pointer
+                    .as_ref()
+                    .is_some_and(|pointer| pointer.dragging);
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        if dragging_sidebar_session {
+                            window.set_window_cursor_style(gpui::CursorStyle::ClosedHand);
+                        }
+                        let move_shell = shell.clone();
+                        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                            if phase == gpui::DispatchPhase::Capture {
+                                let _ = move_shell.update(cx, |this, cx| {
+                                    this.move_sidebar_session_pointer(event, cx);
+                                });
+                            }
+                        });
+                        let up_shell = shell.clone();
+                        window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _, cx| {
+                            if phase == gpui::DispatchPhase::Capture
+                                && event.button == MouseButton::Left
+                            {
+                                up_shell.update(cx, |this, cx| {
+                                    this.release_sidebar_session_pointer(event, cx);
+                                });
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0()
+            })
             .relative()
             .flex()
             .flex_row()
@@ -13268,6 +13373,8 @@ impl Shell {
 mod workspace_persistence {
     include!("shell/workspace_regressions.rs");
     include!("shell/pane_surface_regressions.rs");
+    include!("shell/sidebar_drag_regressions.rs");
+    include!("shell/solo_session_regressions.rs");
     use super::*;
     use gpui::{AppContext, TestAppContext};
 

@@ -118,6 +118,30 @@ impl WorkspaceLayoutStore {
         self.layouts.get(&key_for(space)).cloned()
     }
 
+    /// Find a saved tree that owns a session, preferring its native project
+    /// when more than one project has docked the same session.
+    pub fn space_for_session(
+        &self,
+        session_id: &str,
+        preferred: Option<&str>,
+    ) -> Option<Option<String>> {
+        let contains = |layout: &WorkspaceLayout| {
+            layout.views.values().any(|view| {
+                view.tabs.values().any(|tab| {
+                    tab.panes.values().any(|pane| pane.session_id.as_deref() == Some(session_id))
+                })
+            })
+        };
+        if let Some(layout) = self.layouts.get(&key_for(preferred))
+            && contains(layout)
+        {
+            return Some(preferred.map(str::to_owned));
+        }
+        self.layouts.iter().find_map(|(key, layout)| {
+            contains(layout).then(|| key_space(key).map(str::to_owned))
+        })
+    }
+
     /// Replace the stored layout for a space selection. A no-op when the
     /// layout is byte-equal to what is stored (keeps idle flushes from
     /// rewriting the file).
