@@ -3,7 +3,7 @@ on:
   pull_request:
     paths: ['crates/preview/**', 'crates/proto/**', 'Cargo.toml', 'Cargo.lock', 'edge/**', '.github/workflows/preview-tests.yml']
   push:
-    branches: [main]
+    branches: [main, dev]
     paths: ['crates/preview/**', 'crates/proto/**', 'Cargo.toml', 'Cargo.lock', 'edge/**', '.github/workflows/preview-tests.yml']
 permissions:
   contents: read
@@ -23,6 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - run: cargo test --locked -p zeron-preview
   coordinator:
     runs-on: ubuntu-latest

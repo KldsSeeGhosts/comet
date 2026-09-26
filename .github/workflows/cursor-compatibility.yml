@@ -22,9 +22,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      # Match the linux-debug saver's toolchain (rust-toolchain.toml): the
+      # preinstalled runner rustc could resolve a different cache key.
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+          # Restores the linux-debug cache saved by ui-tests.yml
+          # session-sync-regressions on dev; never saves itself.
+          shared-key: linux-debug
+          save-if: false
       - name: Dependency updater validation
         run: python3 scripts/test-update-cursor-sdk.py
       - name: Harness compatibility, steering, and session recovery

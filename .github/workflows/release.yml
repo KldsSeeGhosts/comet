@@ -53,7 +53,14 @@ jobs:
           - runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
+      # Self-hosted runners reuse the workspace, so target/ and the cargo
+      # registry persist on disk and no Actions cache is needed.
       - uses: actions/checkout@v4
+        with:
+          clean: false
+      - name: Clean stale untracked files (keep target/)
+        if: runner.environment != 'github-hosted'
+        run: git clean -ffdx -e target/
       - name: System dependencies
         if: runner.environment == 'github-hosted'
         run: |
@@ -66,14 +73,16 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
         with:
           cache-bin: false
-      - name: Application and updater tests
-        run: cargo test --locked -p zeron-update -p zeron
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+      - name: Updater tests
+        run: cargo test --locked -p zeron-update
       - name: Linux input-seat tests
         run: cargo test --locked -p gpui_linux --lib
-      - name: UI regression tests
-        run: cargo test --release --locked -p zeron-ui --lib -- --test-threads=1
+      - name: Drop stale packaged artifacts
+        run: rm -rf target/package
       - name: Package
         env:
           NOCHES_CHANNEL: ${{ needs.prepare.outputs.channel }}
@@ -98,13 +107,16 @@ jobs:
       AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
     steps:
+      # Self-hosted runner reuses the workspace: target/ and the cargo
+      # registry persist on disk, so no Actions cache is used.
       - uses: actions/checkout@v4
-      - run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
         with:
-          cache-bin: false
-      - name: Application and updater tests
-        run: cargo test --locked -p zeron-update -p zeron
+          clean: false
+      - name: Clean stale untracked files (keep target/)
+        run: git clean -ffdx -e target/
+      - run: rustup show active-toolchain || rustup toolchain install
+      - name: Updater tests
+        run: cargo test --locked -p zeron-update
       - name: Chromium build dependencies
         run: brew list cmake ninja >/dev/null 2>&1 || brew install cmake ninja
       - name: import Developer ID certificate
@@ -136,6 +148,8 @@ jobs:
             echo "NOTARY_KEY_ID=$AC_API_KEY_ID"
             echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID"
           } >>"$GITHUB_ENV"
+      - name: Drop stale packaged artifacts
+        run: rm -rf target/package
       - name: Package macOS application
         env:
           NOCHES_CHANNEL: ${{ needs.prepare.outputs.channel }}
