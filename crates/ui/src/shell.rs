@@ -6420,7 +6420,7 @@ impl Shell {
             text.opacity(0.9)
         };
         let harness_mark = harness.map(crate::pickers::harness_brand_icon);
-        let card = div()
+        div()
             .id(SharedString::from(row_id.clone()))
             // Fixed three-line card: 9px top/bottom padding centers the
             // 54px of lines (the old fixed-height + justify_center drew
@@ -6651,8 +6651,7 @@ impl Shell {
                         .bg(needs_you_color),
                 )
             })
-            .into_any_element();
-        card
+            .into_any_element()
     }
 
     /// The global connection line. `None` while healthy (`Connected`) or on

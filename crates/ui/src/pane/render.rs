@@ -651,7 +651,7 @@ fn pane_body(
     cx: &Context<'_, Shell>,
     theme: &Theme,
     pane: &PaneSnap,
-    snap: &WorkspaceSnap,
+    _snap: &WorkspaceSnap,
 ) -> AnyElement {
     match pane.mode {
         PaneMode::Terminal => div()
