@@ -61,7 +61,9 @@ fn main() -> anyhow::Result<()> {
         if std::env::var_os("ZERON_PREVIEW_CONTEXT_USAGE").is_some() {
             state.update(cx, |state, cx| {
                 state.context_usage = Some(zeron_proto::ContextUsage {
-                    tokens: Some(84_000), window: Some(200_000),
+                    tokens: Some(84_000),
+                    window: Some(200_000),
+                    ..Default::default()
                 });
                 state.transcript_replayed = true;
                 cx.notify();

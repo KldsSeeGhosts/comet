@@ -2120,6 +2120,15 @@ async fn drive_run(
             }
             continue;
         }
+        // An authoritative snapshot (Pi's extension-written file) replaces
+        // the stored value whole - post-compaction `tokens: None` is real
+        // state, not "keep the previous number".
+        if let AgentEvent::ContextUsageSnapshot { usage } = &event {
+            if let Err(err) = doc_ref.set_context_usage(*usage) {
+                tracing::warn!(%chat_id, error = %err, "context usage write failed");
+            }
+            continue;
+        }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
         // re-opens the session; everything else stays gated. The ACP child
         // keeps forwarding `session/update` frames after a turn completes,

@@ -392,6 +392,14 @@ pub enum AgentEvent {
         tokens: Option<u64>,
         window: Option<u64>,
     },
+    /// Authoritative context snapshot: REPLACES the stored value rather than
+    /// merging, so a source that reports `tokens: None` (Pi right after
+    /// compaction) reads as "waiting" instead of keeping a stale number.
+    /// Additive - old consumers match it to no arm and drop it.
+    #[serde(rename_all = "camelCase")]
+    ContextUsageSnapshot {
+        usage: ContextUsage,
+    },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {
@@ -585,6 +593,24 @@ mod tests {
 pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub window: Option<u64>,
+    /// Token count at which the harness auto-compacts, when it reports it
+    /// truthfully (Pi: contextWindow - reserveTokens). Never guessed -
+    /// absent when unknown. An integer keeps the replicated struct `Eq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_at: Option<u64>,
+    /// Session-wide token totals (input/output/cache-read), when cheaply
+    /// available. Display-only; never feeds the ring's fraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionTokenTotals>,
+}
+
+/// Cumulative billed tokens for the whole session (not the window estimate).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTokenTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
 }
 
 impl ContextUsage {
