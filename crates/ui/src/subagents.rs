@@ -660,6 +660,156 @@ pub fn sidebar_children(
         .into_any_element()
 }
 
+// ---------------------------------------------------------------------------
+// Agents panel (RightSurface::Agents)
+// ---------------------------------------------------------------------------
+
+const AGENTS_ROW_HEIGHT: f32 = 44.0;
+const AGENTS_SECTION_HEIGHT: f32 = 30.0;
+
+/// One 30px "Active" / "Done · N" header, 11.5px text_faint like the
+/// sidebar's own section labels.
+fn agents_section(label: String, theme: &Theme) -> AnyElement {
+    div()
+        .h(px(AGENTS_SECTION_HEIGHT))
+        .w_full()
+        .flex()
+        .items_center()
+        .px(px(Theme::SPACE_SM))
+        .font_weight(FontWeight::MEDIUM)
+        .text_size(crate::typography::ui_rems(11.5))
+        .text_color(theme.text_faint)
+        .child(SharedString::from(label))
+        .into_any_element()
+}
+
+/// The right-pane inventory: every subagent the selector sees for `chat_id`
+/// (not just the strip-visible subset), Active first, each row clickable to
+/// the child thread.
+#[allow(clippy::too_many_arguments)]
+pub fn agents_panel_body(
+    chat_id: &str,
+    summaries: &[SubagentSummary],
+    seen: &HashSet<String>,
+    now: DateTime<Utc>,
+    theme: &Theme,
+    view: gpui::EntityId,
+    open: OpenAgent,
+    cx: &Context<Shell>,
+) -> AnyElement {
+    if summaries.is_empty() {
+        return div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(theme.text_faint)
+            .child("No agents yet")
+            .into_any_element();
+    }
+    let active: Vec<&SubagentSummary> =
+        summaries.iter().filter(|s| s.status.active()).collect();
+    let done: Vec<&SubagentSummary> =
+        summaries.iter().filter(|s| !s.status.active()).collect();
+    let row = |s: &SubagentSummary| -> AnyElement {
+        let summary = s.clone();
+        let chat = chat_id.to_string();
+        let open = open.clone();
+        let is_seen = seen.contains(&s.id)
+            || s.doc_ref
+                .as_ref()
+                .is_some_and(|d| seen.contains(d.as_str()));
+        let mut meta = String::new();
+        if let Some(t) = &s.agent_type {
+            meta.push_str(t);
+        }
+        if let Some(m) = &s.model {
+            if !meta.is_empty() {
+                meta.push_str(" \u{00b7} ");
+            }
+            meta.push_str(m);
+        }
+        div()
+            .id(SharedString::from(format!("agents-row-{}", s.id)))
+            .h(px(AGENTS_ROW_HEIGHT))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .cursor_pointer()
+            .hover(|el| el.bg(crate::theme::wash(0.06)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                open(this, chat.clone(), summary.clone(), cx);
+            }))
+            .child(status_glyph(
+                SharedString::from(format!("agents-glyph-{}", s.id)),
+                s.status,
+                is_seen,
+                theme,
+                view,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(12.5))
+                            .text_color(theme.text)
+                            .child(s.title.clone()),
+                    )
+                    .children(s.summary.clone().map(|sum| {
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .text_color(theme.text_faint)
+                            .child(sum)
+                            .into_any_element()
+                    })),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_faint)
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .child(s.elapsed(now).unwrap_or_default())
+                    .child(SharedString::from(meta)),
+            )
+            .into_any_element()
+    };
+    let mut children: Vec<AnyElement> = Vec::new();
+    if !active.is_empty() {
+        children.push(agents_section("Active".into(), theme));
+        children.extend(active.iter().map(|s| row(s)));
+    }
+    if !done.is_empty() {
+        children.push(agents_section(format!("Done \u{00b7} {}", done.len()), theme));
+        children.extend(done.iter().map(|s| row(s)));
+    }
+    div()
+        .id("agents-panel-rows")
+        .size_full()
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .pb(px(Theme::SPACE_SM))
+        .children(children)
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
