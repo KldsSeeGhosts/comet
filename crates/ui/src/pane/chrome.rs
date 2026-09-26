@@ -289,7 +289,7 @@ pub(crate) fn pane_header(
                         .into_any_element()
                 })),
         )
-        // Title: UI face, 12.5px MEDIUM (rule 4: MEDIUM is the pane title's
+        // Title: UI face, 13px MEDIUM (rule 4: MEDIUM is the pane title's
         // weight). It truncates and may shrink; the context below gives up
         // space first.
         .child(
@@ -297,7 +297,7 @@ pub(crate) fn pane_header(
                 .flex_initial()
                 .min_w_0()
                 .truncate()
-                .text_size(crate::typography::ui_rems(12.5))
+                .text_size(crate::typography::ui_rems(13.0))
                 .font_weight(FontWeight::MEDIUM)
                 // Focus cue (rule 3): the focused title is full-strength text;
                 // unfocused panes rest muted. No border, no size change.
@@ -327,42 +327,62 @@ pub(crate) fn pane_header(
         })
         // Status label (rule 1): the sidebar slot's vocabulary at the pane
         // header's scale - icon plus label in the state color, hidden when
-        // idle so settled panes keep the context line as their last word.
-        .when_some(status_label(meta.state, theme), |el, label| el.child(label))
+        // idle. "Working" adds nothing on the focused pane (the transcript's
+        // live activity line already says it) so it only shows on unfocused
+        // panes; Awaiting input / Failed stay visible everywhere.
+        .when_some(
+            status_label(meta.state, theme).filter(|_| {
+                !(focused && matches!(meta.state, SessionState::Working))
+            }),
+            |el, label| el.child(label),
+        )
         .when_some(action_control, |el, action| el.child(action))
-        // The right-pane toggle lives on the pane header — the window-wide
-        // chat header that used to carry it is gone. Shown only on the
-        // focused session-bound pane so idle panes stay quiet.
-        .when(show_changes, |el| {
-            el.child(
-                control(
-                    format!("pane-changes-{}", pane.0),
-                    icons::SIDEBAR_MINIMALISTIC,
-                    "Toggle right sidebar",
-                )
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.toggle_right_pane(cx);
-                })),
-            )
-        })
-        .when(closable, |el| {
-            el.child(
-                control(
-                    format!("pane-close-{}", pane.0),
-                    icons::CLOSE,
-                    "Close pane",
-                )
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, event, window, cx| {
-                    // The chip's own click must not double-fire through
-                    // the pane's click-to-focus bubble path.
-                    cx.stop_propagation();
-                    this.close_workspace_pane(pane, cx);
-                    window.prevent_default();
-                    let _ = event;
-                })),
+        // Right-side icon controls ride one 2px-gap group; the row's 8px
+        // rhythm supplies the separation from status/action before them.
+        .when(show_changes || closable, |row| {
+            row.child(
+                div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.0))
+                // The right-pane toggle lives on the pane header — the
+                // window-wide chat header that used to carry it is gone.
+                // Shown only on the focused session-bound pane so idle
+                // panes stay quiet.
+                .when(show_changes, |el| {
+                    el.child(
+                        control(
+                            format!("pane-changes-{}", pane.0),
+                            icons::SIDEBAR_MINIMALISTIC,
+                            "Toggle right sidebar",
+                        )
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_right_pane(cx);
+                        })),
+                    )
+                })
+                .when(closable, |el| {
+                    el.child(
+                        control(
+                            format!("pane-close-{}", pane.0),
+                            icons::CLOSE,
+                            "Close pane",
+                        )
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, event, window, cx| {
+                            // The chip's own click must not double-fire
+                            // through the pane's click-to-focus bubble path.
+                            cx.stop_propagation();
+                            this.close_workspace_pane(pane, cx);
+                            window.prevent_default();
+                            let _ = event;
+                        })),
+                    )
+                }),
             )
         })
         .into_any_element()

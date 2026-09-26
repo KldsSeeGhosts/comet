@@ -6,7 +6,7 @@ use zeron_proto::{
 
 use crate::project_actions::{
     ACTION_ICONS, ProjectActionEditor, ProjectActionsKey, ProjectActionsStatus, action_icon,
-    draft_from_action, preferred_action, show_action_label,
+    draft_from_action, preferred_action,
 };
 
 #[derive(Clone)]
@@ -514,7 +514,9 @@ impl Shell {
 
     pub(super) fn render_project_actions_control(
         &mut self,
-        available_titlebar_width: f32,
+        // Kept in the signature: callers already compute it for the header's
+        // other responsive decisions.
+        _available_titlebar_width: f32,
         viewport_height: Pixels,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -542,7 +544,6 @@ impl Shell {
         .cloned();
         let has_imports = !snapshot.importable_actions.is_empty();
         let has_actions = !snapshot.actions.is_empty();
-        let show_label = show_action_label(available_titlebar_width);
         let menu_mounted = self.project_actions.menu.get().is_some();
         let menu_closing = self.project_actions.menu.closing_since();
 
@@ -554,13 +555,16 @@ impl Shell {
             .items_center()
             .h(px(24.0))
             .rounded(px(6.0))
-            // Borderless ghost control (design: "Add action" is ghost text,
-            // not a bordered chip); the segments carry their own hover wash.
+            // Borderless ghost control; the segments carry their own hover
+            // wash (one treatment, wash(0.11), matching the header controls).
             .occlude();
 
         if let Some(action) = preferred.clone() {
             let run_action = action.clone();
             let action_label = SharedString::from(action.name.clone());
+            // A configured action is `[icon] {name}` 12px text_muted on the
+            // same 24px ghost segment - no pill, no plus, the run affordance
+            // reads from the icon alone.
             let main = action_segment(&theme, "project-action-main")
                 .role(gpui::Role::Button)
                 .aria_label(action_label.clone())
@@ -578,17 +582,17 @@ impl Shell {
                 })
                 .child(
                     icon(action_icon(action.icon))
-                        .size(px(13.0))
+                        .size(px(14.0))
                         .text_color(theme.text_muted),
                 )
-                .when(show_label, |el| {
-                    el.child(
-                        div()
-                            .max_w(px(150.0))
-                            .truncate()
-                            .child(SharedString::from(action.name)),
-                    )
-                });
+                .child(
+                    div()
+                        .max_w(px(150.0))
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(action.name)),
+                );
             control = control.child(main).child(
                 action_chevron(
                     &theme,
@@ -625,17 +629,28 @@ impl Shell {
                 );
             control = control.child(retry);
         } else {
+            // No configured action: a quiet 24px icon button (play glyph,
+            // tooltip "Add action") - no plus sign, no outlined pill.
             let add = action_segment(&theme, "project-action-add")
+                .w(px(24.0))
+                .p_0()
+                .justify_center()
+                .role(gpui::Role::Button)
+                .aria_label("Add action")
+                .tooltip(|_, cx| {
+                    cx.new(|_| SurfaceTabTooltip {
+                        text: "Add action".into(),
+                    }).into()
+                })
                 .cursor_pointer()
                 .on_click(
                     cx.listener(|this, _, _, cx| this.open_project_action_editor(None, None, cx)),
                 )
                 .child(
-                    icon(icons::PLUS)
-                        .size(px(13.0))
+                    icon(icons::ACTION_PLAY)
+                        .size(px(14.0))
                         .text_color(theme.text_muted),
-                )
-                .child(SharedString::from("Add action"));
+                );
             control = control.child(add);
             if has_imports {
                 control = control.child(
