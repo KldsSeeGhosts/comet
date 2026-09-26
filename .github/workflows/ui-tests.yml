@@ -50,7 +50,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Pull requests that only touch the iOS app skip the Rust jobs, and
+  # Rust-only pull requests skip the simulator. Pushes and manual runs run all.
+  changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    outputs:
+      ios: ${{ steps.filter.outputs.ios }}
+      native: ${{ steps.filter.outputs.native }}
+    steps:
+      - uses: actions/github-script@v8
+        id: filter
+        with:
+          script: |
+            const all = () => { core.setOutput('ios', 'true'); core.setOutput('native', 'true'); };
+            if (context.eventName !== 'pull_request') return all();
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            // Run everything if the API did not return the full diff.
+            if (files.length < context.payload.pull_request.changed_files) return all();
+            const paths = files.flatMap(f => [f.filename, f.previous_filename]).filter(Boolean);
+            const workflow = p => p === '.github/workflows/ui-tests.yml';
+            const ios = p => p.startsWith('apps/ios/');
+            core.setOutput('ios', String(paths.some(p => ios(p) || workflow(p))));
+            core.setOutput('native', String(paths.some(p => !ios(p))));
+
   session-sync-regressions:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -74,6 +105,8 @@ jobs:
           cargo test --locked -p zeron-engine --lib --test session_publication --test restart_resume --test codex_subagents --test local_profiles
 
   ui-tests:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -104,6 +137,8 @@ jobs:
         run: cargo test --release --locked -p zeron-ui --lib
 
   app-tests:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -131,7 +166,8 @@ jobs:
   macos-ui:
     # Run the desktop-sensitive suite on isolated GitHub-hosted Macs.
     # Fork PRs skip these longer native integration jobs.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: changes
+    if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-latest
     timeout-minutes: 45
     env:
@@ -155,7 +191,8 @@ jobs:
           cargo test --release --locked -p zeron-ui --lib notify::tests:: -- --test-threads=1
 
   macos-browser:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: changes
+    if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-latest
     timeout-minutes: 45
     env:
@@ -207,7 +244,8 @@ jobs:
           if-no-files-found: ignore
 
   macos-frame-recovery:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: changes
+    if: needs.changes.outputs.native == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-latest
     timeout-minutes: 30
     env:
@@ -236,6 +274,8 @@ jobs:
         run: cargo test --release --locked -p gpui_macos --test frame_source_recovery
 
   ios-tests:
+    needs: changes
+    if: needs.changes.outputs.ios == 'true'
     # Keep this on GitHub-hosted macOS. Two self-hosted instances on one
     # Mac Studio still share CPU/RAM, and overlapping a --release LTO compile
     # with the iOS simulator jetsams the sim (signal kill / 600s bootstrap timeout).
@@ -271,6 +311,8 @@ jobs:
           if-no-files-found: ignore
 
   linux-browser:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -312,6 +354,8 @@ jobs:
           if-no-files-found: warn
 
   chromium-browser:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
     strategy:
       fail-fast: false
       matrix:
