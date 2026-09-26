@@ -80,7 +80,7 @@ const ROW_GAP: f32 = 0.0;
 const ROW_SLOT: f32 = ROW_HEIGHT + ROW_GAP;
 const ROW_PAD_X: f32 = 8.0;
 const ROW_RADIUS: f32 = 8.0;
-const PANEL_RADIUS: f32 = 16.0;
+pub(crate) const PANEL_RADIUS: f32 = 16.0;
 const PANEL_PAD_TOP: f32 = 0.0;
 /// The custom 24px queue glyphs have quieter geometry than the legacy set, so
 /// render them slightly larger to preserve the previous optical weight.
@@ -222,7 +222,7 @@ fn queue_attachment_labels(text: &str, paths: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn queue_panel_surface(theme: &Theme) -> gpui::Div {
+pub(crate) fn queue_panel_surface(theme: &Theme) -> gpui::Div {
     div()
         .occlude()
         .rounded_t(px(PANEL_RADIUS))

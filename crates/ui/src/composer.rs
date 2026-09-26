@@ -72,7 +72,7 @@ pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
 /// `max-w-3xl`: stable outer width of the centered composer column.
 pub const COMPOSER_MAX_WIDTH: f32 = 768.0;
 /// The queue reads as a narrower tray emerging from behind the composer.
-const QUEUE_SIDE_INSET: f32 = 16.0;
+pub(crate) const QUEUE_SIDE_INSET: f32 = 16.0;
 /// The composer covers the tray's lower padding so the queue reads as emerging
 /// from behind it instead of as a separate rounded pill.
 pub(crate) const QUEUE_COMPOSER_OVERLAP: f32 = 18.0;
@@ -3875,6 +3875,14 @@ pub enum ComposerEvent {
         setup_error: Option<String>,
         target_device_id: Option<String>,
     },
+    /// An agents-tray pill was clicked: open that subagent's thread (the
+    /// summary carries everything Shell's `open_subagent_summary` needs).
+    OpenSubagentSummary {
+        chat_id: String,
+        summary: crate::subagents::SubagentSummary,
+    },
+    /// The tray chevron / `+N` pill: toggle the right-pane Agents tab.
+    ToggleAgentsPanel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4159,6 +4167,12 @@ pub struct Composer {
     /// Set while an interactive resize is in flight; collapse is deferred
     /// until widths have settled for [`RESIZE_SETTLE_MS`].
     width_changed_at: Option<Instant>,
+    /// Whether the right-pane Agents tab is open; Shell mirrors it so the
+    /// tray chevron can point the right way without reaching into Shell.
+    pub(crate) agents_panel_open: bool,
+    /// Subagent part ids whose thread the user already opened (mirrored
+    /// from Shell's `subagent_seen` while the tray renders).
+    pub(crate) subagent_seen: std::collections::HashSet<String>,
     settle_task: Option<Task<()>>,
     /// In-flight compact↔expanded morph (one per committed flip; manual
     /// drive — see [`FlipMorph`]).
@@ -4262,6 +4276,22 @@ impl Composer {
     /// column's measured width, clamped to `COMPOSER_MAX_WIDTH`).
     pub fn last_available_width(&self) -> Option<f32> {
         self.last_available_width
+    }
+
+    /// Shell mirrors right-pane/tray state the composer cannot reach: the
+    /// Agents tab's open flag (chevron direction) and the set of subagent
+    /// keys whose thread the user already opened (Done glyph tint).
+    pub fn set_agents_panel_state(
+        &mut self,
+        open: bool,
+        seen: std::collections::HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agents_panel_open != open || self.subagent_seen != seen {
+            self.agents_panel_open = open;
+            self.subagent_seen = seen;
+            cx.notify();
+        }
     }
 
     /// Feed the stable conversation-column width into responsive composer
@@ -4425,6 +4455,8 @@ impl Composer {
             last_seen_width: 0.0,
             last_available_width: None,
             width_changed_at: None,
+            agents_panel_open: false,
+            subagent_seen: std::collections::HashSet::new(),
             settle_task: None,
             flip_morph: None,
             last_rendered_height: 0.0,
@@ -4492,7 +4524,8 @@ impl Composer {
             self.dock_height_changed = true;
         }
         self.target = target.clone();
-        self.pickers.update(cx, |pickers, cx| pickers.set_target(target, cx));
+        self.pickers
+            .update(cx, |pickers, cx| pickers.set_target(target, cx));
         self.on_state_changed(cx);
         cx.notify();
     }
@@ -4607,7 +4640,8 @@ impl Composer {
         }
         if !live_text.is_empty() {
             if live_key == self.current_key && self.input.read(cx).text().is_empty() {
-                self.input.update(cx, |input, cx| input.set_text(live_text, cx));
+                self.input
+                    .update(cx, |input, cx| input.set_text(live_text, cx));
             } else {
                 self.drafts.insert(live_key, live_text);
             }
@@ -7641,20 +7675,35 @@ impl Render for Composer {
                 self.staged().len() + self.staged_appshots().len(),
                 self.staged_comments(cx).len(),
             );
+        // The agents tray stacks ABOVE the queue tray on the same
+        // continuous surface: same inset, same top radius, and when the
+        // queue tray is also up its own bottom tuck parks it behind the
+        // queue tray's top edge exactly the way the queue tray tucks behind
+        // the pill.
+        let queue_panel = self.render_queue_panel(show_queue_latest_shortcut, window, cx);
         let container = container.when_some(
-            self.render_queue_panel(show_queue_latest_shortcut, window, cx),
-            |el, panel| {
+            self.render_agents_tray(queue_panel.is_some(), cx),
+            |el, tray| {
                 el.child(motion::fade_quick(
-                    "composer-queue",
+                    "composer-agents-tray",
                     div()
                         .mx(px(QUEUE_SIDE_INSET))
-                        // Cancel the column gap, then tuck the tray one pixel
-                        // behind the composer painted after it.
                         .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
-                        .child(panel),
+                        .child(tray),
                 ))
             },
         );
+        let container = container.when_some(queue_panel, |el, panel| {
+            el.child(motion::fade_quick(
+                "composer-queue",
+                div()
+                    .mx(px(QUEUE_SIDE_INSET))
+                    // Cancel the column gap, then tuck the tray one pixel
+                    // behind the composer painted after it.
+                    .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
+                    .child(panel),
+            ))
+        });
         // Escape backs out of a queue-row edit (the row keeps its old text).
         // Bound here rather than in the input: the input's own Escape belongs
         // to the mention/slash popups, which outrank this while they're open.
@@ -8298,21 +8347,25 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let (_dir, handle) = composer_focus_window(cx);
-        handle.update(cx, |composer, _, cx| {
-            let frame = crate::composer_dock::DockFrame::settled(false);
-            composer.set_dock_frame(frame, cx);
-            composer.input.update(cx, |input, cx| input.set_text("Keep this draft", cx));
-            composer.set_target(ChatTarget::Fixed(None), cx);
-            assert!(composer.dock_frame.is_none());
-            assert_eq!(composer.input.read(cx).text(), "Keep this draft");
-            // The shell continues ticking after adoption; it must not put the
-            // single-pane footer reservation back into the island.
-            composer.set_dock_frame(frame, cx);
-            assert!(composer.dock_frame.is_none());
-            composer.set_target(ChatTarget::Selected, cx);
-            composer.set_dock_frame(frame, cx);
-            assert_eq!(composer.dock_frame, Some(frame));
-        }).unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                let frame = crate::composer_dock::DockFrame::settled(false);
+                composer.set_dock_frame(frame, cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Keep this draft", cx));
+                composer.set_target(ChatTarget::Fixed(None), cx);
+                assert!(composer.dock_frame.is_none());
+                assert_eq!(composer.input.read(cx).text(), "Keep this draft");
+                // The shell continues ticking after adoption; it must not put the
+                // single-pane footer reservation back into the island.
+                composer.set_dock_frame(frame, cx);
+                assert!(composer.dock_frame.is_none());
+                composer.set_target(ChatTarget::Selected, cx);
+                composer.set_dock_frame(frame, cx);
+                assert_eq!(composer.dock_frame, Some(frame));
+            })
+            .unwrap();
     }
 
     #[gpui::test]

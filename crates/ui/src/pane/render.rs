@@ -138,9 +138,6 @@ pub(crate) struct PaneSnap {
     pub transcript: Option<Entity<Transcript>>,
     /// The pane's own composer.
     pub composer: Option<Entity<Composer>>,
-    /// The pane chat's subagent dock-strip data (chat id + the strip's
-    /// visible summaries); `None` when the strip has nothing to show.
-    pub agent_strip: Option<(String, Vec<crate::subagents::SubagentSummary>)>,
 }
 
 /// The content-area outlet for workspace mode: the whole view tree. Every
@@ -648,7 +645,7 @@ fn pane_container(
 }
 
 fn pane_body(
-    cx: &Context<'_, Shell>,
+    _cx: &Context<'_, Shell>,
     theme: &Theme,
     pane: &PaneSnap,
     _snap: &WorkspaceSnap,
@@ -691,30 +688,6 @@ fn pane_body(
             // pane's actual width into the composer's responsive mode (each
             // composer measures against its own pane, not the dock column).
             let composer = pane.composer.clone().map(|composer| {
-                // The subagent dock strip rides the composer's own column:
-                // same padding, same 768px centered axis, so its edges track
-                // the pill's outer edges at every pane width. Its pills/chat
-                // id arrive precomputed in the snapshot.
-                let strip = pane.agent_strip.as_ref().map(|(chat_id, summaries)| {
-                    let open: crate::subagents::OpenAgent = Rc::new(|this, chat, summary, cx| {
-                        this.open_subagent_summary(chat, summary, cx)
-                    });
-                    let toggle: crate::subagents::TogglePanel =
-                        Rc::new(|this, cx| this.toggle_agents_panel(cx));
-                    crate::subagents::dock_strip(
-                        chat_id,
-                        summaries,
-                        &composer,
-                        cx.entity().read(cx).agents_panel_open(cx),
-                        &cx.entity().read(cx).subagent_seen.borrow(),
-                        open,
-                        toggle,
-                        chrono::Utc::now(),
-                        theme,
-                        cx.entity_id(),
-                        cx,
-                    )
-                });
                 div().relative().w_full().px(px(10.0)).pb(px(10.0)).child(
                     div()
                         .relative()
@@ -739,11 +712,6 @@ fn pane_body(
                             .absolute()
                             .inset_0(),
                         )
-                        // The strip shares the composer container's
-                        // px(SPACE_LG) inset, so its edges ARE the pill's
-                        // outer edges (the column is already clamped to
-                        // COMPOSER_MAX_WIDTH and centered).
-                        .child(div().w_full().px(px(Theme::SPACE_LG)).children(strip))
                         .child(composer.clone()),
                 )
             });

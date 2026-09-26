@@ -1,6 +1,6 @@
 //! Codex-style subagent inventory: a pure selector over a chat's transcript
-//! (spawn tool parts) plus the surfaces that render it — the composer dock
-//! strip, the right-pane Agents panel, and the sidebar's nested child rows.
+//! (spawn tool parts) plus the surfaces that render it — the composer agents
+//! tray, the right-pane Agents panel, and the sidebar's nested child rows.
 //! Status hues come only from [`SessionState`]; everything else stays on
 //! neutral theme tokens.
 
@@ -39,7 +39,7 @@ impl SubagentPhase {
     }
 }
 
-/// One spawned subagent, reduced to what the strip/panel/sidebar draw.
+/// One spawned subagent, reduced to what the tray/panel/sidebar draw.
 #[derive(Debug, Clone)]
 pub struct SubagentSummary {
     /// The spawn tool part id (`parent_tool_use_id` for tagged traffic).
@@ -295,7 +295,7 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
     out
 }
 
-/// The strip's visible subset: the latest turn's subagents, plus anything
+/// The tray's visible subset: the latest turn's subagents, plus anything
 /// still live from earlier turns.
 pub fn strip_visible(summaries: &[SubagentSummary]) -> Vec<SubagentSummary> {
     summaries
@@ -350,20 +350,18 @@ pub fn status_glyph(
 }
 
 // ---------------------------------------------------------------------------
-// Composer dock strip
+// Composer agents tray
 // ---------------------------------------------------------------------------
 
-/// The strip's footprint above the composer pill (28px row + 6px gap).
-pub const STRIP_HEIGHT: f32 = 28.0;
-pub const STRIP_BOTTOM_GAP: f32 = 6.0;
+/// The tray content row: `Agents` label, pills, `+N`, chevron (the surface's
+/// own top radius and bottom tuck come from the queue-tray metrics).
+pub const TRAY_ROW_HEIGHT: f32 = 32.0;
 const PILL_GAP: f32 = 6.0;
 
 /// Estimated pill width (12px glyph + ≤22ch title + mono elapsed + pads) —
-/// the strip packs greedily off this estimate; `+N` covers the rest.
-/// `open(chat_id, summary)` — pill/sidebar click → select chat + open thread.
+/// the tray packs greedily off this estimate; `+N` covers the rest.
+/// `open(chat_id, summary)` — sidebar click → select chat + open thread.
 pub type OpenAgent = Rc<dyn Fn(&mut Shell, String, SubagentSummary, &mut Context<Shell>)>;
-/// Right-pane Agents tab toggle (the strip's trailing chevron).
-pub type TogglePanel = Rc<dyn Fn(&mut Shell, &mut Context<Shell>)>;
 /// `open_panel(chat_id)` — sidebar `+N more` → select chat + Agents tab.
 pub type OpenPanel = Rc<dyn Fn(&mut Shell, String, &mut Context<Shell>)>;
 
@@ -371,9 +369,9 @@ fn pill_width(title_chars: usize) -> f32 {
     8.0 * 2.0 + 12.0 + 6.0 + title_chars.min(22) as f32 * 6.6 + 6.0 + 34.0
 }
 
-/// How many leading pills fit `width` (the composer column's content width),
-/// keeping room for the leading label, the `+N` overflow pill and the
-/// trailing chevron.
+/// How many leading pills fit `width` (the tray's inner width), keeping
+/// room for the leading label, the `+N` overflow pill and the trailing
+/// chevron.
 fn fitting(summaries: &[SubagentSummary], width: f32) -> usize {
     let mut used = 74.0 + 28.0 + PILL_GAP;
     let mut shown = 0usize;
@@ -389,49 +387,41 @@ fn fitting(summaries: &[SubagentSummary], width: f32) -> usize {
     shown.min(summaries.len())
 }
 
-/// The strip's pills that fit `width`; `+N` covers the remainder.
-pub fn strip_layout(summaries: &[SubagentSummary], width: f32) -> (Vec<SubagentSummary>, usize) {
+/// The tray's pills that fit `width`; `+N` covers the remainder.
+pub fn tray_layout(summaries: &[SubagentSummary], width: f32) -> (Vec<SubagentSummary>, usize) {
     let shown = fitting(summaries, width);
     (summaries[..shown].to_vec(), summaries.len() - shown)
 }
 
-/// The dock strip: `Agents {done}/{total}` label, fitted pills, `+N`
-/// overflow, and the trailing chevron that toggles the Agents panel.
-/// `seen` = subagent keys whose thread the user already opened.
+/// The agents tray content row: `Agents {done}/{total}` label, fitted
+/// pills, `+N` overflow, and the trailing chevron that toggles the Agents
+/// panel. Rendered INSIDE the queue-tray surface by the composer itself
+/// (its stack order is the composer's), so it is one continuous surface
+/// with the queue tray and the pill on every route.
 ///
-/// The row renders as the composer container's OWN column child (the
-/// caller nests it), so it inherits the same outer padding and centers on
-/// the same `max_w(768px)` axis as the pill - its edges track the pill's
-/// outer edges at every width with no measured offsets.
-#[allow(clippy::too_many_arguments)] // render fn; params are the strip's props
-pub fn dock_strip(
+/// Pills lose their own borders inside the tray (the tray frames them);
+/// fills stay on `wash`. `seen` = subagent keys whose thread the user
+/// already opened. Fitting uses the tray's inner width.
+#[allow(clippy::too_many_arguments)] // render fn; params are the tray's props
+pub fn agents_tray_row(
     chat_id: &str,
     summaries: &[SubagentSummary],
-    composer: &gpui::Entity<crate::composer::Composer>,
+    inner_width: f32,
     panel_open: bool,
     seen: &HashSet<String>,
-    open: OpenAgent,
-    toggle_panel: TogglePanel,
     now: DateTime<Utc>,
     theme: &Theme,
     view: gpui::EntityId,
-    cx: &Context<Shell>,
+    cx: &mut Context<crate::composer::Composer>,
 ) -> AnyElement {
     let done = summaries.iter().filter(|s| !s.status.active()).count();
-    // Fitting budget: the pill column's content width, read off the same
-    // measurement the composer uses for its responsive mode (its own
-    // canvas feeds `set_available_width`) - never a stale layout cell.
-    let width = composer
-        .read(cx)
-        .last_available_width()
-        .unwrap_or(crate::composer::COMPOSER_MAX_WIDTH)
-        - 2.0 * Theme::SPACE_LG;
-    let (shown, more) = strip_layout(summaries, width);
+    let (shown, more) = tray_layout(summaries, inner_width);
     let mut row = div()
-        .id("subagent-dock-strip")
-        .h(px(STRIP_HEIGHT))
+        .id("subagent-agents-tray")
+        .h(px(TRAY_ROW_HEIGHT))
         .w_full()
-        .mb(px(STRIP_BOTTOM_GAP))
+        .pl(px(12.0))
+        .pr(px(6.0))
         .flex()
         .flex_row()
         .items_center()
@@ -459,7 +449,6 @@ pub fn dock_strip(
     for s in shown {
         let summary = s.clone();
         let chat = chat_id.to_string();
-        let open = open.clone();
         let elapsed = s.elapsed(now);
         let phase = s.status;
         row = row.child(
@@ -472,12 +461,14 @@ pub fn dock_strip(
                 .gap(px(6.0))
                 .px(px(8.0))
                 .rounded(px(12.0))
-                .border_1()
-                .border_color(theme.border)
+                .bg(crate::theme::wash(0.06))
                 .cursor_pointer()
-                .hover(|s| s.bg(crate::theme::wash(0.06)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    open(this, chat.clone(), summary.clone(), cx);
+                .hover(|s| s.bg(crate::theme::wash(0.10)))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(crate::composer::ComposerEvent::OpenSubagentSummary {
+                        chat_id: chat.clone(),
+                        summary: summary.clone(),
+                    });
                 }))
                 .child(status_glyph(
                     SharedString::from(format!("agent-pill-glyph-{}", s.id)),
@@ -508,7 +499,6 @@ pub fn dock_strip(
         );
     }
     if more > 0 {
-        let toggle = toggle_panel.clone();
         row = row.child(
             div()
                 .id("agent-pill-more")
@@ -518,12 +508,11 @@ pub fn dock_strip(
                 .items_center()
                 .px(px(8.0))
                 .rounded(px(12.0))
-                .border_1()
-                .border_color(theme.border)
+                .bg(crate::theme::wash(0.06))
                 .cursor_pointer()
-                .hover(|s| s.bg(crate::theme::wash(0.06)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    toggle(this, cx);
+                .hover(|s| s.bg(crate::theme::wash(0.10)))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(crate::composer::ComposerEvent::ToggleAgentsPanel);
                 }))
                 .child(
                     div()
@@ -534,8 +523,8 @@ pub fn dock_strip(
                 ),
         );
     }
-    row = row.child(div().flex_1().min_w_0()).child({
-        let toggle = toggle_panel.clone();
+    row = row.child(div().flex_1().min_w_0());
+    row.child(
         div()
             .id("agents-panel-toggle")
             .size(px(24.0))
@@ -546,8 +535,8 @@ pub fn dock_strip(
             .rounded(px(6.0))
             .cursor_pointer()
             .hover(|s| s.bg(crate::theme::wash(0.08)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                toggle(this, cx);
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.emit(crate::composer::ComposerEvent::ToggleAgentsPanel);
             }))
             .child(
                 icons::icon(if panel_open {
@@ -557,9 +546,9 @@ pub fn dock_strip(
                 })
                 .size(px(12.0))
                 .text_color(theme.text_muted),
-            )
-    });
-    row.into_any_element()
+            ),
+    )
+    .into_any_element()
 }
 
 // ---------------------------------------------------------------------------
@@ -872,6 +861,57 @@ pub fn agents_panel_body(
         .pb(px(Theme::SPACE_SM))
         .children(children)
         .into_any_element()
+}
+
+impl crate::composer::Composer {
+    /// The agents tray: a queue-tray surface over this composer's chat, or
+    /// `None` when nothing qualifies (no chat, or no visible subagents).
+    /// `tucked` (queue tray rendered below) drops the tray's own radius:
+    /// the queue tray's top edge becomes the shared seam.
+    pub(crate) fn render_agents_tray(
+        &mut self,
+        tucked: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let chat_id = self
+            .target
+            .chat_id(self.state.read(cx))
+            .map(str::to_owned)?;
+        let summaries = strip_visible(&subagents_for(self.state.read(cx), &chat_id));
+        if summaries.is_empty() {
+            return None;
+        }
+        let theme = Theme::of(cx).clone();
+        // Fitting budget: the tray's inner width = the measured composer
+        // column minus the tray inset on both sides minus the row pads.
+        let inner_width = self
+            .last_available_width()
+            .unwrap_or(crate::composer::COMPOSER_MAX_WIDTH)
+            - 2.0 * crate::composer::QUEUE_SIDE_INSET
+            - 12.0
+            - 6.0;
+        let panel_open = self.agents_panel_open;
+        let seen = std::mem::take(&mut self.subagent_seen);
+        let row = agents_tray_row(
+            &chat_id,
+            &summaries,
+            inner_width,
+            panel_open,
+            &seen,
+            Utc::now(),
+            &theme,
+            cx.entity_id(),
+            cx,
+        );
+        self.subagent_seen = seen;
+        let surface = crate::queue::queue_panel_surface(&theme)
+            .when(tucked, |el| el.rounded_bl(px(0.0)).rounded_br(px(0.0)))
+            .child(row);
+        Some(
+            crate::frost::frosted(crate::queue::PANEL_RADIUS, crate::frost::MENU_BLUR, surface)
+                .into_any_element(),
+        )
+    }
 }
 
 #[cfg(test)]

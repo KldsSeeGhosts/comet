@@ -1936,6 +1936,10 @@ impl Shell {
                         target_device_id.clone(),
                         cx,
                     ),
+                    ComposerEvent::OpenSubagentSummary { chat_id, summary } => {
+                        this.open_subagent_summary(chat_id.clone(), summary.clone(), cx)
+                    }
+                    ComposerEvent::ToggleAgentsPanel => this.toggle_agents_panel(cx),
                 }
             }
         })
@@ -3575,55 +3579,6 @@ impl Shell {
         self.set_right_active(RightSurface::Subagent(id), cx);
     }
 
-    /// The subagent dock strip above this chat's composer (Codex parity):
-    /// visible while the latest turn has >=1 spawn or any spawn is still
-    /// live. Returns `None` when the chat has no loaded transcript or
-    /// nothing qualifies. Renders inside the composer container's own
-    /// padded column, so its edges track the pill's outer edges.
-    fn subagent_strip(
-        &self,
-        chat_id: &str,
-        composer: &Entity<Composer>,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if chat_id.is_empty() {
-            return None;
-        }
-        let summaries = {
-            let state = self.state.read(cx);
-            crate::subagents::strip_visible(&crate::subagents::subagents_for(state, chat_id))
-        };
-        if summaries.is_empty() {
-            return None;
-        }
-        let theme = Theme::of(cx).clone();
-        let panel_open = self.agents_panel_open(cx);
-        let open: crate::subagents::OpenAgent = std::rc::Rc::new(|this, chat, summary, cx| {
-            this.open_subagent_summary(chat, summary, cx)
-        });
-        let toggle: crate::subagents::TogglePanel =
-            std::rc::Rc::new(|this, cx| this.toggle_agents_panel(cx));
-        Some(
-            motion::fade_quick(
-                "subagent-dock-in",
-                div().child(crate::subagents::dock_strip(
-                    chat_id,
-                    &summaries,
-                    composer,
-                    panel_open,
-                    &self.subagent_seen.borrow(),
-                    open,
-                    toggle,
-                    Utc::now(),
-                    &theme,
-                    cx.entity_id(),
-                    cx,
-                )),
-            )
-            .into_any_element(),
-        )
-    }
-
     /// A pill/sidebar-child click: select the parent chat and open the
     /// subagent thread in the right pane. Doc-less harnesses (Pi) get a
     /// synthetic frozen snapshot of the spawn call's result instead of an
@@ -3680,10 +3635,27 @@ impl Shell {
         self.add_subagent_surface(chat_id, doc_id, summary.title.to_string(), frozen, cx);
     }
 
-    /// Whether the Agents surface is the visible right-pane tab (the dock
-    /// strip chevron's open state).
+    /// Whether the Agents surface is the visible right-pane tab (the agents
+    /// tray chevron's open state).
     pub(crate) fn agents_panel_open(&self, cx: &App) -> bool {
         self.right_pane_open(cx) && self.resolved_right_active(cx) == RightSurface::Agents
+    }
+
+    /// Mirror the Agents-tab open flag + the opened-thread `seen` set into
+    /// every composer that can render the tray (the shared dock composer and
+    /// each workspace pane composer). Called once per render; the composers
+    /// self-notify only on change.
+    fn sync_composer_agents_state(&mut self, cx: &mut Context<Self>) {
+        let open = self.agents_panel_open(cx);
+        let seen = self.subagent_seen.borrow().clone();
+        self.composer.update(cx, |composer, cx| {
+            composer.set_agents_panel_state(open, seen.clone(), cx)
+        });
+        for surface in self.workspace.chat_surfaces.values() {
+            surface.composer.update(cx, |composer, cx| {
+                composer.set_agents_panel_state(open, seen.clone(), cx)
+            });
+        }
     }
 
     /// The strip chevron / sidebar `+N more`: the right pane's Agents tab.
@@ -8470,13 +8442,6 @@ impl Shell {
                                     // its edges ARE the pill's outer edges
                                     // at every width (the outer column is
                                     // already clamped to COMPOSER_MAX_WIDTH).
-                                    .child(div().w_full().px(px(Theme::SPACE_LG)).children(
-                                        self.subagent_strip(
-                                            &self.active_chat.clone(),
-                                            &composer,
-                                            cx,
-                                        ),
-                                    ))
                                     .child(self.composer.clone())
                                     .children(if has_selection {
                                         self.render_jump_to_bottom(cx)
@@ -10841,6 +10806,7 @@ impl Render for Shell {
                         t.set_bottom_clearance(stack_h, cx);
                     }
                 });
+                self.sync_composer_agents_state(cx);
 
                 let sidebar = self.render_sidebar(cx);
                 let sidebar_handle = self.resize_handle(
