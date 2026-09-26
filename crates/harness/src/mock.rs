@@ -479,6 +479,148 @@ impl Harness for MockHarness {
             })
             .into_iter()
             .flatten();
+        // Dev/testing knob: `ZERON_MOCK_AGENTS=1` appends three spawn chips
+        // — one whose tagged subagent traffic settles fast (done), one that
+        // errors (failed), and one whose nested traffic is paced by
+        // `ZERON_MOCK_SUBAGENT_DELAY_MS` so it stays RUNNING through the
+        // demo (set that knob to e.g. 2000 to hold it). Unlike
+        // `ZERON_MOCK_SUBAGENT` (which ends all of its subagents before the
+        // run's Done), this fixture leaves one live at run end — the shape
+        // the dock strip / Agents panel / sidebar children are built for.
+        let mock_agents = std::env::var("ZERON_MOCK_AGENTS")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let agent_events = mock_agents
+            .then(|| {
+                let tag = |parent: &str, event: AgentEvent| AgentEvent::Subagent {
+                    parent_tool_use_id: parent.into(),
+                    event: Box::new(event),
+                };
+                let spawn = |id: &str, description: &str, prompt: &str, ty: &str| {
+                    AgentEvent::ToolCall {
+                        id: id.into(),
+                        call: zeron_proto::ToolCall::Unknown {
+                            name: format!("Agent: {description}"),
+                            input: Some(serde_json::json!({
+                                "description": description,
+                                "prompt": prompt,
+                                "subagent_type": ty,
+                            })),
+                        },
+                    }
+                };
+                let resolve = |id: &str| AgentEvent::ToolResult {
+                    id: id.into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                };
+                let done = |status: DoneStatus| AgentEvent::Done {
+                    status,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                };
+                vec![
+                    AgentEvent::TextDelta {
+                        text: "\n### Agents pass\n\nThree scouts are out; the fold rewrite waits on the slowest.\n\n".into(),
+                    },
+                    spawn(
+                        "mock-agt-run",
+                        "Sweep sidebar state hues",
+                        "Check every session-state hue in the sidebar against the palette.",
+                        "explorer",
+                    ),
+                    spawn(
+                        "mock-agt-done",
+                        "Audit composer padding",
+                        "Verify the composer column keeps its 4px rhythm at every width.",
+                        "reviewer",
+                    ),
+                    spawn(
+                        "mock-agt-fail",
+                        "Probe the dock edge",
+                        "Measure the dock strip's gap above the composer pill.",
+                        "reviewer",
+                    ),
+                    resolve("mock-agt-run"),
+                    resolve("mock-agt-done"),
+                    resolve("mock-agt-fail"),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::UserMessage {
+                            text: "Check every session-state hue in the sidebar against the palette.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-agt-done",
+                        AgentEvent::UserMessage {
+                            text: "Verify the composer column keeps its 4px rhythm at every width.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-agt-fail",
+                        AgentEvent::UserMessage {
+                            text: "Measure the dock strip's gap above the composer pill.".into(),
+                        },
+                    ),
+                    // The quick one finishes inside the first beats.
+                    tag(
+                        "mock-agt-done",
+                        AgentEvent::TextDelta {
+                            text: "Padding holds at every measured width — 4px rhythm intact.".into(),
+                        },
+                    ),
+                    tag("mock-agt-done", done(DoneStatus::Completed)),
+                    // The probe one errors almost immediately.
+                    tag(
+                        "mock-agt-fail",
+                        AgentEvent::TextDelta {
+                            text: "Dock probe hit a stale layout cache.".into(),
+                        },
+                    ),
+                    tag("mock-agt-fail", done(DoneStatus::Errored)),
+                    // The runner streams slowly — every tagged beat keeps
+                    // its chip Running while the parent turn has settled.
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::TextDelta {
+                            text: "Sweeping sidebar rows for hue drift.\n\n".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::ToolCall {
+                            id: "agt-run-read".into(),
+                            call: zeron_proto::ToolCall::ReadFile {
+                                path: "crates/ui/src/shell/spaces.rs".into(),
+                            },
+                        },
+                    ),
+                    tag("mock-agt-run", resolve("agt-run-read")),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::ToolCall {
+                            id: "agt-run-grep".into(),
+                            call: zeron_proto::ToolCall::Search {
+                                pattern: "SessionState::".into(),
+                                path: Some("crates/ui/src".into()),
+                            },
+                        },
+                    ),
+                    tag("mock-agt-run", resolve("agt-run-grep")),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::TextDelta {
+                            text: "Working through each state; sky Working reads correctly on the live card.".into(),
+                        },
+                    ),
+                    // No Done for mock-agt-run: it stays Running past the
+                    // parent's settle, the whole point of the fixture.
+                ]
+            })
+            .into_iter()
+            .flatten();
         // With the code knob, also exercise a MULTILINE Exec command — the
         // round-9 chip breaker shape ("set -e\nfixture_in_original=0"): the
         // Run chip must stay one 30px line.
@@ -629,6 +771,7 @@ impl Harness for MockHarness {
             .chain(thinking_events)
             .chain(code_tool_events)
             .chain(subagent_events)
+            .chain(agent_events)
             .chain(tool_mix_events)
             .chain(code_event)
             .chain(table_event)
