@@ -323,6 +323,23 @@ pub fn cluster_clearance(
         .max(0.0)
 }
 
+/// Extra leading inset for the TOP-LEFT pane header or tab strip: while the
+/// sidebar is collapsing, `sidebar_now` slides left but the titlebar's control
+/// cluster (sidebar toggle + nav, plus the new-session "+" slot when shown)
+/// still overlays the header's leading edge. The pane's leading content must
+/// start `TITLEBAR_IDENTITY_GAP` past the cluster's end: `content_start`
+/// already rides the titlebar tween (traffic lights, fullscreen, Linux
+/// captions) and `sidebar_now` rides the sidebar tween, so the inset animates
+/// with both for free. Right-split panes and expanded sidebars get 0.
+pub fn pane_header_leading_inset(
+    content_start: f32,
+    plus_slot: f32,
+    sidebar_now: f32,
+    header_pad: f32,
+) -> f32 {
+    (content_start + plus_slot - sidebar_now - header_pad).max(0.0)
+}
+
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer
 /// map, then binds the customizable shortcuts from `keymap` (feature-inventory
 /// §1.4). Invalid persisted combos fall back to that shortcut's default.
@@ -11624,6 +11641,40 @@ mod tests {
         assert_eq!(
             cluster_clearance(true, true, 0, 16.0),
             12.0 + CLUSTER_BUTTONS_WIDTH + 8.0 - 16.0
+        );
+    }
+
+    #[test]
+    fn pane_header_leading_inset_clears_the_cluster_only_when_overlapped() {
+        // Collapsed sidebar on macOS: content starts at 88 + 82 + 12 = 182;
+        // a 10px-padded header whose row begins at the window edge needs the
+        // full remainder as inset.
+        let content_start = 88.0 + CLUSTER_BUTTONS_WIDTH + TITLEBAR_IDENTITY_GAP;
+        assert_eq!(
+            pane_header_leading_inset(content_start, 0.0, 0.0, 10.0),
+            content_start - 10.0
+        );
+        // The "+" new-session slot widens the same inset while it fades in.
+        assert_eq!(
+            pane_header_leading_inset(content_start, TITLEBAR_ACTION_SLOT_WIDTH, 0.0, 10.0),
+            content_start + TITLEBAR_ACTION_SLOT_WIDTH - 10.0
+        );
+        // Mid-tween the sidebar covers part of the span; the inset is only
+        // the uncovered remainder.
+        assert_eq!(
+            pane_header_leading_inset(content_start, 0.0, 100.0, 10.0),
+            content_start - 110.0
+        );
+        // Expanded sidebar (row starts at/past the cluster's end) and any
+        // row whose pad already covers the remainder get 0 - the
+        // right-split pane case.
+        assert_eq!(
+            pane_header_leading_inset(content_start, 0.0, content_start, 10.0),
+            0.0
+        );
+        assert_eq!(
+            pane_header_leading_inset(content_start, 0.0, 0.0, content_start),
+            0.0
         );
     }
 

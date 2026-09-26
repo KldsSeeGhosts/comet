@@ -889,7 +889,9 @@ impl Pickers {
     }
 
     /// Effective harness: picked, or the chat's config, or the first listed.
-    fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
+    /// `pub(crate)` so pane headers can borrow the composer's pick for the
+    /// identity mark of an unbound new-session pane.
+    pub(crate) fn effective_harness(&self, cx: &App) -> Option<HarnessId> {
         if let Some(harness) = self.config.harness {
             return Some(harness);
         }

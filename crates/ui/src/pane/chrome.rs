@@ -142,48 +142,36 @@ fn status_label(state: SessionState, theme: &Theme) -> Option<AnyElement> {
 
 /// A tab chip's provider mark: the harness brand icon + optional tint
 /// (Claude gets its brand orange; everything else renders in the muted text
-/// tone). Default chat panes carry the app logo.
+/// tone). `None` renders no glyph: the ZERON_LOGO fallback is illegible at
+/// chip/header sizes, so an unresolvable identity keeps the column empty
+/// instead of wearing a dotted smudge.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TabMark {
-    pub icon: &'static str,
+    pub icon: Option<&'static str>,
     pub tint: Option<Hsla>,
 }
 
 /// The pure mark mapping for a pane (unit-tested): provider_key first
 /// (engine `PaneState::provider_key`, Super tab-object parity), then mode.
 pub(crate) fn tab_mark(mode: PaneMode, provider_key: Option<&str>) -> TabMark {
+    let mark = |icon, tint| TabMark {
+        icon: Some(icon),
+        tint,
+    };
     match provider_key {
-        Some("claude") => TabMark {
-            icon: icons::CLAUDE_MARK,
-            tint: Some(icons::claude_brand()),
-        },
-        Some("codex" | "openai") => TabMark {
-            icon: icons::OPENAI_MARK,
-            tint: None,
-        },
-        Some("devin") => TabMark {
-            icon: icons::DEVIN_MARK,
-            tint: None,
-        },
-        Some("pi") => TabMark {
-            icon: icons::PI_MARK,
-            tint: None,
-        },
-        Some("opencode") => TabMark {
-            icon: icons::OPENCODE_MARK,
-            tint: None,
-        },
-        Some("cursor") => TabMark {
-            icon: icons::CURSOR_MARK,
-            tint: None,
-        },
+        Some("claude") => mark(icons::CLAUDE_MARK, Some(icons::claude_brand())),
+        Some("codex" | "openai") => mark(icons::OPENAI_MARK, None),
+        Some("devin") => mark(icons::DEVIN_MARK, None),
+        Some("pi") => mark(icons::PI_MARK, None),
+        Some("opencode") => mark(icons::OPENCODE_MARK, None),
+        Some("cursor") => mark(icons::CURSOR_MARK, None),
         _ => match mode {
-            PaneMode::Terminal => TabMark {
-                icon: icons::TERMINAL,
-                tint: None,
-            },
+            PaneMode::Terminal => mark(icons::TERMINAL, None),
+            // Unbound chat panes resolve their real identity from the
+            // composer's harness pick at render time (shell/panes.rs); the
+            // map alone cannot name one, so it yields the no-glyph mark.
             PaneMode::Chat => TabMark {
-                icon: icons::ZERON_LOGO,
+                icon: None,
                 tint: None,
             },
         },
@@ -206,7 +194,8 @@ pub(crate) const PANE_HEADER_HEIGHT: f32 = 36.0;
 /// The pane header: leading harness mark, truncated title, project badge,
 /// mono context, status label, then the labelled controls right.
 /// Right-click opens the split/close menu. Draggable headers can be
-/// re-docked.
+/// re-docked. `leading_inset` pads the leading edge (top-left pane only)
+/// past the titlebar cluster while the sidebar collapses; 0 elsewhere.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pane_header(
     pane: PaneId,
@@ -219,6 +208,7 @@ pub(crate) fn pane_header(
     show_changes: bool,
     action_control: Option<AnyElement>,
     draggable: bool,
+    leading_inset: f32,
     theme: &Theme,
     cx: &Context<'_, Shell>,
 ) -> AnyElement {
@@ -252,7 +242,7 @@ pub(crate) fn pane_header(
         .flex_row()
         .items_center()
         .gap(px(8.0))
-        .pl(px(10.0))
+        .pl(px(10.0 + leading_inset))
         .pr(px(6.0))
         .on_mouse_down(
             MouseButton::Right,
@@ -292,11 +282,12 @@ pub(crate) fn pane_header(
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
-                    icon(mark.icon)
+                .children(mark.icon.map(|path| {
+                    icon(path)
                         .size(px(14.0))
-                        .text_color(mark.tint.unwrap_or(theme.text_muted)),
-                ),
+                        .text_color(mark.tint.unwrap_or(theme.text_muted))
+                        .into_any_element()
+                })),
         )
         // Title: UI face, 12.5px MEDIUM (rule 4: MEDIUM is the pane title's
         // weight). It truncates and may shrink; the context below gives up
@@ -382,10 +373,12 @@ pub(crate) fn pane_header(
 /// and a trailing "+" that opens the tool picker committed as `add_tab` to
 /// this view. WS4: every chip is a drag source (ghost = mark + title) and
 /// paints its bounds into `chip_bounds` — the strip's drop/reorder targets
-/// for [`super::hit_test::resolve_drop`].
+/// for [`super::hit_test::resolve_drop`]. `leading_inset` pads before the
+/// first chip so the top-left view's strip clears the titlebar cluster.
 pub(crate) fn tab_strip(
     view: ViewId,
     tabs: &[TabChip],
+    leading_inset: f32,
     theme: &Theme,
     chip_bounds: &Rc<RefCell<BTreeMap<(ViewId, TabId), Bounds<Pixels>>>>,
     cx: &Context<'_, Shell>,
@@ -397,7 +390,8 @@ pub(crate) fn tab_strip(
         .flex_row()
         .items_center()
         .gap(px(4.0))
-        .px(px(8.0))
+        .pl(px(8.0 + leading_inset))
+        .pr(px(8.0))
         .border_b_1()
         .border_color(theme.hairline(0.06));
     for chip in tabs {
@@ -483,7 +477,13 @@ pub(crate) fn tab_strip(
                             .bg(theme.accent),
                     )
                 })
-                .child(icon(chip.mark.icon).size(px(11.0)).flex_none().text_color(mark_tint))
+                .children(chip.mark.icon.map(|path| {
+                    icon(path)
+                        .size(px(11.0))
+                        .flex_none()
+                        .text_color(mark_tint)
+                        .into_any_element()
+                }))
                 .child(div().min_w_0().truncate().child(chip.label.clone()))
                 // Close × closes the tab (last tab
                 // of the only view is an engine-guarded no-op).
@@ -630,34 +630,32 @@ mod tests {
     fn provider_keys_map_to_brand_marks() {
         assert_eq!(
             tab_mark(PaneMode::Chat, Some("claude")).icon,
-            icons::CLAUDE_MARK
+            Some(icons::CLAUDE_MARK)
         );
         assert_eq!(
             tab_mark(PaneMode::Chat, Some("claude")).tint,
             Some(icons::claude_brand())
         );
-        assert_eq!(tab_mark(PaneMode::Chat, Some("codex")).icon, icons::OPENAI_MARK);
-        assert_eq!(tab_mark(PaneMode::Chat, Some("devin")).icon, icons::DEVIN_MARK);
-        assert_eq!(tab_mark(PaneMode::Chat, Some("pi")).icon, icons::PI_MARK);
+        assert_eq!(tab_mark(PaneMode::Chat, Some("codex")).icon, Some(icons::OPENAI_MARK));
+        assert_eq!(tab_mark(PaneMode::Chat, Some("devin")).icon, Some(icons::DEVIN_MARK));
+        assert_eq!(tab_mark(PaneMode::Chat, Some("pi")).icon, Some(icons::PI_MARK));
         assert_eq!(
             tab_mark(PaneMode::Chat, Some("opencode")).icon,
-            icons::OPENCODE_MARK
+            Some(icons::OPENCODE_MARK)
         );
-        assert_eq!(tab_mark(PaneMode::Chat, Some("cursor")).icon, icons::CURSOR_MARK);
+        assert_eq!(tab_mark(PaneMode::Chat, Some("cursor")).icon, Some(icons::CURSOR_MARK));
     }
 
     #[test]
     fn default_panes_fall_back_to_mode_marks() {
-        // No provider_key (every Zeron-minted pane today): chat panes carry
-        // the app logo, terminal panes the terminal glyph.
-        assert_eq!(tab_mark(PaneMode::Chat, None).icon, icons::ZERON_LOGO);
-        assert_eq!(tab_mark(PaneMode::Terminal, None).icon, icons::TERMINAL);
+        // No provider_key: the chat mark is None (the ZERON_LOGO fallback
+        // was an illegible smudge; the composer's harness pick supplies the
+        // real identity at render time). Terminal panes keep their glyph.
+        assert_eq!(tab_mark(PaneMode::Chat, None).icon, None);
+        assert_eq!(tab_mark(PaneMode::Terminal, None).icon, Some(icons::TERMINAL));
         assert_eq!(tab_mark(PaneMode::Chat, None).tint, None);
         // Unknown provider strings fall through to the mode mark, never panic.
-        assert_eq!(
-            tab_mark(PaneMode::Chat, Some("holographic")).icon,
-            icons::ZERON_LOGO
-        );
+        assert_eq!(tab_mark(PaneMode::Chat, Some("holographic")).icon, None);
     }
 
     #[test]

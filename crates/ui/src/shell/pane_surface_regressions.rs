@@ -851,7 +851,7 @@ fn sidebar_payload(session: &'static str) -> crate::pane::TabSplitDrag {
     crate::pane::TabSplitDrag {
         source: crate::pane::hit_test::DragSource::SidebarSession,
         mark: crate::pane::chrome::TabMark {
-            icon: crate::icons::ZERON_LOGO,
+            icon: Some(crate::icons::ZERON_LOGO),
             tint: None,
         },
         title: session.into(),
