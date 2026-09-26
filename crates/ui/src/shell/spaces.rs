@@ -1814,6 +1814,64 @@ impl Shell {
         } else {
             None
         };
+        // Nested child rows: running subagents only, and only under cards
+        // whose transcript is actually open (selected or pinned to a pane) —
+        // the selector can only read loaded transcripts anyway.
+        let pane_open = self
+            .workspace
+            .chat_pane_sessions()
+            .iter()
+            .any(|(_, session)| session.as_deref() == Some(chat.id.as_str()));
+        let sub_summaries = if is_selected || pane_open {
+            let summaries = crate::subagents::subagents_for(self.state.read(cx), &chat.id);
+            summaries
+                .iter()
+                .filter(|s| s.status.active())
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let running_count = sub_summaries.len();
+        // +1 extra row's height when the running set overflows the 3-row
+        // cap (the `+N more` line).
+        let target_rows = running_count.min(crate::subagents::SIDEBAR_CHILD_MAX)
+            + usize::from(running_count > crate::subagents::SIDEBAR_CHILD_MAX);
+        let target_height = target_rows as f32 * crate::subagents::SIDEBAR_CHILD_HEIGHT;
+        // Height tweens ride the disclosure engine: the count change kicks a
+        // collapse tween, the body renders `open` at target thereafter.
+        let motion_key = format!("sub:{}", chat.id);
+        let prev_rows = self
+            .sidebar_sub_rows
+            .insert(chat.id.clone(), target_rows)
+            .unwrap_or(0);
+        if prev_rows != target_rows {
+            self.begin_sidebar_disclosure_motion(
+                &motion_key,
+                prev_rows as f32 * crate::subagents::SIDEBAR_CHILD_HEIGHT,
+                target_height,
+            );
+        }
+        let children = (target_rows > 0).then(|| {
+            let open: crate::subagents::OpenAgent = std::rc::Rc::new(|this, chat, summary, cx| {
+                this.open_subagent_summary(chat, summary, cx)
+            });
+            let open_panel: crate::subagents::OpenPanel = std::rc::Rc::new(|this, chat, cx| {
+                this.open_chat(chat, cx);
+                this.toggle_agents_panel(cx);
+            });
+            let content = crate::subagents::sidebar_children(
+                &chat.id,
+                &sub_summaries,
+                now,
+                theme,
+                cx.entity_id(),
+                open,
+                open_panel,
+                cx,
+            );
+            self.render_sidebar_disclosure_body(&motion_key, true, target_height, content)
+        });
         let element = self.render_chat_row(
             badge,
             transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
@@ -1829,10 +1887,12 @@ impl Shell {
             false,
             jump_label,
             None,
+            children,
             theme,
             cx,
         );
-        (format!("c:{}", chat.id), super::chat_row_height(), element)
+        let height = super::chat_row_height() + target_height;
+        (format!("c:{}", chat.id), height, element)
     }
 
     /// The sidebar's archived shelf — a direct port of t3code's settled

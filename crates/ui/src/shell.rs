@@ -1649,6 +1649,9 @@ pub struct Shell {
     /// Subagent keys (`{chat_id}/{part_id}` or doc id) whose thread the user
     /// already opened — the Done glyph goes neutral once seen.
     pub(crate) subagent_seen: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    /// Per-chat sidebar child-row count last rendered — diffs kick the
+    /// `sub:{chat}` disclosure tween that animates the card's growth.
+    sidebar_sub_rows: std::collections::HashMap<String, usize>,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
@@ -2120,6 +2123,7 @@ impl Shell {
             subagent_seen: std::rc::Rc::new(std::cell::RefCell::new(
                 std::collections::HashSet::new(),
             )),
+            sidebar_sub_rows: std::collections::HashMap::new(),
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
@@ -6158,6 +6162,10 @@ impl Shell {
         // row is busy or under the pointer.
         jump_label: Option<SharedString>,
         search_query: Option<&str>,
+        // Running-subagent rows appended under the card (Codex-style nested
+        // threads). The caller adds their height to the keyed row so the
+        // FLIP estimate and the drawn card agree.
+        sub_children: Option<AnyElement>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -6396,7 +6404,7 @@ impl Shell {
             text.opacity(0.9)
         };
         let harness_mark = harness.map(crate::pickers::harness_brand_icon);
-        div()
+        let card = div()
             .id(SharedString::from(row_id.clone()))
             // Fixed three-line card: the height never varies with content,
             // so the list's FLIP estimates and the drawn row always agree.
@@ -6617,7 +6625,17 @@ impl Shell {
                         .bg(needs_you_color),
                 )
             })
-            .into_any_element()
+            .into_any_element();
+        match sub_children {
+            Some(children) => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(card)
+                .child(children)
+                .into_any_element(),
+            None => card,
+        }
     }
 
     /// The global connection line. `None` while healthy (`Connected`) or on

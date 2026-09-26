@@ -45,9 +45,7 @@ pub struct SubagentSummary {
     /// The spawn tool part id (`parent_tool_use_id` for tagged traffic).
     pub id: String,
     pub title: SharedString,
-    #[allow(dead_code)] // read by the Agents panel, landing in the follow-up commit
     pub agent_type: Option<SharedString>,
-    #[allow(dead_code)] // read by the Agents panel, landing in the follow-up commit
     pub model: Option<SharedString>,
     pub status: SubagentPhase,
     pub started: Option<DateTime<Utc>>,
@@ -543,15 +541,12 @@ pub fn dock_strip(
 // Sidebar nested rows
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // sidebar nested rows land with the card-height animation
 pub const SIDEBAR_CHILD_HEIGHT: f32 = 22.0;
-#[allow(dead_code)]
 pub const SIDEBAR_CHILD_MAX: usize = 3;
 
 /// Up to `SIDEBAR_CHILD_MAX` running subagents below a chat card, aligned to
 /// the card's text start with a 1px hairline tree stub; `+N more` opens the
 /// Agents panel.
-#[allow(dead_code)] // wired into `render_chat_row` in the sidebar commit
 #[allow(clippy::too_many_arguments)]
 pub fn sidebar_children(
     chat_id: &str,

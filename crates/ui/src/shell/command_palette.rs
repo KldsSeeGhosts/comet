@@ -331,6 +331,7 @@ impl Shell {
                     chat.archived,
                     None,
                     Some(&query),
+                    None,
                     &theme,
                     cx,
                 )
