@@ -18,21 +18,31 @@ use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use zeron_proto::AgentEvent;
+use zeron_proto::{AgentEvent, ContextUsage, SessionTokenTotals};
 
 /// Poll cadence. At ~300ms the ring feels live without measurable cost.
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
 
-/// A parsed snapshot file. Tolerant: extra fields (`percent`, `model`,
-/// `sessionTokens`, `ts`, `compactionPercent`) are ignored on the wire - the
-/// ring only carries tokens/window today. A snapshot with no `contextWindow`
-/// yields no event (Pi reports nothing meaningful without a model window).
+/// A parsed snapshot file. `percent`, `model` and `ts` ride along for
+/// future card affordances but are ignored on the wire today. A snapshot
+/// with no `contextWindow` yields no event (Pi reports nothing meaningful
+/// without a model window).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Snapshot {
     /// `null` right after compaction until the next assistant response.
     tokens: Option<u64>,
     context_window: Option<u64>,
+    compaction_percent: Option<f64>,
+    session_tokens: Option<SessionTotals>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionTotals {
+    input: u64,
+    output: u64,
+    cache_read: u64,
 }
 
 fn parse_snapshot(contents: &str) -> Option<Snapshot> {
@@ -40,11 +50,22 @@ fn parse_snapshot(contents: &str) -> Option<Snapshot> {
 }
 
 impl Snapshot {
+    /// The file is authoritative and complete, so the event REPLACES the
+    /// stored usage: `tokens: None` post-compaction must read as "waiting",
+    /// not merge with the stale pre-compaction number.
     fn event(&self) -> Option<AgentEvent> {
         let window = self.context_window.filter(|w| *w > 0)?;
-        Some(AgentEvent::ContextUsage {
-            tokens: self.tokens,
-            window: Some(window),
+        Some(AgentEvent::ContextUsageSnapshot {
+            usage: ContextUsage {
+                tokens: self.tokens,
+                window: Some(window),
+                compaction_percent: self.compaction_percent.filter(|p| *p > 0.0),
+                session: self.session_tokens.map(|s| SessionTokenTotals {
+                    input: s.input,
+                    output: s.output,
+                    cache_read: s.cache_read,
+                }),
+            },
         })
     }
 }
@@ -111,13 +132,32 @@ mod tests {
         .unwrap()
         .event()
         .unwrap();
-        assert_eq!(
+        assert!(matches!(
             ev,
-            AgentEvent::ContextUsage {
-                tokens: Some(84213),
-                window: Some(200000),
-            }
-        );
+            AgentEvent::ContextUsageSnapshot { usage }
+                if usage.tokens == Some(84213) && usage.window == Some(200000)
+        ));
+    }
+
+    #[test]
+    fn snapshot_carries_compaction_and_session_totals() {
+        let ev = parse_snapshot(
+            r#"{"tokens":84213,"contextWindow":200000,"compactionPercent":91.8,"sessionTokens":{"input":50000,"output":10000,"cacheRead":40000}}"#,
+        )
+        .unwrap()
+        .event()
+        .unwrap();
+        assert!(matches!(
+            ev,
+            AgentEvent::ContextUsageSnapshot { usage }
+                if usage.compaction_percent == Some(91.8)
+                    && usage.session
+                        == Some(SessionTokenTotals {
+                            input: 50000,
+                            output: 10000,
+                            cache_read: 40000,
+                        })
+        ));
     }
 
     #[test]
@@ -126,13 +166,11 @@ mod tests {
             .unwrap()
             .event()
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             ev,
-            AgentEvent::ContextUsage {
-                tokens: None,
-                window: Some(200000),
-            }
-        );
+            AgentEvent::ContextUsageSnapshot { usage }
+                if usage.tokens.is_none() && usage.window == Some(200000)
+        ));
     }
 
     #[test]
@@ -163,13 +201,11 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             ev,
-            AgentEvent::ContextUsage {
-                tokens: Some(10),
-                window: Some(1000),
-            }
-        );
+            AgentEvent::ContextUsageSnapshot { usage }
+                if usage.tokens == Some(10) && usage.window == Some(1000)
+        ));
 
         // Same content rewritten with a new mtime still re-emits (fresh
         // snapshot), but an untouched file emits nothing across many ticks.
@@ -180,7 +216,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(matches!(ev, AgentEvent::ContextUsage { .. }));
+        assert!(matches!(ev, AgentEvent::ContextUsageSnapshot { .. }));
 
         tokio::time::sleep(POLL_INTERVAL * 4).await;
         assert!(rx.try_recv().is_err(), "unchanged mtime must not re-emit");
@@ -200,13 +236,11 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             ev,
-            AgentEvent::ContextUsage {
-                tokens: None,
-                window: Some(1000),
-            }
-        );
+            AgentEvent::ContextUsageSnapshot { usage }
+                if usage.tokens.is_none() && usage.window == Some(1000)
+        ));
 
         handle.abort();
     }
@@ -217,12 +251,10 @@ mod tests {
         let file = dir.path().join("context-usage.json");
         assert!(read_event(&file).is_none());
         write(&file, r#"{"tokens":42,"contextWindow":200000}"#);
-        assert_eq!(
+        assert!(matches!(
             read_event(&file),
-            Some(AgentEvent::ContextUsage {
-                tokens: Some(42),
-                window: Some(200000),
-            })
-        );
+            Some(AgentEvent::ContextUsageSnapshot { usage })
+                if usage.tokens == Some(42) && usage.window == Some(200000)
+        ));
     }
 }
