@@ -397,7 +397,9 @@ pub enum AgentEvent {
     /// compaction) reads as "waiting" instead of keeping a stale number.
     /// Additive - old consumers match it to no arm and drop it.
     #[serde(rename_all = "camelCase")]
-    ContextUsageSnapshot { usage: ContextUsage },
+    ContextUsageSnapshot {
+        usage: ContextUsage,
+    },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {

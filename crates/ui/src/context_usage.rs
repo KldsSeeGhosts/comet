@@ -133,10 +133,7 @@ fn detail_lines(usage: Option<ContextUsage>) -> Vec<String> {
                 with_separators(tokens),
                 with_separators(window)
             ),
-            format!(
-                "{} left",
-                with_separators(window.saturating_sub(tokens))
-            ),
+            format!("{} left", with_separators(window.saturating_sub(tokens))),
         ],
         ContextUsage {
             tokens: Some(tokens),
@@ -196,15 +193,9 @@ impl Render for UsageCard {
                     .w_full()
                     .rounded(px(2.0))
                     .bg(theme.text_faint.opacity(0.25))
-                    .child(
-                        div()
-                            .h_full()
-                            .rounded(px(2.0))
-                            .bg(fill)
-                            .w(gpui::relative(
-                                fraction.unwrap_or(0.0).clamp(0.0, 1.0) as f32,
-                            )),
-                    ),
+                    .child(div().h_full().rounded(px(2.0)).bg(fill).w(gpui::relative(
+                        fraction.unwrap_or(0.0).clamp(0.0, 1.0) as f32,
+                    ))),
             )
             .children(detail_lines(usage).into_iter().map(|line| {
                 div()
@@ -318,12 +309,14 @@ mod tests {
             }))[1],
             "0 left"
         );
-        assert!(detail_lines(Some(ContextUsage {
-            tokens: Some(10),
-            window: Some(0),
-            ..Default::default()
-        }))[1]
-            .contains("limit not reported"));
+        assert!(
+            detail_lines(Some(ContextUsage {
+                tokens: Some(10),
+                window: Some(0),
+                ..Default::default()
+            }))[1]
+                .contains("limit not reported")
+        );
         // Post-compaction `tokens: None` is "waiting", never 0% and never a
         // stale pre-compaction count.
         let waiting = detail_lines(Some(ContextUsage {
