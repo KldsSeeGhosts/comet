@@ -201,10 +201,10 @@ triangle Failed, neutral dot Started.
   shows the latest turn's agents plus anything still running, and
   appears/disappears with `motion::fade_quick`.
 - **Agents panel**: `RightSurface::Agents`, one "Agents" tab with the
-  `BOT` icon. `Active` and `Done · N` sections (30px headers like the
-  sidebar's), 44px rows: line 1 is the 12px status glyph, 8px, 13px
-  `text` title truncating, and the mono 11px elapsed right-aligned on
-  the title's baseline; line 2 (16px, starting at the title's x) holds
+  `BOT` icon. `Active` (with the sidebar's 6px sky section dot) and
+  `Done · N` sections (30px headers like the sidebar's), 44px rows: line 1
+  is the 12px status glyph, 8px, 13px `text` title truncating, and the
+  mono 11px elapsed right-aligned, all centered on the 18px line; line 2 (16px, starting at the title's x) holds
   the one-line result in 12px `text_muted` truncating with `agent_type
   · model` in mono 11px `text_faint` right-aligned (either part may be
   absent; no summary and no meta collapses the row to 32px). Rows open
