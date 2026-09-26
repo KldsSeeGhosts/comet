@@ -185,15 +185,21 @@ Status hues come from `SessionState` only: sky equalizer Running,
 emerald check Done (neutral once the thread has been opened), danger
 triangle Failed, neutral dot Started.
 
-- **Dock strip**: a single 28px row above the composer, sharing the
-  composer container's px(SPACE_LG) inset so its left/right edges equal
-  the pill's outer edges at every width, 6px above the pill. Leading `Agents` label (11.5px MEDIUM,
-  `text_faint`) with a mono `{done}/{total}` count, then 24px pills
-  (border only, `wash(0.06)` hover): 12px status glyph, truncated title
-  at 12px `text_muted`, mono 11px elapsed. A trailing chevron toggles
-  the Agents tab, and a `+N` pill opens it when pills overflow. The
-  strip shows the latest turn's agents plus anything still running, and
-  animates its height in.
+- **Agents tray**: a queue-tray surface stacked above the composer pill
+  (same `QUEUE_SIDE_INSET`, rounded top `PANEL_RADIUS`, tucked
+  `QUEUE_COMPOSER_OVERLAP` behind the pill, `popover::surface_bg` +
+  `theme.border`, frost-aware shadow). Rendered by the composer itself
+  on every route, so the transcript's measured bottom clearance already
+  covers it - no floating row. When the queue tray is also up, the
+  agents tray sits on top of it and tucks behind the queue tray's top
+  edge (one continuous stack: agents, queue, pill). The content row is
+  32px: 12px left pad, `Agents` 11.5px MEDIUM `text_faint` + mono
+  `{done}/{total}`, then 24px pills (no border inside the tray -
+  `wash(0.06)` fill, `wash(0.10)` hover): 12px status glyph, truncated
+  title at 12px `text_muted`, mono 11px elapsed. A `+N` pill and the
+  trailing 24px chevron toggle the Agents tab; 6px right pad. The tray
+  shows the latest turn's agents plus anything still running, and
+  appears/disappears with `motion::fade_quick`.
 - **Agents panel**: `RightSurface::Agents`, one "Agents" tab with the
   `BOT` icon. `Active` and `Done · N` sections (30px headers like the
   sidebar's), 44px rows: line 1 is the 12px status glyph, 8px, 13px
