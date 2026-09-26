@@ -6422,13 +6422,19 @@ impl Shell {
         let harness_mark = harness.map(crate::pickers::harness_brand_icon);
         let card = div()
             .id(SharedString::from(row_id.clone()))
-            // Fixed three-line card: the height never varies with content,
-            // so the list's FLIP estimates and the drawn row always agree.
+            // Fixed three-line card: 9px top/bottom padding centers the
+            // 54px of lines (the old fixed-height + justify_center drew
+            // the same 72px box), and nested child rows below line 3 grow
+            // the card from there - the caller adds their height to the
+            // keyed row so the list's FLIP estimates and the drawn row
+            // always agree.
             .relative()
-            .h(px(chat_row_height()))
             .flex()
             .flex_col()
-            .justify_center()
+            .pt(px(9.0))
+            // A bare card keeps the original 72px (justify_center's 9px
+            // bottom); with children the block carries its own pb(4px).
+            .pb(px(if sub_children.is_some() { 0.0 } else { 9.0 }))
             .rounded(px(if search_query.is_some() {
                 popover::PALETTE_ITEM_RADIUS
             } else {
@@ -6626,6 +6632,10 @@ impl Shell {
                         )
                     }),
             )
+            // Running subagent lines live INSIDE the card's wash/radius,
+            // after line 3 (subagents.rs sidebar_children owns the rows;
+            // the caller wraps them in the `sub:{chat}` disclosure tween).
+            .children(sub_children)
             .when(needs_you, |row| {
                 row.child(
                     div()
@@ -6642,16 +6652,7 @@ impl Shell {
                 )
             })
             .into_any_element();
-        match sub_children {
-            Some(children) => div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .child(card)
-                .child(children)
-                .into_any_element(),
-            None => card,
-        }
+        card
     }
 
     /// The global connection line. `None` while healthy (`Connected`) or on

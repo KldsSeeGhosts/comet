@@ -185,8 +185,9 @@ Status hues come from `SessionState` only: sky equalizer Running,
 emerald check Done (neutral once the thread has been opened), danger
 triangle Failed, neutral dot Started.
 
-- **Dock strip**: a single 28px row above the composer, same column
-  width, 6px above the pill. Leading `Agents` label (11.5px MEDIUM,
+- **Dock strip**: a single 28px row above the composer, sharing the
+  composer container's px(SPACE_LG) inset so its left/right edges equal
+  the pill's outer edges at every width, 6px above the pill. Leading `Agents` label (11.5px MEDIUM,
   `text_faint`) with a mono `{done}/{total}` count, then 24px pills
   (border only, `wash(0.06)` hover): 12px status glyph, truncated title
   at 12px `text_muted`, mono 11px elapsed. A trailing chevron toggles
@@ -199,10 +200,15 @@ triangle Failed, neutral dot Started.
   `agent_type · model` right-aligned. Rows open the child thread. There
   is no bulk stop - the engine exposes no subagent-interrupt call.
 - **Sidebar children**: under selected or pane-open cards with running
-  agents only, up to three 22px rows below line 3 (hairline tree stub,
-  glyph, title, elapsed) plus a `+N more` row that selects the chat and
-  opens the Agents tab. Child clicks open the agent thread. Finished
-  agents never nest; card height animates via the disclosure tween.
+  agents only, up to three 22px rows rendered as extra lines INSIDE the
+  card after line 3 (sharing the card's wash and radius; no tree stubs,
+  no hairlines). Each row: 12px status glyph at the card's text-start x,
+  6px gap, 12px `text_muted` title truncating, mono 11px `text_faint`
+  elapsed flush to the card's right edge. A `+N more` row (no glyph,
+  indented to the title start) selects the chat and opens the Agents tab.
+  2px between line 3 and the first child, 4px bottom pad. Child clicks
+  stop propagation and open the agent thread. Finished agents never
+  nest; card height animates via the disclosure tween.
 
 Opening an agent opens its thread, not a dead end: real sub docs go
 through `add_subagent_surface`; doc-less results (Pi) render a frozen

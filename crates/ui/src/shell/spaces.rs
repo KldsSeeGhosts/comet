@@ -1834,10 +1834,21 @@ impl Shell {
         };
         let running_count = sub_summaries.len();
         // +1 extra row's height when the running set overflows the 3-row
-        // cap (the `+N more` line).
+        // cap (the `+N more` line). Children sit INSIDE the card (after
+        // line 3), so their block also carries the 2px gap and 4px bottom
+        // pad the card adds around them.
         let target_rows = running_count.min(crate::subagents::SIDEBAR_CHILD_MAX)
             + usize::from(running_count > crate::subagents::SIDEBAR_CHILD_MAX);
-        let target_height = target_rows as f32 * crate::subagents::SIDEBAR_CHILD_HEIGHT;
+        let rows_height = |rows: usize| {
+            if rows == 0 {
+                0.0
+            } else {
+                crate::subagents::SIDEBAR_CHILD_GAP
+                    + rows as f32 * crate::subagents::SIDEBAR_CHILD_HEIGHT
+                    + crate::subagents::SIDEBAR_CHILD_PAD_BOTTOM
+            }
+        };
+        let target_height = rows_height(target_rows);
         // Height tweens ride the disclosure engine: the count change kicks a
         // collapse tween, the body renders `open` at target thereafter.
         let motion_key = format!("sub:{}", chat.id);
@@ -1848,7 +1859,7 @@ impl Shell {
         if prev_rows != target_rows {
             self.begin_sidebar_disclosure_motion(
                 &motion_key,
-                prev_rows as f32 * crate::subagents::SIDEBAR_CHILD_HEIGHT,
+                rows_height(prev_rows),
                 target_height,
             );
         }

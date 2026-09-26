@@ -568,10 +568,19 @@ pub fn dock_strip(
 
 pub const SIDEBAR_CHILD_HEIGHT: f32 = 22.0;
 pub const SIDEBAR_CHILD_MAX: usize = 3;
+/// Breathing room between a card's line 3 and its first child row.
+pub const SIDEBAR_CHILD_GAP: f32 = 2.0;
+/// Bottom inset when the card carries children (the same 10px a bare card
+/// gets from `justify_center`; line 3's own row keeps its height).
+pub const SIDEBAR_CHILD_PAD_BOTTOM: f32 = 4.0;
 
-/// Up to `SIDEBAR_CHILD_MAX` running subagents below a chat card, aligned to
-/// the card's text start with a 1px hairline tree stub; `+N more` opens the
-/// Agents panel.
+/// Up to `SIDEBAR_CHILD_MAX` running subagents as EXTRA LINES inside the
+/// chat card (after line 3), sharing its wash and radius. Each row: 12px
+/// status glyph at the card's text-start x, 6px gap, 12px `text_muted`
+/// title truncating, mono 11px `text_faint` elapsed flush to the card's
+/// right edge. No tree stubs, no hairlines. `+N more` opens the Agents
+/// panel. Children stop click propagation (they open the thread, not the
+/// card's plain select).
 #[allow(clippy::too_many_arguments)]
 pub fn sidebar_children(
     chat_id: &str,
@@ -588,7 +597,12 @@ pub fn sidebar_children(
         .filter(|s| s.status == SubagentPhase::Running)
         .collect();
     let more = running.len().saturating_sub(SIDEBAR_CHILD_MAX);
-    let mut col = div().w_full().flex().flex_col();
+    let mut col = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .pt(px(SIDEBAR_CHILD_GAP))
+        .pb(px(SIDEBAR_CHILD_PAD_BOTTOM));
     for s in running.iter().take(SIDEBAR_CHILD_MAX) {
         let summary = (*s).clone();
         let chat = chat_id.to_string();
@@ -602,7 +616,6 @@ pub fn sidebar_children(
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
-                .pl(px(10.0))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
@@ -610,19 +623,20 @@ pub fn sidebar_children(
                 }))
                 .child(
                     div()
-                        .w(px(1.0))
-                        .h(px(10.0))
+                        .size(px(12.0))
                         .flex_none()
-                        .bg(theme.hairline(0.10)),
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(status_glyph(
+                            SharedString::from(format!("sub-glyph-{}", s.id)),
+                            s.status,
+                            true,
+                            theme,
+                            view,
+                            cx,
+                        )),
                 )
-                .child(status_glyph(
-                    SharedString::from(format!("sub-glyph-{}", s.id)),
-                    s.status,
-                    true,
-                    theme,
-                    view,
-                    cx,
-                ))
                 .child(
                     div()
                         .flex_1()
@@ -654,9 +668,9 @@ pub fn sidebar_children(
                 .w_full()
                 .flex()
                 .items_center()
-                .pl(px(10.0 + 7.0 + 12.0))
-                .font_family(theme.font_mono.clone())
-                .text_size(crate::typography::ui_rems(11.0))
+                // No glyph: indent to the child rows' title start.
+                .pl(px(12.0 + 6.0))
+                .text_size(crate::typography::ui_rems(12.0))
                 .text_color(theme.text_faint)
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -666,21 +680,7 @@ pub fn sidebar_children(
                 .child(SharedString::from(format!("+{more} more"))),
         );
     }
-    // The tree stub hangs off the card's text-start edge.
-    div()
-        .relative()
-        .w_full()
-        .child(
-            div()
-                .absolute()
-                .left(px(1.0))
-                .top(px(4.0))
-                .bottom(px(4.0))
-                .w(px(1.0))
-                .bg(theme.hairline(0.10)),
-        )
-        .child(col)
-        .into_any_element()
+    col.into_any_element()
 }
 
 // ---------------------------------------------------------------------------
