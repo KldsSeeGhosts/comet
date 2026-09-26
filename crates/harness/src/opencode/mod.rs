@@ -420,11 +420,12 @@ enum Protocol {
 
 impl Protocol {
     /// One readiness poll across both generations. 2.x answers
-    /// `GET /api/health` with `{healthy, version}` and serves its web UI on
-    /// `/global/health`; 1.x answers `GET /global/health` with
-    /// `{healthy, version}` AND also serves `/api/health` — with
-    /// `{"healthy":true}`, no version (both observed live). The version
-    /// field is the only unambiguous discriminator. `None` = still booting.
+    /// `GET /api/health` with `{healthy, version}` (absent on some 2.x
+    /// builds, e.g. 2.0.18, where it 404s) while 1.x answers
+    /// `GET /global/health` with `{healthy, version}`. The version field
+    /// discriminates when present; 2.x builds that dropped it are caught by
+    /// any other `/api/*` route answering JSON - 1.x serves its web UI
+    /// (HTML) under those paths instead. `None` = still booting.
     async fn detect(server: &Server) -> Option<Self> {
         for (path, protocol) in [
             ("/api/health", Protocol::V2),
@@ -437,6 +438,18 @@ impl Protocol {
             {
                 return Some(protocol);
             }
+        }
+        // 2.x without a versioned health endpoint: any JSON answer under
+        // /api/ proves the 2.x router is mounted (1.x has no /api/ routes).
+        if let Ok(resp) = server.get_raw("/api/session/active").await
+            && resp.status().is_success()
+            && resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.contains("json"))
+        {
+            return Some(Protocol::V2);
         }
         None
     }

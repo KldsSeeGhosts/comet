@@ -8,7 +8,46 @@
 //! tagged `sessionUpdate`/snake_case; structs are camelCase; tool kinds and
 //! statuses are snake_case).
 
+use std::collections::HashMap;
+
 use serde_json::Value;
+
+/// Last-known `kind`/`title` per tool call id, session-scoped. ACP
+/// `tool_call_update` fields are partial: pi-acp (and others) send the
+/// identity only on the opening `tool_call`, then stream shape refreshes
+/// (`rawInput`, `status`) with neither. Re-typing a refresh without the
+/// remembered identity defaults kind to "other" and clobbers the call.
+#[derive(Default)]
+pub(crate) struct ToolShapes {
+    calls: HashMap<String, (String, String)>,
+}
+
+impl ToolShapes {
+    /// Fold one update's identity fields into the remembered shape, then
+    /// return the merged (kind, title) for typing. Terminal statuses drop
+    /// the entry so the map stays bounded to open calls.
+    fn merged(&mut self, update: &Value) -> (String, String) {
+        let id = update
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let entry = self.calls.entry(id.to_owned()).or_default();
+        if let Some(kind) = update.get("kind").and_then(Value::as_str) {
+            entry.0 = kind.to_owned();
+        }
+        if let Some(title) = update.get("title").and_then(Value::as_str) {
+            entry.1 = title.to_owned();
+        }
+        let merged = (entry.0.clone(), entry.1.clone());
+        if matches!(
+            update.get("status").and_then(Value::as_str),
+            Some("completed" | "failed" | "cancelled")
+        ) {
+            self.calls.remove(id);
+        }
+        merged
+    }
+}
 use zeron_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};
 
 /// Byte cap applied to tool output text at the harness boundary. The doc-side
@@ -165,12 +204,13 @@ fn arg_from_title(title: &str) -> Option<String> {
 /// in how much structure they put in `rawInput`, so every arm has a fallback.
 /// Title is only used when it looks like a real arg — never a placeholder
 /// label or markdown-escaped summary.
-fn typed_call(update: &Value) -> ToolCall {
-    let kind = update
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("other");
-    let title = str_field(update, "title");
+fn typed_call(update: &Value, identity: (String, String)) -> ToolCall {
+    let (kind, title) = identity;
+    let kind: &str = if kind.is_empty() {
+        "other"
+    } else {
+        kind.as_str()
+    };
     let raw = update.get("rawInput").filter(|v| !v.is_null());
     let raw_str = |key: &str| -> Option<String> {
         raw.and_then(|r| r.get(key))
@@ -336,17 +376,89 @@ fn typed_call(update: &Value) -> ToolCall {
                 }),
             input: raw.cloned(),
         },
-        _ => ToolCall::Unknown {
-            name: if title.is_empty() { kind.into() } else { title },
+        // Well-known tools agents emit with kind "other" (pi sends every
+        // non read/write/edit/bash tool that way, with title = tool name).
+        // A descriptive title falls through to the Unknown arm unchanged.
+        _ => well_known_typed(&title, &raw_str, update).unwrap_or_else(|| ToolCall::Unknown {
+            name: if title.is_empty() {
+                kind.into()
+            } else {
+                title.clone()
+            },
             input: raw.cloned(),
-        },
+        }),
+    }
+}
+
+/// Type a kind-"other" call whose title is a known tool name. Pi built-ins
+/// (grep pattern/path, find pattern/path, ls path) plus generic web/todo
+/// names; anything else stays `Unknown`.
+fn well_known_typed(
+    title: &str,
+    raw_str: &dyn Fn(&str) -> Option<String>,
+    update: &Value,
+) -> Option<ToolCall> {
+    match title.trim() {
+        "grep" => Some(ToolCall::Search {
+            pattern: raw_str("pattern")
+                .or_else(|| raw_str("query"))
+                .unwrap_or_default(),
+            path: raw_str("path"),
+        }),
+        "find" | "glob" => Some(ToolCall::Glob {
+            pattern: raw_str("pattern")
+                .or_else(|| raw_str("glob"))
+                .or_else(|| raw_str("path"))
+                .unwrap_or_default(),
+        }),
+        "ls" => Some(ToolCall::Glob {
+            pattern: raw_str("path").unwrap_or_else(|| ".".into()),
+        }),
+        "web_search" | "websearch" | "search_web" => Some(ToolCall::WebSearch {
+            query: raw_str("query")
+                .or_else(|| raw_str("q"))
+                .or_else(|| raw_str("searchTerm"))
+                .unwrap_or_default(),
+        }),
+        "fetch" | "web_fetch" | "webfetch" => Some(ToolCall::WebFetch {
+            url: raw_str("url").unwrap_or_default(),
+            prompt: raw_str("prompt"),
+        }),
+        "todo" | "todowrite" | "todo_write" => {
+            let items = update
+                .get("rawInput")
+                .and_then(|r| r.get("todos").or_else(|| r.get("items")))
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| {
+                            let text = e
+                                .get("content")
+                                .or_else(|| e.get("text"))
+                                .or_else(|| e.get("task"))
+                                .and_then(Value::as_str)?;
+                            Some(TodoItem {
+                                text: text.to_owned(),
+                                done: matches!(
+                                    e.get("status").and_then(Value::as_str),
+                                    Some("completed" | "done")
+                                ) || e.get("done").and_then(Value::as_bool) == Some(true),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Some(ToolCall::Todo { items })
+        }
+        _ => None,
     }
 }
 
 /// Map one `session/update` payload's `update` object to events.
 /// Message/thought chunks are handled here too (unlike codex, ACP has no
-/// separate delta channel).
-pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
+/// separate delta channel). `shapes` carries each call's remembered
+/// kind/title across the partial `tool_call_update`s that follow it.
+pub(crate) fn map_update(update: &Value, shapes: &mut ToolShapes) -> Vec<AgentEvent> {
     let kind = update
         .get("sessionUpdate")
         .and_then(Value::as_str)
@@ -365,7 +477,7 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             let id = str_field(update, "toolCallId");
             let mut events = vec![AgentEvent::ToolCall {
                 id: id.clone(),
-                call: typed_call(update),
+                call: typed_call(update, shapes.merged(update)),
             }];
             // Some agents send a single terminal-status `tool_call` with the
             // result inline instead of a follow-up update.
@@ -388,8 +500,12 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             {
                 events.push(AgentEvent::ToolCall {
                     id: id.clone(),
-                    call: typed_call(update),
+                    call: typed_call(update, shapes.merged(update)),
                 });
+            } else {
+                // Even a result-only update can close the call; drop the
+                // remembered shape so the map stays bounded.
+                shapes.merged(update);
             }
             if let Some(resolved) = resolved_result(update, id) {
                 events.push(resolved);
@@ -510,7 +626,7 @@ mod tests {
             "content": { "type": "text", "text": "hello" },
         });
         assert_eq!(
-            map_update(&update),
+            map_update(&update, &mut ToolShapes::default()),
             vec![AgentEvent::TextDelta {
                 text: "hello".into()
             }]
@@ -520,7 +636,7 @@ mod tests {
             "content": { "type": "text", "text": "hmm" },
         });
         assert_eq!(
-            map_update(&thought),
+            map_update(&thought, &mut ToolShapes::default()),
             vec![AgentEvent::ReasoningDelta { text: "hmm".into() }]
         );
         // Non-text blocks render as nothing.
@@ -528,7 +644,7 @@ mod tests {
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "image", "data": "...", "mimeType": "image/png" },
         });
-        assert_eq!(map_update(&image), Vec::new());
+        assert_eq!(map_update(&image, &mut ToolShapes::default()), Vec::new());
     }
 
     #[test]
@@ -545,7 +661,7 @@ mod tests {
             ],
         });
         assert_eq!(
-            map_update(&update),
+            map_update(&update, &mut ToolShapes::default()),
             vec![
                 AgentEvent::ToolCall {
                     id: "t1".into(),
@@ -577,7 +693,7 @@ mod tests {
                 "newText": "fn new() {}",
             }],
         });
-        let events = map_update(&update);
+        let events = map_update(&update, &mut ToolShapes::default());
         assert_eq!(events.len(), 2);
         assert_eq!(
             events[0],
@@ -614,7 +730,7 @@ mod tests {
             "content": [{ "type": "diff", "path": "/w/new.rs", "newText": "x" }],
         });
         assert_eq!(
-            map_update(&update),
+            map_update(&update, &mut ToolShapes::default()),
             vec![AgentEvent::ToolCall {
                 id: "t3".into(),
                 call: ToolCall::WriteFile {
@@ -633,7 +749,7 @@ mod tests {
             "status": "failed",
         });
         assert_eq!(
-            map_update(&update),
+            map_update(&update, &mut ToolShapes::default()),
             vec![AgentEvent::ToolResult {
                 id: "t4".into(),
                 is_error: true,
@@ -652,7 +768,7 @@ mod tests {
                 { "content": "write fix", "priority": "high", "status": "in_progress" },
             ],
         });
-        let events = map_update(&update);
+        let events = map_update(&update, &mut ToolShapes::default());
         assert_eq!(
             events[0],
             AgentEvent::ToolCall {
@@ -684,7 +800,7 @@ mod tests {
             ],
         });
         assert_eq!(
-            map_update(&update),
+            map_update(&update, &mut ToolShapes::default()),
             vec![AgentEvent::AvailableCommands {
                 commands: vec![
                     SlashCommand {
@@ -713,7 +829,7 @@ mod tests {
                 { "type": "content", "content": { "type": "text", "text": big } },
             ],
         });
-        let events = map_update(&update);
+        let events = map_update(&update, &mut ToolShapes::default());
         // The content-bearing update refreshes the call, then resolves it.
         let Some(AgentEvent::ToolResult {
             output: Some(output),
@@ -752,7 +868,7 @@ mod tests {
             "rawInput": {},
         });
         assert_eq!(
-            map_update(&grep),
+            map_update(&grep, &mut ToolShapes::default()),
             vec![AgentEvent::ToolCall {
                 id: "t1".into(),
                 call: ToolCall::Search {
@@ -770,7 +886,7 @@ mod tests {
             "rawInput": {},
         });
         assert_eq!(
-            map_update(&read),
+            map_update(&read, &mut ToolShapes::default()),
             vec![AgentEvent::ToolCall {
                 id: "t2".into(),
                 call: ToolCall::ReadFile {
@@ -787,7 +903,7 @@ mod tests {
             "rawInput": {},
         });
         assert_eq!(
-            map_update(&fetch),
+            map_update(&fetch, &mut ToolShapes::default()),
             vec![AgentEvent::ToolCall {
                 id: "t3".into(),
                 call: ToolCall::WebSearch {
@@ -804,7 +920,7 @@ mod tests {
             "rawInput": {},
         });
         assert_eq!(
-            map_update(&web),
+            map_update(&web, &mut ToolShapes::default()),
             vec![AgentEvent::ToolCall {
                 id: "t4".into(),
                 call: ToolCall::Search {
@@ -825,7 +941,7 @@ mod tests {
             "rawInput": { "searchTerm": "multitask cli" },
         });
         assert_eq!(
-            map_update(&update),
+            map_update(&update, &mut ToolShapes::default()),
             vec![AgentEvent::ToolCall {
                 id: "t1".into(),
                 call: ToolCall::WebSearch {
@@ -845,7 +961,7 @@ mod tests {
             "rawInput": {},
         });
         assert_eq!(
-            map_update(&update),
+            map_update(&update, &mut ToolShapes::default()),
             vec![AgentEvent::ToolCall {
                 id: "t1".into(),
                 call: ToolCall::Exec {
@@ -869,7 +985,7 @@ mod tests {
             },
         });
         assert_eq!(
-            map_update(&update),
+            map_update(&update, &mut ToolShapes::default()),
             vec![AgentEvent::ToolCall {
                 id: "t1".into(),
                 call: ToolCall::Unknown {
@@ -882,6 +998,79 @@ mod tests {
                 },
             }]
         );
+    }
+
+    /// The exact pi-acp frame sequence: `tool_call` carries title = tool
+    /// name + kind "other"; follow-up `tool_call_update`s carry only
+    /// rawInput/status. The refresh must merge the remembered identity -
+    /// not re-type the call as Unknown "other".
+    #[test]
+    fn pi_kind_other_tool_keeps_typing_across_partial_updates() {
+        let mut shapes = ToolShapes::default();
+        let open = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "title": "grep",
+            "kind": "other",
+            "status": "pending",
+            "rawInput": { "pattern": "ToolCall", "path": "crates" },
+        });
+        assert!(matches!(
+            map_update(&open, &mut shapes).as_slice(),
+            [AgentEvent::ToolCall {
+                call: ToolCall::Search { pattern, path },
+                ..
+            }] if pattern == "ToolCall" && path.as_deref() == Some("crates")
+        ));
+        let refresh = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "status": "in_progress",
+            "rawInput": { "pattern": "ToolCall", "path": "crates" },
+        });
+        assert!(matches!(
+            map_update(&refresh, &mut shapes).as_slice(),
+            [AgentEvent::ToolCall {
+                call: ToolCall::Search { pattern, .. },
+                ..
+            }] if pattern == "ToolCall"
+        ));
+        let done = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "status": "completed",
+            "content": [{ "type": "content", "content": { "type": "text", "text": "hit" } }],
+        });
+        assert!(matches!(
+            map_update(&done, &mut shapes).as_slice(),
+            [AgentEvent::ToolResult {
+                is_error: false,
+                ..
+            }]
+        ));
+        assert!(shapes.calls.is_empty());
+    }
+
+    /// A pi `ls` call types to a listing (Glob over the path) rather than
+    /// the wall of "Tool other" rows.
+    #[test]
+    fn pi_ls_types_to_glob_listing() {
+        let mut shapes = ToolShapes::default();
+        let update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t9",
+            "title": "ls",
+            "kind": "other",
+            "status": "in_progress",
+            "rawInput": { "path": "crates/ui" },
+        });
+        assert!(matches!(
+            map_update(&update, &mut shapes).as_slice(),
+            [AgentEvent::ToolCall {
+                call: ToolCall::Glob { pattern },
+                ..
+            }] if pattern == "crates/ui"
+        ));
     }
 
     #[test]
@@ -900,7 +1089,7 @@ mod tests {
             },
         });
         assert!(matches!(
-            map_update(&update).as_slice(),
+            map_update(&update, &mut ToolShapes::default()).as_slice(),
             [AgentEvent::ToolCall { call: ToolCall::Unknown { name, .. }, .. }]
                 if name == "Agent: Viz probe"
         ));
@@ -919,7 +1108,7 @@ mod tests {
             },
         });
         assert!(matches!(
-            map_update(&update).as_slice(),
+            map_update(&update, &mut ToolShapes::default()).as_slice(),
             [
                 AgentEvent::ToolCall { call: ToolCall::Unknown { name, .. }, .. },
                 AgentEvent::ToolResult { is_error: false, .. },

@@ -265,12 +265,16 @@ impl ToolCall {
 pub const SUBAGENT_MODEL_KEYS: [&str; 4] = ["model", "modelId", "model_id", "subagent_model"];
 
 /// The spawn-input keys [`sanitize_tool_call`](crate::) must preserve so the
-/// chip can name the child's model. Deliberately tiny: everything else on a
-/// spawn's input (the whole prompt, most of all) stays host-local.
-pub const SUBAGENT_INPUT_KEEP: [&str; 5] = [
+/// chip can name the child's model and the agents UI can title the pill and
+/// tell a background spawn apart (its bare result never means Done).
+/// Deliberately tiny: everything else on a spawn's input (the whole prompt,
+/// most of all) stays host-local.
+pub const SUBAGENT_INPUT_KEEP: [&str; 7] = [
+    "description",
     "model",
     "modelId",
     "model_id",
+    "run_in_background",
     "subagent_model",
     "subagent_type",
 ];
@@ -391,6 +395,14 @@ pub enum AgentEvent {
     ContextUsage {
         tokens: Option<u64>,
         window: Option<u64>,
+    },
+    /// Authoritative context snapshot: REPLACES the stored value rather than
+    /// merging, so a source that reports `tokens: None` (Pi right after
+    /// compaction) reads as "waiting" instead of keeping a stale number.
+    /// Additive - old consumers match it to no arm and drop it.
+    #[serde(rename_all = "camelCase")]
+    ContextUsageSnapshot {
+        usage: ContextUsage,
     },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
@@ -585,6 +597,24 @@ mod tests {
 pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub window: Option<u64>,
+    /// Token count at which the harness auto-compacts, when it reports it
+    /// truthfully (Pi: contextWindow - reserveTokens). Never guessed -
+    /// absent when unknown. An integer keeps the replicated struct `Eq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_at: Option<u64>,
+    /// Session-wide token totals (input/output/cache-read), when cheaply
+    /// available. Display-only; never feeds the ring's fraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionTokenTotals>,
+}
+
+/// Cumulative billed tokens for the whole session (not the window estimate).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTokenTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
 }
 
 impl ContextUsage {

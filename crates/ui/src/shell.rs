@@ -323,6 +323,23 @@ pub fn cluster_clearance(
         .max(0.0)
 }
 
+/// Extra leading inset for the TOP-LEFT pane header or tab strip: while the
+/// sidebar is collapsing, `sidebar_now` slides left but the titlebar's control
+/// cluster (sidebar toggle + nav, plus the new-session "+" slot when shown)
+/// still overlays the header's leading edge. The pane's leading content must
+/// start `TITLEBAR_IDENTITY_GAP` past the cluster's end: `content_start`
+/// already rides the titlebar tween (traffic lights, fullscreen, Linux
+/// captions) and `sidebar_now` rides the sidebar tween, so the inset animates
+/// with both for free. Right-split panes and expanded sidebars get 0.
+pub fn pane_header_leading_inset(
+    content_start: f32,
+    plus_slot: f32,
+    sidebar_now: f32,
+    header_pad: f32,
+) -> f32 {
+    (content_start + plus_slot - sidebar_now - header_pad).max(0.0)
+}
+
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer
 /// map, then binds the customizable shortcuts from `keymap` (feature-inventory
 /// §1.4). Invalid persisted combos fall back to that shortcut's default.
@@ -576,6 +593,9 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
+    /// The chat's subagent inventory (Codex-style Agents panel) - one per
+    /// panel key; lists Active and Done rows that open Subagent tabs.
+    Agents,
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -1582,10 +1602,13 @@ pub struct Shell {
     /// Shared route clock and measured prepaint geometry for the persistent composer.
     composer_dock: crate::composer_dock::SharedDock,
     new_thread_artwork_ready: crate::new_thread_background_effects::Readiness,
-    /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
-    /// (user request), session-transient. `archived_shown` pages the
-    /// expanded list ("Show more" reveals another page).
-    pub(super) archived_open: bool,
+    /// The sidebar's archived accordion (t3code Sidebar): session-transient.
+    /// `None` is "no user choice this session" and resolves per content:
+    /// OPEN when the active list has live rows, COLLAPSED when every session
+    /// is archived - the empty state stays quiet rather than leading with a
+    /// shelf of stale rows. `archived_shown` pages the expanded list
+    /// ("Show more" reveals another page).
+    pub(super) archived_open: Option<bool>,
     pub(super) archived_shown: usize,
     /// Archived slim row under the pointer — swaps its time label for the
     /// Unarchive affordance and restores the dimmed harness mark (t3code's
@@ -1643,6 +1666,12 @@ pub struct Shell {
     /// [`Transcript`] pinned to its subagent doc.
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
     subagent_seq: u64,
+    /// Subagent keys (`{chat_id}/{part_id}` or doc id) whose thread the user
+    /// already opened - the Done glyph goes neutral once seen.
+    pub(crate) subagent_seen: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    /// Per-chat sidebar child-row count last rendered - diffs kick the
+    /// `sub:{chat}` disclosure tween that animates the card's growth.
+    sidebar_sub_rows: std::collections::HashMap<String, usize>,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
@@ -1907,6 +1936,10 @@ impl Shell {
                         target_device_id.clone(),
                         cx,
                     ),
+                    ComposerEvent::OpenSubagentSummary { chat_id, summary } => {
+                        this.open_subagent_summary(chat_id.clone(), summary.clone(), cx)
+                    }
+                    ComposerEvent::ToggleAgentsPanel => this.toggle_agents_panel(cx),
                 }
             }
         })
@@ -2085,7 +2118,7 @@ impl Shell {
             bottom_stack_has_composer: std::rc::Rc::new(std::cell::Cell::new(false)),
             composer_dock: Default::default(),
             new_thread_artwork_ready: Default::default(),
-            archived_open: true,
+            archived_open: None,
             archived_shown: 0,
             archived_hover: None,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
@@ -2111,6 +2144,10 @@ impl Shell {
             diff_seq: 0,
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
+            subagent_seen: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashSet::new(),
+            )),
+            sidebar_sub_rows: std::collections::HashMap::new(),
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
@@ -2838,6 +2875,7 @@ impl Shell {
                         browser.page.url.clone().map(Into::into),
                     )
                 }),
+                RightSurface::Agents => Some((*surface, "Agents".into(), false, None)),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -2858,6 +2896,7 @@ impl Shell {
             | RightSurface::Diff(_)
             | RightSurface::Terminal(_)
             | RightSurface::Subagent(_)
+            | RightSurface::Agents
             | RightSurface::Browser(_) => {
                 return None;
             }
@@ -2960,7 +2999,7 @@ impl Shell {
             }
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
-            RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
+            RightSurface::Subagent(_) | RightSurface::Browser(_) | RightSurface::Agents => {}
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -3509,11 +3548,17 @@ impl Shell {
             transcript.set_workspace_link_handler(links)
         });
         let events = cx.subscribe(&transcript, Self::on_transcript_event);
-        let fetch = if frozen {
+        // A snapshot already in place wins (frozen blob from an earlier
+        // open, or a doc-less result snapshot) - the blob fetch and the live
+        // watch would race it with a possibly-purged doc.
+        let content_ready = !self.state.read(cx).sub_transcript(&doc_id).is_empty();
+        let fetch = if frozen && !content_ready {
             self.spawn_subagent_snapshot_fetch(&chat_id, &doc_id, cx)
-        } else {
+        } else if !frozen {
             self.state
                 .update(cx, |s, cx| s.watch_subagent_doc(doc_id.clone(), cx));
+            None
+        } else {
             None
         };
         self.subagent_tabs.insert(
@@ -3532,6 +3577,98 @@ impl Shell {
             .or_default()
             .push(RightSurface::Subagent(id));
         self.set_right_active(RightSurface::Subagent(id), cx);
+    }
+
+    /// A pill/sidebar-child click: select the parent chat and open the
+    /// subagent thread in the right pane. Doc-less harnesses (Pi) get a
+    /// synthetic frozen snapshot of the spawn call's result instead of an
+    /// empty transcript.
+    pub(crate) fn open_subagent_summary(
+        &mut self,
+        chat_id: String,
+        summary: crate::subagents::SubagentSummary,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.read(cx).selected_chat.as_deref() != Some(chat_id.as_str()) {
+            self.open_chat(chat_id.clone(), cx);
+        }
+        let doc_id = summary
+            .doc_ref
+            .clone()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| {
+                let doc_id = crate::subagents::result_doc_id(&chat_id, &summary.id);
+                let text = summary
+                    .summary
+                    .clone()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "No output.".to_string());
+                self.state.update(cx, |state, _| {
+                    if state.sub_transcript(&doc_id).is_empty() {
+                        state.set_subagent_snapshot(
+                            doc_id.clone(),
+                            vec![zeron_doc::SessionMessageEntry {
+                                id: "result".into(),
+                                role: zeron_doc::MessageRole::Assistant,
+                                parts: vec![zeron_doc::MessagePart::Text {
+                                    id: "t0".into(),
+                                    text,
+                                }],
+                                created_at: summary
+                                    .started
+                                    .map(|t| t.timestamp_millis())
+                                    .unwrap_or_default(),
+                                device_id: String::new(),
+                                status: Some(zeron_doc::MessageStatus::Complete),
+                                continuation_of: None,
+                            }],
+                        );
+                    }
+                });
+                doc_id
+            });
+        self.subagent_seen.borrow_mut().insert(doc_id.clone());
+        self.subagent_seen
+            .borrow_mut()
+            .insert(format!("{chat_id}/{}", summary.id));
+        let frozen = !summary.status.active();
+        self.add_subagent_surface(chat_id, doc_id, summary.title.to_string(), frozen, cx);
+    }
+
+    /// Whether the Agents surface is the visible right-pane tab (the agents
+    /// tray chevron's open state).
+    pub(crate) fn agents_panel_open(&self, cx: &App) -> bool {
+        self.right_pane_open(cx) && self.resolved_right_active(cx) == RightSurface::Agents
+    }
+
+    /// Mirror the Agents-tab open flag + the opened-thread `seen` set into
+    /// every composer that can render the tray (the shared dock composer and
+    /// each workspace pane composer). Called once per render; the composers
+    /// self-notify only on change.
+    fn sync_composer_agents_state(&mut self, cx: &mut Context<Self>) {
+        let open = self.agents_panel_open(cx);
+        let seen = self.subagent_seen.borrow().clone();
+        self.composer.update(cx, |composer, cx| {
+            composer.set_agents_panel_state(open, seen.clone(), cx)
+        });
+        for surface in self.workspace.chat_surfaces.values() {
+            surface.composer.update(cx, |composer, cx| {
+                composer.set_agents_panel_state(open, seen.clone(), cx)
+            });
+        }
+    }
+
+    /// The strip chevron / sidebar `+N more`: the right pane's Agents tab.
+    pub(crate) fn toggle_agents_panel(&mut self, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        let tabs = self.right_tabs.entry(key).or_default();
+        if !tabs.contains(&RightSurface::Agents) {
+            tabs.push(RightSurface::Agents);
+        }
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        self.set_right_active(RightSurface::Agents, cx);
     }
 
     /// Fetch a finished subagent's frozen transcript blob
@@ -3651,7 +3788,7 @@ impl Shell {
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
             }
-            RightSurface::Picker => {}
+            RightSurface::Agents | RightSurface::Picker => {}
         }
         self.panels.update(&key, |p| {
             if p.right_active == surface {
@@ -6013,6 +6150,10 @@ impl Shell {
         // row is busy or under the pointer.
         jump_label: Option<SharedString>,
         search_query: Option<&str>,
+        // Running-subagent rows appended under the card (Codex-style nested
+        // threads). The caller adds their height to the keyed row so the
+        // FLIP estimate and the drawn card agree.
+        sub_children: Option<AnyElement>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -6253,13 +6394,19 @@ impl Shell {
         let harness_mark = harness.map(crate::pickers::harness_brand_icon);
         div()
             .id(SharedString::from(row_id.clone()))
-            // Fixed three-line card: the height never varies with content,
-            // so the list's FLIP estimates and the drawn row always agree.
+            // Fixed three-line card: 9px top/bottom padding centers the
+            // 54px of lines (the old fixed-height + justify_center drew
+            // the same 72px box), and nested child rows below line 3 grow
+            // the card from there - the caller adds their height to the
+            // keyed row so the list's FLIP estimates and the drawn row
+            // always agree.
             .relative()
-            .h(px(chat_row_height()))
             .flex()
             .flex_col()
-            .justify_center()
+            .pt(px(9.0))
+            // A bare card keeps the original 72px (justify_center's 9px
+            // bottom); with children the block carries its own pb(4px).
+            .pb(px(if sub_children.is_some() { 0.0 } else { 9.0 }))
             .rounded(px(if search_query.is_some() {
                 popover::PALETTE_ITEM_RADIUS
             } else {
@@ -6457,6 +6604,10 @@ impl Shell {
                         )
                     }),
             )
+            // Running subagent lines live INSIDE the card's wash/radius,
+            // after line 3 (subagents.rs sidebar_children owns the rows;
+            // the caller wraps them in the `sub:{chat}` disclosure tween).
+            .children(sub_children)
             .when(needs_you, |row| {
                 row.child(
                     div()
@@ -6705,7 +6856,7 @@ impl Shell {
                             .pb(px(Theme::SPACE_SM))
                             .text_size(crate::typography::ui_rems(12.0))
                             .text_color(theme.text_faint)
-                            .child(SharedString::from("No sessions yet"))
+                            .child(SharedString::from("No active sessions"))
                             .into_any_element()
                     })
                     .children(archived_section),
@@ -6778,7 +6929,11 @@ impl Shell {
     ) -> AnyElement {
         let theme = &theme.for_popup();
         let open = self.user_menu.is_open();
-        let action = if self.boot.remote.is_some() { None } else { account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow) };
+        let action = if self.boot.remote.is_some() {
+            None
+        } else {
+            account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow)
+        };
         // Bottom-of-sidebar device strip. The left side remains the account
         // menu trigger, while the two compact actions expose device control
         // and Settings without making the profile menu the whole footer.
@@ -8241,16 +8396,19 @@ impl Shell {
                     .flex_col()
                     .child(
                         gpui::canvas(
-                            move |bounds, window, cx| {
-                                // Reserve the destination footprint, never the animated height.
-                                let next_height = f32::from(bounds.size.height)
-                                    + composer.read(cx).dock_clearance_correction();
-                                let changed = (measured.get() - next_height).abs() > 0.5
-                                    || measured_has_composer.get() != contains_composer;
-                                measured.set(next_height);
-                                measured_has_composer.set(contains_composer);
-                                if changed {
-                                    window.request_animation_frame();
+                            {
+                                let composer = composer.clone();
+                                move |bounds, window, cx| {
+                                    // Reserve the destination footprint, never the animated height.
+                                    let next_height = f32::from(bounds.size.height)
+                                        + composer.read(cx).dock_clearance_correction();
+                                    let changed = (measured.get() - next_height).abs() > 0.5
+                                        || measured_has_composer.get() != contains_composer;
+                                    measured.set(next_height);
+                                    measured_has_composer.set(contains_composer);
+                                    if changed {
+                                        window.request_animation_frame();
+                                    }
                                 }
                             },
                             |_, _, _, _| {},
@@ -8277,6 +8435,13 @@ impl Shell {
                                     .w(px(composer_width))
                                     .opacity(composer_opacity)
                                     .mx_auto()
+                                    .flex()
+                                    .flex_col()
+                                    // The strip shares the composer
+                                    // container's px(SPACE_LG) inset, so
+                                    // its edges ARE the pill's outer edges
+                                    // at every width (the outer column is
+                                    // already clamped to COMPOSER_MAX_WIDTH).
                                     .child(self.composer.clone())
                                     .children(if has_selection {
                                         self.render_jump_to_bottom(cx)
@@ -8733,6 +8898,25 @@ impl Shell {
                         .children(pill)
                         .into_any_element()
                 }
+                RightSurface::Agents => {
+                    let theme = Theme::of(cx).clone();
+                    let chat_id = self.panel_key(cx);
+                    let summaries = crate::subagents::subagents_for(self.state.read(cx), &chat_id);
+                    let open: crate::subagents::OpenAgent =
+                        std::rc::Rc::new(|this, chat, summary, cx| {
+                            this.open_subagent_summary(chat, summary, cx)
+                        });
+                    crate::subagents::agents_panel_body(
+                        &chat_id,
+                        &summaries,
+                        &self.subagent_seen.borrow(),
+                        Utc::now(),
+                        &theme,
+                        cx.entity_id(),
+                        open,
+                        cx,
+                    )
+                }
                 _ => self.render_surface_picker(cx),
             }
         } else {
@@ -9083,7 +9267,7 @@ impl Shell {
                         }
                     })
                     .unwrap_or(icons::LIST),
-                RightSurface::Subagent(_) => icons::BOT,
+                RightSurface::Subagent(_) | RightSurface::Agents => icons::BOT,
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
                 RightSurface::Picker => icons::PLUS,
@@ -10622,6 +10806,7 @@ impl Render for Shell {
                         t.set_bottom_clearance(stack_h, cx);
                     }
                 });
+                self.sync_composer_agents_state(cx);
 
                 let sidebar = self.render_sidebar(cx);
                 let sidebar_handle = self.resize_handle(
@@ -11624,6 +11809,40 @@ mod tests {
         assert_eq!(
             cluster_clearance(true, true, 0, 16.0),
             12.0 + CLUSTER_BUTTONS_WIDTH + 8.0 - 16.0
+        );
+    }
+
+    #[test]
+    fn pane_header_leading_inset_clears_the_cluster_only_when_overlapped() {
+        // Collapsed sidebar on macOS: content starts at 88 + 82 + 12 = 182;
+        // a 10px-padded header whose row begins at the window edge needs the
+        // full remainder as inset.
+        let content_start = 88.0 + CLUSTER_BUTTONS_WIDTH + TITLEBAR_IDENTITY_GAP;
+        assert_eq!(
+            pane_header_leading_inset(content_start, 0.0, 0.0, 10.0),
+            content_start - 10.0
+        );
+        // The "+" new-session slot widens the same inset while it fades in.
+        assert_eq!(
+            pane_header_leading_inset(content_start, TITLEBAR_ACTION_SLOT_WIDTH, 0.0, 10.0),
+            content_start + TITLEBAR_ACTION_SLOT_WIDTH - 10.0
+        );
+        // Mid-tween the sidebar covers part of the span; the inset is only
+        // the uncovered remainder.
+        assert_eq!(
+            pane_header_leading_inset(content_start, 0.0, 100.0, 10.0),
+            content_start - 110.0
+        );
+        // Expanded sidebar (row starts at/past the cluster's end) and any
+        // row whose pad already covers the remainder get 0 - the
+        // right-split pane case.
+        assert_eq!(
+            pane_header_leading_inset(content_start, 0.0, content_start, 10.0),
+            0.0
+        );
+        assert_eq!(
+            pane_header_leading_inset(content_start, 0.0, 0.0, content_start),
+            0.0
         );
     }
 

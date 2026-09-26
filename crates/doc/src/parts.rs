@@ -478,6 +478,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::ContextUsage { .. }
+        | AgentEvent::ContextUsageSnapshot { .. }
         | AgentEvent::AvailableCommands { .. }
         | AgentEvent::UserMessage { .. } => {}
     }
@@ -896,6 +897,7 @@ mod tests {
             ToolCall::Unknown {
                 name: "Agent: Explore theme system".into(),
                 input: Some(serde_json::json!({
+                    "description": "Explore theme system",
                     "model": "haiku",
                     "subagent_type": "Explore",
                 })),

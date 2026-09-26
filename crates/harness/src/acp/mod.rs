@@ -31,6 +31,7 @@
 mod antigravity_paths;
 mod devin_models;
 mod normalize;
+mod pi_usage;
 mod subagent;
 mod subagent_devin;
 
@@ -1208,13 +1209,13 @@ impl AcpHarness {
     }
 
     const CUA_EXTENSION: &str = include_str!("../pi/noches-cua.ts");
+    const CONTEXT_USAGE_EXTENSION: &str = include_str!("../pi/noches-context-usage.ts");
 
-    /// Point pi-acp at a wrapper that loads the Noches computer-use extension.
-    /// Load it even when the managed bridge is unavailable so it can disable
-    /// Pi's legacy `cua` tool on every platform.
-    fn prepare_pi_cua(
-        socket: Option<&Path>,
-    ) -> Result<(Vec<(&'static str, String)>, Option<tempfile::TempDir>), HarnessError> {
+    /// Point pi-acp at a wrapper that loads the Noches extensions. The CUA
+    /// extension loads even when the managed bridge is unavailable so it can
+    /// disable Pi's legacy `cua` tool on every platform; the context-usage
+    /// extension is independent and always loads with it.
+    fn prepare_pi_cua(socket: Option<&Path>) -> Result<PiLaunch, HarnessError> {
         let configured = std::env::var_os("PI_ACP_PI_COMMAND")
             .map(PathBuf::from)
             .filter(|path| {
@@ -1228,7 +1229,7 @@ impl AcpHarness {
             // Without a real Pi executable, no Pi session can expose legacy
             // CUA. Let pi-acp report its usual launch/install error instead.
             if socket.is_none() {
-                return Ok((Vec::new(), None));
+                return Ok((Vec::new(), None, None));
             }
             return Err(HarnessError::NotInstalled(
                 "pi (install @earendil-works/pi-coding-agent, or set PI_ACP_PI_COMMAND)".into(),
@@ -1237,18 +1238,27 @@ impl AcpHarness {
         let (dir, launch_dir) = Self::pi_cua_launch_dir(socket)?;
         let extension = dir.join("noches-cua.ts");
         Self::write_private_file(&extension, Self::CUA_EXTENSION, false)?;
-        let (wrapper, script, executable) = Self::pi_cua_wrapper(&dir, &real, &extension);
+        let usage_extension = dir.join("noches-context-usage.ts");
+        Self::write_private_file(&usage_extension, Self::CONTEXT_USAGE_EXTENSION, false)?;
+        let usage_file = dir.join("context-usage.json");
+        let (wrapper, script, executable) =
+            Self::pi_cua_wrapper(&dir, &real, &extension, &usage_extension);
         Self::write_private_file(&wrapper, &script, executable)?;
         let mut env = vec![
             ("PI_ACP_PI_COMMAND", wrapper.display().to_string()),
             ("NOCHES_CUA_EXTENSION", extension.display().to_string()),
+            (
+                "NOCHES_CUA_USAGE_EXTENSION",
+                usage_extension.display().to_string(),
+            ),
+            ("NOCHES_PI_USAGE_FILE", usage_file.display().to_string()),
         ];
         #[cfg(windows)]
         env.push(("NOCHES_CUA_PI_COMMAND", real.display().to_string()));
         if let Some(socket) = socket {
             env.push(("NOCHES_CUA_SOCKET", socket.display().to_string()));
         }
-        Ok((env, launch_dir))
+        Ok((env, launch_dir, Some(usage_file)))
     }
 
     fn pi_cua_launch_dir(
@@ -1312,13 +1322,19 @@ impl AcpHarness {
     }
 
     #[cfg(unix)]
-    fn pi_cua_wrapper(dir: &Path, real: &Path, extension: &Path) -> (PathBuf, String, bool) {
+    fn pi_cua_wrapper(
+        dir: &Path,
+        real: &Path,
+        extension: &Path,
+        usage_extension: &Path,
+    ) -> (PathBuf, String, bool) {
         (
             dir.join("pi-with-noches-cua"),
             format!(
-                "#!/bin/sh\nexec {} -e {} \"$@\"\n",
+                "#!/bin/sh\nexec {} -e {} -e {} \"$@\"\n",
                 Self::shell_quote(real),
                 Self::shell_quote(extension),
+                Self::shell_quote(usage_extension),
             ),
             true,
         )
@@ -1329,13 +1345,14 @@ impl AcpHarness {
         dir: &Path,
         _real: &Path,
         _extension: &Path,
+        _usage_extension: &Path,
     ) -> (PathBuf, String, bool) {
         (
             dir.join("pi-with-noches-cua.cmd"),
             concat!(
                 "@echo off\r\n",
                 "setlocal DisableDelayedExpansion\r\n",
-                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" %*\r\n",
+                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" -e \"%NOCHES_CUA_USAGE_EXTENSION%\" %*\r\n",
             )
             .to_string(),
             false,
@@ -1370,7 +1387,9 @@ impl AcpHarness {
         for key in [
             "NOCHES_CUA_SOCKET",
             "NOCHES_CUA_EXTENSION",
+            "NOCHES_CUA_USAGE_EXTENSION",
             "NOCHES_CUA_PI_COMMAND",
+            "NOCHES_PI_USAGE_FILE",
         ] {
             cmd.env_remove(key);
         }
@@ -1880,12 +1899,12 @@ impl Harness for AcpHarness {
         // `with_executable` is used by tests and embedders that supply a
         // complete ACP server. Installed Pi runs always load the policy
         // extension, even when this host cannot provide the managed bridge.
-        let (cua_env, pi_launch_dir) = if self.spec.id == HarnessId::Pi && self.executable.is_none()
-        {
-            Self::prepare_pi_cua(controls.computer_use_socket.as_deref())?
-        } else {
-            (Vec::new(), None)
-        };
+        let (cua_env, pi_launch_dir, pi_usage_file) =
+            if self.spec.id == HarnessId::Pi && self.executable.is_none() {
+                Self::prepare_pi_cua(controls.computer_use_socket.as_deref())?
+            } else {
+                (Vec::new(), None, None)
+            };
         let (mut child, stderr_tail) = self
             .spawn_agent(Some(&request.cwd), true, &[], &cua_env)
             .await?;
@@ -1920,6 +1939,7 @@ impl Harness for AcpHarness {
             kill_grace: self.kill_grace,
             handshake_timeout: self.handshake_timeout,
             stderr_tail,
+            pi_usage_file,
             _pi_launch_dir: pi_launch_dir,
         }));
 
@@ -1933,6 +1953,14 @@ impl Harness for AcpHarness {
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
+
+/// Launch plumbing prepared per Pi run: env for the adapter, the private
+/// launch dir guard, and the context-usage file to poll.
+type PiLaunch = (
+    Vec<(&'static str, String)>,
+    Option<tempfile::TempDir>,
+    Option<PathBuf>,
+);
 
 struct Session {
     child: Child,
@@ -1956,6 +1984,9 @@ struct Session {
     kill_grace: Duration,
     handshake_timeout: Duration,
     stderr_tail: crate::StderrTail,
+    /// Pi run's context-usage file (extension-written, harness-polled).
+    /// `None` for every other agent and for test embedders.
+    pi_usage_file: Option<PathBuf>,
     _pi_launch_dir: Option<tempfile::TempDir>,
 }
 
@@ -2347,6 +2378,7 @@ fn session_update_events(
     params: &Value,
     session_id: &str,
     subagents: &mut SubagentObserver,
+    shapes: &mut normalize::ToolShapes,
 ) -> Vec<AgentEvent> {
     if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Vec::new();
@@ -2357,7 +2389,7 @@ fn session_update_events(
             SubagentObserver::Devin(tracker) => tracker.map(update),
             _ => {
                 subagents.observe(update);
-                map_update(update)
+                map_update(update, shapes)
             }
         },
         "_x.ai/session_notification" => {
@@ -2873,6 +2905,7 @@ async fn run_session(session: Session) {
         kill_grace,
         handshake_timeout,
         stderr_tail,
+        pi_usage_file,
         _pi_launch_dir,
     } = session;
     let RunControls {
@@ -3139,6 +3172,12 @@ async fn run_session(session: Session) {
         return;
     }
 
+    // Pi never emits ACP `usage_update`; its extension writes context stats
+    // to a per-run file instead. Poll it for the life of the run.
+    let usage_watcher = pi_usage_file
+        .clone()
+        .map(|path| pi_usage::spawn_watcher(path, event_tx.clone()));
+
     // Subagent correlation + transcript tails: Devin carries nested updates
     // on ACP itself; everything else gets the Grok tracker (inert without
     // Grok's subagent lifecycle extension).
@@ -3151,6 +3190,10 @@ async fn run_session(session: Session) {
             sessions_root,
         ))
     };
+
+    // Per-call kind/title memory across partial tool_call_updates (pi sends
+    // the identity only on the opening frame).
+    let mut tool_shapes = normalize::ToolShapes::default();
 
     // ---- main loop --------------------------------------------------------
     // Prompt-completion settlement state (the prompt-complete extension):
@@ -3296,8 +3339,13 @@ async fn run_session(session: Session) {
                 while let Ok(inc) = incoming.try_recv() {
                     match inc {
                         Incoming::Notification { method, params } => {
-                            let events =
-                                session_update_events(&method, &params, &session_id, &mut subagents);
+                            let events = session_update_events(
+                                &method,
+                                &params,
+                                &session_id,
+                                &mut subagents,
+                                &mut tool_shapes,
+                            );
                             for ev in events {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -3475,8 +3523,13 @@ async fn run_session(session: Session) {
                     }
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
-                    let events =
-                        session_update_events(&method, &params, &session_id, &mut subagents);
+                    let events = session_update_events(
+                        &method,
+                        &params,
+                        &session_id,
+                        &mut subagents,
+                        &mut tool_shapes,
+                    );
                     for ev in events {
                         track_open_tools(&ev, &mut open_tools);
                         if !send(&event_tx, ev).await {
@@ -3586,8 +3639,13 @@ async fn run_session(session: Session) {
                         while let Ok(inc) = incoming.try_recv() {
                             match inc {
                                 Incoming::Notification { method, params } => {
-                                    let events =
-                                        session_update_events(&method, &params, &session_id, &mut subagents);
+                                    let events = session_update_events(
+                                        &method,
+                                        &params,
+                                        &session_id,
+                                        &mut subagents,
+                                        &mut tool_shapes,
+                                    );
                                     for ev in events {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -4002,6 +4060,16 @@ async fn run_session(session: Session) {
     if let Some(handle) = escalation {
         handle.abort();
     }
+    if let Some(watcher) = usage_watcher {
+        watcher.abort();
+    }
+    // The extension's last write can race the poll's final tick; a direct
+    // read lands the settled number before the stream ends.
+    if let Some(path) = pi_usage_file.as_deref()
+        && let Some(ev) = pi_usage::read_event(path)
+    {
+        let _ = send(&event_tx, ev).await;
+    }
     shutdown_child(&mut child, kill_grace).await;
 }
 
@@ -4074,8 +4142,9 @@ mod tests {
         let dir = PathBuf::from(r"C:\Temp\Noches");
         let real = PathBuf::from(r"C:\Users\100%!\AppData\Roaming\npm\pi.cmd");
         let extension = dir.join("日本語 100%!-noches-cua.ts");
+        let usage_extension = dir.join("noches-context-usage.ts");
         let (wrapper, script, executable) =
-            AcpHarness::pi_cua_wrapper(&dir, &real, &extension);
+            AcpHarness::pi_cua_wrapper(&dir, &real, &extension, &usage_extension);
 
         assert_eq!(wrapper, dir.join("pi-with-noches-cua.cmd"));
         assert!(!executable);
@@ -4084,7 +4153,7 @@ mod tests {
             concat!(
                 "@echo off\r\n",
                 "setlocal DisableDelayedExpansion\r\n",
-                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" %*\r\n",
+                "\"%NOCHES_CUA_PI_COMMAND%\" -e \"%NOCHES_CUA_EXTENSION%\" -e \"%NOCHES_CUA_USAGE_EXTENSION%\" %*\r\n",
             )
         );
         assert!(!script.contains(real.to_string_lossy().as_ref()));
@@ -4097,14 +4166,15 @@ mod tests {
         let dir = PathBuf::from("/tmp/noches-private");
         let real = PathBuf::from("/opt/pi agent/bin/pi");
         let extension = dir.join("noches-cua.ts");
+        let usage_extension = dir.join("noches-context-usage.ts");
         let (wrapper, script, executable) =
-            AcpHarness::pi_cua_wrapper(&dir, &real, &extension);
+            AcpHarness::pi_cua_wrapper(&dir, &real, &extension, &usage_extension);
 
         assert_eq!(wrapper, dir.join("pi-with-noches-cua"));
         assert!(executable);
         assert_eq!(
             script,
-            "#!/bin/sh\nexec '/opt/pi agent/bin/pi' -e '/tmp/noches-private/noches-cua.ts' \"$@\"\n"
+            "#!/bin/sh\nexec '/opt/pi agent/bin/pi' -e '/tmp/noches-private/noches-cua.ts' -e '/tmp/noches-private/noches-context-usage.ts' \"$@\"\n"
         );
     }
 

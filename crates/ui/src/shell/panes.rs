@@ -79,17 +79,26 @@ fn pane_meta(session: Option<&str>, state: &AppState) -> chrome::PaneMeta {
 
 /// The pane header's identity mark: a bound chat's harness brand icon + tint
 /// when the chat names one (rule 1: Claude orange, the rest monochrome by
-/// design), else the provider/mode tab mark. Tab chips always keep
-/// [`tab_mark`].
+/// design), else the provider/mode tab mark. For an unbound chat pane the
+/// composer's harness pick supplies the identity (same mark the model chip
+/// shows); `composer_harness` carries that pick or None. Tab chips always
+/// keep [`tab_mark`].
 fn header_mark(
     chat: Option<&zeron_proto::Chat>,
     mode: PaneMode,
     provider_key: Option<&str>,
+    composer_harness: Option<zeron_proto::HarnessId>,
 ) -> chrome::TabMark {
-    match chat.and_then(|chat| chat.config.as_ref().map(|config| config.harness)) {
+    let harness = chat
+        .and_then(|chat| chat.config.as_ref().map(|config| config.harness))
+        .or(composer_harness);
+    match harness {
         Some(harness) => {
             let (icon, tint) = crate::pickers::harness_brand_icon(harness);
-            chrome::TabMark { icon, tint }
+            chrome::TabMark {
+                icon: Some(icon),
+                tint,
+            }
         }
         None => tab_mark(mode, provider_key),
     }
@@ -115,20 +124,32 @@ impl Shell {
     /// The first split may have adopted the dock's composer as a pane's live
     /// composer. Detach it before selecting None so that pane keeps its draft,
     /// attachments, and in-flight send intact.
-    pub(super) fn reveal_workspace_session(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
+    pub(super) fn reveal_workspace_session(
+        &mut self,
+        chat_id: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let owner = if self.find_pane_with_session(chat_id).is_some() {
             Some(self.active_workspace_space.clone())
         } else {
-            let native_space = self.state.read(cx).chats.iter()
+            let native_space = self
+                .state
+                .read(cx)
+                .chats
+                .iter()
                 .find(|chat| chat.id == chat_id)
                 .and_then(|chat| chat.space_id.as_deref());
-            self.workspace_layouts.space_for_session(chat_id, native_space)
+            self.workspace_layouts
+                .space_for_session(chat_id, native_space)
         };
-        let Some(owner) = owner else { return false; };
+        let Some(owner) = owner else {
+            return false;
+        };
         self.solo_chat_ids.remove(chat_id);
         self.solo_session = false;
         if self.state.read(cx).selected_space != owner {
-            self.state.update(cx, |state, cx| state.select_space(owner, cx));
+            self.state
+                .update(cx, |state, cx| state.select_space(owner, cx));
         }
         true
     }
@@ -140,9 +161,12 @@ impl Shell {
         if !self.workspace.is_trivial() {
             self.ensure_pane_chat_surfaces(cx);
         }
-        if self.workspace.chat_surfaces.values().any(|surface| {
-            surface.composer.entity_id() == self.composer.entity_id()
-        }) {
+        if self
+            .workspace
+            .chat_surfaces
+            .values()
+            .any(|surface| surface.composer.entity_id() == self.composer.entity_id())
+        {
             self.composer = cx.new(|cx| Composer::new(self.state.clone(), cx));
             self._composer_events =
                 Self::dock_composer_events(&self.composer, self.transcript.clone(), cx);
@@ -192,11 +216,21 @@ impl Shell {
         let action_control =
             self.render_project_actions_control(available, px(self.viewport_height), cx);
         let project_badges = self.render_pane_project_badges(cx);
+        // The window's top-left view/pane keeps its leading content past the
+        // titlebar cluster while the sidebar tweens shut; everything else
+        // gets 0 (right splits never touch the traffic lights).
+        let leading_inset = crate::shell::pane_header_leading_inset(
+            self.title_bar_content_start(),
+            crate::shell::TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx),
+            self.sidebar_now(),
+            10.0,
+        );
         let snap = Self::workspace_snapshot(
             &self.workspace,
             &self.state,
             action_control,
             project_badges,
+            leading_inset,
             cx,
         );
         // WS4: the active drag's preview, converted to outlet-relative space.
@@ -262,7 +296,13 @@ impl Shell {
                 .unwrap_or_else(|| SharedString::from("New session"));
             let chat_id = row.map(|chat| chat.id.clone());
             let meta = pane_meta(chat_id.as_deref(), state);
-            let mark = header_mark(row, PaneMode::Chat, None);
+            let composer_harness = self
+                .composer
+                .read(cx)
+                .pickers()
+                .read(cx)
+                .effective_harness(cx);
+            let mark = header_mark(row, PaneMode::Chat, None, composer_harness);
             let badge = row
                 .map(|chat| ProjectIconRequest::resolve(state, chat, state.space_for_chat(chat)));
             (title, chat_id, meta, mark, badge)
@@ -285,6 +325,12 @@ impl Shell {
             has_selection,
             action_control,
             false,
+            crate::shell::pane_header_leading_inset(
+                self.title_bar_content_start(),
+                crate::shell::TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx),
+                self.sidebar_now(),
+                10.0,
+            ),
             theme,
             cx,
         )
@@ -416,7 +462,8 @@ impl Shell {
         // matching pane. The shared event listener ignores fixed targets.
         let adopt_shared = {
             let composer = self.composer.read(cx);
-            !self.solo_session && matches!(composer.target, ChatTarget::Selected)
+            !self.solo_session
+                && matches!(composer.target, ChatTarget::Selected)
                 && composer.current_key == session.as_deref().unwrap_or_default()
         };
         let composer = if adopt_shared {
@@ -572,7 +619,9 @@ impl Shell {
                             t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
                         }
                         ComposerEvent::NewThreadTransitionStarted
-                        | ComposerEvent::WorktreeSetup { .. } => {}
+                        | ComposerEvent::WorktreeSetup { .. }
+                        | ComposerEvent::OpenSubagentSummary { .. }
+                        | ComposerEvent::ToggleAgentsPanel => {}
                     });
                 }
                 cx.notify();
@@ -589,6 +638,10 @@ impl Shell {
                 target_device_id.clone(),
                 cx,
             ),
+            ComposerEvent::OpenSubagentSummary { chat_id, summary } => {
+                self.open_subagent_summary(chat_id.clone(), summary.clone(), cx)
+            }
+            ComposerEvent::ToggleAgentsPanel => self.toggle_agents_panel(cx),
         }
     }
 
@@ -601,10 +654,14 @@ impl Shell {
         state: &Entity<AppState>,
         action_control: Option<AnyElement>,
         project_badges: Rc<RefCell<BTreeMap<PaneId, AnyElement>>>,
+        leading_inset: f32,
         cx: &App,
     ) -> WorkspaceSnap {
         let layout = &workspace.layout;
         let global_focus = layout.active_pane_id();
+        // The view leaf at the tree's top-left edge, and (resolved per view
+        // below) the active tab's top-left pane.
+        let top_left_view = *layout.root.first_leaf();
         let pane_title = |session: &Option<String>,
                           mode: zeron_workspace::PaneMode,
                           label: &Option<String>|
@@ -665,6 +722,8 @@ impl Shell {
                     .tabs
                     .get(&active_tab_id)
                     .map(|tab| {
+                        let top_left_pane =
+                            (*view_id == top_left_view).then(|| *tab.root.first_leaf());
                         tab.panes
                             .iter()
                             .map(|(pane_id, pane_state)| {
@@ -684,6 +743,14 @@ impl Shell {
                                         chat,
                                         pane_state.mode,
                                         pane_state.provider_key.as_deref(),
+                                        surface.and_then(|surface| {
+                                            surface
+                                                .composer
+                                                .read(cx)
+                                                .pickers()
+                                                .read(cx)
+                                                .effective_harness(cx)
+                                        }),
                                     ),
                                     meta: pane_meta(
                                         pane_state.session_id.as_deref(),
@@ -691,6 +758,9 @@ impl Shell {
                                     ),
                                     has_session: pane_state.session_id.is_some(),
                                     focused: global_focus == Some(*pane_id),
+                                    leading_inset: (top_left_pane == Some(*pane_id))
+                                        .then_some(leading_inset)
+                                        .unwrap_or(0.0),
                                     transcript: surface
                                         .and_then(|surface| surface.transcript.clone()),
                                     composer: surface.map(|surface| surface.composer.clone()),
@@ -707,6 +777,9 @@ impl Shell {
                     closable: layout.views.len() > 1,
                     active_tab_id,
                     chips,
+                    leading_inset: (*view_id == top_left_view)
+                        .then_some(leading_inset)
+                        .unwrap_or(0.0),
                     active_tab_root: view
                         .tabs
                         .get(&active_tab_id)
@@ -1247,7 +1320,7 @@ impl Shell {
                 source: DragSource::SidebarSession,
                 session_id: Some(pointer.session_id),
                 mark: crate::pane::chrome::TabMark {
-                    icon: crate::icons::ZERON_LOGO,
+                    icon: Some(crate::icons::ZERON_LOGO),
                     tint: None,
                 },
                 title: "".into(),
@@ -2407,16 +2480,20 @@ mod pane_meta_tests {
         state.chats = vec![claude];
 
         // A bound chat's known harness wins over the provider/mode mark.
-        let mark = header_mark(state.chats.first(), PaneMode::Chat, None);
-        assert_eq!(mark.icon, icons::CLAUDE_MARK);
+        let mark = header_mark(state.chats.first(), PaneMode::Chat, None, None);
+        assert_eq!(mark.icon, Some(icons::CLAUDE_MARK));
         assert_eq!(mark.tint, Some(icons::claude_brand()));
-        // Unbound panes (and chats without config) keep the tab mark.
+        // An unbound pane adopts the composer's harness pick (the model
+        // chip's identity); with no pick it keeps the provider/mode mark.
+        let composer_mark =
+            header_mark(None, PaneMode::Chat, None, Some(zeron_proto::HarnessId::Pi));
+        assert_eq!(composer_mark.icon, Some(icons::PI_MARK));
         assert_eq!(
-            header_mark(None, PaneMode::Chat, Some("opencode")),
+            header_mark(None, PaneMode::Chat, Some("opencode"), None),
             tab_mark(PaneMode::Chat, Some("opencode"))
         );
         assert_eq!(
-            header_mark(None, PaneMode::Terminal, None),
+            header_mark(None, PaneMode::Terminal, None, None),
             tab_mark(PaneMode::Terminal, None)
         );
     }

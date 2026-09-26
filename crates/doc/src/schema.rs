@@ -331,11 +331,26 @@ impl SessionDoc {
         let next = zeron_proto::ContextUsage {
             tokens: tokens.or(previous.tokens),
             window: window.filter(|n| *n > 0).or(previous.window),
+            ..previous
         };
         if next != previous {
             self.doc
                 .get_map("meta")
                 .insert("contextUsage", serde_json::to_string(&next)?)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
+    /// Authoritative replacement for sources that own the whole snapshot
+    /// (Pi's extension-written file). Unlike [`Self::update_context_usage`]
+    /// a `None` token count is real state (post-compaction "waiting"), not
+    /// "keep the previous number".
+    pub fn set_context_usage(&self, usage: zeron_proto::ContextUsage) -> Result<(), DocError> {
+        if self.context_usage() != Some(usage) {
+            self.doc
+                .get_map("meta")
+                .insert("contextUsage", serde_json::to_string(&usage)?)?;
             self.doc.commit();
         }
         Ok(())
@@ -2002,7 +2017,8 @@ mod context_usage_tests {
             replica.context_usage(),
             Some(zeron_proto::ContextUsage {
                 tokens: Some(0),
-                window: Some(200_000)
+                window: Some(200_000),
+                ..Default::default()
             })
         );
         host.update_context_usage(None, Some(1_000_000)).unwrap();

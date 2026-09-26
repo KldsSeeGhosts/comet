@@ -480,6 +480,46 @@ async fn cancelled_catalog_decode_releases_a_stalled_http_body() {
     );
     server.await.unwrap();
 }
+
+/// 2.0.18 dropped the version-bearing `/api/health` (404) and serves the
+/// SPA's HTML under `/global/health` - `Protocol::detect` must still resolve
+/// V2 off any answering `/api/*` JSON route, or readiness never converges
+/// and spawn burns the whole startup budget (the "Loading models…" hang).
+#[tokio::test]
+async fn protocol_detect_falls_back_to_api_route_when_health_is_unversioned() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, ct, body) = match path.as_str() {
+                    "/api/health" => ("404 Not Found", "application/json", "{}".to_string()),
+                    // SPA catch-all: HTML, no version field.
+                    "/global/health" => ("200 OK", "text/html", "<html></html>".to_string()),
+                    "/api/session/active" => {
+                        ("200 OK", "application/json", r#"{"data":{}}"#.to_string())
+                    }
+                    _ => ("404 Not Found", "application/json", "{}".to_string()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let attached = Server::attached(base);
+    assert_eq!(attached.protocol().await, Protocol::V2);
+    server.abort();
+}
+
 use serde_json::json;
 
 #[test]

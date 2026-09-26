@@ -479,6 +479,184 @@ impl Harness for MockHarness {
             })
             .into_iter()
             .flatten();
+        // Dev/testing knob: `ZERON_MOCK_AGENTS=1` appends three spawn chips
+        // - one whose tagged subagent traffic settles fast (done), one that
+        // errors (failed), and one whose nested traffic is paced by
+        // `ZERON_MOCK_SUBAGENT_DELAY_MS` so it stays RUNNING through the
+        // demo (set that knob to e.g. 2000 to hold it). Unlike
+        // `ZERON_MOCK_SUBAGENT` (which ends all of its subagents before the
+        // run's Done), this fixture leaves one live at run end - the shape
+        // the dock strip / Agents panel / sidebar children are built for.
+        let mock_agents = std::env::var("ZERON_MOCK_AGENTS")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let agent_events = mock_agents
+            .then(|| {
+                let tag = |parent: &str, event: AgentEvent| AgentEvent::Subagent {
+                    parent_tool_use_id: parent.into(),
+                    event: Box::new(event),
+                };
+                let spawn = |id: &str, description: &str, prompt: &str, ty: &str| {
+                    AgentEvent::ToolCall {
+                        id: id.into(),
+                        call: zeron_proto::ToolCall::Unknown {
+                            name: format!("Agent: {description}"),
+                            input: Some(serde_json::json!({
+                                "description": description,
+                                "prompt": prompt,
+                                "subagent_type": ty,
+                            })),
+                        },
+                    }
+                };
+                let resolve = |id: &str| AgentEvent::ToolResult {
+                    id: id.into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                };
+                let done = |status: DoneStatus| AgentEvent::Done {
+                    status,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                };
+                vec![
+                    AgentEvent::TextDelta {
+                        text: "\n### Agents pass\n\nThree scouts are out; the fold rewrite waits on the slowest.\n\n".into(),
+                    },
+                    spawn(
+                        "mock-agt-run",
+                        "Sweep sidebar state hues",
+                        "Check every session-state hue in the sidebar against the palette.",
+                        "explorer",
+                    ),
+                    spawn(
+                        "mock-agt-done",
+                        "Audit composer padding",
+                        "Verify the composer column keeps its 4px rhythm at every width.",
+                        "reviewer",
+                    ),
+                    spawn(
+                        "mock-agt-fail",
+                        "Probe the dock edge",
+                        "Measure the dock strip's gap above the composer pill.",
+                        "reviewer",
+                    ),
+                    resolve("mock-agt-run"),
+                    resolve("mock-agt-done"),
+                    resolve("mock-agt-fail"),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::UserMessage {
+                            text: "Check every session-state hue in the sidebar against the palette.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-agt-done",
+                        AgentEvent::UserMessage {
+                            text: "Verify the composer column keeps its 4px rhythm at every width.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-agt-fail",
+                        AgentEvent::UserMessage {
+                            text: "Measure the dock strip's gap above the composer pill.".into(),
+                        },
+                    ),
+                    // The quick one finishes inside the first beats.
+                    tag(
+                        "mock-agt-done",
+                        AgentEvent::TextDelta {
+                            text: "Padding holds at every measured width - 4px rhythm intact.".into(),
+                        },
+                    ),
+                    tag("mock-agt-done", done(DoneStatus::Completed)),
+                    // The probe one errors almost immediately.
+                    tag(
+                        "mock-agt-fail",
+                        AgentEvent::TextDelta {
+                            text: "Dock probe hit a stale layout cache.".into(),
+                        },
+                    ),
+                    tag("mock-agt-fail", done(DoneStatus::Errored)),
+                    // The runner streams slowly - every tagged beat keeps
+                    // its chip Running while the parent turn has settled.
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::TextDelta {
+                            text: "Sweeping sidebar rows for hue drift.\n\n".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::ToolCall {
+                            id: "agt-run-read".into(),
+                            call: zeron_proto::ToolCall::ReadFile {
+                                path: "crates/ui/src/shell/spaces.rs".into(),
+                            },
+                        },
+                    ),
+                    tag("mock-agt-run", resolve("agt-run-read")),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::ToolCall {
+                            id: "agt-run-grep".into(),
+                            call: zeron_proto::ToolCall::Search {
+                                pattern: "SessionState::".into(),
+                                path: Some("crates/ui/src".into()),
+                            },
+                        },
+                    ),
+                    tag("mock-agt-run", resolve("agt-run-grep")),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::TextDelta {
+                            text: "Working through each state; sky Working reads correctly on the live card.".into(),
+                        },
+                    ),
+                    // More paced beats: enough tagged traffic that the chip
+                    // stays Running across a ~60s screenshot window.
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::ToolCall {
+                            id: "agt-run-read2".into(),
+                            call: zeron_proto::ToolCall::ReadFile {
+                                path: "crates/ui/src/status_palette.rs".into(),
+                            },
+                        },
+                    ),
+                    tag("mock-agt-run", resolve("agt-run-read2")),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::TextDelta {
+                            text: "Indigo awaiting and emerald completed both hold on their rows.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::ToolCall {
+                            id: "agt-run-grep2".into(),
+                            call: zeron_proto::ToolCall::Search {
+                                pattern: "status_palette".into(),
+                                path: Some("crates/ui/src/shell".into()),
+                            },
+                        },
+                    ),
+                    tag("mock-agt-run", resolve("agt-run-grep2")),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::TextDelta {
+                            text: "Failed rows take the danger hue; working rows keep the equalizer.".into(),
+                        },
+                    ),
+                    // No Done for mock-agt-run: it stays Running through the
+                    // demo, the whole point of the fixture. (The engine still
+                    // freezes it Failed when the parent run finally ends.)
+                ]
+            })
+            .into_iter()
+            .flatten();
         // With the code knob, also exercise a MULTILINE Exec command — the
         // round-9 chip breaker shape ("set -e\nfixture_in_original=0"): the
         // Run chip must stay one 30px line.
@@ -501,6 +679,126 @@ impl Harness for MockHarness {
             })
             .into_iter()
             .flatten();
+        // Dev/testing knob: `ZERON_MOCK_TOOLS=1` appends a representative
+        // tool-family mix for palette/typing QA: explore (read/search/glob),
+        // change (edit), neutral (exec/todo/unknown), a delegate spawn, and
+        // one FAILED exec (icon + trailing tag in danger, row stays muted).
+        let mock_tools = std::env::var("ZERON_MOCK_TOOLS")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let tool_mix_events = mock_tools
+            .then(|| {
+                use zeron_proto::ToolCall;
+                let call = |id: &str, call: ToolCall| AgentEvent::ToolCall {
+                    id: id.into(),
+                    call,
+                };
+                let ok = |id: &str| AgentEvent::ToolResult {
+                    id: id.into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                };
+                vec![
+                    AgentEvent::TextDelta {
+                        text: "\n### Tool pass\n\nSweeping the workspace, then patching and probing.\n\n".into(),
+                    },
+                    call(
+                        "mix-read",
+                        ToolCall::ReadFile {
+                            path: "crates/ui/src/transcript.rs".into(),
+                        },
+                    ),
+                    call(
+                        "mix-grep",
+                        ToolCall::Search {
+                            pattern: "tool_icon_path".into(),
+                            path: Some("crates/ui".into()),
+                        },
+                    ),
+                    call(
+                        "mix-glob",
+                        ToolCall::Glob {
+                            pattern: "crates/ui/src/**/*.rs".into(),
+                        },
+                    ),
+                    call(
+                        "mix-web",
+                        ToolCall::WebSearch {
+                            query: "gpui text_color hsla".into(),
+                        },
+                    ),
+                    call(
+                        "mix-exec",
+                        ToolCall::Exec {
+                            command: "cargo test -p zeron-ui --lib".into(),
+                        },
+                    ),
+                    call(
+                        "mix-edit",
+                        ToolCall::EditFile {
+                            path: "crates/ui/src/transcript.rs".into(),
+                            old_string: None,
+                            new_string: None,
+                        },
+                    ),
+                    call(
+                        "mix-todo",
+                        ToolCall::Todo {
+                            items: vec![
+                                zeron_proto::TodoItem {
+                                    text: "type kind-other tools by title".into(),
+                                    done: true,
+                                },
+                                zeron_proto::TodoItem {
+                                    text: "tint icons by tool family".into(),
+                                    done: false,
+                                },
+                            ],
+                        },
+                    ),
+                    call(
+                        "mix-unknown",
+                        ToolCall::Unknown {
+                            name: "codex-research".into(),
+                            input: Some(serde_json::json!({"query": "tool palette"})),
+                        },
+                    ),
+                    call(
+                        "mix-spawn",
+                        ToolCall::Unknown {
+                            name: "Agent: Sweep the sidebar states".into(),
+                            input: Some(serde_json::json!({
+                                "description": "Sweep the sidebar states",
+                                "prompt": "Check every session-state hue against the palette",
+                            })),
+                        },
+                    ),
+                    call(
+                        "mix-fail",
+                        ToolCall::Exec {
+                            command: "cargo test -p zeron-ui tool_rows".into(),
+                        },
+                    ),
+                    ok("mix-read"),
+                    ok("mix-grep"),
+                    ok("mix-glob"),
+                    ok("mix-web"),
+                    ok("mix-exec"),
+                    ok("mix-edit"),
+                    ok("mix-todo"),
+                    ok("mix-unknown"),
+                    ok("mix-spawn"),
+                    AgentEvent::ToolResult {
+                        id: "mix-fail".into(),
+                        is_error: true,
+                        output: Some("error[E0308]: mismatched types".into()),
+                        diff: None,
+                    },
+                ]
+            })
+            .into_iter()
+            .flatten();
         let events: Vec<Result<AgentEvent, HarnessError>> = body
             .iter()
             .cycle()
@@ -509,6 +807,8 @@ impl Harness for MockHarness {
             .chain(thinking_events)
             .chain(code_tool_events)
             .chain(subagent_events)
+            .chain(agent_events)
+            .chain(tool_mix_events)
             .chain(code_event)
             .chain(table_event)
             .chain(mend_event)

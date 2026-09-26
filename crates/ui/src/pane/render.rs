@@ -107,6 +107,10 @@ pub(crate) struct ViewSnap {
     pub active_tab_id: TabId,
     /// One chip per tab, in display order.
     pub chips: Vec<TabChip>,
+    /// Extra left padding ahead of the strip's first chip: nonzero only for
+    /// the window's top-left view while the titlebar cluster still overlays
+    /// the content edge (sidebar collapsing). Rides the sidebar tween.
+    pub leading_inset: f32,
     pub active_tab_root: SplitNode<PaneId>,
     pub panes: Vec<PaneSnap>,
 }
@@ -126,6 +130,9 @@ pub(crate) struct PaneSnap {
     /// the header title reads it (bright vs muted) without any geometry or
     /// pane-body change.
     pub focused: bool,
+    /// Extra left padding inside this pane's header: nonzero only for the
+    /// window's top-left pane while the titlebar cluster overlays it.
+    pub leading_inset: f32,
     /// The pane's own interactive transcript (`None` on the new-chat canvas
     /// or for a pane with no surface).
     pub transcript: Option<Entity<Transcript>>,
@@ -303,6 +310,7 @@ fn view_node(
                     el.child(chrome::tab_strip(
                         view.view_id,
                         &view.chips,
+                        view.leading_inset,
                         theme,
                         &snap.chip_bounds,
                         cx,
@@ -628,14 +636,20 @@ fn pane_container(
                 .then(|| snap.action_control.borrow_mut().take())
                 .flatten(),
             true,
+            pane.leading_inset,
             theme,
             cx,
         ))
-        .child(pane_body(theme, pane))
+        .child(pane_body(cx, theme, pane, snap))
         .into_any_element()
 }
 
-fn pane_body(theme: &Theme, pane: &PaneSnap) -> AnyElement {
+fn pane_body(
+    _cx: &Context<'_, Shell>,
+    theme: &Theme,
+    pane: &PaneSnap,
+    _snap: &WorkspaceSnap,
+) -> AnyElement {
     match pane.mode {
         PaneMode::Terminal => div()
             .flex_1()
@@ -733,6 +747,7 @@ mod tests {
                 })
                 .collect(),
             active_tab_root: SplitNode::leaf(PaneId(3)),
+            leading_inset: 0.0,
             panes: Vec::new(),
         }
     }
