@@ -554,8 +554,8 @@ impl Shell {
             .items_center()
             .h(px(24.0))
             .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.border)
+            // Borderless ghost control (design: "Add action" is ghost text,
+            // not a bordered chip); the segments carry their own hover wash.
             .occlude();
 
         if let Some(action) = preferred.clone() {
@@ -1029,6 +1029,8 @@ fn project_action_params(
 }
 
 fn action_segment(theme: &Theme, id: &'static str) -> gpui::Stateful<gpui::Div> {
+    // Same animated hover wash as the pane header's icon controls.
+    let hover_key = format!("{}-hover", id);
     div()
         .id(id)
         .h_full()
@@ -1036,9 +1038,14 @@ fn action_segment(theme: &Theme, id: &'static str) -> gpui::Stateful<gpui::Div> 
         .flex()
         .items_center()
         .gap(px(5.0))
-        .text_size(px(11.5))
-        .text_color(theme.text.opacity(0.9))
-        .hover(|style| style.bg(crate::theme::ink(0.07)))
+        .text_size(px(12.0))
+        .text_color(theme.text_muted)
+        .bg(crate::motion::hover_blend(
+            &hover_key,
+            gpui::transparent_black(),
+            theme.wash(0.11),
+        ))
+        .on_hover(crate::motion::hover_listener(hover_key))
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
 }
 
@@ -1046,6 +1053,7 @@ fn action_chevron(
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    let hover_key = "project-actions-chevron-hover";
     div()
         .id("project-actions-chevron")
         .h_full()
@@ -1053,10 +1061,13 @@ fn action_chevron(
         .flex()
         .items_center()
         .justify_center()
-        .border_l_1()
-        .border_color(theme.border)
         .cursor_pointer()
-        .hover(|style| style.bg(crate::theme::ink(0.07)))
+        .bg(crate::motion::hover_blend(
+            hover_key,
+            gpui::transparent_black(),
+            theme.wash(0.11),
+        ))
+        .on_hover(crate::motion::hover_listener(hover_key.to_string()))
         .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .on_click(move |event, window, cx| {
             cx.stop_propagation();

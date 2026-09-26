@@ -123,11 +123,25 @@ impl Shell {
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.command_palette = None;
         self.route = Route::Chat;
+        // A split-bound session reveals its preserved tree, even when the
+        // canvas currently displays a standalone session from another space.
+        // A session minted on the solo canvas stays solo when reopened.
+        let bound_in_workspace = self.reveal_workspace_session(&chat_id, cx);
+        if !bound_in_workspace && (self.solo_session || self.solo_chat_ids.contains(&chat_id)) {
+            self.enter_solo_session(cx);
+        }
         self.focus_composer(cx);
-        // Track the explicit navigation so workspace restore preserves it.
-        self.pending_explicit_nav = Some(Some(chat_id.clone()));
-        self.state
-            .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+        // No pane may be rebound while the solo surface is visible. A normal
+        // sidebar navigation still carries its one-shot intent across a
+        // possible project layout restore.
+        self.pending_explicit_nav = (!self.solo_session).then(|| Some(chat_id.clone()));
+        self.state.update(cx, |s, cx| {
+            if bound_in_workspace {
+                s.select_workspace_pane_chat(Some(chat_id), cx);
+            } else {
+                s.select_chat(Some(chat_id), cx);
+            }
+        });
         cx.notify();
     }
 
@@ -137,10 +151,11 @@ impl Shell {
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
         self.command_palette = None;
         self.route = Route::Chat;
+        self.enter_solo_session(cx);
         self.focus_composer(cx);
-        // Track the explicit new-session intent so workspace restore
-        // does not overwrite it with a saved layout's focused chat.
-        self.pending_explicit_nav = Some(None);
+        // A fresh canvas lives outside the preserved workspace. Selection
+        // notifications still run, but there is no pane-rebinding intent.
+        self.pending_explicit_nav = None;
         let target = {
             let state = self.state.read(cx);
             self.settings

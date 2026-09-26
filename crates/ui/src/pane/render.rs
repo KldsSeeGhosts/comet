@@ -6,12 +6,12 @@
 //!
 //! Hosting rules:
 //! - every Chat-mode pane renders its OWN transcript (or an empty canvas
-//!   area for an unbound pane) over its OWN composer footer — focus changes
-//!   nothing in the element tree; each pane is a rounded island painted
-//!   with the active theme's content background and border tokens;
-//! - click-to-focus controls keyboard/selection routing and strengthens the
-//!   island's border without changing its size or dimming other panes;
-//! - every pane renders its header — the pane's chat identity row;
+//!   area for an unbound pane) over its OWN composer footer - focus changes
+//!   nothing in the element tree; each pane is flush on the same shell glass
+//!   as the single-chat route, separated only by divider hairlines;
+//! - click-to-focus controls keyboard/selection routing and brightens the
+//!   header title without changing any size or dimming other panes;
+//! - every pane renders its header - the pane's chat identity row;
 //! - a sole top-level view hides its tab strip when it has a single tab;
 //!   the strip survives for multi-tab views and any view whose close
 //!   control it carries.
@@ -19,13 +19,15 @@
 //! Sizing: every split child gets `flex_basis(0)` + `flex_grow(weight)` with
 //! weights from [`super::flex_weights`] (the markdown table trick), so nested
 //! ratios compose multiplicatively and the engine's clamped ratios map 1:1 to
-//! on-screen fractions. The divider between two children is a fixed
-//! [`super::DIVIDER_HIT_PX`] flex-none strip straddling the node line;
-//! children share the remaining span, which [`super::ratio_from_pointer`]
-//! accounts for (the engine op lives in `shell/panes.rs`).
+//! on-screen fractions. The seam between two children is a fixed
+//! [`super::DIVIDER_SEAM_PX`] (1px) flex-none hairline; children share the
+//! remaining span, which [`super::ratio_from_pointer`] accounts for (the
+//! engine op lives in `shell/panes.rs`). An [`super::DIVIDER_HIT_PX`] (8px)
+//! hit target overlaps both neighboring panes (3.5px each side) in an overlay
+//! painted after both children so it wins hit-testing over the second pane.
 //!
 //! Paths: a divider's [`DividerTarget`] carries the `Vec<Branch>` path from
-//! the tree root to ITS node — the first child recurses with `path+[First]`,
+//! the tree root to ITS node - the first child recurses with `path+[First]`,
 //! the second with `path+[Second]`, while the divider between them names
 //! `path` itself (the node whose ratio it drags).
 //!
@@ -53,24 +55,27 @@ use crate::transcript::Transcript;
 use super::chrome::{self, TabChip};
 use super::flex_weights;
 use super::hit_test::PreviewKind;
-use super::{DIVIDER_HIT_PX, DividerDrag, DividerGhost, DividerTarget};
-/// The workspace outlet's outer padding: 3px on every side — the window-wide
-/// chat header is gone, so the top reserves no titlebar band. Shared with
+use super::{DIVIDER_HIT_PX, DIVIDER_SEAM_PX, DividerDrag, DividerGhost, DividerTarget};
+
+/// Signed offset of the [`DIVIDER_HIT_PX`] hit strip relative to its
+/// [`DIVIDER_SEAM_PX`] anchor: `-3.5px`, so the 8px band straddles the 1px
+/// hairline evenly (`3.5px` over the first pane, `1px` over the seam, `3.5px`
+/// over the second pane).
+const DIVIDER_HIT_OFFSET_PX: f32 = -((DIVIDER_HIT_PX - DIVIDER_SEAM_PX) / 2.0);
+/// The workspace outlet's outer padding: zero - panes are flush with the
+/// content region and only the dividers separate them. Shared with
 /// `shell/panes.rs`'s drag geometry so the hit-test `content` region is
-/// derived from the SAME constants the outlet lays out with — the preview
+/// derived from the SAME constants the outlet lays out with - the preview
 /// overlay, the pane/view rects and the boundary math must all reference one
 /// coordinate space, not two.
-pub(crate) const OUTLET_PAD_PX: f32 = 3.0;
+pub(crate) const OUTLET_PAD_PX: f32 = 0.0;
 pub(crate) const OUTLET_TOP_PAD_PX: f32 = OUTLET_PAD_PX;
 
-/// The pane tree's inner gutter: each view's active tab pane tree pads this
-/// much inside its view region, so the outermost pane edges sit this far
-/// inside the workspace content edge. `hit_test::BOUNDARY_EPSILON_PX` is
-/// sized from it.
-pub(crate) const PANE_TREE_PAD_PX: f32 = 6.0;
-
-/// Shared by every leaf, including nested horizontal and vertical splits.
-const PANE_ISLAND_RADIUS_PX: f32 = 12.0;
+/// The pane tree's inner gutter: zero - each view's active tab pane tree
+/// fills its view region flush. Kept as the one shared layout constant the
+/// drag geometry references ([`hit_test`] holds its own explicit drop
+/// tolerances so shrinking this to zero cannot silently move them).
+pub(crate) const PANE_TREE_PAD_PX: f32 = 0.0;
 
 /// Immutable render-time snapshot of the workspace tree. Built per frame
 /// (cheap: small trees, cloned ids/titles only).
@@ -87,6 +92,10 @@ pub(crate) struct WorkspaceSnap {
     /// The focused pane's project Action control. Recursive rendering
     /// consumes it exactly once when it reaches that pane.
     pub action_control: Rc<RefCell<Option<AnyElement>>>,
+    /// One take-once 14px project badge per bound pane, keyed by pane
+    /// (`AnyElement` is not cloneable). A pane without a bound chat renders
+    /// none; the pane container removes its own entry.
+    pub project_badges: Rc<RefCell<std::collections::BTreeMap<PaneId, AnyElement>>>,
 }
 
 pub(crate) struct ViewSnap {
@@ -108,12 +117,14 @@ pub(crate) struct PaneSnap {
     pub title: SharedString,
     /// The pane's provider mark (provider drag ghost identity).
     pub mark: chrome::TabMark,
-    pub buddy: Option<chrome::PaneBuddy>,
+    /// The header's session metadata: mono context line + display state.
+    pub meta: chrome::PaneMeta,
     /// Kept in the snapshot contract for the shell's pane bookkeeping; the
     /// header's changes-toggle gate also reads it (focused + bound only).
     pub has_session: bool,
-    /// The one globally focused pane — routing, the changes-toggle gate,
-    /// and island border emphasis; it does not change the pane body.
+    /// The one globally focused pane - routing and the changes-toggle gate;
+    /// the header title reads it (bright vs muted) without any geometry or
+    /// pane-body change.
     pub focused: bool,
     /// The pane's own interactive transcript (`None` on the new-chat canvas
     /// or for a pane with no surface).
@@ -124,15 +135,15 @@ pub(crate) struct PaneSnap {
 
 /// The content-area outlet for workspace mode: the whole view tree. Every
 /// pane renders the entities it owns ([`PaneSnap::transcript`] /
-/// [`PaneSnap::composer`]) — nothing is threaded through the recursion.
+/// [`PaneSnap::composer`]) - nothing is threaded through the recursion.
 ///
-/// WS4: the outlet is the drag surface. `drag_preview` — the active drag's
-/// resolved preview rect in outlet-relative coordinates — paints ABOVE the
+/// WS4: the outlet is the drag surface. `drag_preview` - the active drag's
+/// resolved preview rect in outlet-relative coordinates - paints ABOVE the
 /// tree (§3: half-pane for splits, full region for view splits and center
 /// moves, a 2px insertion marker for strip drops). The offsets
 /// feed an `.absolute()` child, which Taffy measures from this div's
 /// border-box origin (its padding does NOT shift absolute children), and the
-/// conversion subtracts exactly that origin — `DragMoveEvent::bounds`, this
+/// conversion subtracts exactly that origin - `DragMoveEvent::bounds`, this
 /// div's paint-time hitbox. The root's `on_drag_move` receives every pointer
 /// sample while a [`TabSplitDrag`] is live (GPUI capture dispatch, inside or
 /// outside the outlet), `on_drop` commits on mouse-up inside, and the
@@ -143,6 +154,7 @@ pub(crate) fn workspace_outlet(
     theme: &Theme,
     snap: &WorkspaceSnap,
     drag_preview: Option<(Bounds<Pixels>, PreviewKind)>,
+    sidebar_drop_outlet: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
 ) -> AnyElement {
     div()
         .relative()
@@ -151,7 +163,18 @@ pub(crate) fn workspace_outlet(
         .flex_col()
         .overflow_hidden()
         .p(px(OUTLET_PAD_PX))
+        .child(
+            canvas(
+                move |bounds, _, _| sidebar_drop_outlet.set(Some(bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
         .child(view_node(cx, theme, &snap.root, &[], snap))
+        // Share the shell's backdrop with the single-chat route. Painting
+        // theme.bg here made every split workspace substantially darker than
+        // the same chat opened alone, especially on frosted macOS windows.
         // The live drop preview (§3): every resolved plan paints one, above
         // everything it covers.
         .children(drag_preview.map(|(b, kind)| split_drop_preview(b, kind, theme)))
@@ -174,13 +197,13 @@ pub(crate) fn workspace_outlet(
         .into_any_element()
 }
 
-/// The one drop preview for every resolved plan — shared by the workspace
+/// The one drop preview for every resolved plan - shared by the workspace
 /// outlet and the legacy single-pane content area so drag feedback reads
 /// identically on both surfaces. The [`PreviewKind`] the resolver produced
 /// chooses the paint: a solid accent line for strip insertions, a half-pane
 /// wash for pane splits, a fainter full-pane wash for tab joins and
 /// existing-pane focuses, and a stronger half-region wash for view splits.
-/// No listeners, no animation — direct manipulation stays
+/// No listeners, no animation - direct manipulation stays
 /// synchronized with the resolved drop plan.
 pub(crate) fn split_drop_preview(
     bounds: Bounds<Pixels>,
@@ -195,20 +218,18 @@ pub(crate) fn split_drop_preview(
         .h(bounds.size.height);
     match kind {
         PreviewKind::Insertion => el.rounded(px(1.0)).bg(theme.accent).into_any_element(),
+        // Square like the flush panes they describe (no island radius).
         PreviewKind::PaneHalf => el
-            .rounded(px(PANE_ISLAND_RADIUS_PX))
             .border_1()
             .border_color(theme.accent)
             .bg(theme.accent.opacity(0.14))
             .into_any_element(),
         PreviewKind::FullTarget => el
-            .rounded(px(PANE_ISLAND_RADIUS_PX))
             .border_1()
             .border_color(theme.accent)
             .bg(theme.accent.opacity(0.08))
             .into_any_element(),
         PreviewKind::ViewHalf => el
-            .rounded(px(PANE_ISLAND_RADIUS_PX))
             .border_2()
             .border_color(theme.accent)
             .bg(theme.accent.opacity(0.14))
@@ -218,7 +239,7 @@ pub(crate) fn split_drop_preview(
 
 /// Whether a view renders its tab strip: hidden on the common sole-view /
 /// single-tab case (a lone chip is redundant chrome), preserved whenever a
-/// second tab exists OR the strip must carry the view's × — the multi-view
+/// second tab exists OR the strip must carry the view's × - the multi-view
 /// strip owns the visible close-view control.
 pub(crate) fn show_tab_strip(view: &ViewSnap) -> bool {
     view.chips.len() > 1 || view.closable
@@ -247,7 +268,6 @@ fn view_node(
                 *horizontal,
                 *ratio,
                 target,
-                &divider_id_of(path),
                 view_node(cx, theme, first, &joined(path, Branch::First), snap),
                 view_node(cx, theme, second, &joined(path, Branch::Second), snap),
             )
@@ -257,7 +277,7 @@ fn view_node(
                 return Empty.into_any_element();
             };
             // View = optional tab strip + the ACTIVE tab's pane tree. Inactive
-            // tabs keep their surfaces (each pane owns its entities — only the
+            // tabs keep their surfaces (each pane owns its entities - only the
             // ELEMENTS unmount). A paint-time canvas records the view region's
             // bounds (WS4: the SplitView preview washes this whole region).
             let view_bounds_cell = snap.view_bounds.clone();
@@ -304,16 +324,21 @@ fn view_node(
     }
 }
 
-/// `path + [branch]` — the child recursion's path.
+/// `path + [branch]` - the child recursion's path.
 fn joined(path: &[Branch], branch: Branch) -> Vec<Branch> {
     let mut next = path.to_vec();
     next.push(branch);
     next
 }
 
-/// A stable, path-derived element id for a divider (hover keys key off it).
-fn divider_id_of(path: &[Branch]) -> String {
-    let mut id = String::from("ws-div-");
+/// A stable, target-derived element id for a divider (hover keys key off it).
+fn divider_id_of(target: &DividerTarget) -> String {
+    let (mut id, path) = match target {
+        DividerTarget::View { path } => (String::from("ws-div-v-"), path.as_slice()),
+        DividerTarget::Pane { view, tab, path } => {
+            (format!("ws-div-p-{}-{}-", view.0, tab.0), path.as_slice())
+        }
+    };
     for branch in path {
         id.push(match branch {
             Branch::First => 'F',
@@ -349,7 +374,6 @@ fn pane_node(
                 *horizontal,
                 *ratio,
                 target,
-                &divider_id_of(path),
                 pane_node(cx, theme, first, &joined(path, Branch::First), view, snap),
                 pane_node(cx, theme, second, &joined(path, Branch::Second), view, snap),
             )
@@ -363,26 +387,29 @@ fn pane_node(
     }
 }
 
-/// A split's two children with a divider between them: weighted flex with
-/// zero basis so ratios map exactly to sizes regardless of content, and a
-/// fixed-width invisible hit strip straddling the node line (§1: ~8px hit
-/// area; a centered hairline appears on hover). Dragging commits
-/// live ratio updates to THIS node only; double-click equalizes it.
+/// A split's two children with a 1px hairline seam between them and an 8px
+/// hit-target overlay straddling the seam. Weighted flex with zero basis maps
+/// ratios directly to child sizes (`container_length - 1px`), while the
+/// interactive hit strip is painted after both children so GPUI's reverse
+/// paint-order hit test reaches the divider over both the first and second
+/// panes. Dragging commits live ratio updates to THIS node only; double-click
+/// equalizes it.
 fn split_container(
     cx: &Context<'_, Shell>,
     theme: &Theme,
     horizontal: bool,
     ratio: f64,
     target: DividerTarget,
-    id: &str,
     first: AnyElement,
     second: AnyElement,
 ) -> AnyElement {
     let (w_first, w_second) = flex_weights(ratio);
+    let id = divider_id_of(&target);
+    let hover_key = SharedString::from(format!("{id}-hover"));
     let container = if horizontal {
-        div().flex().flex_row()
+        div().relative().flex().flex_row()
     } else {
-        div().flex().flex_col()
+        div().relative().flex().flex_col()
     };
     // The divider consumes a clone for its drag payload; the container keeps
     // one for the ownership filter below.
@@ -392,10 +419,13 @@ fn split_container(
         .min_w_0()
         .min_h_0()
         .child(split_child(w_first, first))
-        .child(divider(cx, theme, id, horizontal, target))
+        .child(divider_seam(theme, &hover_key, horizontal))
         .child(split_child(w_second, second))
+        .child(divider_hit_overlay(
+            cx, &id, hover_key, horizontal, w_first, w_second, target,
+        ))
         // Drag samples arrive here (the container owns the bounds the ratio
-        // math needs — `DragMoveEvent::bounds`). Ancestor containers also
+        // math needs - `DragMoveEvent::bounds`). Ancestor containers also
         // receive the event during capture; each filters by the drag
         // payload's target, so only the container that OWNS the divider
         // applies a ratio.
@@ -410,67 +440,54 @@ fn split_container(
         .into_any_element()
 }
 
-/// The divider strip: an invisible [`DIVIDER_HIT_PX`] hit area straddling the
-/// node line with a 1px hairline at its center visible on hover. At rest the
-/// gap exposes the shell backdrop between the islands' own borders.
-/// Starts a GPUI drag ([`DividerDrag`]) so the container's `on_drag_move`
-/// receives pointer samples; mouse-up (or double-click) resolves here.
-/// `.occlude()` keeps the click that starts a drag from reaching anything
-/// under the strip — a divider press never focuses a pane.
-fn divider(
+/// The 1px visual seam in flex flow between two split children: `theme.border`
+/// at rest, blending to `theme.border_strong` while its hit strip is hovered
+/// (or latched during a live divider drag).
+fn divider_seam(theme: &Theme, hover_key: &SharedString, horizontal: bool) -> AnyElement {
+    let color = crate::motion::hover_blend(hover_key, theme.border, theme.border_strong);
+    div()
+        .flex_none()
+        .when(horizontal, |el| el.w(px(DIVIDER_SEAM_PX)).h_full())
+        .when(!horizontal, |el| el.h(px(DIVIDER_SEAM_PX)).w_full())
+        .bg(color)
+        .into_any_element()
+}
+
+/// Transparent overlay painted after both split children so the [`DIVIDER_HIT_PX`]
+/// hit strip sits above the second pane in GPUI's hit-test and event order.
+/// The outer flex container and its two weighted spacers carry no interactivity
+/// (`should_insert_hitbox` is false), so only the 8px `.occlude()` strip
+/// registers a hitbox (~3.5px over each adjacent pane).
+fn divider_hit_overlay(
     cx: &Context<'_, Shell>,
-    theme: &Theme,
     id: &str,
+    hover_key: SharedString,
     horizontal: bool,
+    w_first: f32,
+    w_second: f32,
     target: DividerTarget,
 ) -> AnyElement {
-    let hover_key = SharedString::from(format!("{}-hover", id));
-    let line = div()
-        .absolute()
-        .top_0()
-        .bottom_0()
-        .left_0()
-        .right_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(if horizontal {
-            // Side-by-side panes: a vertical 1px line.
-            div()
-                .w(px(1.0))
-                .h_full()
-                .bg(crate::motion::hover_blend(
-                    &hover_key,
-                    theme.border_strong.opacity(0.0),
-                    theme.border_strong,
-                ))
-                .into_any_element()
-        } else {
-            // Stacked panes: a horizontal 1px line.
-            div()
-                .h(px(1.0))
-                .w_full()
-                .bg(crate::motion::hover_blend(
-                    &hover_key,
-                    theme.border_strong.opacity(0.0),
-                    theme.border_strong,
-                ))
-                .into_any_element()
-        });
     let drag = DividerDrag {
         target: target.clone(),
         horizontal,
     };
-    div()
-        .id(SharedString::from(format!("{}", id)))
-        .flex_none()
-        .relative()
+    let hit_strip = div()
+        .id(SharedString::from(id.to_owned()))
+        .absolute()
         .occlude()
         .when(horizontal, |el| {
-            el.w(px(DIVIDER_HIT_PX)).cursor_col_resize()
+            el.left(px(DIVIDER_HIT_OFFSET_PX))
+                .top_0()
+                .bottom_0()
+                .w(px(DIVIDER_HIT_PX))
+                .cursor_col_resize()
         })
         .when(!horizontal, |el| {
-            el.h(px(DIVIDER_HIT_PX)).cursor_row_resize()
+            el.top(px(DIVIDER_HIT_OFFSET_PX))
+                .left_0()
+                .right_0()
+                .h(px(DIVIDER_HIT_PX))
+                .cursor_row_resize()
         })
         // Hover feedback pauses while any divider drag is live so the strip
         // never re-fades mid-drag (hover churn reads as flicker). The shell
@@ -479,7 +496,6 @@ fn divider(
         .on_hover(cx.listener(move |this, hovered: &bool, _, _| {
             this.note_divider_hover(&hover_key, *hovered);
         }))
-        .child(line)
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| {
@@ -503,6 +519,33 @@ fn divider(
         .on_mouse_up_out(
             MouseButton::Left,
             cx.listener(|this, _, _, cx| this.end_divider_drag(cx)),
+        );
+    let anchor = div()
+        .flex_none()
+        .relative()
+        .when(horizontal, |el| el.w(px(DIVIDER_SEAM_PX)).h_full())
+        .when(!horizontal, |el| el.h(px(DIVIDER_SEAM_PX)).w_full())
+        .child(hit_strip);
+    let overlay = if horizontal {
+        div().absolute().inset_0().flex().flex_row()
+    } else {
+        div().absolute().inset_0().flex().flex_col()
+    };
+    overlay
+        .child(
+            div()
+                .flex_basis(px(0.0))
+                .flex_grow(w_first)
+                .min_w_0()
+                .min_h_0(),
+        )
+        .child(anchor)
+        .child(
+            div()
+                .flex_basis(px(0.0))
+                .flex_grow(w_second)
+                .min_w_0()
+                .min_h_0(),
         )
         .into_any_element()
 }
@@ -520,13 +563,14 @@ fn split_child(weight: f32, child: AnyElement) -> AnyElement {
         .into_any_element()
 }
 
-/// One pane: click-to-focus container, its header (the chat identity row —
+/// One pane: click-to-focus container, its header (the chat identity row -
 /// `closable` only gates the ×), and the pane's own transcript + composer
-/// body. Each leaf is a complete island, with an opaque content background
-/// for reading and the shell's chosen backdrop visible through the gutters.
-/// Theme tokens preserve light, dark, and custom palettes. Focus changes
-/// only the border color, so switching panes never shifts their contents.
-/// A paint-time canvas records the pane's bounds for the tool-picker anchor.
+/// body. Each leaf is flush on the same shell backdrop as a lone chat (no
+/// radius or island border); the dividers carry the only hairlines. Avoid a
+/// pane-local opaque fill that changes the appearance when a chat is split.
+/// Focus brightens the header title only, so switching panes never shifts
+/// their contents. A paint-time canvas records the pane's bounds for the
+/// tool-picker anchor.
 fn pane_container(
     cx: &Context<'_, Shell>,
     theme: &Theme,
@@ -536,6 +580,7 @@ fn pane_container(
 ) -> AnyElement {
     let pane_id = pane.pane;
     let bounds_cell = snap.pane_bounds.clone();
+    let badge = snap.project_badges.borrow_mut().remove(&pane_id);
     let container = div()
         .flex_1()
         .min_w_0()
@@ -543,14 +588,6 @@ fn pane_container(
         .relative()
         .flex()
         .flex_col()
-        .rounded(px(PANE_ISLAND_RADIUS_PX))
-        .bg(theme.bg)
-        .border_1()
-        .border_color(if pane.focused {
-            theme.border_strong
-        } else {
-            theme.border
-        })
         .overflow_hidden()
         // Click anywhere in the pane focuses it (§7); the listener no-ops
         // when the pane is already focused, so scrolling a transcript never
@@ -565,28 +602,27 @@ fn pane_container(
         .child(
             canvas(
                 move |bounds, _, _| {
-                    // The absolute canvas fills the padding box. Include
-                    // the island's 1px border in drag/drop geometry.
-                    let outer = Bounds {
-                        origin: gpui::point(bounds.origin.x - px(1.0), bounds.origin.y - px(1.0)),
-                        size: gpui::size(bounds.size.width + px(2.0), bounds.size.height + px(2.0)),
-                    };
-                    bounds_cell.borrow_mut().insert(pane_id, outer);
+                    // No island border: the painted bounds ARE the pane's
+                    // drag/drop geometry (flush against its siblings, with
+                    // only the divider strip between them).
+                    bounds_cell.borrow_mut().insert(pane_id, bounds);
                 },
                 |_, _, _, _| {},
             )
             .absolute()
             .inset_0(),
         );
-    // Every pane renders its header — the chat identity row now that the
+    // Every pane renders its header - the chat identity row now that the
     // window-wide chat header is gone.
     container
         .child(chrome::pane_header(
             pane.pane,
             pane.title.clone(),
             pane.mark,
-            pane.buddy.as_ref(),
+            &pane.meta,
+            badge,
             closable,
+            pane.focused,
             pane.focused && pane.has_session,
             pane.focused
                 .then(|| snap.action_control.borrow_mut().take())
@@ -632,7 +668,7 @@ fn pane_body(theme: &Theme, pane: &PaneSnap) -> AnyElement {
                     .into_any_element(),
                 None => div().flex_1().min_w_0().min_h_0().into_any_element(),
             };
-            // The pane's own composer as its FLEX FOOTER — it consumes its
+            // The pane's own composer as its FLEX FOOTER - it consumes its
             // own height out of the pane's column so the transcript above
             // ends at the footer's top edge. A paint-time canvas feeds the
             // pane's actual width into the composer's responsive mode (each
@@ -707,7 +743,38 @@ mod tests {
         assert!(!show_tab_strip(&view(1, false)));
         // A second tab needs the strip to switch.
         assert!(show_tab_strip(&view(2, false)));
-        // A closable view keeps the strip — it carries the ×.
+        // A closable view keeps the strip - it carries the ×.
         assert!(show_tab_strip(&view(1, true)));
+    }
+
+    #[test]
+    fn divider_hit_strip_straddles_the_one_pixel_seam_and_ids_stay_unique() {
+        assert_eq!(DIVIDER_SEAM_PX, 1.0);
+        assert_eq!(DIVIDER_HIT_PX, 8.0);
+        assert_eq!(DIVIDER_HIT_OFFSET_PX, -3.5);
+        assert_eq!(
+            DIVIDER_HIT_PX + 2.0 * DIVIDER_HIT_OFFSET_PX,
+            DIVIDER_SEAM_PX
+        );
+
+        let root_view = DividerTarget::View { path: vec![] };
+        let root_pane_a = DividerTarget::Pane {
+            view: ViewId(1),
+            tab: TabId(2),
+            path: vec![],
+        };
+        let root_pane_b = DividerTarget::Pane {
+            view: ViewId(2),
+            tab: TabId(3),
+            path: vec![],
+        };
+        let nested_pane = DividerTarget::Pane {
+            view: ViewId(1),
+            tab: TabId(2),
+            path: vec![Branch::First, Branch::Second],
+        };
+        assert_ne!(divider_id_of(&root_view), divider_id_of(&root_pane_a));
+        assert_ne!(divider_id_of(&root_pane_a), divider_id_of(&root_pane_b));
+        assert_eq!(divider_id_of(&nested_pane), "ws-div-p-1-2-FS");
     }
 }

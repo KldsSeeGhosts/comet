@@ -74,6 +74,76 @@ fn same_project_navigation_focuses_existing_pane_without_rebinding_its_neighbor(
     }).unwrap();
 }
 
+/// A sidebar row may point to a session hosted in a pane of another space's
+/// layout. Clicking it must reveal that layout rather than follow the chat's
+/// native space and replace the four-pane workspace with a lone chat.
+#[gpui::test]
+fn sidebar_selection_of_foreign_session_keeps_its_four_pane_workspace(
+    cx: &mut TestAppContext,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        seed_selected_project(shell, cx);
+        shell.state.update(cx, |state, _| {
+            state.spaces.push(serde_json::from_value(space("a")).unwrap());
+            state.chats.push(serde_json::from_value(chat("chat-foreign", "a")).unwrap());
+        });
+        shell.on_state_changed(&shell.state.clone(), cx);
+        let first = shell.workspace.focused_pane().unwrap();
+        let second = shell.workspace.split_focused_pane(Direction::Right).unwrap();
+        shell.workspace.set_pane_session(second, Some("chat-b".into())).unwrap();
+        let third = shell.workspace.split_focused_pane(Direction::Down).unwrap();
+        shell.workspace.set_pane_session(third, Some("chat-foreign".into())).unwrap();
+        let fourth = shell.workspace.split_focused_pane(Direction::Right).unwrap();
+        shell.focus_workspace_pane(first, cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        let layout_before = shell.workspace.layout.clone();
+
+        shell.open_chat("chat-foreign".into(), cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        assert_eq!(shell.active_workspace_space.as_deref(), Some("b"));
+        assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("b"));
+        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("chat-foreign"));
+        assert_eq!(shell.workspace.focused_pane(), Some(third));
+        for pane in [first, second, third, fourth] {
+            assert_eq!(
+                shell.workspace.layout.pane(pane).unwrap().session_id,
+                layout_before.pane(pane).unwrap().session_id,
+                "sidebar navigation must preserve every pane binding",
+            );
+        }
+        shell.workspace.layout.validate().unwrap();
+        shell.on_state_changed(&shell.state.clone(), cx);
+        assert_eq!(shell.workspace.focused_pane(), Some(third));
+        assert_eq!(shell.active_workspace_space.as_deref(), Some("b"));
+    }).unwrap();
+}
+
+#[gpui::test]
+fn unbound_foreign_session_still_follows_its_native_space(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| init_app(dir.path(), cx));
+    let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
+    window.update(cx, |shell, _, cx| {
+        seed_selected_project(shell, cx);
+        shell.state.update(cx, |state, _| {
+            state.spaces.push(serde_json::from_value(space("a")).unwrap());
+            state.chats.push(serde_json::from_value(chat("chat-foreign", "a")).unwrap());
+        });
+        shell.on_state_changed(&shell.state.clone(), cx);
+        shell.workspace.split_focused_pane(Direction::Right).unwrap();
+
+        shell.open_chat("chat-foreign".into(), cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        assert_eq!(shell.active_workspace_space.as_deref(), Some("a"));
+        assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("a"));
+        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("chat-foreign"));
+        assert!(shell.workspace.is_trivial());
+    }).unwrap();
+}
+
 #[gpui::test]
 fn explicit_cross_project_navigation_wins_over_saved_focus(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -93,7 +163,7 @@ fn explicit_cross_project_navigation_wins_over_saved_focus(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-fn new_session_intent_clears_only_the_focused_pane_and_is_consumed(cx: &mut TestAppContext) {
+fn new_session_opens_solo_without_rebinding_the_split_workspace(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     cx.update(|cx| init_app(dir.path(), cx));
     let window = cx.add_window(|_, cx| new_shell(dir.path(), cx));
@@ -108,9 +178,16 @@ fn new_session_intent_clears_only_the_focused_pane_and_is_consumed(cx: &mut Test
         shell.open_new_session(cx);
         shell.on_state_changed(&shell.state.clone(), cx);
         assert!(shell.state.read(cx).selected_chat.is_none());
-        assert!(shell.workspace.layout.pane(second).unwrap().session_id.is_none());
+        assert!(shell.solo_session);
+        assert!(!shell.workspace_mode());
+        assert_eq!(shell.workspace.layout.pane(second).unwrap().session_id.as_deref(), Some("chat-b"));
         assert_eq!(shell.workspace.layout.pane(first).unwrap().session_id.as_deref(), Some("chat-a"));
         assert!(shell.pending_explicit_nav.is_none());
+        shell.open_chat("chat-a".into(), cx);
+        shell.on_state_changed(&shell.state.clone(), cx);
+        assert!(shell.workspace_mode());
+        assert_eq!(shell.workspace.focused_pane(), Some(first));
+        assert_eq!(shell.workspace.layout.pane(second).unwrap().session_id.as_deref(), Some("chat-b"));
     }).unwrap();
 }
 
@@ -159,10 +236,8 @@ fn reselecting_the_active_seen_session_does_not_arm_stale_navigation(
     }).unwrap();
 }
 
-/// `+` while already on the new-session canvas re-runs `open_new_session`,
-/// whose `select_chat(None)` is a no-op. The re-armed intent must be consumed
-/// by the guaranteed notification, not survive into an unrelated frame —
-/// where it would unbind whatever the focused pane picked up in between.
+/// Repeated `+` on a solo canvas must never arm a delayed intent that can
+/// unbind a pane on a later, unrelated state notification.
 #[gpui::test]
 fn new_session_request_while_already_on_canvas_does_not_clear_panes_later(
     cx: &mut TestAppContext,
@@ -179,11 +254,11 @@ fn new_session_request_while_already_on_canvas_does_not_clear_panes_later(
         shell.workspace.set_pane_session(second, Some("chat-b".into())).unwrap();
         shell.focus_workspace_pane(second, cx);
         shell.on_state_changed(&shell.state.clone(), cx);
-        // The first request lands on the canvas: the focused pane unbinds.
         shell.open_new_session(cx);
         shell.on_state_changed(&shell.state.clone(), cx);
         assert!(shell.state.read(cx).selected_chat.is_none());
-        assert!(shell.workspace.layout.pane(second).unwrap().session_id.is_none());
+        assert!(shell.solo_session);
+        assert_eq!(shell.workspace.layout.pane(second).unwrap().session_id.as_deref(), Some("chat-b"));
         assert_eq!(shell.workspace.layout.pane(first).unwrap().session_id.as_deref(), Some("chat-a"));
         (first, second)
     }).unwrap();
@@ -201,10 +276,7 @@ fn new_session_request_while_already_on_canvas_does_not_clear_panes_later(
              armed navigation intent is consumed now, not on a later frame",
         );
         assert!(shell.pending_explicit_nav.is_none());
-        // Damage window: the focused pane picks up a session with no AppState
-        // notification in between (a direct binding here; a layout restore or
-        // tab drop in the app). The already-consumed intent must not clear it.
-        shell.workspace.set_pane_session(second, Some("chat-b".into())).unwrap();
+        // A subsequent state notification must not change any preserved pane.
         shell.on_state_changed(&shell.state.clone(), cx);
         assert!(shell.pending_explicit_nav.is_none());
         assert_eq!(shell.workspace.layout.pane(second).unwrap().session_id.as_deref(), Some("chat-b"));
