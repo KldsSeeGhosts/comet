@@ -60,12 +60,14 @@ pub struct SubagentSummary {
 
 impl SubagentSummary {
     /// `45s` / `2m` / `1h 4m` — live for active phases, frozen at finish.
+    /// Settled agents with no observed finish time show nothing rather
+    /// than a guessed duration.
     pub fn elapsed(&self, now: DateTime<Utc>) -> Option<String> {
         let started = self.started?;
         let end = if self.status.active() {
             now
         } else {
-            self.finished.unwrap_or(started)
+            self.finished?
         };
         Some(crate::shell::format_working_elapsed(
             end.signed_duration_since(started).num_seconds(),
@@ -284,12 +286,18 @@ pub fn subagents_for(state: &AppState, chat_id: &str) -> Vec<SubagentSummary> {
         })
     });
     // Record first-observation finish times so terminal agents without a
-    // loaded doc still stop their elapsed clock somewhere stable.
+    // loaded doc still stop their elapsed clock somewhere stable. Only keys
+    // this session has seen ACTIVE qualify — after a restart a terminal
+    // agent's real finish time is gone, and stamping "now" would render a
+    // bogus multi-minute elapsed for a seconds-long agent.
+    let mut active = state.subagent_active_obs.borrow_mut();
     let mut obs = state.subagent_finished_obs.borrow_mut();
     for s in &out {
-        if !s.status.active() && s.finished.is_none() {
-            obs.entry(part_key(chat_id, &s.id))
-                .or_insert_with(|| Utc::now().timestamp_millis());
+        let key = part_key(chat_id, &s.id);
+        if s.status.active() {
+            active.insert(key);
+        } else if s.finished.is_none() && active.contains(&key) {
+            obs.entry(key).or_insert_with(|| Utc::now().timestamp_millis());
         }
     }
     out
@@ -1020,5 +1028,55 @@ mod tests {
         state.transcript = vec![entry("u", MessageRole::User, vec![]), live];
         let out = subagents_for(&state, "c");
         assert_eq!(out[0].status, SubagentPhase::Started);
+    }
+
+    #[test]
+    fn finished_observation_requires_an_active_observation_this_session() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        // A settled agent first observed after an app restart (no doc, no
+        // output): never stamp a finish time and never show a guessed
+        // elapsed.
+        state.transcript = vec![
+            entry("u", MessageRole::User, vec![]),
+            entry(
+                "m",
+                MessageRole::Assistant,
+                vec![spawn("a", true, Some(SubagentStatus::Done))],
+            ),
+        ];
+        let out = subagents_for(&state, "c");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, SubagentPhase::Done);
+        assert!(out[0].finished.is_none());
+        assert!(out[0].elapsed(Utc::now()).is_none());
+        assert!(state.subagent_finished_obs.borrow().is_empty());
+
+        // The same agent seen Running first, then Done: the transition
+        // stamps a finish observation and elapsed freezes.
+        let mut live = entry(
+            "m",
+            MessageRole::Assistant,
+            vec![spawn("a", false, Some(SubagentStatus::Running))],
+        );
+        live.status = Some(MessageStatus::Streaming);
+        state.transcript = vec![entry("u", MessageRole::User, vec![]), live];
+        let out = subagents_for(&state, "c");
+        assert_eq!(out[0].status, SubagentPhase::Running);
+
+        state.transcript = vec![
+            entry("u", MessageRole::User, vec![]),
+            entry(
+                "m",
+                MessageRole::Assistant,
+                vec![spawn("a", true, Some(SubagentStatus::Done))],
+            ),
+        ];
+        // The terminal frame stamps the observation; the next read returns it.
+        subagents_for(&state, "c");
+        let out = subagents_for(&state, "c");
+        assert_eq!(out[0].status, SubagentPhase::Done);
+        assert!(out[0].finished.is_some());
+        assert!(out[0].elapsed(Utc::now()).is_some());
     }
 }

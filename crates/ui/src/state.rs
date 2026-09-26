@@ -842,9 +842,15 @@ pub struct AppState {
     sub_watch_tasks: HashMap<String, Task<()>>,
     /// First-observation finish times for terminal subagents whose doc is
     /// not loaded — `{chat_id}/{part_id}` -> epoch millis. The selector
-    /// (`crate::subagents`) stamps it the frame a terminal status lands, so
-    /// elapsed labels stop somewhere stable even with no doc to read.
+    /// (`crate::subagents`) stamps it the frame a terminal status lands, but
+    /// only for keys this session earlier observed ACTIVE — after a restart
+    /// the real finish time is lost and no duration should be guessed.
     pub(crate) subagent_finished_obs: std::cell::RefCell<HashMap<String, i64>>,
+    /// Subagent keys (`{chat_id}/{part_id}`) this app session has observed
+    /// in an active phase. Memory-only — cleared on restart, which is what
+    /// keeps `subagent_finished_obs` from stamping bogus post-restart
+    /// finish times.
+    pub(crate) subagent_active_obs: std::cell::RefCell<std::collections::HashSet<String>>,
     /// Pending-message queues keyed by chat id for pane-fixed composers.
     /// Independent of `selected_chat`: a pane keeps reading its own queue
     /// while another chat is selected.
@@ -956,6 +962,7 @@ impl AppState {
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
             subagent_finished_obs: std::cell::RefCell::new(HashMap::new()),
+            subagent_active_obs: std::cell::RefCell::new(std::collections::HashSet::new()),
             pane_queues: HashMap::new(),
             pane_queue_tasks: HashMap::new(),
             auto_selected: false,
