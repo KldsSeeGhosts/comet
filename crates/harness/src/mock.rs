@@ -615,8 +615,44 @@ impl Harness for MockHarness {
                             text: "Working through each state; sky Working reads correctly on the live card.".into(),
                         },
                     ),
-                    // No Done for mock-agt-run: it stays Running past the
-                    // parent's settle, the whole point of the fixture.
+                    // More paced beats: enough tagged traffic that the chip
+                    // stays Running across a ~60s screenshot window.
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::ToolCall {
+                            id: "agt-run-read2".into(),
+                            call: zeron_proto::ToolCall::ReadFile {
+                                path: "crates/ui/src/status_palette.rs".into(),
+                            },
+                        },
+                    ),
+                    tag("mock-agt-run", resolve("agt-run-read2")),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::TextDelta {
+                            text: "Indigo awaiting and emerald completed both hold on their rows.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::ToolCall {
+                            id: "agt-run-grep2".into(),
+                            call: zeron_proto::ToolCall::Search {
+                                pattern: "status_palette".into(),
+                                path: Some("crates/ui/src/shell".into()),
+                            },
+                        },
+                    ),
+                    tag("mock-agt-run", resolve("agt-run-grep2")),
+                    tag(
+                        "mock-agt-run",
+                        AgentEvent::TextDelta {
+                            text: "Failed rows take the danger hue; working rows keep the equalizer.".into(),
+                        },
+                    ),
+                    // No Done for mock-agt-run: it stays Running through the
+                    // demo, the whole point of the fixture. (The engine still
+                    // freezes it Failed when the parent run finally ends.)
                 ]
             })
             .into_iter()
